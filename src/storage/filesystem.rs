@@ -32,12 +32,14 @@ impl FilesystemStorage {
     }
 
     pub async fn head_bucket(&self, name: &str) -> bool {
-        self.buckets_dir.join(name).join(".bucket.json").exists()
+        fs::try_exists(self.buckets_dir.join(name).join(".bucket.json"))
+            .await
+            .unwrap_or(false)
     }
 
     pub async fn delete_bucket(&self, name: &str) -> Result<bool, StorageError> {
         let bucket_dir = self.buckets_dir.join(name);
-        if !bucket_dir.exists() {
+        if !fs::try_exists(&bucket_dir).await.unwrap_or(false) {
             return Ok(false);
         }
 
@@ -144,7 +146,13 @@ impl FilesystemStorage {
     ) -> Result<(ByteStream, ObjectMeta), StorageError> {
         let meta = self.read_object_meta(bucket, key).await?;
         let obj_path = self.object_path(bucket, key);
-        let file = fs::File::open(&obj_path).await?;
+        let file = fs::File::open(&obj_path).await.map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                StorageError::NotFound(key.to_string())
+            } else {
+                StorageError::Io(e)
+            }
+        })?;
         let reader = BufReader::new(file);
         Ok((Box::pin(reader), meta))
     }
@@ -228,7 +236,13 @@ impl FilesystemStorage {
         key: &str,
     ) -> Result<ObjectMeta, StorageError> {
         let meta_path = self.meta_path(bucket, key);
-        let data = fs::read_to_string(&meta_path).await?;
+        let data = fs::read_to_string(&meta_path).await.map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                StorageError::NotFound(key.to_string())
+            } else {
+                StorageError::Io(e)
+            }
+        })?;
         Ok(serde_json::from_str(&data)?)
     }
 

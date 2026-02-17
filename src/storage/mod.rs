@@ -34,4 +34,6 @@ pub enum StorageError {
     Io(#[from] std::io::Error),
     #[error("JSON error: {0}")]
     Json(#[from] serde_json::Error),
+    #[error("Not found: {0}")]
+    NotFound(String),
 }

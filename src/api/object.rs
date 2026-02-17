@@ -10,6 +10,7 @@ use tokio_util::io::ReaderStream;
 
 use crate::error::S3Error;
 use crate::server::AppState;
+use crate::storage::StorageError;
 
 pub async fn put_object(
     State(state): State<AppState>,
@@ -94,12 +95,9 @@ pub async fn get_object(
         .storage
         .get_object(&bucket, &key)
         .await
-        .map_err(|e| {
-            if e.to_string().contains("No such file") || e.to_string().contains("not found") {
-                S3Error::no_such_key(&key)
-            } else {
-                S3Error::internal(e)
-            }
+        .map_err(|e| match e {
+            StorageError::NotFound(_) => S3Error::no_such_key(&key),
+            _ => S3Error::internal(e),
         })?;
 
     let stream = ReaderStream::new(reader);
@@ -123,12 +121,9 @@ pub async fn head_object(
         .storage
         .head_object(&bucket, &key)
         .await
-        .map_err(|e| {
-            if e.to_string().contains("No such file") || e.to_string().contains("not found") {
-                S3Error::no_such_key(&key)
-            } else {
-                S3Error::internal(e)
-            }
+        .map_err(|e| match e {
+            StorageError::NotFound(_) => S3Error::no_such_key(&key),
+            _ => S3Error::internal(e),
         })?;
 
     Ok(Response::builder()
@@ -173,13 +168,25 @@ pub async fn delete_objects(
         }
     }
 
+    // Delete objects concurrently
+    let mut set = tokio::task::JoinSet::new();
+    for key in keys.clone() {
+        let storage = state.storage.clone();
+        let bucket = bucket.clone();
+        set.spawn(async move {
+            let _ = storage.delete_object(&bucket, &key).await;
+            key
+        });
+    }
+
     let mut deleted_xml = String::new();
-    for key in &keys {
-        let _ = state.storage.delete_object(&bucket, key).await;
-        deleted_xml.push_str(&format!(
-            "<Deleted><Key>{}</Key></Deleted>",
-            quick_xml::escape::escape(key)
-        ));
+    while let Some(result) = set.join_next().await {
+        if let Ok(key) = result {
+            deleted_xml.push_str(&format!(
+                "<Deleted><Key>{}</Key></Deleted>",
+                quick_xml::escape::escape(&key)
+            ));
+        }
     }
 
     let response_xml = format!(

@@ -114,7 +114,8 @@ jobs:
 
       - name: Get version
         id: version
-        run: TAG="${{ github.event.inputs.version || github.ref_name }}"
+        run: |
+          TAG="${{ github.event.inputs.version || github.ref_name }}"
           echo "VERSION=${TAG#v}" >> $GITHUB_OUTPUT
 
       - name: Build and Push Image (${{ matrix.arch }})
@@ -151,7 +152,8 @@ jobs:
 
       - name: Get version
         id: version
-        run: TAG="${{ github.event.inputs.version || github.ref_name }}"
+        run: |
+          TAG="${{ github.event.inputs.version || github.ref_name }}"
           echo "VERSION=${TAG#v}" >> $GITHUB_OUTPUT
 
       - name: Create & publish manifest on ${{ env.GITHUB_REGISTRY }}

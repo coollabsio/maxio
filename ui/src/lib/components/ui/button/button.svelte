@@ -15,7 +15,7 @@
 				secondary: "bg-secondary text-secondary-foreground border-secondary hover:bg-secondary/80",
 				ghost: "border-transparent hover:bg-accent hover:text-accent-foreground",
 				link: "border-transparent text-primary underline-offset-4 hover:underline",
-				brand: "bg-brand/20 text-white border border-brand-highlight hover:bg-brand hover:text-white",
+				brand: "bg-brand text-brand-foreground border border-brand-highlight hover:bg-brand-hover hover:text-brand-foreground",
 			},
 			size: {
 				default: "h-8 px-3 py-1.5 has-[>svg]:px-2",

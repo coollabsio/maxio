@@ -193,6 +193,45 @@ assert "download overwritten" $AWS s3 cp "s3://$BUCKET/test.txt" "$TMPDIR/overwr
 assert_eq "overwritten content" "updated content" "$(cat "$TMPDIR/overwritten.txt")"
 assert_eq "on-disk overwritten content" "updated content" "$(cat "$DATA_DIR/buckets/$BUCKET/test.txt")"
 
+# --- Range request tests ---
+echo "abcdefghijklmnopqrstuvwxyz" > "$TMPDIR/alphabet.txt"
+assert "upload range-test file" $AWS s3 cp "$TMPDIR/alphabet.txt" "s3://$BUCKET/alphabet.txt"
+
+assert "get-object with range bytes=0-4" \
+    $AWS s3api get-object --bucket "$BUCKET" --key "alphabet.txt" \
+    --range "bytes=0-4" "$TMPDIR/range_out.txt"
+assert_eq "range first 5 bytes" "abcde" "$(cat "$TMPDIR/range_out.txt")"
+
+assert "get-object with range bytes=-3" \
+    $AWS s3api get-object --bucket "$BUCKET" --key "alphabet.txt" \
+    --range "bytes=-3" "$TMPDIR/range_suffix.txt"
+assert_eq "range suffix 3 bytes" "yz" "$(cat "$TMPDIR/range_suffix.txt" | tr -d '\n')"
+
+assert "get-object with open-end range bytes=23-" \
+    $AWS s3api get-object --bucket "$BUCKET" --key "alphabet.txt" \
+    --range "bytes=23-" "$TMPDIR/range_open.txt"
+assert_eq "range open-end" "xyz" "$(cat "$TMPDIR/range_open.txt" | tr -d '\n')"
+
+assert_fail "get-object with invalid range bytes=9999-" \
+    $AWS s3api get-object --bucket "$BUCKET" --key "alphabet.txt" \
+    --range "bytes=9999-" "$TMPDIR/range_invalid.txt"
+
+assert "delete range-test file" $AWS s3 rm "s3://$BUCKET/alphabet.txt"
+
+# --- Folder operations ---
+assert "create folder via put-object" $AWS s3api put-object --bucket "$BUCKET" --key "empty-folder/" --content-length 0
+assert_file_exists "folder marker exists on disk" "$DATA_DIR/buckets/$BUCKET/empty-folder/.folder"
+assert_file_exists "folder marker meta exists on disk" "$DATA_DIR/buckets/$BUCKET/empty-folder/.folder.meta.json"
+
+OUTPUT=$($AWS s3 ls "s3://$BUCKET/" 2>&1)
+assert_eq "list shows folder prefix" "true" "$(echo "$OUTPUT" | grep -q "empty-folder/" && echo true || echo false)"
+
+OUTPUT=$($AWS s3api head-object --bucket "$BUCKET" --key "empty-folder/" 2>&1)
+assert_eq "head folder marker has zero size" "true" "$(echo "$OUTPUT" | grep -q '"ContentLength": 0' && echo true || echo false)"
+
+assert "delete folder marker" $AWS s3api delete-object --bucket "$BUCKET" --key "empty-folder/"
+assert_fail "head deleted folder marker" $AWS s3api head-object --bucket "$BUCKET" --key "empty-folder/"
+
 # --- Delete operations ---
 assert "delete object" $AWS s3 rm "s3://$BUCKET/test.txt"
 assert_file_not_exists "deleted object gone from disk" "$DATA_DIR/buckets/$BUCKET/test.txt"

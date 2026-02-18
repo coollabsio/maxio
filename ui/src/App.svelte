@@ -20,6 +20,14 @@
   let currentPrefix = $state("");
   let currentBreadcrumbs = $state<{ label: string; prefix: string }[]>([]);
   let isDark = $state(document.documentElement.classList.contains("dark"));
+  let pendingPrefix = $state<string | null>(null);
+
+  $effect(() => {
+    if (objectBrowserRef && pendingPrefix) {
+      objectBrowserRef.navigateTo(pendingPrefix);
+      pendingPrefix = null;
+    }
+  });
 
   function applyHash() {
     const hash = window.location.hash.slice(1) || "/";
@@ -32,8 +40,12 @@
       const bucket = decodeURIComponent(parts[0]);
       const prefix = parts.slice(1).join("/");
       selectedBucket = bucket;
-      if (prefix && objectBrowserRef) {
-        objectBrowserRef.navigateTo(prefix);
+      if (prefix) {
+        if (objectBrowserRef) {
+          objectBrowserRef.navigateTo(prefix);
+        } else {
+          pendingPrefix = prefix;
+        }
       }
     }
   }

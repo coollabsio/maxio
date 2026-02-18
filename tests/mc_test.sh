@@ -158,6 +158,14 @@ OUTPUT=$(mc cat "$ALIAS/$BUCKET/test.txt" 2>&1)
 assert_eq "overwritten content" "updated content" "$OUTPUT"
 assert_eq "on-disk overwritten content" "updated content" "$(cat "$DATA_DIR/buckets/$BUCKET/test.txt")"
 
+# --- Folder operations (implicit via nested keys) ---
+assert "upload into new folder" mc cp "$TMPDIR/test.txt" "$ALIAS/$BUCKET/my-folder/sub.txt"
+OUTPUT=$(mc ls "$ALIAS/$BUCKET/" 2>&1)
+assert_eq "list shows folder prefix" "true" "$(echo "$OUTPUT" | grep -q "my-folder/" && echo true || echo false)"
+assert "download from folder" mc cp "$ALIAS/$BUCKET/my-folder/sub.txt" "$TMPDIR/folder-sub.txt"
+assert_eq "folder object content matches" "hello maxio" "$(cat "$TMPDIR/folder-sub.txt")"
+assert "delete folder object" mc rm "$ALIAS/$BUCKET/my-folder/sub.txt"
+
 # --- Delete operations ---
 assert "delete object" mc rm "$ALIAS/$BUCKET/test.txt"
 assert_file_not_exists "deleted object gone from disk" "$DATA_DIR/buckets/$BUCKET/test.txt"

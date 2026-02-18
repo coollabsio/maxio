@@ -9,6 +9,7 @@
   import Trash2 from 'lucide-svelte/icons/trash-2'
   import Share2 from 'lucide-svelte/icons/share-2'
   import Check from 'lucide-svelte/icons/check'
+  import FolderPlus from 'lucide-svelte/icons/folder-plus'
 
   interface Props {
     bucket: string
@@ -27,12 +28,16 @@
   let prefix = $state('')
   let files = $state<S3File[]>([])
   let prefixes = $state<string[]>([])
+  let emptyPrefixes = $state<Set<string>>(new Set())
   let loading = $state(true)
   let error = $state<string | null>(null)
   let uploading = $state(false)
   let fileInput: HTMLInputElement | undefined = $state()
   let copiedKey = $state<string | null>(null)
   let shareMenuKey = $state<string | null>(null)
+  let showCreateFolder = $state(false)
+  let newFolderName = $state('')
+  let creatingFolder = $state(false)
   let shareMenuPos = $state({ top: 0, left: 0 })
 
   const expiryOptions = [
@@ -52,6 +57,7 @@
         const data = await res.json()
         files = data.files
         prefixes = data.prefixes
+        emptyPrefixes = new Set(data.emptyPrefixes || [])
       } else {
         error = `Failed to load objects (${res.status})`
       }
@@ -203,6 +209,52 @@
     }
   }
 
+  async function createFolder() {
+    const name = newFolderName.trim()
+    if (!name) return
+    creatingFolder = true
+    error = null
+    try {
+      const fullName = `${prefix}${name}`
+      const res = await fetch(`/api/buckets/${encodeURIComponent(bucket)}/folders`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name: fullName }),
+      })
+      if (res.ok) {
+        newFolderName = ''
+        showCreateFolder = false
+        await fetchObjects()
+      } else {
+        const data = await res.json()
+        error = data.error || 'Failed to create folder'
+      }
+    } catch (err) {
+      console.error('createFolder failed:', err)
+      error = 'Failed to create folder'
+    } finally {
+      creatingFolder = false
+    }
+  }
+
+  async function deleteFolder(folderPrefix: string, e: Event) {
+    e.stopPropagation()
+    if (!confirm(`Delete empty folder "${displayName(folderPrefix)}"?`)) return
+    error = null
+    try {
+      const res = await fetch(`/api/buckets/${encodeURIComponent(bucket)}/objects/${folderPrefix}`, { method: 'DELETE' })
+      if (res.ok) {
+        await fetchObjects()
+      } else {
+        const data = await res.json()
+        error = data.error || 'Failed to delete folder'
+      }
+    } catch (err) {
+      console.error('deleteFolder failed:', err)
+      error = 'Failed to delete folder'
+    }
+  }
+
   function handleClickOutside(e: MouseEvent) {
     if (shareMenuKey) shareMenuKey = null
   }
@@ -232,6 +284,27 @@
     <Button variant="brand" class="h-8" onclick={() => fileInput?.click()} disabled={uploading}>
       <Upload class="size-4 mr-1" /> {uploading ? 'Uploading...' : 'Upload'}
     </Button>
+    {#if showCreateFolder}
+      <form onsubmit={(e) => { e.preventDefault(); createFolder() }} class="flex items-center gap-2">
+        <input
+          type="text"
+          bind:value={newFolderName}
+          placeholder="folder-name"
+          class="input-cool h-8 w-40"
+          disabled={creatingFolder}
+        />
+        <Button type="submit" variant="brand" class="h-8" disabled={creatingFolder || !newFolderName.trim()}>
+          {creatingFolder ? 'Creating...' : 'Create'}
+        </Button>
+        <Button type="button" variant="ghost" class="h-8" onclick={() => { showCreateFolder = false; newFolderName = '' }}>
+          Cancel
+        </Button>
+      </form>
+    {:else}
+      <Button variant="outline" class="h-8" onclick={() => (showCreateFolder = true)}>
+        <FolderPlus class="size-4 mr-1" /> New Folder
+      </Button>
+    {/if}
   </div>
 
   {#if loading && files.length === 0 && prefixes.length === 0}
@@ -262,7 +335,17 @@
             </Table.Cell>
             <Table.Cell class="text-right text-muted-foreground">&mdash;</Table.Cell>
             <Table.Cell class="text-muted-foreground">&mdash;</Table.Cell>
-            <Table.Cell></Table.Cell>
+            <Table.Cell>
+              {#if emptyPrefixes.has(p)}
+                <button
+                  class="text-muted-foreground hover:text-destructive transition-colors"
+                  onclick={(e) => deleteFolder(p, e)}
+                  title="Delete empty folder"
+                >
+                  <Trash2 class="size-4" />
+                </button>
+              {/if}
+            </Table.Cell>
           </Table.Row>
         {/each}
         {#each files as file}
@@ -276,7 +359,7 @@
             <Table.Cell class="text-right text-muted-foreground">{formatSize(file.size)}</Table.Cell>
             <Table.Cell class="text-muted-foreground">{formatDate(file.lastModified)}</Table.Cell>
             <Table.Cell class="w-24">
-              <span class="flex items-center gap-1">
+              <span class="flex items-center gap-3">
                 <button
                   class="text-muted-foreground hover:text-foreground transition-colors"
                   onclick={(e) => toggleShareMenu(file.key, e)}

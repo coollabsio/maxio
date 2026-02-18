@@ -176,13 +176,116 @@ fn to_http_date(iso: &str) -> String {
         .unwrap_or_else(|_| iso.to_string())
 }
 
+/// Parse an HTTP Range header value into (start, end_inclusive) byte positions.
+/// Returns Ok(Some((start, end))) for valid ranges, Ok(None) for unparseable/ignored,
+/// Err(()) for syntactically valid but unsatisfiable ranges.
+fn parse_range(header: &str, file_size: u64) -> Result<Option<(u64, u64)>, ()> {
+    let header = header.trim();
+    let spec = match header.strip_prefix("bytes=") {
+        Some(s) => s.trim(),
+        None => return Ok(None),
+    };
+    // S3 doesn't support multi-range
+    if spec.contains(',') {
+        return Ok(None);
+    }
+    let (start_str, end_str) = match spec.split_once('-') {
+        Some(parts) => parts,
+        None => return Ok(None),
+    };
+
+    if file_size == 0 {
+        return Err(());
+    }
+
+    if start_str.is_empty() {
+        // Suffix: bytes=-N
+        let suffix: u64 = end_str.parse().map_err(|_| ())?;
+        if suffix == 0 {
+            return Err(());
+        }
+        let start = file_size.saturating_sub(suffix);
+        Ok(Some((start, file_size - 1)))
+    } else if end_str.is_empty() {
+        // Open end: bytes=N-
+        let start: u64 = start_str.parse().map_err(|_| ())?;
+        if start >= file_size {
+            return Err(());
+        }
+        Ok(Some((start, file_size - 1)))
+    } else {
+        // Explicit: bytes=N-M
+        let start: u64 = start_str.parse().map_err(|_| ())?;
+        let end: u64 = end_str.parse().map_err(|_| ())?;
+        if start >= file_size {
+            return Err(());
+        }
+        let end = end.min(file_size - 1);
+        if start > end {
+            return Err(());
+        }
+        Ok(Some((start, end)))
+    }
+}
+
 pub async fn get_object(
     State(state): State<AppState>,
     Path((bucket, key)): Path<(String, String)>,
     Query(params): Query<HashMap<String, String>>,
+    headers: HeaderMap,
 ) -> Result<Response<Body>, S3Error> {
     if params.contains_key("uploadId") {
         return multipart::list_parts(State(state), Path((bucket, key)), Query(params)).await;
+    }
+
+    let range_header = headers
+        .get("range")
+        .and_then(|v| v.to_str().ok());
+
+    if let Some(range_str) = range_header {
+        let meta = state
+            .storage
+            .head_object(&bucket, &key)
+            .await
+            .map_err(|e| match e {
+                StorageError::NotFound(_) => S3Error::no_such_key(&key),
+                StorageError::InvalidKey(msg) => S3Error::invalid_argument(&msg),
+                _ => S3Error::internal(e),
+            })?;
+
+        match parse_range(range_str, meta.size) {
+            Ok(Some((start, end))) => {
+                let length = end - start + 1;
+                let (reader, _) = state
+                    .storage
+                    .get_object_range(&bucket, &key, start, length)
+                    .await
+                    .map_err(|e| match e {
+                        StorageError::NotFound(_) => S3Error::no_such_key(&key),
+                        _ => S3Error::internal(e),
+                    })?;
+
+                let stream = ReaderStream::new(reader);
+                let body = Body::from_stream(stream);
+
+                return Ok(Response::builder()
+                    .status(StatusCode::PARTIAL_CONTENT)
+                    .header("Content-Type", &meta.content_type)
+                    .header("Content-Length", length.to_string())
+                    .header("Content-Range", format!("bytes {}-{}/{}", start, end, meta.size))
+                    .header("Accept-Ranges", "bytes")
+                    .header("ETag", &meta.etag)
+                    .header("Last-Modified", to_http_date(&meta.last_modified))
+                    .body(body)
+                    .unwrap());
+            }
+            Ok(None) => {
+                // Unparseable or multi-range — fall through to full 200
+            }
+            Err(()) => {
+                return Err(S3Error::invalid_range());
+            }
+        }
     }
 
     let (reader, meta) = state
@@ -202,6 +305,7 @@ pub async fn get_object(
         .status(StatusCode::OK)
         .header("Content-Type", &meta.content_type)
         .header("Content-Length", meta.size.to_string())
+        .header("Accept-Ranges", "bytes")
         .header("ETag", &meta.etag)
         .header("Last-Modified", to_http_date(&meta.last_modified))
         .body(body)
@@ -228,6 +332,7 @@ pub async fn head_object(
         .header("Content-Length", meta.size.to_string())
         .header("ETag", &meta.etag)
         .header("Last-Modified", to_http_date(&meta.last_modified))
+        .header("Accept-Ranges", "bytes")
         .body(Body::empty())
         .unwrap())
 }

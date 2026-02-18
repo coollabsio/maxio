@@ -229,7 +229,7 @@ pub async fn list_objects(
         if let Some(pos) = suffix.find(delimiter.as_str()) {
             let common = format!("{}{}", prefix, &suffix[..pos + delimiter.len()]);
             prefix_set.insert(common);
-        } else {
+        } else if !obj.key.ends_with('/') {
             files.push(serde_json::json!({
                 "key": obj.key,
                 "size": obj.size,
@@ -239,11 +239,23 @@ pub async fn list_objects(
         }
     }
 
+    // Determine which prefixes are empty (only contain a folder marker, no real objects)
+    let mut empty_prefixes: Vec<&String> = Vec::new();
+    for p in &prefix_set {
+        let has_children = all_objects.iter().any(|obj| {
+            obj.key.starts_with(p.as_str()) && obj.key != *p
+        });
+        if !has_children {
+            empty_prefixes.push(p);
+        }
+    }
+
     let prefixes: Vec<&String> = prefix_set.iter().collect();
 
     (StatusCode::OK, Json(serde_json::json!({
         "files": files,
         "prefixes": prefixes,
+        "emptyPrefixes": empty_prefixes,
     }))).into_response()
 }
 
@@ -424,6 +436,36 @@ pub async fn presign_object(
         .into_response()
 }
 
+#[derive(serde::Deserialize)]
+pub struct CreateFolderRequest {
+    name: String,
+}
+
+pub async fn create_folder(
+    State(state): State<AppState>,
+    Path(bucket): Path<String>,
+    Json(body): Json<CreateFolderRequest>,
+) -> impl IntoResponse {
+    let name = body.name.trim().trim_matches('/');
+    if name.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "Folder name is required"})),
+        )
+            .into_response();
+    }
+
+    let key = format!("{}/", name);
+    match state.storage.put_object(&bucket, &key, "application/x-directory", Box::pin(tokio::io::empty())).await {
+        Ok(_) => (StatusCode::OK, Json(serde_json::json!({"ok": true}))).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": e.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
 pub fn console_router(state: AppState) -> Router<AppState> {
     let public = Router::new()
         .route("/auth/login", post(login))
@@ -434,6 +476,7 @@ pub fn console_router(state: AppState) -> Router<AppState> {
         .route("/buckets", get(list_buckets))
         .route("/buckets", post(create_bucket))
         .route("/buckets/{bucket}", delete(delete_bucket_api))
+        .route("/buckets/{bucket}/folders", post(create_folder))
         .route("/buckets/{bucket}/objects", get(list_objects))
         .route("/buckets/{bucket}/objects/{*key}", delete(delete_object_api))
         .route("/buckets/{bucket}/upload/{*key}", put(upload_object))

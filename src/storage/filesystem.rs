@@ -2,7 +2,7 @@ use super::{BucketMeta, ByteStream, MultipartUploadMeta, ObjectMeta, PartMeta, P
 use md5::{Digest, Md5};
 use std::path::{Component, Path, PathBuf};
 use tokio::fs;
-use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt, BufReader};
 
 pub struct FilesystemStorage {
     buckets_dir: PathBuf,
@@ -104,13 +104,26 @@ impl FilesystemStorage {
     // --- Object operations ---
 
     fn object_path(&self, bucket: &str, key: &str) -> PathBuf {
-        self.buckets_dir.join(bucket).join(key)
+        if key.ends_with('/') {
+            let dir = key.trim_end_matches('/');
+            self.buckets_dir.join(bucket).join(dir).join(".folder")
+        } else {
+            self.buckets_dir.join(bucket).join(key)
+        }
     }
 
     fn meta_path(&self, bucket: &str, key: &str) -> PathBuf {
-        self.buckets_dir
-            .join(bucket)
-            .join(format!("{}.meta.json", key))
+        if key.ends_with('/') {
+            let dir = key.trim_end_matches('/');
+            self.buckets_dir
+                .join(bucket)
+                .join(dir)
+                .join(".folder.meta.json")
+        } else {
+            self.buckets_dir
+                .join(bucket)
+                .join(format!("{}.meta.json", key))
+        }
     }
 
     fn uploads_dir(&self, bucket: &str) -> PathBuf {
@@ -143,6 +156,12 @@ impl FilesystemStorage {
         mut body: ByteStream,
     ) -> Result<PutResult, StorageError> {
         validate_key(key)?;
+
+        // Folder marker: zero-byte object with key ending in /
+        if key.ends_with('/') {
+            return self.put_folder_marker(bucket, key).await;
+        }
+
         let obj_path = self.object_path(bucket, key);
         if let Some(parent) = obj_path.parent() {
             fs::create_dir_all(parent).await?;
@@ -189,6 +208,40 @@ impl FilesystemStorage {
         })
     }
 
+    async fn put_folder_marker(
+        &self,
+        bucket: &str,
+        key: &str,
+    ) -> Result<PutResult, StorageError> {
+        let folder_dir = self
+            .buckets_dir
+            .join(bucket)
+            .join(key.trim_end_matches('/'));
+        fs::create_dir_all(&folder_dir).await?;
+
+        let marker_path = folder_dir.join(".folder");
+        fs::write(&marker_path, b"").await?;
+
+        let etag = "\"d41d8cd98f00b204e9800998ecf8427e\"".to_string();
+        let now = chrono::Utc::now()
+            .format("%Y-%m-%dT%H:%M:%S%.3fZ")
+            .to_string();
+
+        let meta = ObjectMeta {
+            key: key.to_string(),
+            size: 0,
+            etag: etag.clone(),
+            content_type: "application/x-directory".to_string(),
+            last_modified: now,
+        };
+
+        let meta_path = folder_dir.join(".folder.meta.json");
+        let json = serde_json::to_string_pretty(&meta)?;
+        fs::write(&meta_path, json).await?;
+
+        Ok(PutResult { size: 0, etag })
+    }
+
     pub async fn get_object(
         &self,
         bucket: &str,
@@ -205,6 +258,29 @@ impl FilesystemStorage {
             }
         })?;
         let reader = BufReader::new(file);
+        Ok((Box::pin(reader), meta))
+    }
+
+    pub async fn get_object_range(
+        &self,
+        bucket: &str,
+        key: &str,
+        offset: u64,
+        length: u64,
+    ) -> Result<(ByteStream, ObjectMeta), StorageError> {
+        validate_key(key)?;
+        let meta = self.read_object_meta(bucket, key).await?;
+        let obj_path = self.object_path(bucket, key);
+        let mut file = fs::File::open(&obj_path).await.map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                StorageError::NotFound(key.to_string())
+            } else {
+                StorageError::Io(e)
+            }
+        })?;
+        file.seek(std::io::SeekFrom::Start(offset)).await.map_err(StorageError::Io)?;
+        let limited = file.take(length);
+        let reader = BufReader::new(limited);
         Ok((Box::pin(reader), meta))
     }
 
@@ -527,11 +603,29 @@ impl FilesystemStorage {
                 let path = entry.path();
                 let fname = entry.file_name().to_string_lossy().to_string();
 
-                if fname.ends_with(".meta.json") || fname == ".bucket.json" || fname == ".uploads" {
+                if fname.ends_with(".meta.json")
+                    || fname == ".bucket.json"
+                    || fname == ".uploads"
+                    || fname == ".folder"
+                {
                     continue;
                 }
 
                 if entry.file_type().await?.is_dir() {
+                    // Check for folder marker inside this directory
+                    let marker = path.join(".folder.meta.json");
+                    if marker.exists() {
+                        if let Ok(rel) = path.strip_prefix(base) {
+                            let key = format!("{}/", rel.to_string_lossy());
+                            if key.starts_with(prefix) {
+                                if let Ok(data) = fs::read_to_string(&marker).await {
+                                    if let Ok(meta) = serde_json::from_str::<ObjectMeta>(&data) {
+                                        results.push(meta);
+                                    }
+                                }
+                            }
+                        }
+                    }
                     self.walk_dir(base, &path, prefix, results).await?;
                 } else {
                     if let Ok(rel) = path.strip_prefix(base) {

@@ -24,6 +24,7 @@ pub enum S3ErrorCode {
     NoSuchBucket,
     NoSuchKey,
     NoSuchUpload,
+    InvalidRange,
     NotImplemented,
     EntityTooSmall,
     ExpiredPresignedUrl,
@@ -46,6 +47,7 @@ impl S3ErrorCode {
             Self::NoSuchBucket => "NoSuchBucket",
             Self::NoSuchKey => "NoSuchKey",
             Self::NoSuchUpload => "NoSuchUpload",
+            Self::InvalidRange => "InvalidRange",
             Self::NotImplemented => "NotImplemented",
             Self::EntityTooSmall => "EntityTooSmall",
             Self::ExpiredPresignedUrl => "AccessDenied",
@@ -62,6 +64,7 @@ impl S3ErrorCode {
             Self::NoSuchBucket | Self::NoSuchKey | Self::NoSuchUpload => StatusCode::NOT_FOUND,
             Self::BucketAlreadyOwnedByYou | Self::BucketNotEmpty => StatusCode::CONFLICT,
             Self::InternalError => StatusCode::INTERNAL_SERVER_ERROR,
+            Self::InvalidRange => StatusCode::RANGE_NOT_SATISFIABLE,
             Self::NotImplemented => StatusCode::NOT_IMPLEMENTED,
             _ => StatusCode::BAD_REQUEST,
         }
@@ -199,6 +202,14 @@ impl S3Error {
         Self {
             code: S3ErrorCode::InvalidAccessKeyId,
             message: "The AWS Access Key Id you provided does not exist in our records.".into(),
+            resource: None,
+        }
+    }
+
+    pub fn invalid_range() -> Self {
+        Self {
+            code: S3ErrorCode::InvalidRange,
+            message: "The requested range is not satisfiable".into(),
             resource: None,
         }
     }

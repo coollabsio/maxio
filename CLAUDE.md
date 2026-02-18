@@ -85,7 +85,7 @@ This runs both processes concurrently (Ctrl+C kills both):
 - `src/server.rs` — Axum router construction, AppState, middleware wiring
 - `src/error.rs` — S3Error with XML error response rendering
 - `src/auth/` — AWS Signature V4 verification + Axum middleware
-- `src/api/` — S3 API handlers (bucket.rs, object.rs, multipart.rs, list.rs, router.rs)
+- `src/api/` — S3 API handlers (bucket.rs, object.rs, multipart.rs, list.rs, router.rs, console.rs)
 - `src/storage/` — Filesystem storage (buckets as dirs, objects as files, JSON sidecar metadata)
 - `src/xml/` — S3 XML response types (serde + quick-xml)
 
@@ -96,7 +96,7 @@ This runs both processes concurrently (Ctrl+C kills both):
 - **Path-style only**: `/{bucket}/{key}` routing. No virtual-hosted-style yet
 - **UNSIGNED-PAYLOAD accepted**: Skips body hashing for PutObject (AWS CLI default)
 - **Embedded UI assets**: Frontend is compiled into the binary via `rust-embed`. In debug builds, assets are read from disk (`ui/dist/`) for live reload. In release builds, assets are baked in — single binary, no external files needed
-- **Future web console**: Reserved `/ui/` route namespace. Separate auth (cookies, not SigV4)
+- **Web console**: SPA at `/ui/`, API at `/api/`. Cookie-based auth (HMAC tokens, not SigV4). Presigned URL generation with configurable expiry (1h/6h/24h/7d picker in UI)
 
 ### Data Layout
 
@@ -139,6 +139,26 @@ This runs both processes concurrently (Ctrl+C kills both):
 | AbortMultipartUpload | DELETE | `/{bucket}/{key}?uploadId=X` |
 | ListParts | GET | `/{bucket}/{key}?uploadId=X` |
 | ListMultipartUploads | GET | `/{bucket}?uploads` |
+
+### Console API (`/api/`)
+
+| Endpoint | Method | Auth | Description |
+|---|---|---|---|
+| `/api/auth/login` | POST | none | Login with accessKey/secretKey, sets session cookie |
+| `/api/auth/check` | GET | none | Check if session cookie is valid |
+| `/api/auth/logout` | POST | cookie | Clear session cookie |
+| `/api/buckets` | GET | cookie | List all buckets |
+| `/api/buckets` | POST | cookie | Create bucket (`{ name }`) |
+| `/api/buckets/{bucket}` | DELETE | cookie | Delete bucket |
+| `/api/buckets/{bucket}/objects` | GET | cookie | List objects (`?prefix=&delimiter=`) |
+| `/api/buckets/{bucket}/objects/{key}` | DELETE | cookie | Delete object |
+| `/api/buckets/{bucket}/upload/{key}` | PUT | cookie | Upload object |
+| `/api/buckets/{bucket}/download/{key}` | GET | cookie | Download object |
+| `/api/buckets/{bucket}/presign/{key}` | GET | cookie | Generate presigned URL (`?expires=SECONDS`, default 3600, max 604800) |
+
+### Frontend Error Logging
+
+All `fetch` catch blocks in UI components log errors via `console.error` with context (e.g. `'fetchBuckets failed:'`, `'shareObject failed:'`). Check browser DevTools console for debugging.
 
 ### Testing with MinIO Client (mc)
 
@@ -212,6 +232,6 @@ The web console (`ui/`) follows the Coolify design system. The full specificatio
 
 ## Roadmap
 
-- **Phase 2**: ~~Multipart upload~~, presigned URLs, ~~CopyObject~~, ~~DeleteObjects batch~~, CORS, Range headers
-- **Phase 3**: Web console (SPA at `/ui/`), versioning, lifecycle rules, multi-user, metrics
+- **Phase 2**: ~~Multipart upload~~, ~~presigned URLs~~, ~~CopyObject~~, ~~DeleteObjects batch~~, CORS, Range headers
+- **Phase 3**: ~~Web console (SPA at `/ui/`)~~, versioning, lifecycle rules, multi-user, metrics
 - **Phase 4**: Distributed mode, erasure coding, replication

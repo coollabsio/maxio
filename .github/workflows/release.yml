@@ -4,6 +4,12 @@ on:
   push:
     tags:
       - 'v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to release (e.g. v0.1.0)'
+        required: true
+        type: string
 
 permissions:
   contents: write
@@ -63,7 +69,8 @@ jobs:
 
       - name: Package
         run: |
-          VERSION=${GITHUB_REF_NAME#v}
+          TAG="${{ github.event.inputs.version || github.ref_name }}"
+          VERSION="${TAG#v}"
           ARCHIVE="${{ matrix.artifact }}-${VERSION}.tar.gz"
           cp target/${{ matrix.target }}/release/maxio maxio
           tar czf "${ARCHIVE}" maxio
@@ -107,7 +114,8 @@ jobs:
 
       - name: Get version
         id: version
-        run: echo "VERSION=${GITHUB_REF_NAME#v}" >> $GITHUB_OUTPUT
+        run: TAG="${{ github.event.inputs.version || github.ref_name }}"
+          echo "VERSION=${TAG#v}" >> $GITHUB_OUTPUT
 
       - name: Build and Push Image (${{ matrix.arch }})
         uses: docker/build-push-action@v6
@@ -143,7 +151,8 @@ jobs:
 
       - name: Get version
         id: version
-        run: echo "VERSION=${GITHUB_REF_NAME#v}" >> $GITHUB_OUTPUT
+        run: TAG="${{ github.event.inputs.version || github.ref_name }}"
+          echo "VERSION=${TAG#v}" >> $GITHUB_OUTPUT
 
       - name: Create & publish manifest on ${{ env.GITHUB_REGISTRY }}
         run: |
@@ -173,5 +182,6 @@ jobs:
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ github.event.inputs.version || github.ref_name }}
           generate_release_notes: true
           files: '*.tar.gz'

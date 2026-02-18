@@ -49,13 +49,27 @@ pub async fn put_object(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("application/octet-stream");
 
-    let reader = body_to_reader(&headers, body).await?;
+    let mut reader = body_to_reader(&headers, body).await?;
 
-    // Verify Content-MD5 if provided
+    // If Content-MD5 is provided, buffer the body and verify before writing
     let content_md5 = headers
         .get("content-md5")
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_string());
+
+    if let Some(ref expected_md5) = content_md5 {
+        use md5::Digest;
+        use tokio::io::AsyncReadExt;
+        let mut buf = Vec::new();
+        reader.read_to_end(&mut buf).await.map_err(S3Error::internal)?;
+        let computed_hash = md5::Md5::digest(&buf);
+        use base64::Engine;
+        let computed_md5 = base64::engine::general_purpose::STANDARD.encode(computed_hash);
+        if computed_md5 != *expected_md5 {
+            return Err(S3Error::bad_digest());
+        }
+        reader = Box::pin(std::io::Cursor::new(buf));
+    }
 
     let result = state
         .storage
@@ -65,18 +79,6 @@ pub async fn put_object(
             StorageError::InvalidKey(msg) => S3Error::invalid_argument(&msg),
             _ => S3Error::internal(e),
         })?;
-
-    if let Some(expected_md5) = content_md5 {
-        let hex_md5 = result.etag.trim_matches('"');
-        if let Ok(md5_bytes) = hex::decode(hex_md5) {
-            use base64::Engine;
-            let computed_md5 = base64::engine::general_purpose::STANDARD.encode(&md5_bytes);
-            if computed_md5 != expected_md5 {
-                let _ = state.storage.delete_object(&bucket, &key).await;
-                return Err(S3Error::bad_digest());
-            }
-        }
-    }
 
     let mut builder = Response::builder()
         .status(StatusCode::OK)

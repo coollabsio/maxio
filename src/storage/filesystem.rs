@@ -14,6 +14,9 @@ fn validate_key(key: &str) -> Result<(), StorageError> {
     if key.is_empty() {
         return Err(StorageError::InvalidKey("Key must not be empty".into()));
     }
+    if key.len() > 1024 {
+        return Err(StorageError::InvalidKey("Key must not exceed 1024 bytes".into()));
+    }
     let path = Path::new(key);
     for component in path.components() {
         match component {
@@ -58,7 +61,11 @@ impl FilesystemStorage {
             Ok(()) => {
                 let meta_path = bucket_dir.join(".bucket.json");
                 let json = serde_json::to_string_pretty(meta)?;
-                fs::write(&meta_path, json).await?;
+                if let Err(e) = fs::write(&meta_path, json).await {
+                    // Clean up the empty directory to avoid a half-created bucket
+                    let _ = fs::remove_dir(&bucket_dir).await;
+                    return Err(e.into());
+                }
                 Ok(true)
             }
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
@@ -81,8 +88,32 @@ impl FilesystemStorage {
             return Err(StorageError::BucketNotEmpty);
         }
 
-        fs::remove_dir_all(&bucket_dir).await?;
-        Ok(true)
+        // Remove metadata and internal dirs before the bucket dir itself.
+        // Use remove_dir (not remove_dir_all) for the bucket dir so it fails
+        // atomically if a concurrent put_object added files in between.
+        let _ = fs::remove_file(bucket_dir.join(".bucket.json")).await;
+        let _ = fs::remove_dir_all(bucket_dir.join(".uploads")).await;
+        let _ = fs::remove_dir_all(bucket_dir.join(".versions")).await;
+        match fs::remove_dir(&bucket_dir).await {
+            Ok(()) => Ok(true),
+            Err(e) if e.kind() == std::io::ErrorKind::DirectoryNotEmpty => {
+                // A concurrent write added files — restore bucket metadata
+                // and report not empty. Best-effort: if this fails, the bucket
+                // is effectively deleted (head_bucket checks .bucket.json).
+                let meta = BucketMeta {
+                    name: name.to_string(),
+                    created_at: chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string(),
+                    region: String::new(),
+                    versioning: false,
+                };
+                let _ = fs::write(
+                    bucket_dir.join(".bucket.json"),
+                    serde_json::to_string_pretty(&meta).unwrap_or_default(),
+                ).await;
+                Err(StorageError::BucketNotEmpty)
+            }
+            Err(e) => Err(e.into()),
+        }
     }
 
     pub async fn list_buckets(&self) -> Result<Vec<BucketMeta>, StorageError> {
@@ -431,11 +462,16 @@ impl FilesystemStorage {
                 .format("%Y-%m-%dT%H:%M:%S%.3fZ")
                 .to_string(),
         };
-        fs::write(
+        if let Err(e) = fs::write(
             self.part_meta_path(bucket, upload_id, part_number),
             serde_json::to_string_pretty(&meta)?,
         )
-        .await?;
+        .await
+        {
+            // Clean up orphaned part file on metadata write failure
+            let _ = fs::remove_file(&part_path).await;
+            return Err(e.into());
+        }
         Ok(meta)
     }
 

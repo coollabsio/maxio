@@ -47,6 +47,9 @@ impl LoginRateLimiter {
         let mut map = self.buckets.lock().unwrap();
         let now = Instant::now();
 
+        // Prune expired entries to prevent unbounded memory growth
+        map.retain(|_, b| now.duration_since(b.window_start).as_secs() < RATE_LIMIT_WINDOW_SECS * 2);
+
         let bucket = map.entry(ip.to_string()).or_insert(Bucket {
             count: 0,
             window_start: now,
@@ -106,7 +109,18 @@ fn verify_token(token: &str, access_key: &str, secret_key: &str) -> bool {
     mac.update(format!("{}:{}", access_key, issued_hex).as_bytes());
     let expected = hex::encode(mac.finalize().into_bytes());
 
-    signature == expected
+    constant_time_eq(signature.as_bytes(), expected.as_bytes())
+}
+
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
 }
 
 fn extract_cookie(headers: &HeaderMap) -> Option<String> {
@@ -175,7 +189,10 @@ pub async fn login(
             .into_response();
     }
 
-    if body.access_key != state.config.access_key || body.secret_key != state.config.secret_key {
+    // Use constant-time comparison to prevent timing side-channel attacks
+    let key_match = constant_time_eq(body.access_key.as_bytes(), state.config.access_key.as_bytes());
+    let secret_match = constant_time_eq(body.secret_key.as_bytes(), state.config.secret_key.as_bytes());
+    if !key_match || !secret_match {
         return (
             StatusCode::UNAUTHORIZED,
             Json(serde_json::json!({"error": "Invalid credentials"})),
@@ -388,6 +405,7 @@ pub async fn download_object(
     };
 
     let filename = key.rsplit('/').next().unwrap_or(&key);
+    let safe_filename = sanitize_filename(filename);
     let stream = tokio_util::io::ReaderStream::new(reader);
     let body = axum::body::Body::from_stream(stream);
 
@@ -395,10 +413,18 @@ pub async fn download_object(
         .status(StatusCode::OK)
         .header("Content-Type", &meta.content_type)
         .header("Content-Length", meta.size.to_string())
-        .header("Content-Disposition", format!("attachment; filename=\"{}\"", filename))
+        .header("Content-Disposition", format!("attachment; filename=\"{}\"", safe_filename))
         .body(body)
         .unwrap()
         .into_response()
+}
+
+/// Sanitize a filename for use in Content-Disposition headers.
+/// Removes characters that could enable header injection.
+fn sanitize_filename(name: &str) -> String {
+    name.chars()
+        .filter(|c| *c != '"' && *c != '\\' && *c != '\r' && *c != '\n')
+        .collect()
 }
 
 #[derive(serde::Deserialize)]
@@ -622,6 +648,7 @@ pub async fn download_version(
     };
 
     let filename = key.rsplit('/').next().unwrap_or(&key);
+    let safe_filename = sanitize_filename(filename);
     let stream = tokio_util::io::ReaderStream::new(reader);
     let body = axum::body::Body::from_stream(stream);
 
@@ -629,7 +656,7 @@ pub async fn download_version(
         .status(StatusCode::OK)
         .header("Content-Type", &meta.content_type)
         .header("Content-Length", meta.size.to_string())
-        .header("Content-Disposition", format!("attachment; filename=\"{}\"", filename))
+        .header("Content-Disposition", format!("attachment; filename=\"{}\"", safe_filename))
         .body(body)
         .unwrap()
         .into_response()

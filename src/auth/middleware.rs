@@ -68,6 +68,28 @@ pub async fn auth_middleware(
         return Err(S3Error::access_denied("Invalid region in credential scope"));
     }
 
+    // Validate request timestamp is within ±15 minutes (AWS SigV4 spec)
+    let amz_date = request
+        .headers()
+        .get("x-amz-date")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    if let Ok(request_time) = NaiveDateTime::parse_from_str(amz_date, "%Y%m%dT%H%M%SZ") {
+        let now = Utc::now().naive_utc();
+        let skew = (now - request_time).num_seconds().unsigned_abs();
+        if skew > 15 * 60 {
+            tracing::debug!(
+                "Request timestamp skew too large: {}s (max 900s)",
+                skew
+            );
+            return Err(S3Error::access_denied(
+                "RequestTimeTooSkewed: The difference between the request time and the current time is too large.",
+            ));
+        }
+    } else {
+        return Err(S3Error::access_denied("Invalid or missing X-Amz-Date header"));
+    }
+
     let path = request.uri().path().to_string();
 
     tracing::debug!("Verifying signature for {} {} ?{}", method, path, query);

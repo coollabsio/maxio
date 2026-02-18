@@ -1,7 +1,7 @@
 use clap::Parser;
 
 #[derive(Parser, Debug, Clone)]
-#[command(name = "maxio", about = "S3-compatible object storage server")]
+#[command(name = "maxio", about = "S3-compatible object storage server", version = env!("MAXIO_VERSION"))]
 pub struct Config {
     /// Port to listen on
     #[arg(long, env = "MAXIO_PORT", default_value = "9000")]

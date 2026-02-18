@@ -36,6 +36,54 @@ cargo build --release
 ./target/release/maxio --data-dir ./data --port 9000
 ```
 
+### Docker
+
+```bash
+docker run -d \
+  -p 9000:9000 \
+  -v $(pwd)/data:/data \
+  ghcr.io/coollabsio/maxio
+```
+
+Or from Docker Hub:
+
+```bash
+docker run -d \
+  -p 9000:9000 \
+  -v $(pwd)/data:/data \
+  coollabsio/maxio
+```
+
+Configure with environment variables:
+
+```bash
+docker run -d \
+  -p 9000:9000 \
+  -v $(pwd)/data:/data \
+  -e MAXIO_ACCESS_KEY=myadmin \
+  -e MAXIO_SECRET_KEY=mysecret \
+  ghcr.io/coollabsio/maxio
+```
+
+Docker Compose:
+
+```yaml
+services:
+  maxio:
+    image: ghcr.io/coollabsio/maxio
+    ports:
+      - "9000:9000"
+    volumes:
+      - maxio-data:/data
+    environment:
+      - MAXIO_ACCESS_KEY=minioadmin
+      - MAXIO_SECRET_KEY=minioadmin
+```
+
+```bash
+docker compose up -d
+```
+
 Open `http://localhost:9000/ui/` in your browser. Default credentials: `minioadmin` / `minioadmin`
 
 ## Configuration

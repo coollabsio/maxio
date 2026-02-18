@@ -248,8 +248,8 @@ impl IntoResponse for S3Error {
              <RequestId>{}</RequestId>\
              </Error>",
             self.code.as_str(),
-            self.message,
-            resource,
+            quick_xml::escape::escape(&self.message),
+            quick_xml::escape::escape(resource),
             request_id,
         );
 

@@ -13,6 +13,10 @@ Always spell the product name **MaxIO** (capital M, capital I, capital O). Never
 ## Build & Run
 
 ```bash
+# Build frontend (required — assets are embedded into the binary)
+cd ui && bun run build && cd ..
+
+# Build binary
 cargo build --release
 ./target/release/maxio --data-dir ./data --port 9000
 ```
@@ -45,7 +49,11 @@ kill %1 && rm -rf /tmp/maxio-test
 **Hot-reload dev server** (for manual testing):
 
 ```bash
+# Terminal 1: Rust server (in debug mode, reads ui/dist from disk live)
 RUST_LOG=debug cargo watch -x 'run -- --data-dir ./data'
+
+# Terminal 2: Vite rebuilds ui/dist on source changes
+cd ui && bun run build -- --watch
 ```
 
 ## Architecture
@@ -67,6 +75,7 @@ RUST_LOG=debug cargo watch -x 'run -- --data-dir ./data'
 - **Storage layout**: `{data_dir}/buckets/{bucket-name}/{key-path}` for data, `{key-path}.meta.json` for metadata, `.bucket.json` for bucket metadata
 - **Path-style only**: `/{bucket}/{key}` routing. No virtual-hosted-style yet
 - **UNSIGNED-PAYLOAD accepted**: Skips body hashing for PutObject (AWS CLI default)
+- **Embedded UI assets**: Frontend is compiled into the binary via `rust-embed`. In debug builds, assets are read from disk (`ui/dist/`) for live reload. In release builds, assets are baked in — single binary, no external files needed
 - **Future web console**: Reserved `/ui/` route namespace. Separate auth (cookies, not SigV4)
 
 ### Data Layout

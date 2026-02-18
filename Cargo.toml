@@ -8,7 +8,7 @@ edition = "2024"
 axum = "0.8"
 tokio = { version = "1", features = ["full"] }
 tower = "0.5"
-tower-http = { version = "0.6", features = ["trace", "fs"] }
+tower-http = { version = "0.6", features = ["trace"] }
 hyper = "1"
 http = "1"
 bytes = "1"
@@ -41,6 +41,10 @@ tokio-util = { version = "0.7", features = ["io"] }
 futures = "0.3"
 async-trait = "0.1"
 base64 = "0.22"
+
+# Embedded UI assets
+rust-embed = "8"
+mime_guess = "2"
 
 [dev-dependencies]
 reqwest = { version = "0.12", features = ["json"] }

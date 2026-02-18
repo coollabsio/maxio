@@ -1,6 +1,7 @@
 mod api;
 mod auth;
 mod config;
+mod embedded;
 mod error;
 mod server;
 mod storage;

@@ -16,15 +16,40 @@ use crate::server::AppState;
 type HmacSha256 = Hmac<Sha256>;
 
 const COOKIE_NAME: &str = "maxio_session";
+const TOKEN_MAX_AGE_SECS: i64 = 7 * 24 * 60 * 60; // 7 days
 
-fn generate_token(access_key: &str, secret_key: &str) -> String {
+fn generate_token(access_key: &str, secret_key: &str, issued_at: i64) -> String {
+    let issued_hex = format!("{:x}", issued_at);
     let mut mac = HmacSha256::new_from_slice(secret_key.as_bytes())
         .expect("HMAC can take key of any size");
-    mac.update(access_key.as_bytes());
-    hex::encode(mac.finalize().into_bytes())
+    mac.update(format!("{}:{}", access_key, issued_hex).as_bytes());
+    let sig = hex::encode(mac.finalize().into_bytes());
+    format!("{}.{}", issued_hex, sig)
 }
 
-fn verify_cookie(headers: &HeaderMap, expected: &str) -> bool {
+fn verify_token(token: &str, access_key: &str, secret_key: &str) -> bool {
+    let Some((issued_hex, signature)) = token.split_once('.') else {
+        return false;
+    };
+
+    let Ok(issued_at) = i64::from_str_radix(issued_hex, 16) else {
+        return false;
+    };
+
+    let now = chrono::Utc::now().timestamp();
+    if now - issued_at > TOKEN_MAX_AGE_SECS || issued_at > now + 60 {
+        return false;
+    }
+
+    let mut mac = HmacSha256::new_from_slice(secret_key.as_bytes())
+        .expect("HMAC can take key of any size");
+    mac.update(format!("{}:{}", access_key, issued_hex).as_bytes());
+    let expected = hex::encode(mac.finalize().into_bytes());
+
+    signature == expected
+}
+
+fn extract_cookie(headers: &HeaderMap) -> Option<String> {
     headers
         .get("cookie")
         .and_then(|v| v.to_str().ok())
@@ -34,8 +59,6 @@ fn verify_cookie(headers: &HeaderMap, expected: &str) -> bool {
                 .find(|c| c.starts_with(&format!("{}=", COOKIE_NAME)))
                 .map(|c| c[COOKIE_NAME.len() + 1..].to_string())
         })
-        .map(|token| token == expected)
-        .unwrap_or(false)
 }
 
 async fn console_auth_middleware(
@@ -43,8 +66,11 @@ async fn console_auth_middleware(
     request: Request,
     next: Next,
 ) -> Response {
-    let expected = generate_token(&state.config.access_key, &state.config.secret_key);
-    if !verify_cookie(request.headers(), &expected) {
+    let authenticated = extract_cookie(request.headers())
+        .map(|token| verify_token(&token, &state.config.access_key, &state.config.secret_key))
+        .unwrap_or(false);
+
+    if !authenticated {
         return (StatusCode::UNAUTHORIZED, Json(serde_json::json!({"error": "Not authenticated"}))).into_response();
     }
     next.run(request).await
@@ -65,8 +91,12 @@ pub async fn login(
         return (StatusCode::UNAUTHORIZED, HeaderMap::new(), Json(serde_json::json!({"error": "Invalid credentials"})));
     }
 
-    let token = generate_token(&state.config.access_key, &state.config.secret_key);
-    let cookie = format!("{}={}; Path=/; HttpOnly; SameSite=Strict", COOKIE_NAME, token);
+    let now = chrono::Utc::now().timestamp();
+    let token = generate_token(&state.config.access_key, &state.config.secret_key, now);
+    let cookie = format!(
+        "{}={}; Path=/; HttpOnly; SameSite=Strict; Max-Age={}",
+        COOKIE_NAME, token, TOKEN_MAX_AGE_SECS
+    );
 
     let mut headers = HeaderMap::new();
     headers.insert("Set-Cookie", cookie.parse().unwrap());
@@ -78,9 +108,11 @@ pub async fn check(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
-    let expected = generate_token(&state.config.access_key, &state.config.secret_key);
+    let authenticated = extract_cookie(&headers)
+        .map(|token| verify_token(&token, &state.config.access_key, &state.config.secret_key))
+        .unwrap_or(false);
 
-    if verify_cookie(&headers, &expected) {
+    if authenticated {
         (StatusCode::OK, Json(serde_json::json!({"ok": true})))
     } else {
         (StatusCode::UNAUTHORIZED, Json(serde_json::json!({"error": "Not authenticated"})))

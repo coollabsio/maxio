@@ -141,7 +141,7 @@ See [CLAUDE.md](CLAUDE.md) for the full development workflow, architecture detai
 
 ## Core Maintainer
 
-| [<img src="https://github.com/andrasbacsai.png" width="60" /><br />Andras Bacsai](https://github.com/andrasbacsai) |
+| [<img src="https://github.com/andrasbacsai.png" width="120" /><br />Andras Bacsai](https://github.com/andrasbacsai) |
 |---|
 
 ## License

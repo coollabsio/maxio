@@ -20,8 +20,10 @@ MaxIO is a lightweight, single-binary S3-compatible object storage server writte
 - **Pure Filesystem Storage** — No database. Buckets are directories, objects are files, metadata in `.meta.json` sidecars
 - **AWS Signature V4** — Compatible with `mc`, AWS CLI, and any S3 SDK
 - **Web Console** — Built-in UI at `/ui/` for browsing, uploading, and managing objects
-- **S3 API Coverage** — ListBuckets, CreateBucket, HeadBucket, DeleteBucket, GetBucketLocation, ListObjectsV1/V2, PutObject, GetObject, HeadObject, DeleteObject, DeleteObjects (batch)
+- **S3 API Coverage** — ListBuckets, CreateBucket, HeadBucket, DeleteBucket, GetBucketLocation, ListObjectsV1/V2, PutObject, GetObject, HeadObject, DeleteObject, DeleteObjects (batch), CopyObject, Multipart Upload
 - **Range Requests** — HTTP 206 Partial Content support via `Range` header on GetObject
+- **Checksum Verification** — CRC32, CRC32C, SHA-1, and SHA-256 checksums on upload with automatic validation and persistent storage
+- **Erasure Coding** — Optional chunked storage with per-chunk SHA-256 integrity verification and Reed-Solomon parity for automatic recovery from corrupted or missing data
 
 ## Installation
 
@@ -98,6 +100,9 @@ Open `http://localhost:9000/ui/` in your browser. Default credentials: `minioadm
 | `MAXIO_ACCESS_KEY` | `--access-key` | `minioadmin` | Access key (aliases: `MINIO_ROOT_USER`, `MINIO_ACCESS_KEY`) |
 | `MAXIO_SECRET_KEY` | `--secret-key` | `minioadmin` | Secret key (aliases: `MINIO_ROOT_PASSWORD`, `MINIO_SECRET_KEY`) |
 | `MAXIO_REGION` | `--region` | `us-east-1` | S3 region (aliases: `MINIO_REGION_NAME`, `MINIO_REGION`) |
+| `MAXIO_ERASURE_CODING` | `--erasure-coding` | `false` | Enable erasure coding with per-chunk integrity checksums |
+| `MAXIO_CHUNK_SIZE` | `--chunk-size` | `10485760` (10MB) | Chunk size in bytes for erasure coding |
+| `MAXIO_PARITY_SHARDS` | `--parity-shards` | `0` | Number of parity shards per object (requires `--erasure-coding`, 0 = no parity) |
 
 ## Usage
 
@@ -129,11 +134,11 @@ aws --endpoint-url http://localhost:9000 s3 rb s3://my-bucket
 
 ## Roadmap
 
-- Multipart upload, presigned URLs, CopyObject
+- ~~Multipart upload~~, ~~presigned URLs~~, ~~CopyObject~~
 - CORS, ~~Range headers~~
 - Versioning, lifecycle rules
 - Multi-user support
-- Distributed mode, erasure coding, replication
+- Distributed mode, ~~erasure coding~~, replication
 
 ## Contributing
 

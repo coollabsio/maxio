@@ -47,4 +47,16 @@ pub struct Config {
     /// Default region (MAXIO_REGION, MINIO_REGION_NAME, MINIO_REGION)
     #[arg(long, env = "MAXIO_REGION", default_value_t = default_region())]
     pub region: String,
+
+    /// Enable erasure coding with per-chunk integrity checksums
+    #[arg(long, env = "MAXIO_ERASURE_CODING", default_value = "false")]
+    pub erasure_coding: bool,
+
+    /// Chunk size in bytes for erasure coding (default 10MB)
+    #[arg(long, env = "MAXIO_CHUNK_SIZE", default_value = "10485760")]
+    pub chunk_size: u64,
+
+    /// Number of parity shards for erasure coding (0 = no parity, requires --erasure-coding)
+    #[arg(long, env = "MAXIO_PARITY_SHARDS", default_value = "0")]
+    pub parity_shards: u32,
 }

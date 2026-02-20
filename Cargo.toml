@@ -40,6 +40,9 @@ clap = { version = "4", features = ["derive", "env"] }
 uuid = { version = "1", features = ["v4"] }
 chrono = { version = "0.4", features = ["serde"] }
 md-5 = "0.10"
+crc32fast = "1"
+crc32c = "0.6"
+sha1 = "0.10"
 percent-encoding = "2"
 thiserror = "2"
 anyhow = "1"
@@ -51,6 +54,7 @@ base64 = "0.22"
 rust-embed = "8"
 mime_guess = "2"
 rand = "0.10.0"
+reed-solomon-erasure = "6"
 
 [dev-dependencies]
 reqwest = { version = "0.12", features = ["json"] }

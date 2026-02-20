@@ -177,6 +177,33 @@ assert "delete nested object" mc rm "$ALIAS/$BUCKET/folder/nested/file.txt"
 assert_file_not_exists "deleted nested object gone from disk" "$DATA_DIR/buckets/$BUCKET/folder/nested/file.txt"
 assert "delete large object" mc rm "$ALIAS/$BUCKET/big.bin"
 
+# --- Erasure coding corruption detection ---
+# These tests only run when the server has erasure coding enabled (chunks on disk)
+echo "hello erasure" > "$TMPDIR/ec-test.txt"
+assert "upload ec test object" mc cp "$TMPDIR/ec-test.txt" "$ALIAS/$BUCKET/ec-test.txt"
+
+EC_DIR="$DATA_DIR/buckets/$BUCKET/ec-test.txt.ec"
+if [ -d "$EC_DIR" ]; then
+    # Server has erasure coding enabled — test corruption detection
+    assert_file_exists "ec chunk dir exists" "$EC_DIR"
+    assert_file_exists "ec manifest exists" "$EC_DIR/manifest.json"
+
+    # Verify download works before corruption
+    assert "download ec object before corruption" mc cp "$ALIAS/$BUCKET/ec-test.txt" "$TMPDIR/ec-before.txt"
+    assert_eq "ec content before corruption" "hello erasure" "$(cat "$TMPDIR/ec-before.txt")"
+
+    # Corrupt the first chunk by overwriting with garbage
+    printf "CORRUPTED" > "$EC_DIR/000000"
+
+    # Download should fail due to checksum mismatch
+    assert_fail "download ec object after corruption fails" mc cp "$ALIAS/$BUCKET/ec-test.txt" "$TMPDIR/ec-after.txt"
+
+    green "INFO: erasure coding corruption tests ran (server has EC enabled)"
+else
+    green "INFO: erasure coding corruption tests skipped (server has EC disabled)"
+fi
+assert "delete ec test object" mc rm "$ALIAS/$BUCKET/ec-test.txt"
+
 # Delete bucket (should work now that it's empty)
 assert "delete empty bucket" mc rb "$ALIAS/$BUCKET"
 assert_file_not_exists "bucket dir gone from disk" "$DATA_DIR/buckets/$BUCKET"

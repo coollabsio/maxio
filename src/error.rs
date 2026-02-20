@@ -152,6 +152,14 @@ impl S3Error {
         }
     }
 
+    pub fn bad_checksum(algo: &str) -> Self {
+        Self {
+            code: S3ErrorCode::BadDigest,
+            message: format!("The {} checksum you specified did not match what we received.", algo),
+            resource: None,
+        }
+    }
+
     pub fn malformed_xml() -> Self {
         Self {
             code: S3ErrorCode::MalformedXML,

@@ -373,7 +373,7 @@ pub async fn upload_object(
         stream.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e)),
     );
 
-    match state.storage.put_object(&bucket, &key, content_type, Box::pin(reader)).await {
+    match state.storage.put_object(&bucket, &key, content_type, Box::pin(reader), None).await {
         Ok(result) => (StatusCode::OK, Json(serde_json::json!({
             "ok": true,
             "etag": result.etag,
@@ -557,7 +557,7 @@ pub async fn create_folder(
     }
 
     let key = format!("{}/", name);
-    match state.storage.put_object(&bucket, &key, "application/x-directory", Box::pin(tokio::io::empty())).await {
+    match state.storage.put_object(&bucket, &key, "application/x-directory", Box::pin(tokio::io::empty()), None).await {
         Ok(_) => (StatusCode::OK, Json(serde_json::json!({"ok": true}))).into_response(),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,

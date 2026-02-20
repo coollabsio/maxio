@@ -23,7 +23,12 @@ async fn main() -> anyhow::Result<()> {
 
     let config = Config::parse();
 
-    let storage = storage::filesystem::FilesystemStorage::new(&config.data_dir).await?;
+    let storage = storage::filesystem::FilesystemStorage::new(
+        &config.data_dir,
+        config.erasure_coding,
+        config.chunk_size,
+        config.parity_shards,
+    ).await?;
 
     let state = server::AppState {
         storage: Arc::new(storage),
@@ -46,6 +51,14 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!("Secret Key: [REDACTED]");
     tracing::info!("Data dir:   {}", config.data_dir);
     tracing::info!("Region:     {}", config.region);
+    if config.erasure_coding {
+        tracing::info!("Erasure coding: enabled (chunk size: {}MB)", config.chunk_size / (1024 * 1024));
+        if config.parity_shards > 0 {
+            tracing::info!("Parity shards: {} (can tolerate {} lost/corrupt chunks per object)", config.parity_shards, config.parity_shards);
+        }
+    } else if config.parity_shards > 0 {
+        tracing::warn!("--parity-shards ignored: requires --erasure-coding to be enabled");
+    }
     let display_host = if config.address == "0.0.0.0" { "localhost" } else { &config.address };
     tracing::info!("Web UI:     http://{}:{}/ui/", display_host, config.port);
 

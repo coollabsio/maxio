@@ -4,6 +4,7 @@ use maxio::storage::filesystem::FilesystemStorage;
 use std::sync::Arc;
 use tempfile::TempDir;
 
+use base64::Engine;
 use hmac::{Hmac, Mac};
 use sha2::{Digest, Sha256};
 
@@ -18,7 +19,7 @@ async fn start_server() -> (String, TempDir) {
     let tmp = TempDir::new().unwrap();
     let data_dir = tmp.path().to_str().unwrap().to_string();
 
-    let storage = FilesystemStorage::new(&data_dir).await.unwrap();
+    let storage = FilesystemStorage::new(&data_dir, false, 10 * 1024 * 1024, 0).await.unwrap();
 
     let config = Config {
         port: 0,
@@ -27,6 +28,9 @@ async fn start_server() -> (String, TempDir) {
         access_key: ACCESS_KEY.to_string(),
         secret_key: SECRET_KEY.to_string(),
         region: REGION.to_string(),
+        erasure_coding: false,
+        chunk_size: 10 * 1024 * 1024,
+        parity_shards: 0,
     };
 
     let state = AppState {
@@ -265,6 +269,36 @@ async fn s3_request(
     }
 
     builder.send().await.unwrap()
+}
+
+/// Like s3_request but returns Result instead of panicking on send errors.
+async fn s3_request_result(
+    method: &str,
+    url: &str,
+    body: Vec<u8>,
+) -> Result<reqwest::Response, reqwest::Error> {
+    let mut headers = Vec::new();
+    sign_request(method, url, &mut headers, &body);
+
+    let client = client();
+    let mut builder = match method {
+        "GET" => client.get(url),
+        "PUT" => client.put(url),
+        "HEAD" => client.head(url),
+        "DELETE" => client.delete(url),
+        "POST" => client.post(url),
+        _ => panic!("unsupported method"),
+    };
+
+    for (k, v) in &headers {
+        builder = builder.header(k.as_str(), v.as_str());
+    }
+
+    if !body.is_empty() {
+        builder = builder.body(body);
+    }
+
+    builder.send().await
 }
 
 /// Sign and send a request with extra headers (e.g. x-amz-copy-source).
@@ -1952,4 +1986,612 @@ async fn test_delete_folder_marker() {
     // HeadObject should now return 404
     let resp = s3_request("HEAD", &format!("{}/mybucket/empty-dir/", base_url), vec![]).await;
     assert_eq!(resp.status(), 404);
+}
+
+// --- Erasure Coding Tests ---
+
+/// Start a server with erasure coding enabled (small chunk size for testing).
+async fn start_server_ec() -> (String, TempDir) {
+    let tmp = TempDir::new().unwrap();
+    let data_dir = tmp.path().to_str().unwrap().to_string();
+
+    // Use 1KB chunk size for easy multi-chunk testing
+    let storage = FilesystemStorage::new(&data_dir, true, 1024, 0).await.unwrap();
+
+    let config = Config {
+        port: 0,
+        address: "127.0.0.1".to_string(),
+        data_dir,
+        access_key: ACCESS_KEY.to_string(),
+        secret_key: SECRET_KEY.to_string(),
+        region: REGION.to_string(),
+        erasure_coding: true,
+        chunk_size: 1024,
+        parity_shards: 0,
+    };
+
+    let state = AppState {
+        storage: Arc::new(storage),
+        config: Arc::new(config),
+        login_rate_limiter: Arc::new(maxio::api::console::LoginRateLimiter::new()),
+    };
+
+    let app = server::build_router(state);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let base_url = format!("http://{}", addr);
+
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    (base_url, tmp)
+}
+
+#[tokio::test]
+async fn test_ec_put_and_get_object() {
+    let (base_url, _tmp) = start_server_ec().await;
+    s3_request("PUT", &format!("{}/testbucket", base_url), vec![]).await;
+
+    // Upload 3KB of data (should create 3 chunks with 1KB chunk size)
+    let data = vec![0x42u8; 3 * 1024];
+    s3_request_with_headers(
+        "PUT",
+        &format!("{}/testbucket/bigfile.bin", base_url),
+        data.clone(),
+        vec![],
+    )
+    .await;
+
+    // GET should return identical data
+    let resp = s3_request("GET", &format!("{}/testbucket/bigfile.bin", base_url), vec![]).await;
+    assert_eq!(resp.status(), 200);
+    let body = resp.bytes().await.unwrap();
+    assert_eq!(body.len(), 3 * 1024);
+    assert_eq!(&body[..], &data[..]);
+}
+
+#[tokio::test]
+async fn test_ec_small_object() {
+    let (base_url, _tmp) = start_server_ec().await;
+    s3_request("PUT", &format!("{}/testbucket", base_url), vec![]).await;
+
+    // Upload less than one chunk
+    let data = b"small data".to_vec();
+    s3_request_with_headers(
+        "PUT",
+        &format!("{}/testbucket/small.txt", base_url),
+        data.clone(),
+        vec![],
+    )
+    .await;
+
+    let resp = s3_request("GET", &format!("{}/testbucket/small.txt", base_url), vec![]).await;
+    assert_eq!(resp.status(), 200);
+    let body = resp.bytes().await.unwrap();
+    assert_eq!(&body[..], &data[..]);
+}
+
+#[tokio::test]
+async fn test_ec_range_request() {
+    let (base_url, _tmp) = start_server_ec().await;
+    s3_request("PUT", &format!("{}/testbucket", base_url), vec![]).await;
+
+    // 3KB of sequential bytes so we can verify exact ranges
+    let data: Vec<u8> = (0..3072).map(|i| (i % 256) as u8).collect();
+    s3_request_with_headers(
+        "PUT",
+        &format!("{}/testbucket/rangetest.bin", base_url),
+        data.clone(),
+        vec![],
+    )
+    .await;
+
+    // Range spanning chunk boundary (bytes 500-1500, crosses from chunk 0 to chunk 1)
+    let resp = s3_request_with_headers(
+        "GET",
+        &format!("{}/testbucket/rangetest.bin", base_url),
+        vec![],
+        vec![("Range", "bytes=500-1499")],
+    )
+    .await;
+    assert_eq!(resp.status(), 206);
+    let body = resp.bytes().await.unwrap();
+    assert_eq!(body.len(), 1000);
+    assert_eq!(&body[..], &data[500..1500]);
+}
+
+#[tokio::test]
+async fn test_ec_delete_object() {
+    let (base_url, tmp) = start_server_ec().await;
+    s3_request("PUT", &format!("{}/testbucket", base_url), vec![]).await;
+
+    s3_request_with_headers(
+        "PUT",
+        &format!("{}/testbucket/todelete.txt", base_url),
+        b"delete me".to_vec(),
+        vec![],
+    )
+    .await;
+
+    // Verify .ec directory exists
+    let ec_dir = tmp.path().join("buckets/testbucket/todelete.txt.ec");
+    assert!(ec_dir.exists(), "EC dir should exist after PUT");
+
+    s3_request("DELETE", &format!("{}/testbucket/todelete.txt", base_url), vec![]).await;
+
+    assert!(!ec_dir.exists(), "EC dir should be removed after DELETE");
+    let resp = s3_request("GET", &format!("{}/testbucket/todelete.txt", base_url), vec![]).await;
+    assert_eq!(resp.status(), 404);
+}
+
+#[tokio::test]
+async fn test_ec_etag_matches_flat_file() {
+    // Verify that EC objects produce the same ETag as flat-file objects
+    let (base_url_flat, _tmp1) = start_server().await;
+    let (base_url_ec, _tmp2) = start_server_ec().await;
+
+    for base in [&base_url_flat, &base_url_ec] {
+        s3_request("PUT", &format!("{}/testbucket", base), vec![]).await;
+    }
+
+    let data = b"hello world etag test".to_vec();
+    let resp_flat = s3_request_with_headers(
+        "PUT",
+        &format!("{}/testbucket/etagtest.txt", base_url_flat),
+        data.clone(),
+        vec![],
+    )
+    .await;
+    let resp_ec = s3_request_with_headers(
+        "PUT",
+        &format!("{}/testbucket/etagtest.txt", base_url_ec),
+        data.clone(),
+        vec![],
+    )
+    .await;
+
+    let etag_flat = resp_flat.headers().get("etag").unwrap().to_str().unwrap().to_string();
+    let etag_ec = resp_ec.headers().get("etag").unwrap().to_str().unwrap().to_string();
+    assert_eq!(etag_flat, etag_ec, "ETags should match between flat and EC storage");
+}
+
+#[tokio::test]
+async fn test_ec_bitrot_detection() {
+    let (base_url, tmp) = start_server_ec().await;
+    s3_request("PUT", &format!("{}/testbucket", base_url), vec![]).await;
+
+    s3_request_with_headers(
+        "PUT",
+        &format!("{}/testbucket/corrupt.bin", base_url),
+        vec![0xAA; 2048],
+        vec![],
+    )
+    .await;
+
+    // Corrupt chunk 0 on disk
+    let chunk_path = tmp.path().join("buckets/testbucket/corrupt.bin.ec/000000");
+    std::fs::write(&chunk_path, vec![0xFF; 1024]).unwrap();
+
+    // GET should fail — either a 500 response or a connection error
+    // (the error may occur mid-stream after headers are sent)
+    let url = format!("{}/testbucket/corrupt.bin", base_url);
+    let result = s3_request_result("GET", &url, vec![]).await;
+    match result {
+        Ok(resp) => {
+            // If we get a response, reading the body should fail or status should be 500
+            if resp.status() == 200 {
+                let body_result = resp.bytes().await;
+                assert!(body_result.is_err() || body_result.unwrap() != vec![0xAA; 2048],
+                    "Should not return original uncorrupted data");
+            }
+        }
+        Err(_) => {
+            // Connection error is expected — chunk verification failed mid-stream
+        }
+    }
+}
+
+#[tokio::test]
+async fn test_ec_list_objects() {
+    let (base_url, _tmp) = start_server_ec().await;
+    s3_request("PUT", &format!("{}/testbucket", base_url), vec![]).await;
+
+    s3_request_with_headers(
+        "PUT",
+        &format!("{}/testbucket/file1.txt", base_url),
+        b"one".to_vec(),
+        vec![],
+    )
+    .await;
+    s3_request_with_headers(
+        "PUT",
+        &format!("{}/testbucket/file2.txt", base_url),
+        b"two".to_vec(),
+        vec![],
+    )
+    .await;
+
+    let resp = s3_request(
+        "GET",
+        &format!("{}/testbucket?list-type=2", base_url),
+        vec![],
+    )
+    .await;
+    let body = resp.text().await.unwrap();
+    assert!(body.contains("<Key>file1.txt</Key>"), "body: {}", body);
+    assert!(body.contains("<Key>file2.txt</Key>"), "body: {}", body);
+    // .ec directories should NOT appear as objects
+    assert!(!body.contains(".ec"), "body should not contain .ec: {}", body);
+}
+
+// --- Checksum tests ---
+
+#[tokio::test]
+async fn test_put_object_with_crc32_checksum() {
+    let (base_url, _tmp) = start_server().await;
+
+    // Create bucket
+    s3_request("PUT", &format!("{}/checksum-bucket", base_url), vec![]).await;
+
+    // Compute CRC32 of body
+    let body = b"hello checksum world";
+    let crc = crc32fast::hash(body);
+    let crc_b64 = base64::engine::general_purpose::STANDARD.encode(crc.to_be_bytes());
+
+    // PUT with correct checksum
+    let resp = s3_request_with_headers(
+        "PUT",
+        &format!("{}/checksum-bucket/test.txt", base_url),
+        body.to_vec(),
+        vec![("x-amz-checksum-crc32", &crc_b64)],
+    )
+    .await;
+    assert_eq!(resp.status(), 200);
+    assert_eq!(
+        resp.headers().get("x-amz-checksum-crc32").unwrap().to_str().unwrap(),
+        crc_b64
+    );
+
+    // GET should return the checksum header
+    let resp = s3_request("GET", &format!("{}/checksum-bucket/test.txt", base_url), vec![]).await;
+    assert_eq!(resp.status(), 200);
+    assert_eq!(
+        resp.headers().get("x-amz-checksum-crc32").unwrap().to_str().unwrap(),
+        crc_b64
+    );
+
+    // HEAD should also return it
+    let resp = s3_request("HEAD", &format!("{}/checksum-bucket/test.txt", base_url), vec![]).await;
+    assert_eq!(resp.status(), 200);
+    assert_eq!(
+        resp.headers().get("x-amz-checksum-crc32").unwrap().to_str().unwrap(),
+        crc_b64
+    );
+}
+
+#[tokio::test]
+async fn test_put_object_with_wrong_checksum() {
+    let (base_url, _tmp) = start_server().await;
+    s3_request("PUT", &format!("{}/checksum-bucket", base_url), vec![]).await;
+
+    // Send a wrong CRC32 value
+    let resp = s3_request_with_headers(
+        "PUT",
+        &format!("{}/checksum-bucket/bad.txt", base_url),
+        b"some data".to_vec(),
+        vec![("x-amz-checksum-crc32", "AAAAAAAA")],
+    )
+    .await;
+    assert_eq!(resp.status(), 400);
+    let body = resp.text().await.unwrap();
+    assert!(body.contains("BadDigest"), "expected BadDigest error: {}", body);
+}
+
+#[tokio::test]
+async fn test_put_object_with_algorithm_only() {
+    let (base_url, _tmp) = start_server().await;
+    s3_request("PUT", &format!("{}/checksum-bucket", base_url), vec![]).await;
+
+    let body_bytes = b"compute my checksum please";
+
+    // Send only the algorithm header, no value — server should compute
+    let resp = s3_request_with_headers(
+        "PUT",
+        &format!("{}/checksum-bucket/algo-only.txt", base_url),
+        body_bytes.to_vec(),
+        vec![("x-amz-checksum-algorithm", "CRC32C")],
+    )
+    .await;
+    assert_eq!(resp.status(), 200);
+
+    // Verify a CRC32C header was returned
+    let checksum = resp.headers().get("x-amz-checksum-crc32c").unwrap().to_str().unwrap();
+    assert!(!checksum.is_empty());
+
+    // Verify it's the correct value
+    let expected_crc = crc32c::crc32c(body_bytes);
+    let expected_b64 = base64::engine::general_purpose::STANDARD.encode(expected_crc.to_be_bytes());
+    assert_eq!(checksum, expected_b64);
+}
+
+#[tokio::test]
+async fn test_put_object_no_checksum_backward_compat() {
+    let (base_url, _tmp) = start_server().await;
+    s3_request("PUT", &format!("{}/checksum-bucket", base_url), vec![]).await;
+
+    let resp = s3_request_with_headers(
+        "PUT",
+        &format!("{}/checksum-bucket/no-checksum.txt", base_url),
+        b"plain old upload".to_vec(),
+        vec![],
+    )
+    .await;
+    assert_eq!(resp.status(), 200);
+
+    // No checksum headers should be in the response
+    assert!(resp.headers().get("x-amz-checksum-crc32").is_none());
+    assert!(resp.headers().get("x-amz-checksum-crc32c").is_none());
+    assert!(resp.headers().get("x-amz-checksum-sha1").is_none());
+    assert!(resp.headers().get("x-amz-checksum-sha256").is_none());
+}
+
+#[tokio::test]
+async fn test_put_object_with_sha256_checksum() {
+    use base64::Engine;
+
+    let (base_url, _tmp) = start_server().await;
+    s3_request("PUT", &format!("{}/checksum-bucket", base_url), vec![]).await;
+
+    let body = b"sha256 test data";
+    let hash = <sha2::Sha256 as sha2::Digest>::digest(body);
+    let hash_b64 = base64::engine::general_purpose::STANDARD.encode(hash);
+
+    let resp = s3_request_with_headers(
+        "PUT",
+        &format!("{}/checksum-bucket/sha256.txt", base_url),
+        body.to_vec(),
+        vec![("x-amz-checksum-sha256", &hash_b64)],
+    )
+    .await;
+    assert_eq!(resp.status(), 200);
+    assert_eq!(
+        resp.headers().get("x-amz-checksum-sha256").unwrap().to_str().unwrap(),
+        hash_b64
+    );
+}
+
+// --- Parity / Reed-Solomon Tests ---
+
+/// Start a server with erasure coding + parity enabled (small chunks for testing).
+async fn start_server_parity(parity_shards: u32) -> (String, TempDir) {
+    let tmp = TempDir::new().unwrap();
+    let data_dir = tmp.path().to_str().unwrap().to_string();
+
+    // 100-byte chunks for easy multi-chunk testing
+    let storage = FilesystemStorage::new(&data_dir, true, 100, parity_shards).await.unwrap();
+
+    let config = Config {
+        port: 0,
+        address: "127.0.0.1".to_string(),
+        data_dir,
+        access_key: ACCESS_KEY.to_string(),
+        secret_key: SECRET_KEY.to_string(),
+        region: REGION.to_string(),
+        erasure_coding: true,
+        chunk_size: 100,
+        parity_shards,
+    };
+
+    let state = AppState {
+        storage: Arc::new(storage),
+        config: Arc::new(config),
+        login_rate_limiter: Arc::new(maxio::api::console::LoginRateLimiter::new()),
+    };
+
+    let app = server::build_router(state);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let base_url = format!("http://{}", addr);
+
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    (base_url, tmp)
+}
+
+#[tokio::test]
+async fn test_parity_write_creates_parity_chunks() {
+    let (base_url, tmp) = start_server_parity(2).await;
+
+    // Create bucket
+    s3_request("PUT", &format!("{}/parity-test", base_url), vec![]).await;
+
+    // Write 350 bytes → 4 data chunks (100+100+100+50) + 2 parity
+    let data = vec![0xABu8; 350];
+    s3_request("PUT", &format!("{}/parity-test/file.bin", base_url), data).await;
+
+    // Check the .ec directory
+    let ec_dir = tmp.path().join("buckets/parity-test/file.bin.ec");
+    assert!(ec_dir.is_dir());
+
+    // Should have 6 chunk files + manifest.json = 7 entries
+    let entries: Vec<_> = std::fs::read_dir(&ec_dir).unwrap().collect();
+    assert_eq!(entries.len(), 7, "expected 4 data + 2 parity + 1 manifest");
+
+    // Verify manifest
+    let manifest: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(ec_dir.join("manifest.json")).unwrap()
+    ).unwrap();
+    assert_eq!(manifest["version"], 2);
+    assert_eq!(manifest["chunk_count"], 4);
+    assert_eq!(manifest["parity_shards"], 2);
+    assert_eq!(manifest["chunks"].as_array().unwrap().len(), 6);
+
+    // Verify parity chunks have kind: "parity"
+    let chunks = manifest["chunks"].as_array().unwrap();
+    for i in 0..4 {
+        // data chunks should not have "kind" field (skipped when data) or be "data"
+        let kind = chunks[i].get("kind");
+        assert!(kind.is_none() || kind.unwrap() == "data");
+    }
+    assert_eq!(chunks[4]["kind"], "parity");
+    assert_eq!(chunks[5]["kind"], "parity");
+}
+
+#[tokio::test]
+async fn test_parity_read_healthy() {
+    let (base_url, _tmp) = start_server_parity(2).await;
+
+    s3_request("PUT", &format!("{}/parity-test", base_url), vec![]).await;
+
+    let data = vec![0xCDu8; 350];
+    s3_request("PUT", &format!("{}/parity-test/file.bin", base_url), data.clone()).await;
+
+    let resp = s3_request("GET", &format!("{}/parity-test/file.bin", base_url), vec![]).await;
+    assert_eq!(resp.status(), 200);
+    let body = resp.bytes().await.unwrap();
+    assert_eq!(body.as_ref(), &data[..]);
+}
+
+#[tokio::test]
+async fn test_parity_recovery_corrupted_chunk() {
+    let (base_url, tmp) = start_server_parity(2).await;
+
+    s3_request("PUT", &format!("{}/parity-test", base_url), vec![]).await;
+
+    let data = vec![0xEFu8; 350];
+    s3_request("PUT", &format!("{}/parity-test/file.bin", base_url), data.clone()).await;
+
+    // Corrupt data chunk 1 (overwrite with zeros)
+    let chunk_path = tmp.path().join("buckets/parity-test/file.bin.ec/000001");
+    std::fs::write(&chunk_path, vec![0u8; 100]).unwrap();
+
+    // Read should still succeed via RS recovery
+    let resp = s3_request("GET", &format!("{}/parity-test/file.bin", base_url), vec![]).await;
+    assert_eq!(resp.status(), 200);
+    let body = resp.bytes().await.unwrap();
+    assert_eq!(body.as_ref(), &data[..]);
+}
+
+#[tokio::test]
+async fn test_parity_recovery_missing_chunk() {
+    let (base_url, tmp) = start_server_parity(2).await;
+
+    s3_request("PUT", &format!("{}/parity-test", base_url), vec![]).await;
+
+    let data = vec![0x42u8; 350];
+    s3_request("PUT", &format!("{}/parity-test/file.bin", base_url), data.clone()).await;
+
+    // Delete data chunk 0
+    let chunk_path = tmp.path().join("buckets/parity-test/file.bin.ec/000000");
+    std::fs::remove_file(&chunk_path).unwrap();
+
+    let resp = s3_request("GET", &format!("{}/parity-test/file.bin", base_url), vec![]).await;
+    assert_eq!(resp.status(), 200);
+    let body = resp.bytes().await.unwrap();
+    assert_eq!(body.as_ref(), &data[..]);
+}
+
+#[tokio::test]
+async fn test_parity_too_many_failures() {
+    let (base_url, tmp) = start_server_parity(2).await;
+
+    s3_request("PUT", &format!("{}/parity-test", base_url), vec![]).await;
+
+    let data = vec![0x77u8; 350];
+    s3_request("PUT", &format!("{}/parity-test/file.bin", base_url), data).await;
+
+    // Delete 3 chunks (more than m=2 parity can handle)
+    for i in 0..3 {
+        let chunk_path = tmp.path().join(format!("buckets/parity-test/file.bin.ec/{:06}", i));
+        std::fs::remove_file(&chunk_path).unwrap();
+    }
+
+    // The server will return an error or drop the connection when RS recovery fails.
+    // Since the object is streamed, the error may manifest as a connection reset
+    // rather than a clean HTTP error status.
+    let result = s3_request_result("GET", &format!("{}/parity-test/file.bin", base_url), vec![]).await;
+    match result {
+        Err(_) => {} // Connection error — expected
+        Ok(resp) => {
+            // Either a server error status, or streaming started but body will be incomplete
+            if resp.status() == 200 {
+                let body_result = resp.bytes().await;
+                assert!(body_result.is_err() || body_result.unwrap().len() != 350);
+            } else {
+                assert!(resp.status().is_server_error());
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn test_parity_range_read_degraded() {
+    let (base_url, tmp) = start_server_parity(2).await;
+
+    s3_request("PUT", &format!("{}/parity-test", base_url), vec![]).await;
+
+    // Create data with distinct bytes per chunk for easy verification
+    let mut data = Vec::new();
+    for i in 0u8..4 {
+        let chunk_len = if i < 3 { 100 } else { 50 };
+        data.extend(std::iter::repeat(i + 1).take(chunk_len));
+    }
+    assert_eq!(data.len(), 350);
+    s3_request("PUT", &format!("{}/parity-test/file.bin", base_url), data.clone()).await;
+
+    // Corrupt chunk 1
+    let chunk_path = tmp.path().join("buckets/parity-test/file.bin.ec/000001");
+    std::fs::write(&chunk_path, vec![0u8; 100]).unwrap();
+
+    // Range read spanning chunk 0 and chunk 1 (bytes 50-149)
+    let resp = s3_request_with_headers(
+        "GET",
+        &format!("{}/parity-test/file.bin", base_url),
+        vec![],
+        vec![("range", "bytes=50-149")],
+    )
+    .await;
+    assert_eq!(resp.status(), 206);
+    let body = resp.bytes().await.unwrap();
+    assert_eq!(body.as_ref(), &data[50..150]);
+}
+
+#[tokio::test]
+async fn test_parity_backward_compat_v1_manifest() {
+    // EC without parity should still work (v1 manifest, no parity fields)
+    let (base_url, _tmp) = start_server_ec().await;
+
+    s3_request("PUT", &format!("{}/compat-test", base_url), vec![]).await;
+
+    let data = vec![0xAAu8; 2048];
+    s3_request("PUT", &format!("{}/compat-test/file.bin", base_url), data.clone()).await;
+
+    let resp = s3_request("GET", &format!("{}/compat-test/file.bin", base_url), vec![]).await;
+    assert_eq!(resp.status(), 200);
+    let body = resp.bytes().await.unwrap();
+    assert_eq!(body.as_ref(), &data[..]);
+}
+
+#[tokio::test]
+async fn test_parity_empty_object() {
+    let (base_url, tmp) = start_server_parity(2).await;
+
+    s3_request("PUT", &format!("{}/parity-test", base_url), vec![]).await;
+
+    // Empty object — should skip parity
+    s3_request("PUT", &format!("{}/parity-test/empty.bin", base_url), vec![]).await;
+
+    let ec_dir = tmp.path().join("buckets/parity-test/empty.bin.ec");
+    let manifest: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(ec_dir.join("manifest.json")).unwrap()
+    ).unwrap();
+    assert_eq!(manifest["version"], 1); // no parity for empty
+    assert!(manifest.get("parity_shards").is_none() || manifest["parity_shards"].is_null());
+
+    let resp = s3_request("GET", &format!("{}/parity-test/empty.bin", base_url), vec![]).await;
+    assert_eq!(resp.status(), 200);
+    assert_eq!(resp.bytes().await.unwrap().len(), 0);
 }

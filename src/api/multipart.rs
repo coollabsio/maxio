@@ -9,10 +9,10 @@ use axum::{
 
 use crate::error::S3Error;
 use crate::server::AppState;
-use crate::storage::StorageError;
+use crate::storage::{ChecksumAlgorithm, StorageError};
 use crate::xml::{response::to_xml, types::*};
 
-use super::object::body_to_reader;
+use super::object::{body_to_reader, extract_checksum};
 
 const COMPLETE_BODY_MAX: usize = 1024 * 1024;
 
@@ -27,9 +27,13 @@ pub async fn create_multipart_upload(
         .get("content-type")
         .and_then(|v| v.to_str().ok())
         .unwrap_or("application/octet-stream");
+    let checksum_algorithm = headers
+        .get("x-amz-checksum-algorithm")
+        .and_then(|v| v.to_str().ok())
+        .and_then(ChecksumAlgorithm::from_header_str);
     let upload = state
         .storage
-        .create_multipart_upload(&bucket, &key, content_type)
+        .create_multipart_upload(&bucket, &key, content_type, checksum_algorithm)
         .await
         .map_err(map_storage_err)?;
 
@@ -65,18 +69,21 @@ pub async fn upload_part(
         .parse::<u32>()
         .map_err(|_| S3Error::invalid_part("invalid part number"))?;
 
+    let checksum = extract_checksum(&headers);
     let reader = body_to_reader(&headers, body).await?;
     let part = state
         .storage
-        .upload_part(&bucket, upload_id, part_number, reader)
+        .upload_part(&bucket, upload_id, part_number, reader, checksum)
         .await
         .map_err(map_storage_err)?;
 
-    Ok(Response::builder()
+    let mut builder = Response::builder()
         .status(StatusCode::OK)
-        .header("ETag", part.etag)
-        .body(Body::empty())
-        .unwrap())
+        .header("ETag", &part.etag);
+    if let (Some(algo), Some(val)) = (&part.checksum_algorithm, &part.checksum_value) {
+        builder = builder.header(algo.header_name(), val.as_str());
+    }
+    Ok(builder.body(Body::empty()).unwrap())
 }
 
 pub async fn complete_multipart_upload(
@@ -110,11 +117,13 @@ pub async fn complete_multipart_upload(
     })
     .map_err(S3Error::internal)?;
 
-    Ok(Response::builder()
+    let mut builder = Response::builder()
         .status(StatusCode::OK)
-        .header("content-type", "application/xml")
-        .body(Body::from(xml))
-        .unwrap())
+        .header("content-type", "application/xml");
+    if let (Some(algo), Some(val)) = (&result.checksum_algorithm, &result.checksum_value) {
+        builder = builder.header(algo.header_name(), val.as_str());
+    }
+    Ok(builder.body(Body::from(xml)).unwrap())
 }
 
 pub async fn abort_multipart_upload(
@@ -222,6 +231,7 @@ async fn ensure_bucket_exists(state: &AppState, bucket: &str) -> Result<(), S3Er
 
 fn map_storage_err(err: StorageError) -> S3Error {
     match err {
+        StorageError::ChecksumMismatch(_) => S3Error::bad_checksum("x-amz-checksum"),
         StorageError::UploadNotFound(upload_id) => S3Error::no_such_upload(&upload_id),
         StorageError::InvalidKey(msg) if msg.contains("part too small") => S3Error::entity_too_small(),
         StorageError::InvalidKey(msg)

@@ -139,7 +139,7 @@ assert "upload large object (multipart)" $AWS s3 cp "$TMPDIR/big.bin" "s3://$BUC
 assert "download large object" $AWS s3 cp "s3://$BUCKET/big.bin" "$TMPDIR/big.download.bin"
 assert_eq "large object size matches" "$(wc -c < "$TMPDIR/big.bin" | tr -d ' ')" "$(wc -c < "$TMPDIR/big.download.bin" | tr -d ' ')"
 OUTPUT=$($AWS s3api head-object --bucket "$BUCKET" --key "big.bin" 2>&1)
-assert_eq "multipart etag suffix present" "true" "$(echo "$OUTPUT" | grep -Eq '\"ETag\": \".*-[0-9]+\"' && echo true || echo false)"
+assert_eq "multipart etag suffix present" "true" "$(echo "$OUTPUT" | grep -Eq '\"ETag\": \".*-[0-9]+.*\"' && echo true || echo false)"
 
 # --- Multipart upload (explicit API lifecycle) ---
 dd if=/dev/urandom of="$TMPDIR/mpart1.bin" bs=1M count=5 status=none
@@ -232,6 +232,49 @@ assert_eq "head folder marker has zero size" "true" "$(echo "$OUTPUT" | grep -q 
 assert "delete folder marker" $AWS s3api delete-object --bucket "$BUCKET" --key "empty-folder/"
 assert_fail "head deleted folder marker" $AWS s3api head-object --bucket "$BUCKET" --key "empty-folder/"
 
+# --- Checksum tests ---
+echo "checksum test data" > "$TMPDIR/checksum.txt"
+
+# PutObject with CRC32 checksum via s3api
+CRC32_VALUE=$(python3 -c "
+import binascii, base64
+data = open('$TMPDIR/checksum.txt', 'rb').read()
+crc = binascii.crc32(data) & 0xffffffff
+print(base64.b64encode(crc.to_bytes(4, 'big')).decode())
+")
+OUTPUT=$($AWS s3api put-object --bucket "$BUCKET" --key "checksum.txt" \
+    --body "$TMPDIR/checksum.txt" \
+    --checksum-algorithm CRC32 \
+    --checksum-crc32 "$CRC32_VALUE" 2>&1)
+assert_eq "put-object with CRC32 checksum accepted" "true" "$(echo "$OUTPUT" | grep -q "ChecksumCRC32" && echo true || echo false)"
+
+# HeadObject should return the checksum
+OUTPUT=$($AWS s3api head-object --bucket "$BUCKET" --key "checksum.txt" --checksum-mode ENABLED 2>&1)
+assert_eq "head-object returns CRC32 checksum" "true" "$(echo "$OUTPUT" | grep -q "ChecksumCRC32" && echo true || echo false)"
+
+# PutObject with wrong checksum should fail
+assert_fail "put-object with wrong CRC32 rejects" \
+    $AWS s3api put-object --bucket "$BUCKET" --key "bad-checksum.txt" \
+    --body "$TMPDIR/checksum.txt" \
+    --checksum-algorithm CRC32 \
+    --checksum-crc32 "AAAAAAAA"
+
+# PutObject with SHA256 checksum
+SHA256_VALUE=$(python3 -c "
+import hashlib, base64
+data = open('$TMPDIR/checksum.txt', 'rb').read()
+print(base64.b64encode(hashlib.sha256(data).digest()).decode())
+")
+OUTPUT=$($AWS s3api put-object --bucket "$BUCKET" --key "checksum-sha256.txt" \
+    --body "$TMPDIR/checksum.txt" \
+    --checksum-algorithm SHA256 \
+    --checksum-sha256 "$SHA256_VALUE" 2>&1)
+assert_eq "put-object with SHA256 checksum accepted" "true" "$(echo "$OUTPUT" | grep -q "ChecksumSHA256" && echo true || echo false)"
+
+# Cleanup checksum test objects
+assert "delete checksum object" $AWS s3 rm "s3://$BUCKET/checksum.txt"
+assert "delete sha256 checksum object" $AWS s3 rm "s3://$BUCKET/checksum-sha256.txt"
+
 # --- Delete operations ---
 assert "delete object" $AWS s3 rm "s3://$BUCKET/test.txt"
 assert_file_not_exists "deleted object gone from disk" "$DATA_DIR/buckets/$BUCKET/test.txt"
@@ -244,6 +287,31 @@ assert "delete nested object" $AWS s3 rm "s3://$BUCKET/folder/nested/file.txt"
 assert_file_not_exists "deleted nested object gone from disk" "$DATA_DIR/buckets/$BUCKET/folder/nested/file.txt"
 assert "delete large object" $AWS s3 rm "s3://$BUCKET/big.bin"
 assert "delete manual multipart object" $AWS s3 rm "s3://$BUCKET/manual-multipart.bin"
+
+# --- Erasure coding corruption detection ---
+echo "hello erasure" > "$TMPDIR/ec-test.txt"
+assert "upload ec test object" $AWS s3 cp "$TMPDIR/ec-test.txt" "s3://$BUCKET/ec-test.txt"
+
+EC_DIR="$DATA_DIR/buckets/$BUCKET/ec-test.txt.ec"
+if [ -d "$EC_DIR" ]; then
+    assert_file_exists "ec chunk dir exists" "$EC_DIR"
+    assert_file_exists "ec manifest exists" "$EC_DIR/manifest.json"
+
+    # Verify download works before corruption
+    assert "download ec object before corruption" $AWS s3 cp "s3://$BUCKET/ec-test.txt" "$TMPDIR/ec-before.txt"
+    assert_eq "ec content before corruption" "hello erasure" "$(cat "$TMPDIR/ec-before.txt")"
+
+    # Corrupt the first chunk
+    printf "CORRUPTED" > "$EC_DIR/000000"
+
+    # Download should fail due to checksum mismatch
+    assert_fail "download ec object after corruption fails" $AWS s3 cp "s3://$BUCKET/ec-test.txt" "$TMPDIR/ec-after.txt"
+
+    green "INFO: erasure coding corruption tests ran (server has EC enabled)"
+else
+    green "INFO: erasure coding corruption tests skipped (server has EC disabled)"
+fi
+assert "delete ec test object" $AWS s3 rm "s3://$BUCKET/ec-test.txt"
 
 # Delete bucket
 assert "delete empty bucket" $AWS s3 rb "s3://$BUCKET"

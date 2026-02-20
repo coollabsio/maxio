@@ -11,10 +11,45 @@ use tokio_util::io::ReaderStream;
 
 use crate::error::S3Error;
 use crate::server::AppState;
-use crate::storage::StorageError;
+use crate::storage::{ChecksumAlgorithm, StorageError};
 use crate::xml::{response::to_xml, types::CopyObjectResult};
 
 use super::multipart;
+
+/// Extract checksum algorithm and optional expected value from request headers.
+pub(crate) fn extract_checksum(headers: &HeaderMap) -> Option<(ChecksumAlgorithm, Option<String>)> {
+    let pairs = [
+        ("x-amz-checksum-crc32", ChecksumAlgorithm::CRC32),
+        ("x-amz-checksum-crc32c", ChecksumAlgorithm::CRC32C),
+        ("x-amz-checksum-sha1", ChecksumAlgorithm::SHA1),
+        ("x-amz-checksum-sha256", ChecksumAlgorithm::SHA256),
+    ];
+
+    // Check for a value header first (implies the algorithm)
+    for (header, algo) in &pairs {
+        if let Some(val) = headers.get(*header).and_then(|v| v.to_str().ok()) {
+            return Some((*algo, Some(val.to_string())));
+        }
+    }
+
+    // Fall back to algorithm-only header (compute but don't validate)
+    headers
+        .get("x-amz-checksum-algorithm")
+        .and_then(|v| v.to_str().ok())
+        .and_then(ChecksumAlgorithm::from_header_str)
+        .map(|algo| (algo, None))
+}
+
+fn add_checksum_header(
+    builder: http::response::Builder,
+    meta: &crate::storage::ObjectMeta,
+) -> http::response::Builder {
+    if let (Some(algo), Some(val)) = (&meta.checksum_algorithm, &meta.checksum_value) {
+        builder.header(algo.header_name(), val.as_str())
+    } else {
+        builder
+    }
+}
 
 pub async fn put_object(
     State(state): State<AppState>,
@@ -71,12 +106,15 @@ pub async fn put_object(
         reader = Box::pin(std::io::Cursor::new(buf));
     }
 
+    let checksum = extract_checksum(&headers);
+
     let result = state
         .storage
-        .put_object(&bucket, &key, content_type, reader)
+        .put_object(&bucket, &key, content_type, reader, checksum)
         .await
         .map_err(|e| match e {
             StorageError::InvalidKey(msg) => S3Error::invalid_argument(&msg),
+            StorageError::ChecksumMismatch(_) => S3Error::bad_checksum("x-amz-checksum"),
             _ => S3Error::internal(e),
         })?;
 
@@ -86,6 +124,9 @@ pub async fn put_object(
         .header("Content-Length", result.size.to_string());
     if let Some(vid) = &result.version_id {
         builder = builder.header("x-amz-version-id", vid.as_str());
+    }
+    if let (Some(algo), Some(val)) = (&result.checksum_algorithm, &result.checksum_value) {
+        builder = builder.header(algo.header_name(), val.as_str());
     }
     Ok(builder.body(Body::empty()).unwrap())
 }
@@ -142,10 +183,13 @@ async fn copy_object(
         _ => return Err(S3Error::invalid_argument("invalid x-amz-metadata-directive")),
     };
 
+    // Propagate source checksum algorithm so it's recomputed during copy
+    let checksum = src_meta.checksum_algorithm.map(|algo| (algo, None));
+
     // Write destination
     let result = state
         .storage
-        .put_object(&bucket, &key, &content_type, reader)
+        .put_object(&bucket, &key, &content_type, reader, checksum)
         .await
         .map_err(|e| match e {
             StorageError::InvalidKey(msg) => S3Error::invalid_argument(&msg),
@@ -330,6 +374,7 @@ pub async fn get_object(
     if let Some(vid) = &meta.version_id {
         builder = builder.header("x-amz-version-id", vid.as_str());
     }
+    builder = add_checksum_header(builder, &meta);
     Ok(builder.body(body).unwrap())
 }
 
@@ -371,6 +416,7 @@ pub async fn head_object(
     if let Some(vid) = &meta.version_id {
         builder = builder.header("x-amz-version-id", vid.as_str());
     }
+    builder = add_checksum_header(builder, &meta);
     Ok(builder.body(Body::empty()).unwrap())
 }
 

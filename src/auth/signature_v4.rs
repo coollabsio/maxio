@@ -226,10 +226,16 @@ fn canonical_uri(uri: &str) -> String {
     if path.is_empty() || path == "/" {
         return "/".to_string();
     }
-    // URI-encode each path segment individually, preserving '/' separators
+    // Decode first (path arrives percent-encoded from HTTP), then re-encode
+    // to normalize per AWS SigV4 spec. Without decoding first, already-encoded
+    // characters like %20 would be double-encoded to %2520.
     let segments: Vec<String> = path
         .split('/')
-        .map(|s| percent_encoding::utf8_percent_encode(s, S3_URI_ENCODE).to_string())
+        .map(|s| {
+            let decoded = percent_encoding::percent_decode_str(s)
+                .decode_utf8_lossy();
+            percent_encoding::utf8_percent_encode(&decoded, S3_URI_ENCODE).to_string()
+        })
         .collect();
     segments.join("/")
 }

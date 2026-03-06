@@ -45,7 +45,7 @@ async fn start_server() -> (String, TempDir) {
     let base_url = format!("http://{}", addr);
 
     tokio::spawn(async move {
-        axum::serve(listener, app).await.unwrap();
+        axum::serve(listener, app.into_make_service_with_connect_info::<std::net::SocketAddr>()).await.unwrap();
     });
 
     (base_url, tmp)
@@ -1661,6 +1661,138 @@ async fn test_presigned_bad_signature() {
     assert_eq!(resp.status(), 403);
 }
 
+// ── Console presign endpoint tests ───────────────────────────────────
+
+/// Helper: login via console API and return the session cookie value.
+async fn console_login(base_url: &str) -> String {
+    let resp = client()
+        .post(&format!("{}/api/auth/login", base_url))
+        .json(&serde_json::json!({"accessKey": ACCESS_KEY, "secretKey": SECRET_KEY}))
+        .send()
+        .await
+        .unwrap();
+    if resp.status() != 200 {
+        let status = resp.status();
+        let body = resp.text().await.unwrap();
+        panic!("login failed with status {}: {}", status, body);
+    }
+    let set_cookie = resp
+        .headers()
+        .get("set-cookie")
+        .expect("login should set cookie")
+        .to_str()
+        .unwrap()
+        .to_string();
+    // Extract value from "maxio_session=VALUE; ..."
+    let value = set_cookie
+        .strip_prefix("maxio_session=")
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap();
+    value.to_string()
+}
+
+#[tokio::test]
+async fn test_console_presign_simple_key() {
+    let (base_url, _tmp) = start_server().await;
+
+    // Create bucket and upload object via S3 API
+    s3_request("PUT", &format!("{}/cpresign-bucket", base_url), vec![]).await;
+    let body = b"console presign test";
+    s3_request("PUT", &format!("{}/cpresign-bucket/test.txt", base_url), body.to_vec()).await;
+
+    // Login to console API
+    let session = console_login(&base_url).await;
+
+    // Generate presigned URL via console endpoint
+    let resp = client()
+        .get(&format!(
+            "{}/api/buckets/cpresign-bucket/presign/test.txt?expires=300",
+            base_url
+        ))
+        .header("Cookie", format!("maxio_session={}", session))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let json: serde_json::Value = resp.json().await.unwrap();
+    let presigned_url = json["url"].as_str().expect("response should have url field");
+
+    // Fetch the presigned URL without any auth — should succeed
+    let resp = client().get(presigned_url).send().await.unwrap();
+    assert_eq!(resp.status(), 200, "presigned URL should return 200, got {}", resp.status());
+    assert_eq!(resp.bytes().await.unwrap().as_ref(), body);
+}
+
+#[tokio::test]
+async fn test_console_presign_key_with_spaces() {
+    let (base_url, _tmp) = start_server().await;
+
+    s3_request("PUT", &format!("{}/cpresign-space", base_url), vec![]).await;
+    let body = b"file with spaces";
+    // Upload with a key containing spaces (URL-encoded in the request)
+    s3_request(
+        "PUT",
+        &format!("{}/cpresign-space/my%20file.txt", base_url),
+        body.to_vec(),
+    )
+    .await;
+
+    let session = console_login(&base_url).await;
+
+    // Request presigned URL for the key with spaces (URL-encoded in the API path)
+    let resp = client()
+        .get(&format!(
+            "{}/api/buckets/cpresign-space/presign/my%20file.txt?expires=300",
+            base_url
+        ))
+        .header("Cookie", format!("maxio_session={}", session))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let json: serde_json::Value = resp.json().await.unwrap();
+    let presigned_url = json["url"].as_str().expect("response should have url field");
+
+    let resp = client().get(presigned_url).send().await.unwrap();
+    assert_eq!(resp.status(), 200, "presigned URL for key with spaces should return 200, got {}", resp.status());
+    assert_eq!(resp.bytes().await.unwrap().as_ref(), body);
+}
+
+#[tokio::test]
+async fn test_console_presign_nested_key() {
+    let (base_url, _tmp) = start_server().await;
+
+    s3_request("PUT", &format!("{}/cpresign-nested", base_url), vec![]).await;
+    let body = b"nested key content";
+    s3_request(
+        "PUT",
+        &format!("{}/cpresign-nested/folder/sub/file.txt", base_url),
+        body.to_vec(),
+    )
+    .await;
+
+    let session = console_login(&base_url).await;
+
+    let resp = client()
+        .get(&format!(
+            "{}/api/buckets/cpresign-nested/presign/folder/sub/file.txt?expires=300",
+            base_url
+        ))
+        .header("Cookie", format!("maxio_session={}", session))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let json: serde_json::Value = resp.json().await.unwrap();
+    let presigned_url = json["url"].as_str().expect("response should have url field");
+
+    let resp = client().get(presigned_url).send().await.unwrap();
+    assert_eq!(resp.status(), 200, "presigned URL for nested key should return 200, got {}", resp.status());
+    assert_eq!(resp.bytes().await.unwrap().as_ref(), body);
+}
+
 // ── Range request tests ──────────────────────────────────────────────
 
 #[tokio::test]
@@ -2033,7 +2165,7 @@ async fn start_server_ec() -> (String, TempDir) {
     let base_url = format!("http://{}", addr);
 
     tokio::spawn(async move {
-        axum::serve(listener, app).await.unwrap();
+        axum::serve(listener, app.into_make_service_with_connect_info::<std::net::SocketAddr>()).await.unwrap();
     });
 
     (base_url, tmp)
@@ -2406,7 +2538,7 @@ async fn start_server_parity(parity_shards: u32) -> (String, TempDir) {
     let base_url = format!("http://{}", addr);
 
     tokio::spawn(async move {
-        axum::serve(listener, app).await.unwrap();
+        axum::serve(listener, app.into_make_service_with_connect_info::<std::net::SocketAddr>()).await.unwrap();
     });
 
     (base_url, tmp)

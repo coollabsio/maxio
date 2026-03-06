@@ -465,7 +465,24 @@ pub async fn presign_object(
     let access_key = &state.config.access_key;
 
     let credential = format!("{}/{}/{}/s3/aws4_request", access_key, date_stamp, region);
-    let path = format!("/{}/{}", bucket, key);
+
+    const S3_ENCODE: &percent_encoding::AsciiSet = &percent_encoding::NON_ALPHANUMERIC
+        .remove(b'-')
+        .remove(b'_')
+        .remove(b'.')
+        .remove(b'~');
+    let encode =
+        |s: &str| -> String { percent_encoding::utf8_percent_encode(s, S3_ENCODE).to_string() };
+
+    // URI-encode each path segment per AWS SigV4 spec. The bucket/key values
+    // arrive decoded from Axum's Path extractor, so we must encode them for
+    // both the canonical request and the presigned URL.
+    let encoded_key: String = key
+        .split('/')
+        .map(|s| encode(s))
+        .collect::<Vec<_>>()
+        .join("/");
+    let path = format!("/{}/{}", encode(&bucket), encoded_key);
 
     // Build query string params (sorted alphabetically, excluding Signature)
     let qs_params = [
@@ -475,14 +492,6 @@ pub async fn presign_object(
         ("X-Amz-Expires", expires_secs.to_string()),
         ("X-Amz-SignedHeaders", "host".to_string()),
     ];
-
-    const S3_ENCODE: &percent_encoding::AsciiSet = &percent_encoding::NON_ALPHANUMERIC
-        .remove(b'-')
-        .remove(b'_')
-        .remove(b'.')
-        .remove(b'~');
-    let encode =
-        |s: &str| -> String { percent_encoding::utf8_percent_encode(s, S3_ENCODE).to_string() };
 
     let canonical_qs: String = qs_params
         .iter()

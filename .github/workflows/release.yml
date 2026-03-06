@@ -38,6 +38,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Sync version from tag
+        run: |
+          TAG="${{ github.event.inputs.version || github.ref_name }}"
+          VERSION="${TAG#v}"
+          echo "$VERSION" > VERSION
+          sed -i "0,/^version = /s/^version = .*/version = \"$VERSION\"/" Cargo.toml
+
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -97,6 +104,13 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+
+      - name: Sync version from tag
+        run: |
+          TAG="${{ github.event.inputs.version || github.ref_name }}"
+          VERSION="${TAG#v}"
+          echo "$VERSION" > VERSION
+          sed -i "0,/^version = /s/^version = .*/version = \"$VERSION\"/" Cargo.toml
 
       - name: Login to ${{ env.GITHUB_REGISTRY }}
         uses: docker/login-action@v3

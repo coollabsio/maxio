@@ -14,11 +14,14 @@ RUN cd ui && bun install && bun run build
 RUN cargo build --release
 
 FROM debian:bookworm-slim
-RUN apt-get update && apt-get install -y ca-certificates && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y ca-certificates wget && rm -rf /var/lib/apt/lists/*
 COPY --from=builder /app/target/release/maxio /usr/local/bin/maxio
 
 ENV MAXIO_DATA_DIR="/data"
 EXPOSE 9000
 VOLUME ["/data"]
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+  CMD wget -q -O /dev/null http://127.0.0.1:9000/ui || exit 1
 
 ENTRYPOINT ["maxio"]

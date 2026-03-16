@@ -133,8 +133,15 @@ This runs both processes concurrently (Ctrl+C kills both):
 | HeadObject | HEAD | `/{bucket}/{key}` |
 | DeleteObject | DELETE | `/{bucket}/{key}` |
 | CopyObject | PUT | `/{bucket}/{key}` (with `x-amz-copy-source` header) |
+| GetObjectTagging | GET | `/{bucket}/{key}?tagging` |
+| PutObjectTagging | PUT | `/{bucket}/{key}?tagging` |
+| DeleteObjectTagging | DELETE | `/{bucket}/{key}?tagging` |
+| GetBucketCors | GET | `/{bucket}?cors` |
+| PutBucketCors | PUT | `/{bucket}?cors` |
+| DeleteBucketCors | DELETE | `/{bucket}?cors` |
 | CreateMultipartUpload | POST | `/{bucket}/{key}?uploads` |
 | UploadPart | PUT | `/{bucket}/{key}?partNumber=N&uploadId=X` |
+| UploadPartCopy | PUT | `/{bucket}/{key}?partNumber=N&uploadId=X` (with `x-amz-copy-source` header) |
 | CompleteMultipartUpload | POST | `/{bucket}/{key}?uploadId=X` |
 | AbortMultipartUpload | DELETE | `/{bucket}/{key}?uploadId=X` |
 | ListParts | GET | `/{bucket}/{key}?uploadId=X` |
@@ -232,6 +239,6 @@ The web console (`ui/`) follows the Coolify design system. The full specificatio
 
 ## Roadmap
 
-- **Phase 2**: ~~Multipart upload~~, ~~presigned URLs~~, ~~CopyObject~~, ~~DeleteObjects batch~~, CORS, Range headers
+- **Phase 2**: ~~Multipart upload~~, ~~presigned URLs~~, ~~CopyObject~~, ~~DeleteObjects batch~~, ~~CORS~~, Range headers
 - **Phase 3**: ~~Web console (SPA at `/ui/`)~~, versioning, lifecycle rules, multi-user, metrics
 - **Phase 4**: Distributed mode, erasure coding, replication

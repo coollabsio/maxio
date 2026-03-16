@@ -2738,3 +2738,463 @@ async fn test_parity_empty_object() {
     assert_eq!(resp.status(), 200);
     assert_eq!(resp.bytes().await.unwrap().len(), 0);
 }
+
+// ── Object Tagging ────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn test_put_and_get_object_tagging() {
+    let (base, _tmp) = start_server().await;
+    s3_request("PUT", &format!("{}/tag-bucket", base), vec![]).await;
+    s3_request("PUT", &format!("{}/tag-bucket/obj.txt", base), b"hello".to_vec()).await;
+
+    let tagging_xml = r#"<Tagging><TagSet><Tag><Key>env</Key><Value>prod</Value></Tag><Tag><Key>team</Key><Value>platform</Value></Tag></TagSet></Tagging>"#;
+    let resp = s3_request(
+        "PUT",
+        &format!("{}/tag-bucket/obj.txt?tagging", base),
+        tagging_xml.as_bytes().to_vec(),
+    ).await;
+    assert_eq!(resp.status(), 200);
+
+    let resp = s3_request("GET", &format!("{}/tag-bucket/obj.txt?tagging", base), vec![]).await;
+    assert_eq!(resp.status(), 200);
+    let body = resp.text().await.unwrap();
+    assert!(body.contains("<Key>env</Key>"));
+    assert!(body.contains("<Value>prod</Value>"));
+    assert!(body.contains("<Key>team</Key>"));
+    assert!(body.contains("<Value>platform</Value>"));
+}
+
+#[tokio::test]
+async fn test_get_object_tagging_no_tags() {
+    let (base, _tmp) = start_server().await;
+    s3_request("PUT", &format!("{}/notag-bucket", base), vec![]).await;
+    s3_request("PUT", &format!("{}/notag-bucket/obj.txt", base), b"hello".to_vec()).await;
+
+    let resp = s3_request("GET", &format!("{}/notag-bucket/obj.txt?tagging", base), vec![]).await;
+    assert_eq!(resp.status(), 200);
+    let body = resp.text().await.unwrap();
+    assert!(body.contains("<Tagging>") || body.contains("<TagSet"));
+    assert!(!body.contains("<Tag>"));
+}
+
+#[tokio::test]
+async fn test_delete_object_tagging() {
+    let (base, _tmp) = start_server().await;
+    s3_request("PUT", &format!("{}/deltag-bucket", base), vec![]).await;
+    s3_request("PUT", &format!("{}/deltag-bucket/obj.txt", base), b"hello".to_vec()).await;
+
+    let tagging_xml = r#"<Tagging><TagSet><Tag><Key>env</Key><Value>prod</Value></Tag></TagSet></Tagging>"#;
+    s3_request("PUT", &format!("{}/deltag-bucket/obj.txt?tagging", base), tagging_xml.as_bytes().to_vec()).await;
+
+    let resp = s3_request("DELETE", &format!("{}/deltag-bucket/obj.txt?tagging", base), vec![]).await;
+    assert_eq!(resp.status(), 204);
+
+    let resp = s3_request("GET", &format!("{}/deltag-bucket/obj.txt?tagging", base), vec![]).await;
+    assert_eq!(resp.status(), 200);
+    let body = resp.text().await.unwrap();
+    assert!(!body.contains("<Tag>"));
+}
+
+#[tokio::test]
+async fn test_get_object_tagging_no_such_key() {
+    let (base, _tmp) = start_server().await;
+    s3_request("PUT", &format!("{}/nsk-bucket", base), vec![]).await;
+
+    let resp = s3_request("GET", &format!("{}/nsk-bucket/nonexistent.txt?tagging", base), vec![]).await;
+    assert_eq!(resp.status(), 404);
+    let body = resp.text().await.unwrap();
+    assert!(body.contains("NoSuchKey"));
+}
+
+#[tokio::test]
+async fn test_put_object_tagging_too_many_tags() {
+    let (base, _tmp) = start_server().await;
+    s3_request("PUT", &format!("{}/manytagbucket", base), vec![]).await;
+    s3_request("PUT", &format!("{}/manytagbucket/obj.txt", base), b"data".to_vec()).await;
+
+    let tags: String = (1..=11)
+        .map(|i| format!("<Tag><Key>key{}</Key><Value>val{}</Value></Tag>", i, i))
+        .collect();
+    let tagging_xml = format!("<Tagging><TagSet>{}</TagSet></Tagging>", tags);
+    let resp = s3_request(
+        "PUT",
+        &format!("{}/manytagbucket/obj.txt?tagging", base),
+        tagging_xml.into_bytes(),
+    ).await;
+    assert_eq!(resp.status(), 400);
+    let body = resp.text().await.unwrap();
+    assert!(body.contains("InvalidArgument"));
+}
+
+#[tokio::test]
+async fn test_put_object_tagging_key_too_long() {
+    let (base, _tmp) = start_server().await;
+    s3_request("PUT", &format!("{}/longtag-bucket", base), vec![]).await;
+    s3_request("PUT", &format!("{}/longtag-bucket/obj.txt", base), b"data".to_vec()).await;
+
+    let long_key = "k".repeat(129);
+    let tagging_xml = format!("<Tagging><TagSet><Tag><Key>{}</Key><Value>v</Value></Tag></TagSet></Tagging>", long_key);
+    let resp = s3_request(
+        "PUT",
+        &format!("{}/longtag-bucket/obj.txt?tagging", base),
+        tagging_xml.into_bytes(),
+    ).await;
+    assert_eq!(resp.status(), 400);
+    let body = resp.text().await.unwrap();
+    assert!(body.contains("InvalidArgument"));
+}
+
+#[tokio::test]
+async fn test_put_object_tagging_value_too_long() {
+    let (base, _tmp) = start_server().await;
+    s3_request("PUT", &format!("{}/longval-bucket", base), vec![]).await;
+    s3_request("PUT", &format!("{}/longval-bucket/obj.txt", base), b"data".to_vec()).await;
+
+    let long_val = "v".repeat(257);
+    let tagging_xml = format!("<Tagging><TagSet><Tag><Key>k</Key><Value>{}</Value></Tag></TagSet></Tagging>", long_val);
+    let resp = s3_request(
+        "PUT",
+        &format!("{}/longval-bucket/obj.txt?tagging", base),
+        tagging_xml.into_bytes(),
+    ).await;
+    assert_eq!(resp.status(), 400);
+    let body = resp.text().await.unwrap();
+    assert!(body.contains("InvalidArgument"));
+}
+
+// UploadPartCopy: copy entire source object as a multipart part
+#[tokio::test]
+async fn test_upload_part_copy_full() {
+    let (base, _tmp) = start_server().await;
+
+    // Create source bucket and object
+    s3_request("PUT", &format!("{}/src-upc", base), vec![]).await;
+    let src_data: Vec<u8> = (0u8..255).cycle().take(5 * 1024 * 1024).collect(); // 5 MiB
+    s3_request("PUT", &format!("{}/src-upc/source.bin", base), src_data.clone()).await;
+
+    // Create destination bucket and start multipart upload
+    s3_request("PUT", &format!("{}/dst-upc", base), vec![]).await;
+    let create = s3_request("POST", &format!("{}/dst-upc/dest.bin?uploads=", base), vec![]).await;
+    let upload_id = extract_xml_tag(&create.text().await.unwrap(), "UploadId").unwrap();
+
+    // UploadPartCopy: copy full source as part 1
+    let resp = s3_request_with_headers(
+        "PUT",
+        &format!("{}/dst-upc/dest.bin?partNumber=1&uploadId={}", base, upload_id),
+        vec![],
+        vec![("x-amz-copy-source", "/src-upc/source.bin")],
+    ).await;
+    assert_eq!(resp.status(), 200, "upload_part_copy should return 200");
+    let body = resp.text().await.unwrap();
+    assert!(body.contains("<CopyPartResult>"), "response should be CopyPartResult XML, got: {}", body);
+    let etag = extract_xml_tag(&body, "ETag").unwrap();
+    assert!(etag.starts_with('"') && etag.ends_with('"'), "ETag should be quoted");
+
+    // Complete the multipart upload
+    let complete_xml = format!(
+        "<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>{}</ETag></Part></CompleteMultipartUpload>",
+        etag
+    );
+    let complete = s3_request(
+        "POST",
+        &format!("{}/dst-upc/dest.bin?uploadId={}", base, upload_id),
+        complete_xml.into_bytes(),
+    ).await;
+    assert_eq!(complete.status(), 200);
+
+    // Verify content matches source
+    let get = s3_request("GET", &format!("{}/dst-upc/dest.bin", base), vec![]).await;
+    assert_eq!(get.status(), 200);
+    assert_eq!(get.bytes().await.unwrap().as_ref(), src_data.as_slice());
+}
+
+// UploadPartCopy: copy a byte range from source object as a multipart part
+#[tokio::test]
+async fn test_upload_part_copy_range() {
+    let (base, _tmp) = start_server().await;
+
+    // Create source with known content
+    s3_request("PUT", &format!("{}/src-upcr", base), vec![]).await;
+    // part1: 5 MiB of 'A', part2: 1 KiB of 'B'
+    let part1: Vec<u8> = vec![b'A'; 5 * 1024 * 1024];
+    let part2: Vec<u8> = vec![b'B'; 1024];
+    let mut src_data = part1.clone();
+    src_data.extend_from_slice(&part2);
+    s3_request("PUT", &format!("{}/src-upcr/source.bin", base), src_data.clone()).await;
+
+    // Create destination and start multipart upload
+    s3_request("PUT", &format!("{}/dst-upcr", base), vec![]).await;
+    let create = s3_request("POST", &format!("{}/dst-upcr/dest.bin?uploads=", base), vec![]).await;
+    let upload_id = extract_xml_tag(&create.text().await.unwrap(), "UploadId").unwrap();
+
+    // Part 1: bytes 0 to (5MiB - 1)
+    let r1 = s3_request_with_headers(
+        "PUT",
+        &format!("{}/dst-upcr/dest.bin?partNumber=1&uploadId={}", base, upload_id),
+        vec![],
+        vec![
+            ("x-amz-copy-source", "/src-upcr/source.bin"),
+            ("x-amz-copy-source-range", &format!("bytes=0-{}", 5 * 1024 * 1024 - 1)),
+        ],
+    ).await;
+    assert_eq!(r1.status(), 200);
+    let body1 = r1.text().await.unwrap();
+    assert!(body1.contains("<CopyPartResult>"));
+    let e1 = extract_xml_tag(&body1, "ETag").unwrap();
+
+    // Part 2: remaining bytes
+    let r2 = s3_request_with_headers(
+        "PUT",
+        &format!("{}/dst-upcr/dest.bin?partNumber=2&uploadId={}", base, upload_id),
+        vec![],
+        vec![
+            ("x-amz-copy-source", "/src-upcr/source.bin"),
+            ("x-amz-copy-source-range", &format!("bytes={}-{}", 5 * 1024 * 1024, src_data.len() - 1)),
+        ],
+    ).await;
+    assert_eq!(r2.status(), 200);
+    let body2 = r2.text().await.unwrap();
+    assert!(body2.contains("<CopyPartResult>"));
+    let e2 = extract_xml_tag(&body2, "ETag").unwrap();
+
+    // Complete
+    let complete_xml = format!(
+        "<CompleteMultipartUpload>\
+            <Part><PartNumber>1</PartNumber><ETag>{}</ETag></Part>\
+            <Part><PartNumber>2</PartNumber><ETag>{}</ETag></Part>\
+        </CompleteMultipartUpload>",
+        e1, e2
+    );
+    let complete = s3_request(
+        "POST",
+        &format!("{}/dst-upcr/dest.bin?uploadId={}", base, upload_id),
+        complete_xml.into_bytes(),
+    ).await;
+    assert_eq!(complete.status(), 200);
+
+    // Verify reconstructed content matches original source
+    let get = s3_request("GET", &format!("{}/dst-upcr/dest.bin", base), vec![]).await;
+    assert_eq!(get.status(), 200);
+    assert_eq!(get.bytes().await.unwrap().as_ref(), src_data.as_slice());
+}
+
+// ---- CORS API tests ----
+
+const CORS_XML_WILDCARD: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<CORSConfiguration>
+  <CORSRule>
+    <AllowedOrigin>*</AllowedOrigin>
+    <AllowedMethod>GET</AllowedMethod>
+    <AllowedMethod>PUT</AllowedMethod>
+    <AllowedHeader>*</AllowedHeader>
+    <MaxAgeSeconds>3600</MaxAgeSeconds>
+  </CORSRule>
+</CORSConfiguration>"#;
+
+const CORS_XML_EXACT_ORIGIN: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<CORSConfiguration>
+  <CORSRule>
+    <AllowedOrigin>http://example.com</AllowedOrigin>
+    <AllowedMethod>GET</AllowedMethod>
+  </CORSRule>
+</CORSConfiguration>"#;
+
+#[tokio::test]
+async fn test_put_get_delete_bucket_cors() {
+    let (base, _tmp) = start_server().await;
+    s3_request("PUT", &format!("{}/cors-bucket", base), vec![]).await;
+
+    // GetBucketCors on bucket with no CORS → 404 NoSuchCORSConfiguration
+    let resp = s3_request("GET", &format!("{}/cors-bucket?cors", base), vec![]).await;
+    assert_eq!(resp.status(), 404);
+    let body = resp.text().await.unwrap();
+    assert!(body.contains("NoSuchCORSConfiguration"));
+
+    // PutBucketCors
+    let resp = s3_request(
+        "PUT",
+        &format!("{}/cors-bucket?cors", base),
+        CORS_XML_WILDCARD.as_bytes().to_vec(),
+    )
+    .await;
+    assert_eq!(resp.status(), 200);
+
+    // GetBucketCors → should return config
+    let resp = s3_request("GET", &format!("{}/cors-bucket?cors", base), vec![]).await;
+    assert_eq!(resp.status(), 200);
+    let body = resp.text().await.unwrap();
+    assert!(body.contains("CORSConfiguration"));
+    assert!(body.contains("AllowedMethod"));
+    assert!(body.contains("GET"));
+
+    // DeleteBucketCors
+    let resp = s3_request("DELETE", &format!("{}/cors-bucket?cors", base), vec![]).await;
+    assert_eq!(resp.status(), 204);
+
+    // GetBucketCors after delete → 404 again
+    let resp = s3_request("GET", &format!("{}/cors-bucket?cors", base), vec![]).await;
+    assert_eq!(resp.status(), 404);
+}
+
+#[tokio::test]
+async fn test_put_cors_invalid_method() {
+    let (base, _tmp) = start_server().await;
+    s3_request("PUT", &format!("{}/cors-invalid", base), vec![]).await;
+
+    let bad_cors = r#"<?xml version="1.0" encoding="UTF-8"?>
+<CORSConfiguration>
+  <CORSRule>
+    <AllowedOrigin>*</AllowedOrigin>
+    <AllowedMethod>PATCH</AllowedMethod>
+  </CORSRule>
+</CORSConfiguration>"#;
+
+    let resp = s3_request(
+        "PUT",
+        &format!("{}/cors-invalid?cors", base),
+        bad_cors.as_bytes().to_vec(),
+    )
+    .await;
+    assert_eq!(resp.status(), 400);
+    let body = resp.text().await.unwrap();
+    assert!(body.contains("InvalidArgument"));
+}
+
+#[tokio::test]
+async fn test_cors_preflight_allowed() {
+    let (base, _tmp) = start_server().await;
+    s3_request("PUT", &format!("{}/preflight-bucket", base), vec![]).await;
+    s3_request(
+        "PUT",
+        &format!("{}/preflight-bucket?cors", base),
+        CORS_XML_WILDCARD.as_bytes().to_vec(),
+    )
+    .await;
+
+    // OPTIONS preflight — should return 200 with CORS headers
+    let resp = client()
+        .request(
+            reqwest::Method::OPTIONS,
+            format!("{}/preflight-bucket/file.txt", base),
+        )
+        .header("Origin", "http://example.com")
+        .header("Access-Control-Request-Method", "GET")
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 200);
+    let headers = resp.headers();
+    assert!(headers.contains_key("access-control-allow-origin"));
+    assert!(headers.contains_key("access-control-allow-methods"));
+}
+
+#[tokio::test]
+async fn test_cors_preflight_no_config_returns_403() {
+    let (base, _tmp) = start_server().await;
+    s3_request("PUT", &format!("{}/no-cors-bucket", base), vec![]).await;
+
+    let resp = client()
+        .request(
+            reqwest::Method::OPTIONS,
+            format!("{}/no-cors-bucket/file.txt", base),
+        )
+        .header("Origin", "http://example.com")
+        .header("Access-Control-Request-Method", "GET")
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 403);
+}
+
+#[tokio::test]
+async fn test_cors_preflight_unmatched_origin_returns_403() {
+    let (base, _tmp) = start_server().await;
+    s3_request("PUT", &format!("{}/exact-origin-bucket", base), vec![]).await;
+    s3_request(
+        "PUT",
+        &format!("{}/exact-origin-bucket?cors", base),
+        CORS_XML_EXACT_ORIGIN.as_bytes().to_vec(),
+    )
+    .await;
+
+    let resp = client()
+        .request(
+            reqwest::Method::OPTIONS,
+            format!("{}/exact-origin-bucket/file.txt", base),
+        )
+        .header("Origin", "http://other.com")
+        .header("Access-Control-Request-Method", "GET")
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 403);
+}
+
+#[tokio::test]
+async fn test_cors_normal_request_gets_headers() {
+    let (base, _tmp) = start_server().await;
+    s3_request("PUT", &format!("{}/cors-normal-bucket", base), vec![]).await;
+    s3_request(
+        "PUT",
+        &format!("{}/cors-normal-bucket/obj.txt", base),
+        b"hello".to_vec(),
+    )
+    .await;
+    s3_request(
+        "PUT",
+        &format!("{}/cors-normal-bucket?cors", base),
+        CORS_XML_WILDCARD.as_bytes().to_vec(),
+    )
+    .await;
+
+    let resp = s3_request_with_headers(
+        "GET",
+        &format!("{}/cors-normal-bucket/obj.txt", base),
+        vec![],
+        vec![("origin", "http://example.com")],
+    )
+    .await;
+
+    assert_eq!(resp.status(), 200);
+    let headers = resp.headers();
+    assert!(headers.contains_key("access-control-allow-origin"));
+    assert_eq!(
+        headers
+            .get("access-control-allow-origin")
+            .unwrap()
+            .to_str()
+            .unwrap(),
+        "http://example.com"
+    );
+}
+
+#[tokio::test]
+async fn test_cors_no_origin_no_cors_headers() {
+    let (base, _tmp) = start_server().await;
+    s3_request("PUT", &format!("{}/cors-noorigin-bucket", base), vec![]).await;
+    s3_request(
+        "PUT",
+        &format!("{}/cors-noorigin-bucket/obj.txt", base),
+        b"hello".to_vec(),
+    )
+    .await;
+    s3_request(
+        "PUT",
+        &format!("{}/cors-noorigin-bucket?cors", base),
+        CORS_XML_WILDCARD.as_bytes().to_vec(),
+    )
+    .await;
+
+    let resp = s3_request(
+        "GET",
+        &format!("{}/cors-noorigin-bucket/obj.txt", base),
+        vec![],
+    )
+    .await;
+
+    assert_eq!(resp.status(), 200);
+    assert!(!resp.headers().contains_key("access-control-allow-origin"));
+}

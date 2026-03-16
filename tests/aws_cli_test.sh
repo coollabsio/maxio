@@ -186,6 +186,55 @@ assert_eq "copy-object has ETag" "true" "$(echo "$OUTPUT" | grep -q "ETag" && ec
 assert "download api-copied object" $AWS s3 cp "s3://$BUCKET/api-copy.txt" "$TMPDIR/api-copy.txt"
 assert_eq "api-copied content matches" "hello maxio" "$(cat "$TMPDIR/api-copy.txt")"
 
+# --- UploadPartCopy ---
+# Prepare a source object large enough to serve as multipart copy parts (5 MiB + 1 KiB)
+dd if=/dev/urandom of="$TMPDIR/upc-source.bin" bs=1M count=5 status=none
+dd if=/dev/urandom of="$TMPDIR/upc-tail.bin" bs=1024 count=1 status=none
+cat "$TMPDIR/upc-source.bin" "$TMPDIR/upc-tail.bin" > "$TMPDIR/upc-full.bin"
+assert "upload upc source object" $AWS s3 cp "$TMPDIR/upc-full.bin" "s3://$BUCKET/upc-source.bin"
+
+UPC_SIZE=$(wc -c < "$TMPDIR/upc-full.bin" | tr -d ' ')
+UPC_PART1_END=$((5 * 1024 * 1024 - 1))
+UPC_PART2_START=$((5 * 1024 * 1024))
+UPC_PART2_END=$((UPC_SIZE - 1))
+
+UPC_UPLOAD_ID=$($AWS s3api create-multipart-upload --bucket "$BUCKET" --key "upc-dest.bin" --query UploadId --output text 2>/dev/null || true)
+assert_eq "upc create multipart upload id" "true" "$([ -n "$UPC_UPLOAD_ID" ] && [ "$UPC_UPLOAD_ID" != "None" ] && echo true || echo false)"
+
+UPC_ETAG1=$($AWS s3api upload-part-copy \
+  --bucket "$BUCKET" --key "upc-dest.bin" \
+  --upload-id "$UPC_UPLOAD_ID" --part-number 1 \
+  --copy-source "$BUCKET/upc-source.bin" \
+  --copy-source-range "bytes=0-$UPC_PART1_END" \
+  --query CopyPartResult.ETag --output text 2>/dev/null || true)
+assert_eq "upc part 1 etag present" "true" "$([ -n "$UPC_ETAG1" ] && [ "$UPC_ETAG1" != "None" ] && echo true || echo false)"
+
+UPC_ETAG2=$($AWS s3api upload-part-copy \
+  --bucket "$BUCKET" --key "upc-dest.bin" \
+  --upload-id "$UPC_UPLOAD_ID" --part-number 2 \
+  --copy-source "$BUCKET/upc-source.bin" \
+  --copy-source-range "bytes=$UPC_PART2_START-$UPC_PART2_END" \
+  --query CopyPartResult.ETag --output text 2>/dev/null || true)
+assert_eq "upc part 2 etag present" "true" "$([ -n "$UPC_ETAG2" ] && [ "$UPC_ETAG2" != "None" ] && echo true || echo false)"
+
+UPC_COMPLETE_JSON="$TMPDIR/upc-complete.json"
+cat > "$UPC_COMPLETE_JSON" <<EOF
+{
+  "Parts": [
+    {"ETag": $UPC_ETAG1, "PartNumber": 1},
+    {"ETag": $UPC_ETAG2, "PartNumber": 2}
+  ]
+}
+EOF
+assert "upc complete multipart upload" $AWS s3api complete-multipart-upload \
+  --bucket "$BUCKET" --key "upc-dest.bin" \
+  --upload-id "$UPC_UPLOAD_ID" \
+  --multipart-upload "file://$UPC_COMPLETE_JSON"
+
+assert "upc download result" $AWS s3 cp "s3://$BUCKET/upc-dest.bin" "$TMPDIR/upc-download.bin"
+assert_eq "upc result size matches source" "$UPC_SIZE" "$(wc -c < "$TMPDIR/upc-download.bin" | tr -d ' ')"
+assert_eq "upc result content matches source" "$(md5sum "$TMPDIR/upc-full.bin" | cut -d' ' -f1)" "$(md5sum "$TMPDIR/upc-download.bin" | cut -d' ' -f1)"
+
 # --- Overwrite object ---
 echo "updated content" > "$TMPDIR/updated.txt"
 assert "overwrite object" $AWS s3 cp "$TMPDIR/updated.txt" "s3://$BUCKET/test.txt"
@@ -275,6 +324,68 @@ assert_eq "put-object with SHA256 checksum accepted" "true" "$(echo "$OUTPUT" | 
 assert "delete checksum object" $AWS s3 rm "s3://$BUCKET/checksum.txt"
 assert "delete sha256 checksum object" $AWS s3 rm "s3://$BUCKET/checksum-sha256.txt"
 
+# --- Conditional request headers ---
+echo "conditional test" > "$TMPDIR/cond.txt"
+assert "upload conditional test object" $AWS s3 cp "$TMPDIR/cond.txt" "s3://$BUCKET/cond.txt"
+
+# Capture ETag (strip surrounding quotes from JSON output)
+COND_ETAG=$($AWS s3api head-object --bucket "$BUCKET" --key "cond.txt" --query ETag --output text 2>/dev/null)
+
+# If-Match: matching ETag → 200
+assert "get-object if-match correct etag" \
+    $AWS s3api get-object --bucket "$BUCKET" --key "cond.txt" \
+    --if-match "$COND_ETAG" "$TMPDIR/cond-out.txt"
+
+# If-Match: wrong ETag → 412 Precondition Failed
+assert_fail "get-object if-match wrong etag returns 412" \
+    $AWS s3api get-object --bucket "$BUCKET" --key "cond.txt" \
+    --if-match '"wrongetag000000000000000000000000"' "$TMPDIR/cond-out.txt"
+
+# If-None-Match: matching ETag → 304 (AWS CLI treats this as a failure/error exit)
+assert_fail "get-object if-none-match matching etag returns 304" \
+    $AWS s3api get-object --bucket "$BUCKET" --key "cond.txt" \
+    --if-none-match "$COND_ETAG" "$TMPDIR/cond-out.txt"
+
+# If-None-Match: non-matching ETag → 200
+assert "get-object if-none-match different etag succeeds" \
+    $AWS s3api get-object --bucket "$BUCKET" --key "cond.txt" \
+    --if-none-match '"wrongetag000000000000000000000000"' "$TMPDIR/cond-out.txt"
+
+# If-Modified-Since: far future date → 304 (object was not modified since then)
+assert_fail "get-object if-modified-since future returns 304" \
+    $AWS s3api get-object --bucket "$BUCKET" --key "cond.txt" \
+    --if-modified-since "Mon, 01 Jan 2099 00:00:00 GMT" "$TMPDIR/cond-out.txt"
+
+# If-Modified-Since: past date → 200 (object was modified after that date)
+assert "get-object if-modified-since past succeeds" \
+    $AWS s3api get-object --bucket "$BUCKET" --key "cond.txt" \
+    --if-modified-since "Mon, 01 Jan 2000 00:00:00 GMT" "$TMPDIR/cond-out.txt"
+
+# If-Unmodified-Since: far future date → 200 (object has not been modified since)
+assert "get-object if-unmodified-since future succeeds" \
+    $AWS s3api get-object --bucket "$BUCKET" --key "cond.txt" \
+    --if-unmodified-since "Mon, 01 Jan 2099 00:00:00 GMT" "$TMPDIR/cond-out.txt"
+
+# If-Unmodified-Since: past date → 412 (object was modified after threshold)
+assert_fail "get-object if-unmodified-since past returns 412" \
+    $AWS s3api get-object --bucket "$BUCKET" --key "cond.txt" \
+    --if-unmodified-since "Mon, 01 Jan 2000 00:00:00 GMT" "$TMPDIR/cond-out.txt"
+
+# Same conditions on HeadObject
+assert "head-object if-match correct etag" \
+    $AWS s3api head-object --bucket "$BUCKET" --key "cond.txt" \
+    --if-match "$COND_ETAG"
+
+assert_fail "head-object if-match wrong etag returns 412" \
+    $AWS s3api head-object --bucket "$BUCKET" --key "cond.txt" \
+    --if-match '"wrongetag000000000000000000000000"'
+
+assert_fail "head-object if-none-match matching etag returns 304" \
+    $AWS s3api head-object --bucket "$BUCKET" --key "cond.txt" \
+    --if-none-match "$COND_ETAG"
+
+assert "delete conditional test object" $AWS s3 rm "s3://$BUCKET/cond.txt"
+
 # --- Delete operations ---
 assert "delete object" $AWS s3 rm "s3://$BUCKET/test.txt"
 assert_file_not_exists "deleted object gone from disk" "$DATA_DIR/buckets/$BUCKET/test.txt"
@@ -317,6 +428,74 @@ assert "delete ec test object" $AWS s3 rm "s3://$BUCKET/ec-test.txt"
 assert "delete empty bucket" $AWS s3 rb "s3://$BUCKET"
 assert_file_not_exists "bucket dir gone from disk" "$DATA_DIR/buckets/$BUCKET"
 assert_fail "head deleted bucket" $AWS s3api head-bucket --bucket "$BUCKET"
+
+# --- CORS tests ---
+CORS_BUCKET="cors-test-$$"
+assert "create cors test bucket" $AWS s3api create-bucket --bucket "$CORS_BUCKET"
+
+# GetBucketCors on bucket with no CORS config should return an error
+assert_fail "get-bucket-cors on unconfigured bucket fails" \
+    $AWS s3api get-bucket-cors --bucket "$CORS_BUCKET"
+
+# PutBucketCors
+cat > "$TMPDIR/cors.json" <<'EOF'
+{
+  "CORSRules": [
+    {
+      "AllowedOrigins": ["*"],
+      "AllowedMethods": ["GET", "PUT"],
+      "AllowedHeaders": ["*"],
+      "MaxAgeSeconds": 3600
+    }
+  ]
+}
+EOF
+assert "put-bucket-cors" \
+    $AWS s3api put-bucket-cors --bucket "$CORS_BUCKET" --cors-configuration file://"$TMPDIR/cors.json"
+
+# GetBucketCors — should succeed now
+assert "get-bucket-cors succeeds after put" \
+    $AWS s3api get-bucket-cors --bucket "$CORS_BUCKET"
+
+# Verify content via curl preflight
+PREFLIGHT_STATUS=$(curl -s -o /dev/null -w "%{http_code}" -X OPTIONS \
+    -H "Origin: http://example.com" \
+    -H "Access-Control-Request-Method: GET" \
+    "$ENDPOINT/$CORS_BUCKET/test-object.txt")
+if [ "$PREFLIGHT_STATUS" = "200" ]; then
+    green "PASS: CORS preflight returns 200"
+    PASS=$((PASS + 1))
+else
+    red "FAIL: CORS preflight returned $PREFLIGHT_STATUS (expected 200)"
+    FAIL=$((FAIL + 1))
+fi
+
+# Preflight without CORS config should return 403
+NOCORS_BUCKET="no-cors-$$"
+assert "create no-cors bucket" $AWS s3api create-bucket --bucket "$NOCORS_BUCKET"
+NOCORS_PREFLIGHT=$(curl -s -o /dev/null -w "%{http_code}" -X OPTIONS \
+    -H "Origin: http://example.com" \
+    -H "Access-Control-Request-Method: GET" \
+    "$ENDPOINT/$NOCORS_BUCKET/test.txt")
+if [ "$NOCORS_PREFLIGHT" = "403" ]; then
+    green "PASS: CORS preflight without config returns 403"
+    PASS=$((PASS + 1))
+else
+    red "FAIL: CORS preflight without config returned $NOCORS_PREFLIGHT (expected 403)"
+    FAIL=$((FAIL + 1))
+fi
+
+# DeleteBucketCors
+assert "delete-bucket-cors" \
+    $AWS s3api delete-bucket-cors --bucket "$CORS_BUCKET"
+
+# GetBucketCors after delete should fail again
+assert_fail "get-bucket-cors fails after delete" \
+    $AWS s3api get-bucket-cors --bucket "$CORS_BUCKET"
+
+# Cleanup CORS test buckets
+assert "delete cors test bucket" $AWS s3api delete-bucket --bucket "$CORS_BUCKET"
+assert "delete no-cors test bucket" $AWS s3api delete-bucket --bucket "$NOCORS_BUCKET"
 
 # --- Summary ---
 echo ""

@@ -34,6 +34,10 @@ pub async fn handle_bucket_get(
         return super::bucket::get_bucket_versioning(state, bucket).await;
     }
 
+    if params.contains_key("cors") {
+        return super::bucket::get_bucket_cors(state, bucket).await;
+    }
+
     if params.contains_key("versions") {
         return list_object_versions(state, bucket, params).await;
     }

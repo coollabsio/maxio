@@ -29,6 +29,8 @@ pub enum S3ErrorCode {
     NotImplemented,
     EntityTooSmall,
     ExpiredPresignedUrl,
+    NoSuchCORSConfiguration,
+    PreconditionFailed,
     SignatureDoesNotMatch,
 }
 
@@ -53,6 +55,8 @@ impl S3ErrorCode {
             Self::NotImplemented => "NotImplemented",
             Self::EntityTooSmall => "EntityTooSmall",
             Self::ExpiredPresignedUrl => "AccessDenied",
+            Self::PreconditionFailed => "PreconditionFailed",
+            Self::NoSuchCORSConfiguration => "NoSuchCORSConfiguration",
             Self::SignatureDoesNotMatch => "SignatureDoesNotMatch",
         }
     }
@@ -63,13 +67,16 @@ impl S3ErrorCode {
             | Self::ExpiredPresignedUrl
             | Self::InvalidAccessKeyId
             | Self::SignatureDoesNotMatch => StatusCode::FORBIDDEN,
-            Self::NoSuchBucket | Self::NoSuchKey | Self::NoSuchUpload | Self::NoSuchVersion => {
-                StatusCode::NOT_FOUND
-            }
+            Self::NoSuchBucket
+            | Self::NoSuchKey
+            | Self::NoSuchUpload
+            | Self::NoSuchVersion
+            | Self::NoSuchCORSConfiguration => StatusCode::NOT_FOUND,
             Self::BucketAlreadyOwnedByYou | Self::BucketNotEmpty => StatusCode::CONFLICT,
             Self::InternalError => StatusCode::INTERNAL_SERVER_ERROR,
             Self::InvalidRange => StatusCode::RANGE_NOT_SATISFIABLE,
             Self::NotImplemented => StatusCode::NOT_IMPLEMENTED,
+            Self::PreconditionFailed => StatusCode::PRECONDITION_FAILED,
             _ => StatusCode::BAD_REQUEST,
         }
     }
@@ -238,6 +245,22 @@ impl S3Error {
         Self {
             code: S3ErrorCode::NotImplemented,
             message: msg.to_string(),
+            resource: None,
+        }
+    }
+
+    pub fn no_such_cors_configuration() -> Self {
+        Self {
+            code: S3ErrorCode::NoSuchCORSConfiguration,
+            message: "The CORS configuration does not exist".into(),
+            resource: None,
+        }
+    }
+
+    pub fn precondition_failed() -> Self {
+        Self {
+            code: S3ErrorCode::PreconditionFailed,
+            message: "At least one of the pre-conditions you specified did not hold.".into(),
             resource: None,
         }
     }

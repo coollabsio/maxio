@@ -1,4 +1,4 @@
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 #[derive(Serialize)]
 #[serde(rename = "ListAllMyBucketsResult")]
@@ -181,8 +181,38 @@ pub struct ListMultipartUploadsResult {
 }
 
 #[derive(Serialize)]
+#[serde(rename = "Tagging")]
+pub struct Tagging {
+    #[serde(rename = "TagSet")]
+    pub tag_set: TagSet,
+}
+
+#[derive(Serialize)]
+pub struct TagSet {
+    #[serde(rename = "Tag", skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<Tag>,
+}
+
+#[derive(Serialize)]
+pub struct Tag {
+    #[serde(rename = "Key")]
+    pub key: String,
+    #[serde(rename = "Value")]
+    pub value: String,
+}
+
+#[derive(Serialize)]
 #[serde(rename = "CopyObjectResult")]
 pub struct CopyObjectResult {
+    #[serde(rename = "ETag")]
+    pub etag: String,
+    #[serde(rename = "LastModified")]
+    pub last_modified: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename = "CopyPartResult")]
+pub struct CopyPartResult {
     #[serde(rename = "ETag")]
     pub etag: String,
     #[serde(rename = "LastModified")]
@@ -245,4 +275,25 @@ pub struct DeleteMarkerEntry {
     pub is_latest: bool,
     #[serde(rename = "LastModified")]
     pub last_modified: String,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+#[serde(rename = "CORSConfiguration")]
+pub struct CorsConfiguration {
+    #[serde(rename = "CORSRule", default)]
+    pub rules: Vec<CorsRuleXml>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct CorsRuleXml {
+    #[serde(rename = "AllowedOrigin")]
+    pub allowed_origins: Vec<String>,
+    #[serde(rename = "AllowedMethod")]
+    pub allowed_methods: Vec<String>,
+    #[serde(rename = "AllowedHeader", default, skip_serializing_if = "Vec::is_empty")]
+    pub allowed_headers: Vec<String>,
+    #[serde(rename = "ExposeHeader", default, skip_serializing_if = "Vec::is_empty")]
+    pub expose_headers: Vec<String>,
+    #[serde(rename = "MaxAgeSeconds", skip_serializing_if = "Option::is_none")]
+    pub max_age_seconds: Option<u32>,
 }

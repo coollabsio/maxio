@@ -2,6 +2,7 @@ pub mod chunk_reader;
 pub mod filesystem;
 
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::pin::Pin;
 use tokio::io::AsyncRead;
 
@@ -54,12 +55,26 @@ fn is_false(v: &bool) -> bool {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CorsRule {
+    pub allowed_origins: Vec<String>,
+    pub allowed_methods: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allowed_headers: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub expose_headers: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_age_seconds: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BucketMeta {
     pub name: String,
     pub created_at: String,
     pub region: String,
     #[serde(default, skip_serializing_if = "is_false")]
     pub versioning: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cors_rules: Option<Vec<CorsRule>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -79,6 +94,8 @@ pub struct ObjectMeta {
     pub checksum_algorithm: Option<ChecksumAlgorithm>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub checksum_value: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tags: Option<HashMap<String, String>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -149,6 +149,7 @@ impl FilesystemStorage {
                     created_at: chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string(),
                     region: String::new(),
                     versioning: false,
+                    cors_rules: None,
                 };
                 let _ = fs::write(
                     bucket_dir.join(".bucket.json"),
@@ -336,6 +337,7 @@ impl FilesystemStorage {
             storage_format: None,
             checksum_algorithm,
             checksum_value: checksum_value.clone(),
+            tags: None,
         };
 
         let meta_path = self.meta_path(bucket, key);
@@ -459,6 +461,7 @@ impl FilesystemStorage {
             storage_format: Some(storage_format.to_string()),
             checksum_algorithm: checksum_algo,
             checksum_value: checksum_value.clone(),
+            tags: None,
         };
 
         let meta_path = self.meta_path(bucket, key);
@@ -677,6 +680,7 @@ impl FilesystemStorage {
             storage_format: Some(storage_format.to_string()),
             checksum_algorithm,
             checksum_value: checksum_value.clone(),
+            tags: None,
         };
 
         let meta_path = self.meta_path(bucket, key);
@@ -725,6 +729,7 @@ impl FilesystemStorage {
             storage_format: None,
             checksum_algorithm: None,
             checksum_value: None,
+            tags: None,
         };
 
         let meta_path = folder_dir.join(".folder.meta.json");
@@ -801,6 +806,43 @@ impl FilesystemStorage {
     ) -> Result<ObjectMeta, StorageError> {
         validate_key(key)?;
         self.read_object_meta(bucket, key).await
+    }
+
+    pub async fn get_object_tagging(
+        &self,
+        bucket: &str,
+        key: &str,
+    ) -> Result<std::collections::HashMap<String, String>, StorageError> {
+        validate_key(key)?;
+        let meta = self.read_object_meta(bucket, key).await?;
+        Ok(meta.tags.unwrap_or_default())
+    }
+
+    pub async fn put_object_tagging(
+        &self,
+        bucket: &str,
+        key: &str,
+        tags: std::collections::HashMap<String, String>,
+    ) -> Result<(), StorageError> {
+        validate_key(key)?;
+        let mut meta = self.read_object_meta(bucket, key).await?;
+        meta.tags = if tags.is_empty() { None } else { Some(tags) };
+        let json = serde_json::to_string_pretty(&meta)?;
+        fs::write(self.meta_path(bucket, key), json).await?;
+        Ok(())
+    }
+
+    pub async fn delete_object_tagging(
+        &self,
+        bucket: &str,
+        key: &str,
+    ) -> Result<(), StorageError> {
+        validate_key(key)?;
+        let mut meta = self.read_object_meta(bucket, key).await?;
+        meta.tags = None;
+        let json = serde_json::to_string_pretty(&meta)?;
+        fs::write(self.meta_path(bucket, key), json).await?;
+        Ok(())
     }
 
     pub async fn delete_object(
@@ -1055,6 +1097,7 @@ impl FilesystemStorage {
             storage_format: None,
             checksum_algorithm,
             checksum_value: checksum_value.clone(),
+            tags: None,
         };
         let meta_path = self.meta_path(bucket, &upload_meta.key);
         if let Some(parent) = meta_path.parent() {
@@ -1365,6 +1408,56 @@ impl FilesystemStorage {
         Ok(())
     }
 
+    pub async fn put_bucket_cors(
+        &self,
+        bucket: &str,
+        rules: Vec<crate::storage::CorsRule>,
+    ) -> Result<(), StorageError> {
+        let meta_path = self.buckets_dir.join(bucket).join(".bucket.json");
+        let data = fs::read_to_string(&meta_path).await.map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                StorageError::NotFound(bucket.to_string())
+            } else {
+                StorageError::Io(e)
+            }
+        })?;
+        let mut meta: BucketMeta = serde_json::from_str(&data)?;
+        meta.cors_rules = Some(rules);
+        fs::write(&meta_path, serde_json::to_string_pretty(&meta)?).await?;
+        Ok(())
+    }
+
+    pub async fn get_bucket_cors(
+        &self,
+        bucket: &str,
+    ) -> Result<Option<Vec<crate::storage::CorsRule>>, StorageError> {
+        let meta_path = self.buckets_dir.join(bucket).join(".bucket.json");
+        let data = fs::read_to_string(&meta_path).await.map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                StorageError::NotFound(bucket.to_string())
+            } else {
+                StorageError::Io(e)
+            }
+        })?;
+        let meta: BucketMeta = serde_json::from_str(&data)?;
+        Ok(meta.cors_rules)
+    }
+
+    pub async fn delete_bucket_cors(&self, bucket: &str) -> Result<(), StorageError> {
+        let meta_path = self.buckets_dir.join(bucket).join(".bucket.json");
+        let data = fs::read_to_string(&meta_path).await.map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                StorageError::NotFound(bucket.to_string())
+            } else {
+                StorageError::Io(e)
+            }
+        })?;
+        let mut meta: BucketMeta = serde_json::from_str(&data)?;
+        meta.cors_rules = None;
+        fs::write(&meta_path, serde_json::to_string_pretty(&meta)?).await?;
+        Ok(())
+    }
+
     /// Remove all `.versions/` directories in the bucket, keeping only current (top-level) files.
     /// Also remove any objects whose latest version was a delete marker (restore nothing).
     async fn cleanup_versions(&self, bucket: &str) -> Result<(), StorageError> {
@@ -1470,6 +1563,7 @@ impl FilesystemStorage {
             storage_format: None,
             checksum_algorithm: None,
             checksum_value: None,
+            tags: None,
         };
 
         let ver_dir = self.versions_dir(bucket, key);

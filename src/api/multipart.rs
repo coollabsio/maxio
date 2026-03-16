@@ -221,7 +221,7 @@ pub async fn list_multipart_uploads(
         .unwrap())
 }
 
-async fn ensure_bucket_exists(state: &AppState, bucket: &str) -> Result<(), S3Error> {
+pub(super) async fn ensure_bucket_exists(state: &AppState, bucket: &str) -> Result<(), S3Error> {
     match state.storage.head_bucket(bucket).await {
         Ok(true) => Ok(()),
         Ok(false) => Err(S3Error::no_such_bucket(bucket)),
@@ -229,7 +229,7 @@ async fn ensure_bucket_exists(state: &AppState, bucket: &str) -> Result<(), S3Er
     }
 }
 
-fn map_storage_err(err: StorageError) -> S3Error {
+pub(super) fn map_storage_err(err: StorageError) -> S3Error {
     match err {
         StorageError::ChecksumMismatch(_) => S3Error::bad_checksum("x-amz-checksum"),
         StorageError::UploadNotFound(upload_id) => S3Error::no_such_upload(&upload_id),

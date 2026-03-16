@@ -263,6 +263,7 @@ pub async fn create_bucket(
         created_at: now,
         region: state.config.region.clone(),
         versioning: false,
+        cors_rules: None,
     };
 
     match state.storage.create_bucket(&meta).await {

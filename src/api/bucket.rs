@@ -9,7 +9,7 @@ use axum::{
 
 use crate::error::S3Error;
 use crate::server::AppState;
-use crate::storage::{BucketMeta, StorageError};
+use crate::storage::{BucketMeta, CorsRule, StorageError};
 use crate::xml::{response::to_xml, types::*};
 
 pub async fn list_buckets(State(state): State<AppState>) -> Result<Response<Body>, S3Error> {
@@ -59,6 +59,7 @@ pub async fn create_bucket(
         created_at: now,
         region: state.config.region.clone(),
         versioning: false,
+        cors_rules: None,
     };
 
     let created = state
@@ -98,7 +99,11 @@ pub async fn head_bucket(
 pub async fn delete_bucket(
     State(state): State<AppState>,
     Path(bucket): Path<String>,
+    Query(params): Query<HashMap<String, String>>,
 ) -> Result<Response<Body>, S3Error> {
+    if params.contains_key("cors") {
+        return delete_bucket_cors(state, bucket).await;
+    }
     match state.storage.delete_bucket(&bucket).await {
         Ok(true) => Ok(Response::builder()
             .status(StatusCode::NO_CONTENT)
@@ -118,6 +123,9 @@ pub async fn handle_bucket_put(
 ) -> Result<Response<Body>, S3Error> {
     if params.contains_key("versioning") {
         return put_bucket_versioning(State(state), Path(bucket), body).await;
+    }
+    if params.contains_key("cors") {
+        return put_bucket_cors(state, bucket, body).await;
     }
     create_bucket(State(state), Path(bucket)).await
 }
@@ -182,6 +190,128 @@ pub async fn get_bucket_versioning(
         .status(StatusCode::OK)
         .header("content-type", "application/xml")
         .body(Body::from(xml))
+        .unwrap())
+}
+
+async fn put_bucket_cors(
+    state: AppState,
+    bucket: String,
+    body: Body,
+) -> Result<Response<Body>, S3Error> {
+    match state.storage.head_bucket(&bucket).await {
+        Ok(true) => {}
+        Ok(false) => return Err(S3Error::no_such_bucket(&bucket)),
+        Err(e) => return Err(S3Error::internal(e)),
+    }
+
+    let body_bytes = axum::body::to_bytes(body, 64 * 1024)
+        .await
+        .map_err(|e| S3Error::internal(e))?;
+
+    let config: CorsConfiguration = quick_xml::de::from_str(&String::from_utf8_lossy(&body_bytes))
+        .map_err(|_| S3Error::malformed_xml())?;
+
+    if config.rules.len() > 100 {
+        return Err(S3Error::invalid_argument(
+            "CORS configuration cannot have more than 100 rules",
+        ));
+    }
+    for rule in &config.rules {
+        if rule.allowed_origins.is_empty() || rule.allowed_methods.is_empty() {
+            return Err(S3Error::malformed_xml());
+        }
+        for method in &rule.allowed_methods {
+            match method.as_str() {
+                "GET" | "PUT" | "POST" | "DELETE" | "HEAD" => {}
+                _ => {
+                    return Err(S3Error::invalid_argument(&format!(
+                        "Invalid HTTP method in CORS rule: {}",
+                        method
+                    )))
+                }
+            }
+        }
+    }
+
+    let rules: Vec<CorsRule> = config
+        .rules
+        .into_iter()
+        .map(|r| CorsRule {
+            allowed_origins: r.allowed_origins,
+            allowed_methods: r.allowed_methods,
+            allowed_headers: r.allowed_headers,
+            expose_headers: r.expose_headers,
+            max_age_seconds: r.max_age_seconds,
+        })
+        .collect();
+
+    state
+        .storage
+        .put_bucket_cors(&bucket, rules)
+        .await
+        .map_err(|e| S3Error::internal(e))?;
+
+    Ok(Response::builder()
+        .status(StatusCode::OK)
+        .body(Body::empty())
+        .unwrap())
+}
+
+pub async fn get_bucket_cors(
+    state: AppState,
+    bucket: String,
+) -> Result<Response<Body>, S3Error> {
+    let rules = state
+        .storage
+        .get_bucket_cors(&bucket)
+        .await
+        .map_err(|e| match e {
+            StorageError::NotFound(_) => S3Error::no_such_bucket(&bucket),
+            e => S3Error::internal(e),
+        })?;
+
+    let rules = rules.ok_or_else(|| S3Error::no_such_cors_configuration())?;
+
+    let config = CorsConfiguration {
+        rules: rules
+            .into_iter()
+            .map(|r| crate::xml::types::CorsRuleXml {
+                allowed_origins: r.allowed_origins,
+                allowed_methods: r.allowed_methods,
+                allowed_headers: r.allowed_headers,
+                expose_headers: r.expose_headers,
+                max_age_seconds: r.max_age_seconds,
+            })
+            .collect(),
+    };
+
+    let xml = to_xml(&config).map_err(|e| S3Error::internal(e))?;
+    Ok(Response::builder()
+        .status(StatusCode::OK)
+        .header("content-type", "application/xml")
+        .body(Body::from(xml))
+        .unwrap())
+}
+
+async fn delete_bucket_cors(
+    state: AppState,
+    bucket: String,
+) -> Result<Response<Body>, S3Error> {
+    match state.storage.head_bucket(&bucket).await {
+        Ok(true) => {}
+        Ok(false) => return Err(S3Error::no_such_bucket(&bucket)),
+        Err(e) => return Err(S3Error::internal(e)),
+    }
+
+    state
+        .storage
+        .delete_bucket_cors(&bucket)
+        .await
+        .map_err(|e| S3Error::internal(e))?;
+
+    Ok(Response::builder()
+        .status(StatusCode::NO_CONTENT)
+        .body(Body::empty())
         .unwrap())
 }
 

@@ -4,6 +4,7 @@ use axum::routing::get;
 use std::sync::Arc;
 
 use crate::api::console::{console_router, LoginRateLimiter};
+use crate::api::cors::cors_middleware;
 use crate::api::router::s3_router;
 use crate::auth::middleware::auth_middleware;
 use crate::config::Config;
@@ -18,10 +19,15 @@ pub struct AppState {
 }
 
 pub fn build_router(state: AppState) -> Router {
-    let s3_routes = s3_router().layer(axum::middleware::from_fn_with_state(
-        state.clone(),
-        auth_middleware,
-    ));
+    let s3_routes = s3_router()
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            auth_middleware,
+        ))
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            cors_middleware,
+        ));
 
     Router::new()
         .nest("/api", console_router(state.clone()))

@@ -1,6 +1,6 @@
 [package]
 name = "maxio"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 description = "S3-compatible object storage server — single-binary replacement for MinIO"
 license = "Apache-2.0"

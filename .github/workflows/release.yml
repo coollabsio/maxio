@@ -34,6 +34,9 @@ jobs:
           - target: aarch64-unknown-linux-gnu
             runner: ubuntu-latest
             artifact: maxio-linux-arm64
+          - target: aarch64-apple-darwin
+            runner: macos-latest
+            artifact: maxio-macos-arm64
 
     steps:
       - uses: actions/checkout@v4
@@ -43,7 +46,7 @@ jobs:
           TAG="${{ github.event.inputs.version || github.ref_name }}"
           VERSION="${TAG#v}"
           echo "$VERSION" > VERSION
-          sed -i "0,/^version = /s/^version = .*/version = \"$VERSION\"/" Cargo.toml
+          sed -i.bak "1,/^version = /s/^version = .*/version = \"$VERSION\"/" Cargo.toml && rm -f Cargo.toml.bak
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -110,7 +113,7 @@ jobs:
           TAG="${{ github.event.inputs.version || github.ref_name }}"
           VERSION="${TAG#v}"
           echo "$VERSION" > VERSION
-          sed -i "0,/^version = /s/^version = .*/version = \"$VERSION\"/" Cargo.toml
+          sed -i.bak "1,/^version = /s/^version = .*/version = \"$VERSION\"/" Cargo.toml && rm -f Cargo.toml.bak
 
       - name: Login to ${{ env.GITHUB_REGISTRY }}
         uses: docker/login-action@v3
@@ -193,7 +196,7 @@ jobs:
     steps:
       - uses: actions/download-artifact@v4
         with:
-          pattern: maxio-linux-*
+          pattern: maxio-*
           merge-multiple: true
 
       - name: Create GitHub Release

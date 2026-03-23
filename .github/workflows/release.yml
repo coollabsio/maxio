@@ -203,5 +203,4 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ github.event.inputs.version || github.ref_name }}
-          generate_release_notes: true
           files: '*.tar.gz'

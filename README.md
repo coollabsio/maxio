@@ -28,7 +28,7 @@ MaxIO is a lightweight, single-binary S3-compatible object storage server writte
 
 ## Benchmarks MaxIO vs MinIO
 
-Hetzner CCX13
+Hetzner CCX13 (./tests/bench-remote.sh <remote server>)
 
 Before optimization (MaxIO <0.3.2)
 

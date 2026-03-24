@@ -26,6 +26,35 @@ MaxIO is a lightweight, single-binary S3-compatible object storage server writte
 - **Checksum Verification** — CRC32, CRC32C, SHA-1, and SHA-256 checksums on upload with automatic validation and persistent storage
 - **Erasure Coding** — Optional chunked storage with per-chunk SHA-256 integrity verification and Reed-Solomon parity for automatic recovery from corrupted or missing data
 
+## Benchmarks MaxIO vs MinIO
+
+Hetzner CCX13
+
+Before optimization (MaxIO <0.3.2)
+
+| Scenario | MaxIO | MinIO |
+|----------|-------|-------|
+| PUT 4KiB         | 14.66 MiB/s, 3753.64 obj/s | 4.60 MiB/s, 1178.18 obj/s |
+| PUT 1MiB         | 337.18 MiB/s, 337.18 obj/s | 214.06 MiB/s, 214.06 obj/s |
+| PUT 64MiB        | 253.11 MiB/s, 3.95 obj/s | 330.56 MiB/s, 5.17 obj/s |
+| GET 4KiB         | 0.82 MiB/s, 208.89 obj/s | 12.57 MiB/s, 3218.50 obj/s |
+| GET 1MiB         | 203.54 MiB/s, 203.54 obj/s | 930.64 MiB/s, 930.64 obj/s |
+| Mixed 1MiB       | 275.17 MiB/s, 366.98 obj/s | 339.91 MiB/s, 453.40 obj/s |
+| Multipart 100MiB | 451.29 MiB/s, 45.13 obj/s | 1888.60 MiB/s, 188.86 obj/s |
+
+After optimization (MaxIO >= 0.3.2)
+
+| Scenario | MaxIO | MinIO |
+|----------|-------|-------|
+| PUT 4KiB         | 12.59 MiB/s, 3221.82 obj/s | 3.81 MiB/s, 975.72 obj/s |
+| PUT 1MiB         | 348.93 MiB/s, 348.93 obj/s | 207.11 MiB/s, 207.11 obj/s |
+| PUT 64MiB        | 285.48 MiB/s, 4.46 obj/s | 333.53 MiB/s, 5.21 obj/s |
+| GET 4KiB         | 26.17 MiB/s, 6699.48 obj/s | 12.29 MiB/s, 3145.10 obj/s |
+| GET 1MiB         | 1864.38 MiB/s, 1864.38 obj/s | 760.68 MiB/s, 760.68 obj/s |
+| Mixed 1MiB       | 606.38 MiB/s, 808.94 obj/s | 343.56 MiB/s, 458.19 obj/s |
+| Multipart 100MiB | 2376.32 MiB/s, 237.63 obj/s | 1781.91 MiB/s, 178.19 obj/s |
+
+
 ## Installation
 
 ### Build from Source

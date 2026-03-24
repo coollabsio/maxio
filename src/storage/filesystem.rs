@@ -338,6 +338,7 @@ impl FilesystemStorage {
             checksum_algorithm,
             checksum_value: checksum_value.clone(),
             tags: None,
+            part_sizes: None,
         };
 
         let meta_path = self.meta_path(bucket, key);
@@ -462,6 +463,7 @@ impl FilesystemStorage {
             checksum_algorithm: checksum_algo,
             checksum_value: checksum_value.clone(),
             tags: None,
+            part_sizes: None,
         };
 
         let meta_path = self.meta_path(bucket, key);
@@ -668,6 +670,7 @@ impl FilesystemStorage {
             (None, None)
         };
 
+        let part_sizes: Vec<u64> = selected.iter().map(|p| p.size).collect();
         let storage_format = if has_parity { "chunked-v2" } else { "chunked-v1" };
         let object_meta = ObjectMeta {
             key: key.to_string(),
@@ -681,6 +684,7 @@ impl FilesystemStorage {
             checksum_algorithm,
             checksum_value: checksum_value.clone(),
             tags: None,
+            part_sizes: Some(part_sizes),
         };
 
         let meta_path = self.meta_path(bucket, key);
@@ -730,6 +734,7 @@ impl FilesystemStorage {
             checksum_algorithm: None,
             checksum_value: None,
             tags: None,
+            part_sizes: None,
         };
 
         let meta_path = folder_dir.join(".folder.meta.json");
@@ -1086,6 +1091,7 @@ impl FilesystemStorage {
             (None, None)
         };
 
+        let part_sizes: Vec<u64> = selected.iter().map(|p| p.size).collect();
         let object_meta = ObjectMeta {
             key: upload_meta.key.clone(),
             size: total_size,
@@ -1098,6 +1104,7 @@ impl FilesystemStorage {
             checksum_algorithm,
             checksum_value: checksum_value.clone(),
             tags: None,
+            part_sizes: Some(part_sizes),
         };
         let meta_path = self.meta_path(bucket, &upload_meta.key);
         if let Some(parent) = meta_path.parent() {
@@ -1564,6 +1571,7 @@ impl FilesystemStorage {
             checksum_algorithm: None,
             checksum_value: None,
             tags: None,
+            part_sizes: None,
         };
 
         let ver_dir = self.versions_dir(bucket, key);

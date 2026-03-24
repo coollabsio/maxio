@@ -228,6 +228,36 @@ RUST_LOG=debug cargo watch -x 'run -- --data-dir ./data' &
 ./tests/aws_cli_test.sh
 ```
 
+### Benchmarking (MaxIO vs MinIO)
+
+Uses [WARP](https://github.com/minio/warp) to compare MaxIO against MinIO across 7 scenarios: PUT (4KiB/1MiB/64MiB), GET (4KiB/1MiB), mixed workload, and multipart uploads. Prerequisites: `brew install minio-warp` and `brew install minio/stable/minio`.
+
+```bash
+# Full benchmark (starts both servers automatically)
+cargo build --release
+./tests/bench.sh
+
+# Quick benchmark (small objects + mixed only, 10s each)
+./tests/bench.sh --duration=10s --scenarios=put-small,get-small,mixed
+
+# Custom duration
+./tests/bench.sh --duration=60s
+
+# Against external servers (skip automatic server management)
+./tests/bench.sh --maxio-host=server1:9000 --minio-host=server2:9000
+
+# Via justfile
+just bench          # full (30s per scenario)
+just bench-quick    # quick smoke test
+```
+
+**Remote server benchmark** (single command — cross-compiles, copies binary, auto-downloads warp + minio on the server, runs, streams results):
+
+```bash
+./tests/bench-remote.sh user@host
+./tests/bench-remote.sh user@host --duration=60s --scenarios=put-small,mixed
+```
+
 ## UI Design System
 
 The web console (`ui/`) follows the Coolify design system. The full specification is in [`ui/DESIGN_SYSTEM.md`](ui/DESIGN_SYSTEM.md). Key points:

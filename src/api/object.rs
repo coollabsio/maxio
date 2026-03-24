@@ -511,6 +511,59 @@ pub async fn get_object(
         return multipart::list_parts(State(state), Path((bucket, key)), Query(params)).await;
     }
 
+    if let Some(part_num_str) = params.get("partNumber") {
+        let part_num: u32 = part_num_str
+            .parse()
+            .map_err(|_| S3Error::invalid_argument("invalid partNumber"))?;
+        let meta = state
+            .storage
+            .head_object(&bucket, &key)
+            .await
+            .map_err(|e| match e {
+                StorageError::NotFound(_) => S3Error::no_such_key(&key),
+                StorageError::InvalidKey(msg) => S3Error::invalid_argument(&msg),
+                _ => S3Error::internal(e),
+            })?;
+        let part_sizes = meta
+            .part_sizes
+            .as_ref()
+            .ok_or_else(|| S3Error::invalid_argument("object is not a multipart upload"))?;
+        let idx = (part_num as usize)
+            .checked_sub(1)
+            .ok_or_else(|| S3Error::invalid_argument("partNumber must be >= 1"))?;
+        if idx >= part_sizes.len() {
+            return Err(S3Error::invalid_argument("partNumber exceeds total parts"));
+        }
+        let offset: u64 = part_sizes[..idx].iter().sum();
+        let length = part_sizes[idx];
+        let total_parts = part_sizes.len();
+
+        let (reader, _) = state
+            .storage
+            .get_object_range(&bucket, &key, offset, length)
+            .await
+            .map_err(|e| match e {
+                StorageError::NotFound(_) => S3Error::no_such_key(&key),
+                _ => S3Error::internal(e),
+            })?;
+
+        let stream = ReaderStream::new(reader);
+        let body = Body::from_stream(stream);
+        return Ok(Response::builder()
+            .status(StatusCode::PARTIAL_CONTENT)
+            .header("Content-Type", &meta.content_type)
+            .header("Content-Length", length.to_string())
+            .header(
+                "Content-Range",
+                format!("bytes {}-{}/{}", offset, offset + length - 1, meta.size),
+            )
+            .header("ETag", &meta.etag)
+            .header("Last-Modified", to_http_date(&meta.last_modified))
+            .header("x-amz-mp-parts-count", total_parts.to_string())
+            .body(body)
+            .unwrap());
+    }
+
     let range_header = headers
         .get("range")
         .and_then(|v| v.to_str().ok());
@@ -652,6 +705,41 @@ pub async fn head_object(
             ConditionalResult::NotModified => Ok(not_modified_response(&meta)),
             ConditionalResult::PreconditionFailed => Err(S3Error::precondition_failed()),
         };
+    }
+
+    if let Some(part_num_str) = params.get("partNumber") {
+        let part_num: u32 = part_num_str
+            .parse()
+            .map_err(|_| S3Error::invalid_argument("invalid partNumber"))?;
+        let part_sizes = meta
+            .part_sizes
+            .as_ref()
+            .ok_or_else(|| S3Error::invalid_argument("object is not a multipart upload"))?;
+        let idx = (part_num as usize)
+            .checked_sub(1)
+            .ok_or_else(|| S3Error::invalid_argument("partNumber must be >= 1"))?;
+        if idx >= part_sizes.len() {
+            return Err(S3Error::invalid_argument("partNumber exceeds total parts"));
+        }
+        let offset: u64 = part_sizes[..idx].iter().sum();
+        let length = part_sizes[idx];
+        let total_parts = part_sizes.len();
+
+        let mut builder = Response::builder()
+            .status(StatusCode::PARTIAL_CONTENT)
+            .header("Content-Type", &meta.content_type)
+            .header("Content-Length", length.to_string())
+            .header(
+                "Content-Range",
+                format!("bytes {}-{}/{}", offset, offset + length - 1, meta.size),
+            )
+            .header("ETag", &meta.etag)
+            .header("Last-Modified", to_http_date(&meta.last_modified))
+            .header("x-amz-mp-parts-count", total_parts.to_string());
+        if let Some(vid) = &meta.version_id {
+            builder = builder.header("x-amz-version-id", vid.as_str());
+        }
+        return Ok(builder.body(Body::empty()).unwrap());
     }
 
     let mut builder = Response::builder()
@@ -842,6 +930,7 @@ mod tests {
             checksum_algorithm: None,
             checksum_value: None,
             tags: None,
+            part_sizes: None,
         }
     }
 

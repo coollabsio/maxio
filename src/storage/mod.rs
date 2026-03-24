@@ -96,6 +96,8 @@ pub struct ObjectMeta {
     pub checksum_value: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tags: Option<HashMap<String, String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub part_sizes: Option<Vec<u64>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

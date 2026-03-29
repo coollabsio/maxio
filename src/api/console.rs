@@ -3,12 +3,12 @@ use std::net::SocketAddr;
 use std::time::Instant;
 
 use axum::{
+    Json, Router,
     extract::{ConnectInfo, Path, Query, Request, State},
     http::{HeaderMap, StatusCode},
     middleware::Next,
     response::{IntoResponse, Response},
     routing::{delete, get, post, put},
-    Json, Router,
 };
 use futures::TryStreamExt;
 use hmac::{Hmac, Mac};
@@ -48,7 +48,9 @@ impl LoginRateLimiter {
         let now = Instant::now();
 
         // Prune expired entries to prevent unbounded memory growth
-        map.retain(|_, b| now.duration_since(b.window_start).as_secs() < RATE_LIMIT_WINDOW_SECS * 2);
+        map.retain(|_, b| {
+            now.duration_since(b.window_start).as_secs() < RATE_LIMIT_WINDOW_SECS * 2
+        });
 
         let bucket = map.entry(ip.to_string()).or_insert(Bucket {
             count: 0,
@@ -83,8 +85,8 @@ fn extract_client_ip(headers: &HeaderMap, addr: &SocketAddr) -> String {
 
 fn generate_token(access_key: &str, secret_key: &str, issued_at: i64) -> String {
     let issued_hex = format!("{:x}", issued_at);
-    let mut mac = HmacSha256::new_from_slice(secret_key.as_bytes())
-        .expect("HMAC can take key of any size");
+    let mut mac =
+        HmacSha256::new_from_slice(secret_key.as_bytes()).expect("HMAC can take key of any size");
     mac.update(format!("{}:{}", access_key, issued_hex).as_bytes());
     let sig = hex::encode(mac.finalize().into_bytes());
     format!("{}.{}", issued_hex, sig)
@@ -104,8 +106,8 @@ fn verify_token(token: &str, access_key: &str, secret_key: &str) -> bool {
         return false;
     }
 
-    let mut mac = HmacSha256::new_from_slice(secret_key.as_bytes())
-        .expect("HMAC can take key of any size");
+    let mut mac =
+        HmacSha256::new_from_slice(secret_key.as_bytes()).expect("HMAC can take key of any size");
     mac.update(format!("{}:{}", access_key, issued_hex).as_bytes());
     let expected = hex::encode(mac.finalize().into_bytes());
 
@@ -128,7 +130,8 @@ fn extract_cookie(headers: &HeaderMap) -> Option<String> {
         .get("cookie")
         .and_then(|v| v.to_str().ok())
         .and_then(|cookies| {
-            cookies.split(';')
+            cookies
+                .split(';')
                 .map(|c| c.trim())
                 .find(|c| c.starts_with(&format!("{}=", COOKIE_NAME)))
                 .map(|c| c[COOKIE_NAME.len() + 1..].to_string())
@@ -160,7 +163,11 @@ async fn console_auth_middleware(
         .unwrap_or(false);
 
     if !authenticated {
-        return (StatusCode::UNAUTHORIZED, Json(serde_json::json!({"error": "Not authenticated"}))).into_response();
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({"error": "Not authenticated"})),
+        )
+            .into_response();
     }
     next.run(request).await
 }
@@ -190,8 +197,14 @@ pub async fn login(
     }
 
     // Use constant-time comparison to prevent timing side-channel attacks
-    let key_match = constant_time_eq(body.access_key.as_bytes(), state.config.access_key.as_bytes());
-    let secret_match = constant_time_eq(body.secret_key.as_bytes(), state.config.secret_key.as_bytes());
+    let key_match = constant_time_eq(
+        body.access_key.as_bytes(),
+        state.config.access_key.as_bytes(),
+    );
+    let secret_match = constant_time_eq(
+        body.secret_key.as_bytes(),
+        state.config.secret_key.as_bytes(),
+    );
     if !key_match || !secret_match {
         return (
             StatusCode::UNAUTHORIZED,
@@ -207,13 +220,15 @@ pub async fn login(
     let mut resp_headers = HeaderMap::new();
     resp_headers.insert("Set-Cookie", cookie.parse().unwrap());
 
-    (StatusCode::OK, resp_headers, Json(serde_json::json!({"ok": true}))).into_response()
+    (
+        StatusCode::OK,
+        resp_headers,
+        Json(serde_json::json!({"ok": true})),
+    )
+        .into_response()
 }
 
-pub async fn check(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-) -> impl IntoResponse {
+pub async fn check(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
     let authenticated = extract_cookie(&headers)
         .map(|token| verify_token(&token, &state.config.access_key, &state.config.secret_key))
         .unwrap_or(false);
@@ -221,7 +236,10 @@ pub async fn check(
     if authenticated {
         (StatusCode::OK, Json(serde_json::json!({"ok": true})))
     } else {
-        (StatusCode::UNAUTHORIZED, Json(serde_json::json!({"error": "Not authenticated"})))
+        (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({"error": "Not authenticated"})),
+        )
     }
 }
 
@@ -229,12 +247,14 @@ pub async fn logout(headers: HeaderMap) -> impl IntoResponse {
     let cookie = make_cookie("", 0, &headers);
     let mut resp_headers = HeaderMap::new();
     resp_headers.insert("Set-Cookie", cookie.parse().unwrap());
-    (StatusCode::OK, resp_headers, Json(serde_json::json!({"ok": true})))
+    (
+        StatusCode::OK,
+        resp_headers,
+        Json(serde_json::json!({"ok": true})),
+    )
 }
 
-pub async fn list_buckets(
-    State(state): State<AppState>,
-) -> impl IntoResponse {
+pub async fn list_buckets(State(state): State<AppState>) -> impl IntoResponse {
     match state.storage.list_buckets().await {
         Ok(buckets) => {
             let list: Vec<serde_json::Value> = buckets.into_iter().map(|b| {
@@ -242,9 +262,11 @@ pub async fn list_buckets(
             }).collect();
             (StatusCode::OK, Json(serde_json::json!({ "buckets": list }))).into_response()
         }
-        Err(e) => {
-            (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": e.to_string() }))).into_response()
-        }
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": e.to_string() })),
+        )
+            .into_response(),
     }
 }
 
@@ -257,7 +279,9 @@ pub async fn create_bucket(
     State(state): State<AppState>,
     Json(body): Json<CreateBucketRequest>,
 ) -> impl IntoResponse {
-    let now = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string();
+    let now = chrono::Utc::now()
+        .format("%Y-%m-%dT%H:%M:%S%.3fZ")
+        .to_string();
     let meta = crate::storage::BucketMeta {
         name: body.name.clone(),
         created_at: now,
@@ -268,8 +292,16 @@ pub async fn create_bucket(
 
     match state.storage.create_bucket(&meta).await {
         Ok(true) => (StatusCode::OK, Json(serde_json::json!({"ok": true}))).into_response(),
-        Ok(false) => (StatusCode::CONFLICT, Json(serde_json::json!({"error": "Bucket already exists"}))).into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()}))).into_response(),
+        Ok(false) => (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({"error": "Bucket already exists"})),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": e.to_string()})),
+        )
+            .into_response(),
     }
 }
 
@@ -279,11 +311,21 @@ pub async fn delete_bucket_api(
 ) -> impl IntoResponse {
     match state.storage.delete_bucket(&bucket).await {
         Ok(true) => (StatusCode::OK, Json(serde_json::json!({"ok": true}))).into_response(),
-        Ok(false) => (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "Bucket not found"}))).into_response(),
-        Err(crate::storage::StorageError::BucketNotEmpty) => {
-            (StatusCode::CONFLICT, Json(serde_json::json!({"error": "Bucket is not empty"}))).into_response()
-        }
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()}))).into_response(),
+        Ok(false) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "Bucket not found"})),
+        )
+            .into_response(),
+        Err(crate::storage::StorageError::BucketNotEmpty) => (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({"error": "Bucket is not empty"})),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": e.to_string()})),
+        )
+            .into_response(),
     }
 }
 
@@ -300,8 +342,20 @@ pub async fn list_objects(
 ) -> impl IntoResponse {
     match state.storage.head_bucket(&bucket).await {
         Ok(true) => {}
-        Ok(false) => return (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "Bucket not found"}))).into_response(),
-        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()}))).into_response(),
+        Ok(false) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"error": "Bucket not found"})),
+            )
+                .into_response();
+        }
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": e.to_string()})),
+            )
+                .into_response();
+        }
     }
 
     let prefix = params.prefix.unwrap_or_default();
@@ -310,7 +364,11 @@ pub async fn list_objects(
     let all_objects = match state.storage.list_objects(&bucket, &prefix).await {
         Ok(objects) => objects,
         Err(e) => {
-            return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()}))).into_response();
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": e.to_string()})),
+            )
+                .into_response();
         }
     };
 
@@ -335,9 +393,9 @@ pub async fn list_objects(
     // Determine which prefixes are empty (only contain a folder marker, no real objects)
     let mut empty_prefixes: Vec<&String> = Vec::new();
     for p in &prefix_set {
-        let has_children = all_objects.iter().any(|obj| {
-            obj.key.starts_with(p.as_str()) && obj.key != *p
-        });
+        let has_children = all_objects
+            .iter()
+            .any(|obj| obj.key.starts_with(p.as_str()) && obj.key != *p);
         if !has_children {
             empty_prefixes.push(p);
         }
@@ -345,11 +403,15 @@ pub async fn list_objects(
 
     let prefixes: Vec<&String> = prefix_set.iter().collect();
 
-    (StatusCode::OK, Json(serde_json::json!({
-        "files": files,
-        "prefixes": prefixes,
-        "emptyPrefixes": empty_prefixes,
-    }))).into_response()
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "files": files,
+            "prefixes": prefixes,
+            "emptyPrefixes": empty_prefixes,
+        })),
+    )
+        .into_response()
 }
 
 pub async fn upload_object(
@@ -360,8 +422,20 @@ pub async fn upload_object(
 ) -> impl IntoResponse {
     match state.storage.head_bucket(&bucket).await {
         Ok(true) => {}
-        Ok(false) => return (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "Bucket not found"}))).into_response(),
-        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()}))).into_response(),
+        Ok(false) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"error": "Bucket not found"})),
+            )
+                .into_response();
+        }
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": e.to_string()})),
+            )
+                .into_response();
+        }
     }
 
     let content_type = headers
@@ -374,13 +448,25 @@ pub async fn upload_object(
         stream.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e)),
     );
 
-    match state.storage.put_object(&bucket, &key, content_type, Box::pin(reader), None).await {
-        Ok(result) => (StatusCode::OK, Json(serde_json::json!({
-            "ok": true,
-            "etag": result.etag,
-            "size": result.size,
-        }))).into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()}))).into_response(),
+    match state
+        .storage
+        .put_object(&bucket, &key, content_type, Box::pin(reader), None)
+        .await
+    {
+        Ok(result) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "ok": true,
+                "etag": result.etag,
+                "size": result.size,
+            })),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": e.to_string()})),
+        )
+            .into_response(),
     }
 }
 
@@ -388,9 +474,31 @@ pub async fn delete_object_api(
     State(state): State<AppState>,
     Path((bucket, key)): Path<(String, String)>,
 ) -> impl IntoResponse {
+    match state.storage.head_bucket(&bucket).await {
+        Ok(true) => {}
+        Ok(false) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"error": "Bucket not found"})),
+            )
+                .into_response();
+        }
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": e.to_string()})),
+            )
+                .into_response();
+        }
+    }
+
     match state.storage.delete_object(&bucket, &key).await {
         Ok(_) => (StatusCode::OK, Json(serde_json::json!({"ok": true}))).into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()}))).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": e.to_string()})),
+        )
+            .into_response(),
     }
 }
 
@@ -401,7 +509,11 @@ pub async fn download_object(
     let (reader, meta) = match state.storage.get_object(&bucket, &key).await {
         Ok(r) => r,
         Err(_) => {
-            return (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "Object not found"}))).into_response();
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"error": "Object not found"})),
+            )
+                .into_response();
         }
     };
 
@@ -414,7 +526,10 @@ pub async fn download_object(
         .status(StatusCode::OK)
         .header("Content-Type", &meta.content_type)
         .header("Content-Length", meta.size.to_string())
-        .header("Content-Disposition", format!("attachment; filename=\"{}\"", safe_filename))
+        .header(
+            "Content-Disposition",
+            format!("attachment; filename=\"{}\"", safe_filename),
+        )
         .body(body)
         .unwrap()
         .into_response()
@@ -447,7 +562,7 @@ pub async fn presign_object(
                 StatusCode::NOT_FOUND,
                 Json(serde_json::json!({"error": "Object not found"})),
             )
-                .into_response()
+                .into_response();
         }
     }
 
@@ -567,7 +682,17 @@ pub async fn create_folder(
     }
 
     let key = format!("{}/", name);
-    match state.storage.put_object(&bucket, &key, "application/x-directory", Box::pin(tokio::io::empty()), None).await {
+    match state
+        .storage
+        .put_object(
+            &bucket,
+            &key,
+            "application/x-directory",
+            Box::pin(tokio::io::empty()),
+            None,
+        )
+        .await
+    {
         Ok(_) => (StatusCode::OK, Json(serde_json::json!({"ok": true}))).into_response(),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -582,8 +707,16 @@ pub async fn get_versioning(
     Path(bucket): Path<String>,
 ) -> impl IntoResponse {
     match state.storage.is_versioned(&bucket).await {
-        Ok(enabled) => (StatusCode::OK, Json(serde_json::json!({"enabled": enabled}))).into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()}))).into_response(),
+        Ok(enabled) => (
+            StatusCode::OK,
+            Json(serde_json::json!({"enabled": enabled})),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": e.to_string()})),
+        )
+            .into_response(),
     }
 }
 
@@ -599,7 +732,11 @@ pub async fn set_versioning(
 ) -> impl IntoResponse {
     match state.storage.set_versioning(&bucket, body.enabled).await {
         Ok(()) => (StatusCode::OK, Json(serde_json::json!({"ok": true}))).into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()}))).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": e.to_string()})),
+        )
+            .into_response(),
     }
 }
 
@@ -613,9 +750,19 @@ pub async fn list_versions(
     Path(bucket): Path<String>,
     Query(params): Query<ListVersionsParams>,
 ) -> impl IntoResponse {
-    let all = match state.storage.list_object_versions(&bucket, &params.key).await {
+    let all = match state
+        .storage
+        .list_object_versions(&bucket, &params.key)
+        .await
+    {
         Ok(v) => v,
-        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()}))).into_response(),
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": e.to_string()})),
+            )
+                .into_response();
+        }
     };
 
     // Filter to only versions matching this exact key
@@ -633,16 +780,28 @@ pub async fn list_versions(
         })
         .collect();
 
-    (StatusCode::OK, Json(serde_json::json!({"versions": versions}))).into_response()
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({"versions": versions})),
+    )
+        .into_response()
 }
 
 pub async fn delete_version(
     State(state): State<AppState>,
     Path((bucket, version_id, key)): Path<(String, String, String)>,
 ) -> impl IntoResponse {
-    match state.storage.delete_object_version(&bucket, &key, &version_id).await {
+    match state
+        .storage
+        .delete_object_version(&bucket, &key, &version_id)
+        .await
+    {
         Ok(_) => (StatusCode::OK, Json(serde_json::json!({"ok": true}))).into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()}))).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": e.to_string()})),
+        )
+            .into_response(),
     }
 }
 
@@ -650,10 +809,18 @@ pub async fn download_version(
     State(state): State<AppState>,
     Path((bucket, version_id, key)): Path<(String, String, String)>,
 ) -> Response {
-    let (reader, meta) = match state.storage.get_object_version(&bucket, &key, &version_id).await {
+    let (reader, meta) = match state
+        .storage
+        .get_object_version(&bucket, &key, &version_id)
+        .await
+    {
         Ok(r) => r,
         Err(_) => {
-            return (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "Version not found"}))).into_response();
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"error": "Version not found"})),
+            )
+                .into_response();
         }
     };
 
@@ -666,7 +833,10 @@ pub async fn download_version(
         .status(StatusCode::OK)
         .header("Content-Type", &meta.content_type)
         .header("Content-Length", meta.size.to_string())
-        .header("Content-Disposition", format!("attachment; filename=\"{}\"", safe_filename))
+        .header(
+            "Content-Disposition",
+            format!("attachment; filename=\"{}\"", safe_filename),
+        )
         .body(body)
         .unwrap()
         .into_response()
@@ -684,15 +854,24 @@ pub fn console_router(state: AppState) -> Router<AppState> {
         .route("/buckets/{bucket}", delete(delete_bucket_api))
         .route("/buckets/{bucket}/folders", post(create_folder))
         .route("/buckets/{bucket}/objects", get(list_objects))
-        .route("/buckets/{bucket}/objects/{*key}", delete(delete_object_api))
+        .route(
+            "/buckets/{bucket}/objects/{*key}",
+            delete(delete_object_api),
+        )
         .route("/buckets/{bucket}/upload/{*key}", put(upload_object))
         .route("/buckets/{bucket}/download/{*key}", get(download_object))
         .route("/buckets/{bucket}/presign/{*key}", get(presign_object))
         .route("/buckets/{bucket}/versioning", get(get_versioning))
         .route("/buckets/{bucket}/versioning", put(set_versioning))
         .route("/buckets/{bucket}/versions", get(list_versions))
-        .route("/buckets/{bucket}/versions/{version_id}/objects/{*key}", delete(delete_version))
-        .route("/buckets/{bucket}/versions/{version_id}/download/{*key}", get(download_version))
+        .route(
+            "/buckets/{bucket}/versions/{version_id}/objects/{*key}",
+            delete(delete_version),
+        )
+        .route(
+            "/buckets/{bucket}/versions/{version_id}/download/{*key}",
+            get(download_version),
+        )
         .layer(axum::middleware::from_fn_with_state(
             state,
             console_auth_middleware,

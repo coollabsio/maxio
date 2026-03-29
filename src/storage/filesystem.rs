@@ -1,5 +1,8 @@
-use super::{BucketMeta, ByteStream, ChecksumAlgorithm, ChunkInfo, ChunkKind, ChunkManifest, DeleteResult, MultipartUploadMeta, ObjectMeta, PartMeta, PutResult, StorageError};
 use super::chunk_reader::VerifiedChunkReader;
+use super::{
+    BucketMeta, ByteStream, ChecksumAlgorithm, ChunkInfo, ChunkKind, ChunkManifest, DeleteResult,
+    MultipartUploadMeta, ObjectMeta, PartMeta, PutResult, StorageError,
+};
 use base64::Engine;
 use md5::{Digest, Md5};
 use rand::RngExt;
@@ -46,7 +49,6 @@ impl ChecksumHasher {
             Self::Sha256(h) => b64.encode(Digest::finalize(h)),
         }
     }
-
 }
 
 pub struct FilesystemStorage {
@@ -62,7 +64,9 @@ fn validate_key(key: &str) -> Result<(), StorageError> {
         return Err(StorageError::InvalidKey("Key must not be empty".into()));
     }
     if key.len() > 1024 {
-        return Err(StorageError::InvalidKey("Key must not exceed 1024 bytes".into()));
+        return Err(StorageError::InvalidKey(
+            "Key must not exceed 1024 bytes".into(),
+        ));
     }
     let path = Path::new(key);
     for component in path.components() {
@@ -94,10 +98,20 @@ fn validate_upload_id(upload_id: &str) -> Result<(), StorageError> {
 }
 
 impl FilesystemStorage {
-    pub async fn new(data_dir: &str, erasure_coding: bool, chunk_size: u64, parity_shards: u32) -> Result<Self, anyhow::Error> {
+    pub async fn new(
+        data_dir: &str,
+        erasure_coding: bool,
+        chunk_size: u64,
+        parity_shards: u32,
+    ) -> Result<Self, anyhow::Error> {
         let buckets_dir = Path::new(data_dir).join("buckets");
         fs::create_dir_all(&buckets_dir).await?;
-        Ok(Self { buckets_dir, erasure_coding, chunk_size, parity_shards })
+        Ok(Self {
+            buckets_dir,
+            erasure_coding,
+            chunk_size,
+            parity_shards,
+        })
     }
 
     // --- Bucket operations ---
@@ -149,7 +163,9 @@ impl FilesystemStorage {
                 // is effectively deleted (head_bucket checks .bucket.json).
                 let meta = BucketMeta {
                     name: name.to_string(),
-                    created_at: chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string(),
+                    created_at: chrono::Utc::now()
+                        .format("%Y-%m-%dT%H:%M:%S%.3fZ")
+                        .to_string(),
                     region: String::new(),
                     versioning: false,
                     cors_rules: None,
@@ -157,7 +173,8 @@ impl FilesystemStorage {
                 let _ = fs::write(
                     bucket_dir.join(".bucket.json"),
                     serde_json::to_string_pretty(&meta).unwrap_or_default(),
-                ).await;
+                )
+                .await;
                 Err(StorageError::BucketNotEmpty)
             }
             Err(e) => Err(e.into()),
@@ -207,9 +224,7 @@ impl FilesystemStorage {
     }
 
     fn ec_dir(&self, bucket: &str, key: &str) -> PathBuf {
-        self.buckets_dir
-            .join(bucket)
-            .join(format!("{}.ec", key))
+        self.buckets_dir.join(bucket).join(format!("{}.ec", key))
     }
 
     fn chunk_path(&self, bucket: &str, key: &str, index: u32) -> PathBuf {
@@ -274,7 +289,15 @@ impl FilesystemStorage {
         }
 
         if self.erasure_coding {
-            return self.put_object_chunked(bucket, key, content_type, body, checksum.as_ref().map(|(a, _)| *a)).await;
+            return self
+                .put_object_chunked(
+                    bucket,
+                    key,
+                    content_type,
+                    body,
+                    checksum.as_ref().map(|(a, _)| *a),
+                )
+                .await;
         }
 
         let obj_path = self.object_path(bucket, key);
@@ -285,7 +308,9 @@ impl FilesystemStorage {
         let file = fs::File::create(&obj_path).await?;
         let mut writer = BufWriter::with_capacity(IO_BUFFER_SIZE, file);
         let mut hasher = Md5::new();
-        let mut checksum_hasher = checksum.as_ref().map(|(algo, _)| ChecksumHasher::new(*algo));
+        let mut checksum_hasher = checksum
+            .as_ref()
+            .map(|(algo, _)| ChecksumHasher::new(*algo));
         let mut size: u64 = 0;
         let mut buf = vec![0u8; IO_BUFFER_SIZE];
 
@@ -312,7 +337,8 @@ impl FilesystemStorage {
             if let Some(expected_val) = expected {
                 if computed != expected_val {
                     return Err(StorageError::ChecksumMismatch(format!(
-                        "expected {}, got {}", expected_val, computed
+                        "expected {}, got {}",
+                        expected_val, computed
                     )));
                 }
             }
@@ -321,7 +347,9 @@ impl FilesystemStorage {
             (None, None)
         };
 
-        let now = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string();
+        let now = chrono::Utc::now()
+            .format("%Y-%m-%dT%H:%M:%S%.3fZ")
+            .to_string();
 
         let versioned = self.is_versioned(bucket).await.unwrap_or(false);
         let version_id = if versioned {
@@ -393,7 +421,9 @@ impl FilesystemStorage {
             if n == 0 {
                 // Flush remaining chunk_buf
                 if !chunk_buf.is_empty() {
-                    let ci = self.write_chunk(bucket, key, chunk_index, &chunk_buf).await?;
+                    let ci = self
+                        .write_chunk(bucket, key, chunk_index, &chunk_buf)
+                        .await?;
                     chunks.push(ci);
                 }
                 break;
@@ -408,7 +438,9 @@ impl FilesystemStorage {
 
             while chunk_buf.len() >= self.chunk_size as usize {
                 let chunk_data: Vec<u8> = chunk_buf.drain(..self.chunk_size as usize).collect();
-                let ci = self.write_chunk(bucket, key, chunk_index, &chunk_data).await?;
+                let ci = self
+                    .write_chunk(bucket, key, chunk_index, &chunk_data)
+                    .await?;
                 chunks.push(ci);
                 chunk_index += 1;
             }
@@ -435,8 +467,16 @@ impl FilesystemStorage {
             chunk_size: self.chunk_size,
             chunk_count: data_chunk_count,
             chunks,
-            parity_shards: if has_parity { Some(self.parity_shards) } else { None },
-            shard_size: if has_parity { Some(self.chunk_size) } else { None },
+            parity_shards: if has_parity {
+                Some(self.parity_shards)
+            } else {
+                None
+            },
+            shard_size: if has_parity {
+                Some(self.chunk_size)
+            } else {
+                None
+            },
         };
         let manifest_json = serde_json::to_string_pretty(&manifest)?;
         fs::write(self.manifest_path(bucket, key), manifest_json).await?;
@@ -445,7 +485,9 @@ impl FilesystemStorage {
         let etag_quoted = format!("\"{}\"", etag);
         let checksum_value = checksum_hasher.map(|h| h.finalize_base64());
 
-        let now = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string();
+        let now = chrono::Utc::now()
+            .format("%Y-%m-%dT%H:%M:%S%.3fZ")
+            .to_string();
 
         let versioned = self.is_versioned(bucket).await.unwrap_or(false);
         let version_id = if versioned {
@@ -454,7 +496,11 @@ impl FilesystemStorage {
             None
         };
 
-        let storage_format = if has_parity { "chunked-v2" } else { "chunked-v1" };
+        let storage_format = if has_parity {
+            "chunked-v2"
+        } else {
+            "chunked-v1"
+        };
         let meta = ObjectMeta {
             key: key.to_string(),
             size: total_size,
@@ -525,7 +571,9 @@ impl FilesystemStorage {
         if k + m > 255 {
             return Err(StorageError::InvalidKey(format!(
                 "too many shards: {} data + {} parity = {} > 255 (GF(2^8) limit). Increase --chunk-size",
-                k, m, k + m
+                k,
+                m,
+                k + m
             )));
         }
 
@@ -546,12 +594,10 @@ impl FilesystemStorage {
         }
 
         // Encode parity
-        let rs = ReedSolomon::new(k, m).map_err(|e| {
-            StorageError::InvalidKey(format!("Reed-Solomon init error: {e}"))
-        })?;
-        rs.encode(&mut all_shards).map_err(|e| {
-            StorageError::InvalidKey(format!("Reed-Solomon encode error: {e}"))
-        })?;
+        let rs = ReedSolomon::new(k, m)
+            .map_err(|e| StorageError::InvalidKey(format!("Reed-Solomon init error: {e}")))?;
+        rs.encode(&mut all_shards)
+            .map_err(|e| StorageError::InvalidKey(format!("Reed-Solomon encode error: {e}")))?;
 
         // Write parity chunks to disk
         let mut parity_infos = Vec::with_capacity(m);
@@ -596,7 +642,8 @@ impl FilesystemStorage {
 
         let mut buf = vec![0u8; IO_BUFFER_SIZE];
         for part in selected {
-            let mut part_file = fs::File::open(self.part_path(bucket, upload_id, part.part_number)).await?;
+            let mut part_file =
+                fs::File::open(self.part_path(bucket, upload_id, part.part_number)).await?;
             loop {
                 let n = part_file.read(&mut buf).await?;
                 if n == 0 {
@@ -607,7 +654,9 @@ impl FilesystemStorage {
 
                 while chunk_buf.len() >= self.chunk_size as usize {
                     let chunk_data: Vec<u8> = chunk_buf.drain(..self.chunk_size as usize).collect();
-                    let ci = self.write_chunk(bucket, key, chunk_index, &chunk_data).await?;
+                    let ci = self
+                        .write_chunk(bucket, key, chunk_index, &chunk_data)
+                        .await?;
                     chunks.push(ci);
                     chunk_index += 1;
                 }
@@ -620,7 +669,9 @@ impl FilesystemStorage {
 
         // Flush remaining
         if !chunk_buf.is_empty() {
-            let ci = self.write_chunk(bucket, key, chunk_index, &chunk_buf).await?;
+            let ci = self
+                .write_chunk(bucket, key, chunk_index, &chunk_buf)
+                .await?;
             chunks.push(ci);
         }
 
@@ -644,44 +695,68 @@ impl FilesystemStorage {
             chunk_size: self.chunk_size,
             chunk_count: data_chunk_count,
             chunks,
-            parity_shards: if has_parity { Some(self.parity_shards) } else { None },
-            shard_size: if has_parity { Some(self.chunk_size) } else { None },
+            parity_shards: if has_parity {
+                Some(self.parity_shards)
+            } else {
+                None
+            },
+            shard_size: if has_parity {
+                Some(self.chunk_size)
+            } else {
+                None
+            },
         };
-        fs::write(self.manifest_path(bucket, key), serde_json::to_string_pretty(&manifest)?).await?;
+        fs::write(
+            self.manifest_path(bucket, key),
+            serde_json::to_string_pretty(&manifest)?,
+        )
+        .await?;
 
-        let etag = format!("\"{}-{}\"", hex::encode(etag_hasher.finalize()), selected.len());
+        let etag = format!(
+            "\"{}-{}\"",
+            hex::encode(etag_hasher.finalize()),
+            selected.len()
+        );
 
         // Compute composite checksum if algorithm was specified
-        let (checksum_algorithm, checksum_value) = if let Some(algo) = upload_meta.checksum_algorithm {
-            let b64 = base64::engine::general_purpose::STANDARD;
-            let mut raw_checksums = Vec::new();
-            for part in selected {
-                if let Some(ref val) = part.checksum_value {
-                    if let Ok(raw) = b64.decode(val) {
-                        raw_checksums.extend_from_slice(&raw);
+        let (checksum_algorithm, checksum_value) =
+            if let Some(algo) = upload_meta.checksum_algorithm {
+                let b64 = base64::engine::general_purpose::STANDARD;
+                let mut raw_checksums = Vec::new();
+                for part in selected {
+                    if let Some(ref val) = part.checksum_value {
+                        if let Ok(raw) = b64.decode(val) {
+                            raw_checksums.extend_from_slice(&raw);
+                        }
                     }
                 }
-            }
-            if !raw_checksums.is_empty() {
-                let mut composite_hasher = ChecksumHasher::new(algo);
-                composite_hasher.update(&raw_checksums);
-                let composite = format!("{}-{}", composite_hasher.finalize_base64(), selected.len());
-                (Some(algo), Some(composite))
+                if !raw_checksums.is_empty() {
+                    let mut composite_hasher = ChecksumHasher::new(algo);
+                    composite_hasher.update(&raw_checksums);
+                    let composite =
+                        format!("{}-{}", composite_hasher.finalize_base64(), selected.len());
+                    (Some(algo), Some(composite))
+                } else {
+                    (Some(algo), None)
+                }
             } else {
-                (Some(algo), None)
-            }
-        } else {
-            (None, None)
-        };
+                (None, None)
+            };
 
         let part_sizes: Vec<u64> = selected.iter().map(|p| p.size).collect();
-        let storage_format = if has_parity { "chunked-v2" } else { "chunked-v1" };
+        let storage_format = if has_parity {
+            "chunked-v2"
+        } else {
+            "chunked-v1"
+        };
         let object_meta = ObjectMeta {
             key: key.to_string(),
             size: total_size,
             etag: etag.clone(),
             content_type: upload_meta.content_type.clone(),
-            last_modified: chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string(),
+            last_modified: chrono::Utc::now()
+                .format("%Y-%m-%dT%H:%M:%S%.3fZ")
+                .to_string(),
             version_id: None,
             is_delete_marker: false,
             storage_format: Some(storage_format.to_string()),
@@ -707,11 +782,7 @@ impl FilesystemStorage {
         })
     }
 
-    async fn put_folder_marker(
-        &self,
-        bucket: &str,
-        key: &str,
-    ) -> Result<PutResult, StorageError> {
+    async fn put_folder_marker(&self, bucket: &str, key: &str) -> Result<PutResult, StorageError> {
         let folder_dir = self
             .buckets_dir
             .join(bucket)
@@ -813,7 +884,9 @@ impl FilesystemStorage {
                     StorageError::Io(e)
                 }
             })?;
-            file.seek(std::io::SeekFrom::Start(offset)).await.map_err(StorageError::Io)?;
+            file.seek(std::io::SeekFrom::Start(offset))
+                .await
+                .map_err(StorageError::Io)?;
             let mut data = vec![0u8; length as usize];
             file.read_exact(&mut data).await.map_err(StorageError::Io)?;
             return Ok((Box::pin(std::io::Cursor::new(data)), meta));
@@ -825,17 +898,15 @@ impl FilesystemStorage {
                 StorageError::Io(e)
             }
         })?;
-        file.seek(std::io::SeekFrom::Start(offset)).await.map_err(StorageError::Io)?;
+        file.seek(std::io::SeekFrom::Start(offset))
+            .await
+            .map_err(StorageError::Io)?;
         let limited = file.take(length);
         let reader = BufReader::with_capacity(IO_BUFFER_SIZE, limited);
         Ok((Box::pin(reader), meta))
     }
 
-    pub async fn head_object(
-        &self,
-        bucket: &str,
-        key: &str,
-    ) -> Result<ObjectMeta, StorageError> {
+    pub async fn head_object(&self, bucket: &str, key: &str) -> Result<ObjectMeta, StorageError> {
         validate_key(key)?;
         self.read_object_meta(bucket, key).await
     }
@@ -864,11 +935,7 @@ impl FilesystemStorage {
         Ok(())
     }
 
-    pub async fn delete_object_tagging(
-        &self,
-        bucket: &str,
-        key: &str,
-    ) -> Result<(), StorageError> {
+    pub async fn delete_object_tagging(&self, bucket: &str, key: &str) -> Result<(), StorageError> {
         validate_key(key)?;
         let mut meta = self.read_object_meta(bucket, key).await?;
         meta.tags = None;
@@ -883,6 +950,9 @@ impl FilesystemStorage {
         key: &str,
     ) -> Result<DeleteResult, StorageError> {
         validate_key(key)?;
+        if !self.head_bucket(bucket).await? {
+            return Err(StorageError::NotFound(bucket.to_string()));
+        }
 
         let versioned = self.is_versioned(bucket).await.unwrap_or(false);
         if versioned {
@@ -947,7 +1017,9 @@ impl FilesystemStorage {
             bucket: bucket.to_string(),
             key: key.to_string(),
             content_type: content_type.to_string(),
-            initiated: chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string(),
+            initiated: chrono::Utc::now()
+                .format("%Y-%m-%dT%H:%M:%S%.3fZ")
+                .to_string(),
             checksum_algorithm,
         };
 
@@ -966,7 +1038,9 @@ impl FilesystemStorage {
     ) -> Result<PartMeta, StorageError> {
         validate_upload_id(upload_id)?;
         if part_number == 0 || part_number > 10_000 {
-            return Err(StorageError::InvalidKey("part number must be 1..=10000".into()));
+            return Err(StorageError::InvalidKey(
+                "part number must be 1..=10000".into(),
+            ));
         }
         let upload_dir = self.upload_dir(bucket, upload_id);
         if !fs::try_exists(&upload_dir).await? {
@@ -977,7 +1051,9 @@ impl FilesystemStorage {
         let file = fs::File::create(&part_path).await?;
         let mut writer = BufWriter::with_capacity(IO_BUFFER_SIZE, file);
         let mut hasher = Md5::new();
-        let mut checksum_hasher = checksum.as_ref().map(|(algo, _)| ChecksumHasher::new(*algo));
+        let mut checksum_hasher = checksum
+            .as_ref()
+            .map(|(algo, _)| ChecksumHasher::new(*algo));
         let mut size: u64 = 0;
         let mut buf = vec![0u8; IO_BUFFER_SIZE];
 
@@ -1002,7 +1078,8 @@ impl FilesystemStorage {
                 if computed != expected_val {
                     let _ = fs::remove_file(&part_path).await;
                     return Err(StorageError::ChecksumMismatch(format!(
-                        "expected {}, got {}", expected_val, computed
+                        "expected {}, got {}",
+                        expected_val, computed
                     )));
                 }
             }
@@ -1065,7 +1142,9 @@ impl FilesystemStorage {
         }
 
         if self.erasure_coding {
-            return self.complete_multipart_chunked(bucket, upload_id, &upload_meta, &selected).await;
+            return self
+                .complete_multipart_chunked(bucket, upload_id, &upload_meta, &selected)
+                .await;
         }
 
         let obj_path = self.object_path(bucket, &upload_meta.key);
@@ -1079,7 +1158,8 @@ impl FilesystemStorage {
         let mut buf = vec![0u8; IO_BUFFER_SIZE];
 
         for part in &selected {
-            let mut part_file = fs::File::open(self.part_path(bucket, upload_id, part.part_number)).await?;
+            let mut part_file =
+                fs::File::open(self.part_path(bucket, upload_id, part.part_number)).await?;
             loop {
                 let n = part_file.read(&mut buf).await?;
                 if n == 0 {
@@ -1095,30 +1175,36 @@ impl FilesystemStorage {
         }
         writer.flush().await?;
 
-        let etag = format!("\"{}-{}\"", hex::encode(etag_hasher.finalize()), selected.len());
+        let etag = format!(
+            "\"{}-{}\"",
+            hex::encode(etag_hasher.finalize()),
+            selected.len()
+        );
 
         // Compute composite checksum if algorithm was specified
-        let (checksum_algorithm, checksum_value) = if let Some(algo) = upload_meta.checksum_algorithm {
-            let b64 = base64::engine::general_purpose::STANDARD;
-            let mut raw_checksums = Vec::new();
-            for part in &selected {
-                if let Some(ref val) = part.checksum_value {
-                    if let Ok(raw) = b64.decode(val) {
-                        raw_checksums.extend_from_slice(&raw);
+        let (checksum_algorithm, checksum_value) =
+            if let Some(algo) = upload_meta.checksum_algorithm {
+                let b64 = base64::engine::general_purpose::STANDARD;
+                let mut raw_checksums = Vec::new();
+                for part in &selected {
+                    if let Some(ref val) = part.checksum_value {
+                        if let Ok(raw) = b64.decode(val) {
+                            raw_checksums.extend_from_slice(&raw);
+                        }
                     }
                 }
-            }
-            if !raw_checksums.is_empty() {
-                let mut composite_hasher = ChecksumHasher::new(algo);
-                composite_hasher.update(&raw_checksums);
-                let composite = format!("{}-{}", composite_hasher.finalize_base64(), selected.len());
-                (Some(algo), Some(composite))
+                if !raw_checksums.is_empty() {
+                    let mut composite_hasher = ChecksumHasher::new(algo);
+                    composite_hasher.update(&raw_checksums);
+                    let composite =
+                        format!("{}-{}", composite_hasher.finalize_base64(), selected.len());
+                    (Some(algo), Some(composite))
+                } else {
+                    (Some(algo), None)
+                }
             } else {
-                (Some(algo), None)
-            }
-        } else {
-            (None, None)
-        };
+                (None, None)
+            };
 
         let part_sizes: Vec<u64> = selected.iter().map(|p| p.size).collect();
         let object_meta = ObjectMeta {
@@ -1126,7 +1212,9 @@ impl FilesystemStorage {
             size: total_size,
             etag: etag.clone(),
             content_type: upload_meta.content_type,
-            last_modified: chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string(),
+            last_modified: chrono::Utc::now()
+                .format("%Y-%m-%dT%H:%M:%S%.3fZ")
+                .to_string(),
             version_id: None,
             is_delete_marker: false,
             storage_format: None,
@@ -1246,11 +1334,7 @@ impl FilesystemStorage {
         })
     }
 
-    async fn read_object_meta(
-        &self,
-        bucket: &str,
-        key: &str,
-    ) -> Result<ObjectMeta, StorageError> {
+    async fn read_object_meta(&self, bucket: &str, key: &str) -> Result<ObjectMeta, StorageError> {
         let meta_path = self.meta_path(bucket, key);
         let data = fs::read_to_string(&meta_path).await.map_err(|e| {
             if e.kind() == std::io::ErrorKind::NotFound {
@@ -1297,10 +1381,10 @@ impl FilesystemStorage {
                         // Strip the .ec suffix to get the key
                         let key = rel_str.strip_suffix(".ec").unwrap_or(&rel_str).to_string();
                         if key.starts_with(prefix) {
-                            if let Ok(meta) = self.read_object_meta(
-                                base.file_name().unwrap().to_str().unwrap(),
-                                &key,
-                            ).await {
+                            if let Ok(meta) = self
+                                .read_object_meta(base.file_name().unwrap().to_str().unwrap(), &key)
+                                .await
+                            {
                                 results.push(meta);
                             }
                         }
@@ -1328,10 +1412,10 @@ impl FilesystemStorage {
                     if let Ok(rel) = path.strip_prefix(base) {
                         let key = rel.to_string_lossy().to_string();
                         if key.starts_with(prefix) {
-                            if let Ok(meta) = self.read_object_meta(
-                                base.file_name().unwrap().to_str().unwrap(),
-                                &key,
-                            ).await {
+                            if let Ok(meta) = self
+                                .read_object_meta(base.file_name().unwrap().to_str().unwrap(), &key)
+                                .await
+                            {
                                 results.push(meta);
                             }
                         }
@@ -1419,11 +1503,7 @@ impl FilesystemStorage {
         Ok(meta.versioning)
     }
 
-    pub async fn set_versioning(
-        &self,
-        bucket: &str,
-        enabled: bool,
-    ) -> Result<(), StorageError> {
+    pub async fn set_versioning(&self, bucket: &str, enabled: bool) -> Result<(), StorageError> {
         let meta_path = self.buckets_dir.join(bucket).join(".bucket.json");
         let data = fs::read_to_string(&meta_path).await.map_err(|e| {
             if e.kind() == std::io::ErrorKind::NotFound {
@@ -1620,11 +1700,7 @@ impl FilesystemStorage {
     }
 
     /// Scan versions for a key and update the top-level files to reflect the latest non-delete-marker.
-    async fn update_current_version(
-        &self,
-        bucket: &str,
-        key: &str,
-    ) -> Result<(), StorageError> {
+    async fn update_current_version(&self, bucket: &str, key: &str) -> Result<(), StorageError> {
         let ver_dir = self.versions_dir(bucket, key);
         if !fs::try_exists(&ver_dir).await.unwrap_or(false) {
             return Ok(());
@@ -1711,7 +1787,9 @@ impl FilesystemStorage {
         }
 
         // Check for chunked version
-        let ver_ec_dir = self.versions_dir(bucket, key).join(format!("{}.ec", version_id));
+        let ver_ec_dir = self
+            .versions_dir(bucket, key)
+            .join(format!("{}.ec", version_id));
         if ver_ec_dir.is_dir() {
             let manifest_path = ver_ec_dir.join("manifest.json");
             let manifest_data = fs::read_to_string(&manifest_path).await.map_err(|e| {
@@ -1734,7 +1812,10 @@ impl FilesystemStorage {
                 StorageError::Io(e)
             }
         })?;
-        Ok((Box::pin(BufReader::with_capacity(IO_BUFFER_SIZE, file)), meta))
+        Ok((
+            Box::pin(BufReader::with_capacity(IO_BUFFER_SIZE, file)),
+            meta,
+        ))
     }
 
     pub async fn head_object_version(
@@ -1780,7 +1861,9 @@ impl FilesystemStorage {
         let _ = fs::remove_file(&ver_meta_path).await;
         let ver_data_path = self.version_data_path(bucket, key, version_id);
         let _ = fs::remove_file(&ver_data_path).await;
-        let ver_ec_dir = self.versions_dir(bucket, key).join(format!("{}.ec", version_id));
+        let ver_ec_dir = self
+            .versions_dir(bucket, key)
+            .join(format!("{}.ec", version_id));
         let _ = fs::remove_dir_all(&ver_ec_dir).await;
 
         // Clean up empty versions dir

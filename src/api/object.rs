@@ -139,21 +139,43 @@ pub async fn put_object(
     Ok(builder.body(Body::empty()).unwrap())
 }
 
-/// Parse the `x-amz-copy-source` header into (src_bucket, src_key).
-fn parse_copy_source(headers: &HeaderMap) -> Result<(String, String), S3Error> {
+struct CopySource {
+    bucket: String,
+    key: String,
+    version_id: Option<String>,
+}
+
+/// Parse the `x-amz-copy-source` header into bucket/key and optional versionId.
+fn parse_copy_source(headers: &HeaderMap) -> Result<CopySource, S3Error> {
     let copy_source = headers
         .get("x-amz-copy-source")
         .and_then(|v| v.to_str().ok())
         .ok_or_else(|| S3Error::invalid_argument("missing x-amz-copy-source header"))?;
 
-    let decoded = percent_encoding::percent_decode_str(copy_source)
+    let (raw_path, raw_query) = copy_source.split_once('?').unwrap_or((copy_source, ""));
+    let version_id = raw_query.split('&').find_map(|pair| {
+        let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+        if key != "versionId" {
+            return None;
+        }
+        percent_encoding::percent_decode_str(value)
+            .decode_utf8()
+            .ok()
+            .map(|value| value.into_owned())
+    });
+
+    let decoded = percent_encoding::percent_decode_str(raw_path)
         .decode_utf8()
         .map_err(|_| S3Error::invalid_argument("invalid x-amz-copy-source encoding"))?;
     let trimmed = decoded.trim_start_matches('/');
     let (src_bucket, src_key) = trimmed
         .split_once('/')
         .ok_or_else(|| S3Error::invalid_argument("invalid x-amz-copy-source format"))?;
-    Ok((src_bucket.to_string(), src_key.to_string()))
+    Ok(CopySource {
+        bucket: src_bucket.to_string(),
+        key: src_key.to_string(),
+        version_id,
+    })
 }
 
 /// Parse `x-amz-copy-source-range: bytes=start-end` into (start, end) inclusive.
@@ -189,7 +211,10 @@ async fn upload_part_copy(
     Query(params): Query<HashMap<String, String>>,
     headers: HeaderMap,
 ) -> Result<Response<Body>, S3Error> {
-    let (src_bucket, src_key) = parse_copy_source(&headers)?;
+    let copy_source = parse_copy_source(&headers)?;
+    let src_bucket = copy_source.bucket;
+    let src_key = copy_source.key;
+    let src_version_id = copy_source.version_id;
 
     let upload_id = params
         .get("uploadId")
@@ -203,40 +228,78 @@ async fn upload_part_copy(
     multipart::ensure_bucket_exists(&state, &bucket).await?;
 
     // Get source metadata first to validate range before opening the file
-    let src_meta = state
-        .storage
-        .head_object(&src_bucket, &src_key)
-        .await
-        .map_err(|e| match e {
-            StorageError::NotFound(_) => S3Error::no_such_key(&src_key),
-            _ => S3Error::internal(e),
-        })?;
+    let src_meta = if let Some(version_id) = src_version_id.as_deref() {
+        state
+            .storage
+            .head_object_version(&src_bucket, &src_key, version_id)
+            .await
+            .map_err(|e| match e {
+                StorageError::VersionNotFound(_) => S3Error::no_such_version(version_id),
+                StorageError::NotFound(_) => S3Error::no_such_key(&src_key),
+                _ => S3Error::internal(e),
+            })?
+    } else {
+        state
+            .storage
+            .head_object(&src_bucket, &src_key)
+            .await
+            .map_err(|e| match e {
+                StorageError::NotFound(_) => S3Error::no_such_key(&src_key),
+                _ => S3Error::internal(e),
+            })?
+    };
 
     let range = parse_copy_source_range(&headers, src_meta.size)?;
 
     let reader = match range {
         None => {
-            let (r, _) = state
-                .storage
-                .get_object(&src_bucket, &src_key)
-                .await
-                .map_err(|e| match e {
-                    StorageError::NotFound(_) => S3Error::no_such_key(&src_key),
-                    StorageError::InvalidKey(msg) => S3Error::invalid_argument(&msg),
-                    _ => S3Error::internal(e),
-                })?;
+            let (r, _) = if let Some(version_id) = src_version_id.as_deref() {
+                state
+                    .storage
+                    .get_object_version(&src_bucket, &src_key, version_id)
+                    .await
+                    .map_err(|e| match e {
+                        StorageError::VersionNotFound(_) => S3Error::no_such_version(version_id),
+                        StorageError::NotFound(_) => S3Error::no_such_key(&src_key),
+                        StorageError::InvalidKey(msg) => S3Error::invalid_argument(&msg),
+                        _ => S3Error::internal(e),
+                    })?
+            } else {
+                state
+                    .storage
+                    .get_object(&src_bucket, &src_key)
+                    .await
+                    .map_err(|e| match e {
+                        StorageError::NotFound(_) => S3Error::no_such_key(&src_key),
+                        StorageError::InvalidKey(msg) => S3Error::invalid_argument(&msg),
+                        _ => S3Error::internal(e),
+                    })?
+            };
             r
         }
         Some((start, end)) => {
-            let (r, _) = state
-                .storage
-                .get_object_range(&src_bucket, &src_key, start, end - start + 1)
-                .await
-                .map_err(|e| match e {
-                    StorageError::NotFound(_) => S3Error::no_such_key(&src_key),
-                    StorageError::InvalidKey(msg) => S3Error::invalid_argument(&msg),
-                    _ => S3Error::internal(e),
-                })?;
+            let (r, _) = if let Some(version_id) = src_version_id.as_deref() {
+                state
+                    .storage
+                    .get_object_version_range(&src_bucket, &src_key, version_id, start, end - start + 1)
+                    .await
+                    .map_err(|e| match e {
+                        StorageError::VersionNotFound(_) => S3Error::no_such_version(version_id),
+                        StorageError::NotFound(_) => S3Error::no_such_key(&src_key),
+                        StorageError::InvalidKey(msg) => S3Error::invalid_argument(&msg),
+                        _ => S3Error::internal(e),
+                    })?
+            } else {
+                state
+                    .storage
+                    .get_object_range(&src_bucket, &src_key, start, end - start + 1)
+                    .await
+                    .map_err(|e| match e {
+                        StorageError::NotFound(_) => S3Error::no_such_key(&src_key),
+                        StorageError::InvalidKey(msg) => S3Error::invalid_argument(&msg),
+                        _ => S3Error::internal(e),
+                    })?
+            };
             r
         }
     };
@@ -266,7 +329,10 @@ async fn copy_object(
     Path((bucket, key)): Path<(String, String)>,
     headers: HeaderMap,
 ) -> Result<Response<Body>, S3Error> {
-    let (src_bucket, src_key) = parse_copy_source(&headers)?;
+    let copy_source = parse_copy_source(&headers)?;
+    let src_bucket = copy_source.bucket;
+    let src_key = copy_source.key;
+    let src_version_id = copy_source.version_id;
     let (src_bucket, src_key) = (src_bucket.as_str(), src_key.as_str());
 
     // Validate destination bucket
@@ -277,15 +343,28 @@ async fn copy_object(
     }
 
     // Get source object
-    let (reader, src_meta) = state
-        .storage
-        .get_object(src_bucket, src_key)
-        .await
-        .map_err(|e| match e {
-            StorageError::NotFound(_) => S3Error::no_such_key(src_key),
-            StorageError::InvalidKey(msg) => S3Error::invalid_argument(&msg),
-            _ => S3Error::internal(e),
-        })?;
+    let (reader, src_meta) = if let Some(version_id) = src_version_id.as_deref() {
+        state
+            .storage
+            .get_object_version(src_bucket, src_key, version_id)
+            .await
+            .map_err(|e| match e {
+                StorageError::VersionNotFound(_) => S3Error::no_such_version(version_id),
+                StorageError::NotFound(_) => S3Error::no_such_key(src_key),
+                StorageError::InvalidKey(msg) => S3Error::invalid_argument(&msg),
+                _ => S3Error::internal(e),
+            })?
+    } else {
+        state
+            .storage
+            .get_object(src_bucket, src_key)
+            .await
+            .map_err(|e| match e {
+                StorageError::NotFound(_) => S3Error::no_such_key(src_key),
+                StorageError::InvalidKey(msg) => S3Error::invalid_argument(&msg),
+                _ => S3Error::internal(e),
+            })?
+    };
 
     // Determine content-type based on metadata directive
     let directive = headers

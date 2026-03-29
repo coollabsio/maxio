@@ -472,6 +472,16 @@ fn extract_xml_tag(body: &str, tag: &str) -> Option<String> {
     Some(body[from..to].to_string())
 }
 
+async fn enable_bucket_versioning(base_url: &str, bucket: &str) -> reqwest::Response {
+    let xml = br#"<VersioningConfiguration><Status>Enabled</Status></VersioningConfiguration>"#;
+    s3_request(
+        "PUT",
+        &format!("{}/{}?versioning=", base_url, bucket),
+        xml.to_vec(),
+    )
+    .await
+}
+
 
 // ---- Tests ----
 
@@ -1523,6 +1533,55 @@ async fn test_copy_object_no_leading_slash() {
 
     let resp = s3_request("GET", &format!("{}/mybucket/dst.txt", base_url), vec![]).await;
     assert_eq!(resp.bytes().await.unwrap().as_ref(), b"no slash");
+}
+
+#[tokio::test]
+async fn test_copy_object_specific_source_version() {
+    let (base_url, _tmp) = start_server().await;
+    s3_request("PUT", &format!("{}/src-bucket", base_url), vec![]).await;
+    s3_request("PUT", &format!("{}/dst-bucket", base_url), vec![]).await;
+    assert_eq!(
+        enable_bucket_versioning(&base_url, "src-bucket").await.status(),
+        200
+    );
+
+    let v1_body = b"old version".to_vec();
+    let put_v1 = s3_request(
+        "PUT",
+        &format!("{}/src-bucket/file.txt", base_url),
+        v1_body.clone(),
+    )
+    .await;
+    let version_id_v1 = put_v1
+        .headers()
+        .get("x-amz-version-id")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+
+    s3_request(
+        "PUT",
+        &format!("{}/src-bucket/file.txt", base_url),
+        b"new version".to_vec(),
+    )
+    .await;
+
+    let resp = s3_request_with_headers(
+        "PUT",
+        &format!("{}/dst-bucket/copied.txt", base_url),
+        vec![],
+        vec![(
+            "x-amz-copy-source",
+            &format!("/src-bucket/file.txt?versionId={}", version_id_v1),
+        )],
+    )
+    .await;
+    assert_eq!(resp.status(), 200);
+
+    let get = s3_request("GET", &format!("{}/dst-bucket/copied.txt", base_url), vec![]).await;
+    assert_eq!(get.status(), 200);
+    assert_eq!(get.bytes().await.unwrap().as_ref(), v1_body.as_slice());
 }
 
 /// Generate a presigned URL for the given method/path.
@@ -3048,6 +3107,73 @@ async fn test_upload_part_copy_range() {
     let get = s3_request("GET", &format!("{}/dst-upcr/dest.bin", base), vec![]).await;
     assert_eq!(get.status(), 200);
     assert_eq!(get.bytes().await.unwrap().as_ref(), src_data.as_slice());
+}
+
+#[tokio::test]
+async fn test_upload_part_copy_specific_source_version() {
+    let (base, _tmp) = start_server().await;
+
+    s3_request("PUT", &format!("{}/src-upcv", base), vec![]).await;
+    s3_request("PUT", &format!("{}/dst-upcv", base), vec![]).await;
+    assert_eq!(
+        enable_bucket_versioning(&base, "src-upcv").await.status(),
+        200
+    );
+
+    let source_v1 = vec![b'A'; 5 * 1024 * 1024];
+    let put_v1 = s3_request(
+        "PUT",
+        &format!("{}/src-upcv/source.bin", base),
+        source_v1.clone(),
+    )
+    .await;
+    let version_id_v1 = put_v1
+        .headers()
+        .get("x-amz-version-id")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+
+    s3_request(
+        "PUT",
+        &format!("{}/src-upcv/source.bin", base),
+        vec![b'B'; 5 * 1024 * 1024],
+    )
+    .await;
+
+    let create = s3_request("POST", &format!("{}/dst-upcv/dest.bin?uploads=", base), vec![]).await;
+    let upload_id = extract_xml_tag(&create.text().await.unwrap(), "UploadId").unwrap();
+
+    let resp = s3_request_with_headers(
+        "PUT",
+        &format!("{}/dst-upcv/dest.bin?partNumber=1&uploadId={}", base, upload_id),
+        vec![],
+        vec![(
+            "x-amz-copy-source",
+            &format!("/src-upcv/source.bin?versionId={}", version_id_v1),
+        )],
+    )
+    .await;
+    assert_eq!(resp.status(), 200);
+    let body = resp.text().await.unwrap();
+    let etag = extract_xml_tag(&body, "ETag").unwrap();
+
+    let complete_xml = format!(
+        "<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>{}</ETag></Part></CompleteMultipartUpload>",
+        etag
+    );
+    let complete = s3_request(
+        "POST",
+        &format!("{}/dst-upcv/dest.bin?uploadId={}", base, upload_id),
+        complete_xml.into_bytes(),
+    )
+    .await;
+    assert_eq!(complete.status(), 200);
+
+    let get = s3_request("GET", &format!("{}/dst-upcv/dest.bin", base), vec![]).await;
+    assert_eq!(get.status(), 200);
+    assert_eq!(get.bytes().await.unwrap().as_ref(), source_v1.as_slice());
 }
 
 // ---- CORS API tests ----

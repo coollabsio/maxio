@@ -1737,6 +1737,72 @@ impl FilesystemStorage {
         Ok((Box::pin(BufReader::with_capacity(IO_BUFFER_SIZE, file)), meta))
     }
 
+    pub async fn get_object_version_range(
+        &self,
+        bucket: &str,
+        key: &str,
+        version_id: &str,
+        offset: u64,
+        length: u64,
+    ) -> Result<(ByteStream, ObjectMeta), StorageError> {
+        validate_key(key)?;
+        let ver_meta_path = self.version_meta_path(bucket, key, version_id);
+        let data = fs::read_to_string(&ver_meta_path).await.map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                StorageError::VersionNotFound(version_id.to_string())
+            } else {
+                StorageError::Io(e)
+            }
+        })?;
+        let meta: ObjectMeta = serde_json::from_str(&data)?;
+
+        if meta.is_delete_marker {
+            return Err(StorageError::NotFound(key.to_string()));
+        }
+
+        let ver_ec_dir = self.versions_dir(bucket, key).join(format!("{}.ec", version_id));
+        if ver_ec_dir.is_dir() {
+            let manifest_path = ver_ec_dir.join("manifest.json");
+            let manifest_data = fs::read_to_string(&manifest_path).await.map_err(|e| {
+                if e.kind() == std::io::ErrorKind::NotFound {
+                    StorageError::VersionNotFound(version_id.to_string())
+                } else {
+                    StorageError::Io(e)
+                }
+            })?;
+            let manifest: ChunkManifest = serde_json::from_str(&manifest_data)?;
+            let reader = VerifiedChunkReader::with_range(ver_ec_dir, manifest, offset, length);
+            return Ok((Box::pin(reader), meta));
+        }
+
+        let ver_data_path = self.version_data_path(bucket, key, version_id);
+        if length <= SMALL_OBJECT_THRESHOLD {
+            let mut file = fs::File::open(&ver_data_path).await.map_err(|e| {
+                if e.kind() == std::io::ErrorKind::NotFound {
+                    StorageError::VersionNotFound(version_id.to_string())
+                } else {
+                    StorageError::Io(e)
+                }
+            })?;
+            file.seek(std::io::SeekFrom::Start(offset)).await.map_err(StorageError::Io)?;
+            let mut data = vec![0u8; length as usize];
+            file.read_exact(&mut data).await.map_err(StorageError::Io)?;
+            return Ok((Box::pin(std::io::Cursor::new(data)), meta));
+        }
+
+        let mut file = fs::File::open(&ver_data_path).await.map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                StorageError::VersionNotFound(version_id.to_string())
+            } else {
+                StorageError::Io(e)
+            }
+        })?;
+        file.seek(std::io::SeekFrom::Start(offset)).await.map_err(StorageError::Io)?;
+        let limited = file.take(length);
+        let reader = BufReader::with_capacity(IO_BUFFER_SIZE, limited);
+        Ok((Box::pin(reader), meta))
+    }
+
     pub async fn head_object_version(
         &self,
         bucket: &str,

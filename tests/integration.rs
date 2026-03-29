@@ -19,7 +19,9 @@ async fn start_server() -> (String, TempDir) {
     let tmp = TempDir::new().unwrap();
     let data_dir = tmp.path().to_str().unwrap().to_string();
 
-    let storage = FilesystemStorage::new(&data_dir, false, 10 * 1024 * 1024, 0).await.unwrap();
+    let storage = FilesystemStorage::new(&data_dir, false, 10 * 1024 * 1024, 0)
+        .await
+        .unwrap();
 
     let config = Config {
         port: 0,
@@ -45,19 +47,19 @@ async fn start_server() -> (String, TempDir) {
     let base_url = format!("http://{}", addr);
 
     tokio::spawn(async move {
-        axum::serve(listener, app.into_make_service_with_connect_info::<std::net::SocketAddr>()).await.unwrap();
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await
+        .unwrap();
     });
 
     (base_url, tmp)
 }
 
 /// Sign a request with AWS Signature V4.
-fn sign_request(
-    method: &str,
-    url: &str,
-    headers: &mut Vec<(String, String)>,
-    body: &[u8],
-) {
+fn sign_request(method: &str, url: &str, headers: &mut Vec<(String, String)>, body: &[u8]) {
     let parsed = reqwest::Url::parse(url).unwrap();
     let host = parsed.host_str().unwrap();
     let port = parsed.port().unwrap();
@@ -101,7 +103,11 @@ fn sign_request(
             })
             .collect();
         pairs.sort();
-        pairs.iter().map(|(k, v)| format!("{}={}", k, v)).collect::<Vec<_>>().join("&")
+        pairs
+            .iter()
+            .map(|(k, v)| format!("{}={}", k, v))
+            .collect::<Vec<_>>()
+            .join("&")
     };
 
     let canonical_request = format!(
@@ -151,12 +157,7 @@ fn client() -> reqwest::Client {
 }
 
 /// Sign a request using comma-only separators (no spaces), like mc does.
-fn sign_request_compact(
-    method: &str,
-    url: &str,
-    headers: &mut Vec<(String, String)>,
-    body: &[u8],
-) {
+fn sign_request_compact(method: &str, url: &str, headers: &mut Vec<(String, String)>, body: &[u8]) {
     // Reuse the same signing logic but produce compact auth header
     let parsed = reqwest::Url::parse(url).unwrap();
     let host = parsed.host_str().unwrap();
@@ -199,7 +200,11 @@ fn sign_request_compact(
             })
             .collect();
         pairs.sort();
-        pairs.iter().map(|(k, v)| format!("{}={}", k, v)).collect::<Vec<_>>().join("&")
+        pairs
+            .iter()
+            .map(|(k, v)| format!("{}={}", k, v))
+            .collect::<Vec<_>>()
+            .join("&")
     };
 
     let canonical_request = format!(
@@ -242,11 +247,7 @@ fn sign_request_compact(
 }
 
 /// Build a signed request and send it.
-async fn s3_request(
-    method: &str,
-    url: &str,
-    body: Vec<u8>,
-) -> reqwest::Response {
+async fn s3_request(method: &str, url: &str, body: Vec<u8>) -> reqwest::Response {
     let mut headers = Vec::new();
     sign_request(method, url, &mut headers, &body);
 
@@ -336,11 +337,7 @@ async fn s3_request_with_headers(
 }
 
 /// Build a signed request with compact auth header (no spaces after commas).
-async fn s3_request_compact(
-    method: &str,
-    url: &str,
-    body: Vec<u8>,
-) -> reqwest::Response {
+async fn s3_request_compact(method: &str, url: &str, body: Vec<u8>) -> reqwest::Response {
     let mut headers = Vec::new();
     sign_request_compact(method, url, &mut headers, &body);
 
@@ -366,10 +363,7 @@ async fn s3_request_compact(
 }
 
 /// Build a PUT request with STREAMING-AWS4-HMAC-SHA256-PAYLOAD (AWS chunked encoding).
-async fn s3_put_chunked(
-    url: &str,
-    data: &[u8],
-) -> reqwest::Response {
+async fn s3_put_chunked(url: &str, data: &[u8]) -> reqwest::Response {
     let parsed = reqwest::Url::parse(url).unwrap();
     let host = parsed.host_str().unwrap();
     let port = parsed.port().unwrap();
@@ -388,7 +382,10 @@ async fn s3_put_chunked(
         ("host".to_string(), host_header.clone()),
         ("x-amz-content-sha256".to_string(), payload_hash.to_string()),
         ("x-amz-date".to_string(), amz_date.clone()),
-        ("x-amz-decoded-content-length".to_string(), data.len().to_string()),
+        (
+            "x-amz-decoded-content-length".to_string(),
+            data.len().to_string(),
+        ),
     ];
     sign_headers.sort_by(|a, b| a.0.cmp(&b.0));
 
@@ -446,9 +443,7 @@ async fn s3_put_chunked(
     );
     chunked_body.extend_from_slice(data);
     chunked_body.extend_from_slice(b"\r\n");
-    chunked_body.extend_from_slice(
-        format!("0;chunk-signature={}\r\n", chunk_sig).as_bytes(),
-    );
+    chunked_body.extend_from_slice(format!("0;chunk-signature={}\r\n", chunk_sig).as_bytes());
 
     client()
         .put(url)
@@ -472,6 +467,15 @@ fn extract_xml_tag(body: &str, tag: &str) -> Option<String> {
     Some(body[from..to].to_string())
 }
 
+async fn enable_bucket_versioning(base_url: &str, bucket: &str) -> reqwest::Response {
+    let xml = br#"<VersioningConfiguration><Status>Enabled</Status></VersioningConfiguration>"#;
+    s3_request(
+        "PUT",
+        &format!("{}/{}?versioning=", base_url, bucket),
+        xml.to_vec(),
+    )
+    .await
+}
 
 // ---- Tests ----
 
@@ -652,12 +656,7 @@ async fn test_list_objects() {
     )
     .await;
 
-    let resp = s3_request(
-        "GET",
-        &format!("{}/mybucket?list-type=2", base_url),
-        vec![],
-    )
-    .await;
+    let resp = s3_request("GET", &format!("{}/mybucket?list-type=2", base_url), vec![]).await;
     assert_eq!(resp.status(), 200);
     let body = resp.text().await.unwrap();
     assert!(body.contains("<Key>a.txt</Key>"));
@@ -697,21 +696,55 @@ async fn test_last_modified_http_date_format() {
     // HEAD should return RFC 7231 Last-Modified
     let resp = s3_request("HEAD", &format!("{}/mybucket/file.txt", base_url), vec![]).await;
     assert_eq!(resp.status(), 200);
-    let last_modified = resp.headers().get("last-modified").unwrap().to_str().unwrap();
+    let last_modified = resp
+        .headers()
+        .get("last-modified")
+        .unwrap()
+        .to_str()
+        .unwrap();
     // Should match pattern like "Mon, 17 Feb 2026 22:17:45 GMT"
-    assert!(last_modified.ends_with(" GMT"), "Last-Modified should end with GMT: {}", last_modified);
-    assert!(last_modified.contains(", "), "Last-Modified should contain comma-space: {}", last_modified);
+    assert!(
+        last_modified.ends_with(" GMT"),
+        "Last-Modified should end with GMT: {}",
+        last_modified
+    );
+    assert!(
+        last_modified.contains(", "),
+        "Last-Modified should contain comma-space: {}",
+        last_modified
+    );
     // Must NOT be ISO 8601 (no "T" between date and time digits)
-    assert!(!last_modified.contains("T0"), "Last-Modified must not be ISO 8601: {}", last_modified);
-    assert!(!last_modified.contains("T1"), "Last-Modified must not be ISO 8601: {}", last_modified);
-    assert!(!last_modified.contains("T2"), "Last-Modified must not be ISO 8601: {}", last_modified);
+    assert!(
+        !last_modified.contains("T0"),
+        "Last-Modified must not be ISO 8601: {}",
+        last_modified
+    );
+    assert!(
+        !last_modified.contains("T1"),
+        "Last-Modified must not be ISO 8601: {}",
+        last_modified
+    );
+    assert!(
+        !last_modified.contains("T2"),
+        "Last-Modified must not be ISO 8601: {}",
+        last_modified
+    );
 
     // GET should also return RFC 7231 Last-Modified
     let resp = s3_request("GET", &format!("{}/mybucket/file.txt", base_url), vec![]).await;
-    let last_modified = resp.headers().get("last-modified").unwrap().to_str().unwrap();
+    let last_modified = resp
+        .headers()
+        .get("last-modified")
+        .unwrap()
+        .to_str()
+        .unwrap();
     assert!(last_modified.ends_with(" GMT"));
     // Verify it parses as HTTP date (day-of-week, DD Mon YYYY HH:MM:SS GMT)
-    assert!(last_modified.len() > 25, "Last-Modified should be full HTTP date: {}", last_modified);
+    assert!(
+        last_modified.len() > 25,
+        "Last-Modified should be full HTTP date: {}",
+        last_modified
+    );
 }
 
 #[tokio::test]
@@ -723,11 +756,7 @@ async fn test_put_object_aws_chunked_encoding() {
     s3_request("PUT", &format!("{}/mybucket", base_url), vec![]).await;
 
     let data = b"hello chunked world";
-    let resp = s3_put_chunked(
-        &format!("{}/mybucket/chunked.txt", base_url),
-        data,
-    )
-    .await;
+    let resp = s3_put_chunked(&format!("{}/mybucket/chunked.txt", base_url), data).await;
     assert_eq!(resp.status(), 200);
     assert!(resp.headers().contains_key("etag"));
 
@@ -735,7 +764,11 @@ async fn test_put_object_aws_chunked_encoding() {
     let resp = s3_request("GET", &format!("{}/mybucket/chunked.txt", base_url), vec![]).await;
     assert_eq!(resp.status(), 200);
     let body = resp.bytes().await.unwrap();
-    assert_eq!(body.as_ref(), data, "Chunked upload content should be decoded");
+    assert_eq!(
+        body.as_ref(),
+        data,
+        "Chunked upload content should be decoded"
+    );
 }
 
 #[tokio::test]
@@ -753,7 +786,11 @@ async fn test_put_object_response_headers() {
     .await;
     assert_eq!(resp.status(), 200);
     let etag = resp.headers().get("etag").unwrap().to_str().unwrap();
-    assert!(etag.starts_with('"') && etag.ends_with('"'), "ETag should be quoted: {}", etag);
+    assert!(
+        etag.starts_with('"') && etag.ends_with('"'),
+        "ETag should be quoted: {}",
+        etag
+    );
 
     // HEAD should return Content-Type, Content-Length, ETag, Last-Modified
     let resp = s3_request("HEAD", &format!("{}/mybucket/file.txt", base_url), vec![]).await;
@@ -777,9 +814,24 @@ async fn test_delete_objects_batch() {
     let (base_url, _tmp) = start_server().await;
 
     s3_request("PUT", &format!("{}/mybucket", base_url), vec![]).await;
-    s3_request("PUT", &format!("{}/mybucket/a.txt", base_url), b"aaa".to_vec()).await;
-    s3_request("PUT", &format!("{}/mybucket/b.txt", base_url), b"bbb".to_vec()).await;
-    s3_request("PUT", &format!("{}/mybucket/c.txt", base_url), b"ccc".to_vec()).await;
+    s3_request(
+        "PUT",
+        &format!("{}/mybucket/a.txt", base_url),
+        b"aaa".to_vec(),
+    )
+    .await;
+    s3_request(
+        "PUT",
+        &format!("{}/mybucket/b.txt", base_url),
+        b"bbb".to_vec(),
+    )
+    .await;
+    s3_request(
+        "PUT",
+        &format!("{}/mybucket/c.txt", base_url),
+        b"ccc".to_vec(),
+    )
+    .await;
 
     // Batch delete a.txt and b.txt
     let delete_xml = r#"<?xml version="1.0" encoding="UTF-8"?>
@@ -796,7 +848,10 @@ async fn test_delete_objects_batch() {
     .await;
     assert_eq!(resp.status(), 200);
     let body = resp.text().await.unwrap();
-    assert!(body.contains("<Deleted>"), "Response should contain Deleted elements");
+    assert!(
+        body.contains("<Deleted>"),
+        "Response should contain Deleted elements"
+    );
     assert!(body.contains("<Key>a.txt</Key>"));
     assert!(body.contains("<Key>b.txt</Key>"));
 
@@ -825,7 +880,12 @@ async fn test_trailing_slash_bucket_routes() {
     assert_eq!(resp.status(), 200);
 
     // GET (list) with trailing slash
-    let resp = s3_request("GET", &format!("{}/mybucket/?list-type=2", base_url), vec![]).await;
+    let resp = s3_request(
+        "GET",
+        &format!("{}/mybucket/?list-type=2", base_url),
+        vec![],
+    )
+    .await;
     assert_eq!(resp.status(), 200);
 
     // DELETE with trailing slash
@@ -861,7 +921,10 @@ async fn test_chunked_upload_interrupted_then_retry() {
         ("host".to_string(), host_header.clone()),
         ("x-amz-content-sha256".to_string(), payload_hash.to_string()),
         ("x-amz-date".to_string(), amz_date.clone()),
-        ("x-amz-decoded-content-length".to_string(), "1000".to_string()),
+        (
+            "x-amz-decoded-content-length".to_string(),
+            "1000".to_string(),
+        ),
     ];
     sign_headers.sort_by(|a, b| a.0.cmp(&b.0));
 
@@ -879,7 +942,8 @@ async fn test_chunked_upload_interrupted_then_retry() {
     let scope = format!("{}/{}/s3/aws4_request", date_stamp, REGION);
     let string_to_sign = format!(
         "AWS4-HMAC-SHA256\n{}\n{}\n{}",
-        amz_date, scope,
+        amz_date,
+        scope,
         hex::encode(Sha256::digest(canonical_request.as_bytes()))
     );
     let key = format!("AWS4{}", SECRET_KEY);
@@ -929,7 +993,11 @@ async fn test_chunked_upload_interrupted_then_retry() {
     // Now do a proper chunked upload to the same key — this MUST succeed
     let good_data = b"hello after interrupted upload";
     let resp = s3_put_chunked(&url, good_data).await;
-    assert_eq!(resp.status(), 200, "Retry upload after interrupted should succeed");
+    assert_eq!(
+        resp.status(),
+        200,
+        "Retry upload after interrupted should succeed"
+    );
 
     // Verify content is from the successful retry, not the partial upload
     let resp = s3_request("GET", &url, vec![]).await;
@@ -970,7 +1038,10 @@ async fn test_chunked_upload_multi_chunk() {
         ("host".to_string(), host_header.clone()),
         ("x-amz-content-sha256".to_string(), payload_hash.to_string()),
         ("x-amz-date".to_string(), amz_date.clone()),
-        ("x-amz-decoded-content-length".to_string(), total_len.to_string()),
+        (
+            "x-amz-decoded-content-length".to_string(),
+            total_len.to_string(),
+        ),
     ];
     sign_headers.sort_by(|a, b| a.0.cmp(&b.0));
 
@@ -988,7 +1059,8 @@ async fn test_chunked_upload_multi_chunk() {
     let scope = format!("{}/{}/s3/aws4_request", date_stamp, REGION);
     let string_to_sign = format!(
         "AWS4-HMAC-SHA256\n{}\n{}\n{}",
-        amz_date, scope,
+        amz_date,
+        scope,
         hex::encode(Sha256::digest(canonical_request.as_bytes()))
     );
     let key = format!("AWS4{}", SECRET_KEY);
@@ -1024,9 +1096,7 @@ async fn test_chunked_upload_multi_chunk() {
         chunked_body.extend_from_slice(b"\r\n");
     }
     // Terminating chunk
-    chunked_body.extend_from_slice(
-        format!("0;chunk-signature={}\r\n", chunk_sig).as_bytes(),
-    );
+    chunked_body.extend_from_slice(format!("0;chunk-signature={}\r\n", chunk_sig).as_bytes());
 
     let resp = client()
         .put(&url)
@@ -1048,7 +1118,11 @@ async fn test_chunked_upload_multi_chunk() {
     assert_eq!(resp.status(), 200);
     let body = resp.bytes().await.unwrap();
     let expected = b"first chunk data second chunk data third chunk data";
-    assert_eq!(body.as_ref(), expected, "Multi-chunk content should be concatenated");
+    assert_eq!(
+        body.as_ref(),
+        expected,
+        "Multi-chunk content should be concatenated"
+    );
 
     // Verify content-length matches
     let resp = s3_request("HEAD", &url, vec![]).await;
@@ -1063,7 +1137,12 @@ async fn test_multipart_create_upload() {
     let (base_url, _tmp) = start_server().await;
     s3_request("PUT", &format!("{}/mybucket", base_url), vec![]).await;
 
-    let resp = s3_request("POST", &format!("{}/mybucket/large.bin?uploads=", base_url), vec![]).await;
+    let resp = s3_request(
+        "POST",
+        &format!("{}/mybucket/large.bin?uploads=", base_url),
+        vec![],
+    )
+    .await;
     assert_eq!(resp.status(), 200);
     let body = resp.text().await.unwrap();
     let upload_id = extract_xml_tag(&body, "UploadId").unwrap();
@@ -1074,12 +1153,20 @@ async fn test_multipart_create_upload() {
 async fn test_multipart_upload_part() {
     let (base_url, _tmp) = start_server().await;
     s3_request("PUT", &format!("{}/mybucket", base_url), vec![]).await;
-    let create = s3_request("POST", &format!("{}/mybucket/large.bin?uploads=", base_url), vec![]).await;
+    let create = s3_request(
+        "POST",
+        &format!("{}/mybucket/large.bin?uploads=", base_url),
+        vec![],
+    )
+    .await;
     let upload_id = extract_xml_tag(&create.text().await.unwrap(), "UploadId").unwrap();
 
     let resp = s3_request(
         "PUT",
-        &format!("{}/mybucket/large.bin?partNumber=1&uploadId={}", base_url, upload_id),
+        &format!(
+            "{}/mybucket/large.bin?partNumber=1&uploadId={}",
+            base_url, upload_id
+        ),
         b"part-one".to_vec(),
     )
     .await;
@@ -1092,25 +1179,48 @@ async fn test_multipart_upload_part() {
 async fn test_multipart_complete() {
     let (base_url, _tmp) = start_server().await;
     s3_request("PUT", &format!("{}/mybucket", base_url), vec![]).await;
-    let create = s3_request("POST", &format!("{}/mybucket/large.bin?uploads=", base_url), vec![]).await;
+    let create = s3_request(
+        "POST",
+        &format!("{}/mybucket/large.bin?uploads=", base_url),
+        vec![],
+    )
+    .await;
     let upload_id = extract_xml_tag(&create.text().await.unwrap(), "UploadId").unwrap();
 
     let p1 = vec![b'a'; 5 * 1024 * 1024];
     let p2 = b"tail".to_vec();
     let r1 = s3_request(
         "PUT",
-        &format!("{}/mybucket/large.bin?partNumber=1&uploadId={}", base_url, upload_id),
+        &format!(
+            "{}/mybucket/large.bin?partNumber=1&uploadId={}",
+            base_url, upload_id
+        ),
         p1.clone(),
     )
     .await;
-    let e1 = r1.headers().get("etag").unwrap().to_str().unwrap().to_string();
+    let e1 = r1
+        .headers()
+        .get("etag")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
     let r2 = s3_request(
         "PUT",
-        &format!("{}/mybucket/large.bin?partNumber=2&uploadId={}", base_url, upload_id),
+        &format!(
+            "{}/mybucket/large.bin?partNumber=2&uploadId={}",
+            base_url, upload_id
+        ),
         p2.clone(),
     )
     .await;
-    let e2 = r2.headers().get("etag").unwrap().to_str().unwrap().to_string();
+    let e2 = r2
+        .headers()
+        .get("etag")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
 
     let complete_xml = format!(
         "<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>{}</ETag></Part><Part><PartNumber>2</PartNumber><ETag>{}</ETag></Part></CompleteMultipartUpload>",
@@ -1133,26 +1243,171 @@ async fn test_multipart_complete() {
 }
 
 #[tokio::test]
+async fn test_multipart_complete_in_versioned_bucket_preserves_prior_versions() {
+    let (base_url, _tmp) = start_server().await;
+    assert_eq!(
+        s3_request("PUT", &format!("{}/mybucket", base_url), vec![])
+            .await
+            .status(),
+        200
+    );
+    assert_eq!(
+        enable_bucket_versioning(&base_url, "mybucket")
+            .await
+            .status(),
+        200
+    );
+
+    let create_v1 = s3_request(
+        "POST",
+        &format!("{}/mybucket/large.bin?uploads=", base_url),
+        vec![],
+    )
+    .await;
+    let upload_id_v1 = extract_xml_tag(&create_v1.text().await.unwrap(), "UploadId").unwrap();
+    let part_v1 = vec![b'a'; 5 * 1024 * 1024];
+    let upload_part_v1 = s3_request(
+        "PUT",
+        &format!(
+            "{}/mybucket/large.bin?partNumber=1&uploadId={}",
+            base_url, upload_id_v1
+        ),
+        part_v1.clone(),
+    )
+    .await;
+    let etag_v1 = upload_part_v1
+        .headers()
+        .get("etag")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+    let complete_v1 = s3_request(
+        "POST",
+        &format!("{}/mybucket/large.bin?uploadId={}", base_url, upload_id_v1),
+        format!(
+            "<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>{}</ETag></Part></CompleteMultipartUpload>",
+            etag_v1
+        )
+        .into_bytes(),
+    )
+    .await;
+    assert_eq!(complete_v1.status(), 200);
+    let version_id_v1 = complete_v1
+        .headers()
+        .get("x-amz-version-id")
+        .expect("multipart completion should return version id")
+        .to_str()
+        .unwrap()
+        .to_string();
+
+    let create_v2 = s3_request(
+        "POST",
+        &format!("{}/mybucket/large.bin?uploads=", base_url),
+        vec![],
+    )
+    .await;
+    let upload_id_v2 = extract_xml_tag(&create_v2.text().await.unwrap(), "UploadId").unwrap();
+    let part_v2 = vec![b'b'; 5 * 1024 * 1024];
+    let upload_part_v2 = s3_request(
+        "PUT",
+        &format!(
+            "{}/mybucket/large.bin?partNumber=1&uploadId={}",
+            base_url, upload_id_v2
+        ),
+        part_v2.clone(),
+    )
+    .await;
+    let etag_v2 = upload_part_v2
+        .headers()
+        .get("etag")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+    let complete_v2 = s3_request(
+        "POST",
+        &format!("{}/mybucket/large.bin?uploadId={}", base_url, upload_id_v2),
+        format!(
+            "<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>{}</ETag></Part></CompleteMultipartUpload>",
+            etag_v2
+        )
+        .into_bytes(),
+    )
+    .await;
+    assert_eq!(complete_v2.status(), 200);
+    let version_id_v2 = complete_v2
+        .headers()
+        .get("x-amz-version-id")
+        .expect("multipart overwrite should return version id")
+        .to_str()
+        .unwrap()
+        .to_string();
+    assert_ne!(version_id_v1, version_id_v2);
+
+    let current = s3_request("GET", &format!("{}/mybucket/large.bin", base_url), vec![]).await;
+    assert_eq!(current.status(), 200);
+    assert_eq!(current.bytes().await.unwrap().as_ref(), part_v2.as_slice());
+
+    let prior = s3_request(
+        "GET",
+        &format!(
+            "{}/mybucket/large.bin?versionId={}",
+            base_url, version_id_v1
+        ),
+        vec![],
+    )
+    .await;
+    assert_eq!(prior.status(), 200);
+    assert_eq!(prior.bytes().await.unwrap().as_ref(), part_v1.as_slice());
+}
+
+#[tokio::test]
 async fn test_multipart_get_part_number() {
     let (base_url, _tmp) = start_server().await;
     s3_request("PUT", &format!("{}/mybucket", base_url), vec![]).await;
-    let create = s3_request("POST", &format!("{}/mybucket/parts.bin?uploads=", base_url), vec![]).await;
+    let create = s3_request(
+        "POST",
+        &format!("{}/mybucket/parts.bin?uploads=", base_url),
+        vec![],
+    )
+    .await;
     let upload_id = extract_xml_tag(&create.text().await.unwrap(), "UploadId").unwrap();
 
     let p1 = vec![b'A'; 5 * 1024 * 1024];
     let p2 = vec![b'B'; 3 * 1024 * 1024];
     let r1 = s3_request(
         "PUT",
-        &format!("{}/mybucket/parts.bin?partNumber=1&uploadId={}", base_url, upload_id),
+        &format!(
+            "{}/mybucket/parts.bin?partNumber=1&uploadId={}",
+            base_url, upload_id
+        ),
         p1.clone(),
-    ).await;
-    let e1 = r1.headers().get("etag").unwrap().to_str().unwrap().to_string();
+    )
+    .await;
+    let e1 = r1
+        .headers()
+        .get("etag")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
     let r2 = s3_request(
         "PUT",
-        &format!("{}/mybucket/parts.bin?partNumber=2&uploadId={}", base_url, upload_id),
+        &format!(
+            "{}/mybucket/parts.bin?partNumber=2&uploadId={}",
+            base_url, upload_id
+        ),
         p2.clone(),
-    ).await;
-    let e2 = r2.headers().get("etag").unwrap().to_str().unwrap().to_string();
+    )
+    .await;
+    let e2 = r2
+        .headers()
+        .get("etag")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
 
     let complete_xml = format!(
         "<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>{}</ETag></Part><Part><PartNumber>2</PartNumber><ETag>{}</ETag></Part></CompleteMultipartUpload>",
@@ -1162,26 +1417,34 @@ async fn test_multipart_get_part_number() {
         "POST",
         &format!("{}/mybucket/parts.bin?uploadId={}", base_url, upload_id),
         complete_xml.into_bytes(),
-    ).await;
+    )
+    .await;
     assert_eq!(complete.status(), 200);
 
     // GET partNumber=1 should return only part 1 data
-    let get_p1 = s3_request("GET", &format!("{}/mybucket/parts.bin?partNumber=1", base_url), vec![]).await;
+    let get_p1 = s3_request(
+        "GET",
+        &format!("{}/mybucket/parts.bin?partNumber=1", base_url),
+        vec![],
+    )
+    .await;
     assert_eq!(get_p1.status(), 206);
     assert_eq!(
         get_p1.headers().get("content-length").unwrap(),
         &(5 * 1024 * 1024).to_string()
     );
-    assert_eq!(
-        get_p1.headers().get("x-amz-mp-parts-count").unwrap(),
-        "2"
-    );
+    assert_eq!(get_p1.headers().get("x-amz-mp-parts-count").unwrap(), "2");
     let body1 = get_p1.bytes().await.unwrap();
     assert_eq!(body1.len(), 5 * 1024 * 1024);
     assert!(body1.iter().all(|&b| b == b'A'));
 
     // GET partNumber=2 should return only part 2 data
-    let get_p2 = s3_request("GET", &format!("{}/mybucket/parts.bin?partNumber=2", base_url), vec![]).await;
+    let get_p2 = s3_request(
+        "GET",
+        &format!("{}/mybucket/parts.bin?partNumber=2", base_url),
+        vec![],
+    )
+    .await;
     assert_eq!(get_p2.status(), 206);
     assert_eq!(
         get_p2.headers().get("content-length").unwrap(),
@@ -1192,39 +1455,64 @@ async fn test_multipart_get_part_number() {
     assert!(body2.iter().all(|&b| b == b'B'));
 
     // HEAD partNumber=1 should return part-specific headers
-    let head_p1 = s3_request("HEAD", &format!("{}/mybucket/parts.bin?partNumber=1", base_url), vec![]).await;
+    let head_p1 = s3_request(
+        "HEAD",
+        &format!("{}/mybucket/parts.bin?partNumber=1", base_url),
+        vec![],
+    )
+    .await;
     assert_eq!(head_p1.status(), 206);
     assert_eq!(
         head_p1.headers().get("content-length").unwrap(),
         &(5 * 1024 * 1024).to_string()
     );
-    assert_eq!(
-        head_p1.headers().get("x-amz-mp-parts-count").unwrap(),
-        "2"
-    );
+    assert_eq!(head_p1.headers().get("x-amz-mp-parts-count").unwrap(), "2");
 }
 
 #[tokio::test]
 async fn test_multipart_complete_part_too_small() {
     let (base_url, _tmp) = start_server().await;
     s3_request("PUT", &format!("{}/mybucket", base_url), vec![]).await;
-    let create = s3_request("POST", &format!("{}/mybucket/large.bin?uploads=", base_url), vec![]).await;
+    let create = s3_request(
+        "POST",
+        &format!("{}/mybucket/large.bin?uploads=", base_url),
+        vec![],
+    )
+    .await;
     let upload_id = extract_xml_tag(&create.text().await.unwrap(), "UploadId").unwrap();
 
     let r1 = s3_request(
         "PUT",
-        &format!("{}/mybucket/large.bin?partNumber=1&uploadId={}", base_url, upload_id),
+        &format!(
+            "{}/mybucket/large.bin?partNumber=1&uploadId={}",
+            base_url, upload_id
+        ),
         b"tiny".to_vec(),
     )
     .await;
-    let e1 = r1.headers().get("etag").unwrap().to_str().unwrap().to_string();
+    let e1 = r1
+        .headers()
+        .get("etag")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
     let r2 = s3_request(
         "PUT",
-        &format!("{}/mybucket/large.bin?partNumber=2&uploadId={}", base_url, upload_id),
+        &format!(
+            "{}/mybucket/large.bin?partNumber=2&uploadId={}",
+            base_url, upload_id
+        ),
         b"tail".to_vec(),
     )
     .await;
-    let e2 = r2.headers().get("etag").unwrap().to_str().unwrap().to_string();
+    let e2 = r2
+        .headers()
+        .get("etag")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
 
     let complete_xml = format!(
         "<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>{}</ETag></Part><Part><PartNumber>2</PartNumber><ETag>{}</ETag></Part></CompleteMultipartUpload>",
@@ -1245,7 +1533,12 @@ async fn test_multipart_complete_part_too_small() {
 async fn test_multipart_abort() {
     let (base_url, _tmp) = start_server().await;
     s3_request("PUT", &format!("{}/mybucket", base_url), vec![]).await;
-    let create = s3_request("POST", &format!("{}/mybucket/large.bin?uploads=", base_url), vec![]).await;
+    let create = s3_request(
+        "POST",
+        &format!("{}/mybucket/large.bin?uploads=", base_url),
+        vec![],
+    )
+    .await;
     let upload_id = extract_xml_tag(&create.text().await.unwrap(), "UploadId").unwrap();
 
     let abort = s3_request(
@@ -1261,12 +1554,20 @@ async fn test_multipart_abort() {
 async fn test_multipart_list_parts() {
     let (base_url, _tmp) = start_server().await;
     s3_request("PUT", &format!("{}/mybucket", base_url), vec![]).await;
-    let create = s3_request("POST", &format!("{}/mybucket/large.bin?uploads=", base_url), vec![]).await;
+    let create = s3_request(
+        "POST",
+        &format!("{}/mybucket/large.bin?uploads=", base_url),
+        vec![],
+    )
+    .await;
     let upload_id = extract_xml_tag(&create.text().await.unwrap(), "UploadId").unwrap();
 
     s3_request(
         "PUT",
-        &format!("{}/mybucket/large.bin?partNumber=1&uploadId={}", base_url, upload_id),
+        &format!(
+            "{}/mybucket/large.bin?partNumber=1&uploadId={}",
+            base_url, upload_id
+        ),
         b"part-one".to_vec(),
     )
     .await;
@@ -1286,7 +1587,12 @@ async fn test_multipart_list_parts() {
 async fn test_multipart_list_uploads() {
     let (base_url, _tmp) = start_server().await;
     s3_request("PUT", &format!("{}/mybucket", base_url), vec![]).await;
-    let create = s3_request("POST", &format!("{}/mybucket/large.bin?uploads=", base_url), vec![]).await;
+    let create = s3_request(
+        "POST",
+        &format!("{}/mybucket/large.bin?uploads=", base_url),
+        vec![],
+    )
+    .await;
     let upload_id = extract_xml_tag(&create.text().await.unwrap(), "UploadId").unwrap();
 
     let list = s3_request("GET", &format!("{}/mybucket?uploads=", base_url), vec![]).await;
@@ -1316,7 +1622,12 @@ async fn test_multipart_no_such_upload() {
 async fn test_multipart_excluded_from_list_objects() {
     let (base_url, _tmp) = start_server().await;
     s3_request("PUT", &format!("{}/mybucket", base_url), vec![]).await;
-    let create = s3_request("POST", &format!("{}/mybucket/in-progress.bin?uploads=", base_url), vec![]).await;
+    let create = s3_request(
+        "POST",
+        &format!("{}/mybucket/in-progress.bin?uploads=", base_url),
+        vec![],
+    )
+    .await;
     let upload_id = extract_xml_tag(&create.text().await.unwrap(), "UploadId").unwrap();
     s3_request(
         "PUT",
@@ -1338,25 +1649,48 @@ async fn test_multipart_excluded_from_list_objects() {
 async fn test_multipart_etag_format() {
     let (base_url, _tmp) = start_server().await;
     s3_request("PUT", &format!("{}/mybucket", base_url), vec![]).await;
-    let create = s3_request("POST", &format!("{}/mybucket/etag.bin?uploads=", base_url), vec![]).await;
+    let create = s3_request(
+        "POST",
+        &format!("{}/mybucket/etag.bin?uploads=", base_url),
+        vec![],
+    )
+    .await;
     let upload_id = extract_xml_tag(&create.text().await.unwrap(), "UploadId").unwrap();
 
     let p1 = vec![b'a'; 5 * 1024 * 1024];
     let p2 = b"tail".to_vec();
     let r1 = s3_request(
         "PUT",
-        &format!("{}/mybucket/etag.bin?partNumber=1&uploadId={}", base_url, upload_id),
+        &format!(
+            "{}/mybucket/etag.bin?partNumber=1&uploadId={}",
+            base_url, upload_id
+        ),
         p1,
     )
     .await;
-    let e1 = r1.headers().get("etag").unwrap().to_str().unwrap().to_string();
+    let e1 = r1
+        .headers()
+        .get("etag")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
     let r2 = s3_request(
         "PUT",
-        &format!("{}/mybucket/etag.bin?partNumber=2&uploadId={}", base_url, upload_id),
+        &format!(
+            "{}/mybucket/etag.bin?partNumber=2&uploadId={}",
+            base_url, upload_id
+        ),
         p2,
     )
     .await;
-    let e2 = r2.headers().get("etag").unwrap().to_str().unwrap().to_string();
+    let e2 = r2
+        .headers()
+        .get("etag")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
     let complete_xml = format!(
         "<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>{}</ETag></Part><Part><PartNumber>2</PartNumber><ETag>{}</ETag></Part></CompleteMultipartUpload>",
         e1, e2
@@ -1379,7 +1713,12 @@ async fn test_copy_object_basic() {
     s3_request("PUT", &format!("{}/mybucket", base_url), vec![]).await;
 
     // Upload source object
-    s3_request("PUT", &format!("{}/mybucket/src.txt", base_url), b"copy me".to_vec()).await;
+    s3_request(
+        "PUT",
+        &format!("{}/mybucket/src.txt", base_url),
+        b"copy me".to_vec(),
+    )
+    .await;
 
     // Copy to new key in same bucket
     let resp = s3_request_with_headers(
@@ -1408,7 +1747,12 @@ async fn test_copy_object_cross_bucket() {
     s3_request("PUT", &format!("{}/src-bucket", base_url), vec![]).await;
     s3_request("PUT", &format!("{}/dst-bucket", base_url), vec![]).await;
 
-    s3_request("PUT", &format!("{}/src-bucket/file.txt", base_url), b"cross bucket".to_vec()).await;
+    s3_request(
+        "PUT",
+        &format!("{}/src-bucket/file.txt", base_url),
+        b"cross bucket".to_vec(),
+    )
+    .await;
 
     let resp = s3_request_with_headers(
         "PUT",
@@ -1450,7 +1794,11 @@ async fn test_copy_object_metadata_copy() {
     // HEAD destination — content-type should be preserved
     let resp = s3_request("HEAD", &format!("{}/mybucket/dst.txt", base_url), vec![]).await;
     assert_eq!(
-        resp.headers().get("content-type").unwrap().to_str().unwrap(),
+        resp.headers()
+            .get("content-type")
+            .unwrap()
+            .to_str()
+            .unwrap(),
         "text/plain"
     );
 }
@@ -1483,7 +1831,11 @@ async fn test_copy_object_metadata_replace() {
 
     let resp = s3_request("HEAD", &format!("{}/mybucket/dst.txt", base_url), vec![]).await;
     assert_eq!(
-        resp.headers().get("content-type").unwrap().to_str().unwrap(),
+        resp.headers()
+            .get("content-type")
+            .unwrap()
+            .to_str()
+            .unwrap(),
         "application/json"
     );
 }
@@ -1509,7 +1861,12 @@ async fn test_copy_object_source_not_found() {
 async fn test_copy_object_no_leading_slash() {
     let (base_url, _tmp) = start_server().await;
     s3_request("PUT", &format!("{}/mybucket", base_url), vec![]).await;
-    s3_request("PUT", &format!("{}/mybucket/src.txt", base_url), b"no slash".to_vec()).await;
+    s3_request(
+        "PUT",
+        &format!("{}/mybucket/src.txt", base_url),
+        b"no slash".to_vec(),
+    )
+    .await;
 
     // Copy source without leading slash
     let resp = s3_request_with_headers(
@@ -1538,7 +1895,10 @@ fn presign_url(base_url: &str, method: &str, path: &str, expires_secs: u64) -> S
     let credential = format!("{}/{}/{}/s3/aws4_request", ACCESS_KEY, date_stamp, REGION);
 
     let mut qs_params = vec![
-        ("X-Amz-Algorithm".to_string(), "AWS4-HMAC-SHA256".to_string()),
+        (
+            "X-Amz-Algorithm".to_string(),
+            "AWS4-HMAC-SHA256".to_string(),
+        ),
         ("X-Amz-Credential".to_string(), credential.clone()),
         ("X-Amz-Date".to_string(), amz_date.clone()),
         ("X-Amz-Expires".to_string(), expires_secs.to_string()),
@@ -1561,7 +1921,8 @@ fn presign_url(base_url: &str, method: &str, path: &str, expires_secs: u64) -> S
     let scope = format!("{}/{}/s3/aws4_request", date_stamp, REGION);
     let string_to_sign = format!(
         "AWS4-HMAC-SHA256\n{}\n{}\n{}",
-        amz_date, scope,
+        amz_date,
+        scope,
         hex::encode(Sha256::digest(canonical_request.as_bytes()))
     );
 
@@ -1582,7 +1943,10 @@ fn presign_url(base_url: &str, method: &str, path: &str, expires_secs: u64) -> S
     mac.update(string_to_sign.as_bytes());
     let signature = hex::encode(mac.finalize().into_bytes());
 
-    format!("{}{}?{}&X-Amz-Signature={}", base_url, path, canonical_qs, signature)
+    format!(
+        "{}{}?{}&X-Amz-Signature={}",
+        base_url, path, canonical_qs, signature
+    )
 }
 
 fn percent_encode_s3(input: &str) -> String {
@@ -1620,7 +1984,12 @@ async fn test_presigned_put_object() {
 
     let presigned = presign_url(&base_url, "PUT", "/presign-put-bucket/uploaded.txt", 300);
     let body = b"uploaded via presigned PUT";
-    let resp = client().put(&presigned).body(body.to_vec()).send().await.unwrap();
+    let resp = client()
+        .put(&presigned)
+        .body(body.to_vec())
+        .send()
+        .await
+        .unwrap();
     assert_eq!(resp.status(), 200);
 
     let url = format!("{}/presign-put-bucket/uploaded.txt", base_url);
@@ -1642,7 +2011,14 @@ async fn test_presigned_head_object() {
     let presigned = presign_url(&base_url, "HEAD", "/presign-head-bucket/test.txt", 300);
     let resp = client().head(&presigned).send().await.unwrap();
     assert_eq!(resp.status(), 200);
-    assert_eq!(resp.headers().get("content-length").unwrap().to_str().unwrap(), "9");
+    assert_eq!(
+        resp.headers()
+            .get("content-length")
+            .unwrap()
+            .to_str()
+            .unwrap(),
+        "9"
+    );
 }
 
 #[tokio::test]
@@ -1655,7 +2031,8 @@ async fn test_presigned_expired_url() {
     s3_request("PUT", &url, b"data".to_vec()).await;
 
     // Manually craft a presigned URL with a timestamp from 2 hours ago
-    let parsed = reqwest::Url::parse(&format!("{}/presign-expire-bucket/test.txt", base_url)).unwrap();
+    let parsed =
+        reqwest::Url::parse(&format!("{}/presign-expire-bucket/test.txt", base_url)).unwrap();
     let host = parsed.host_str().unwrap();
     let port = parsed.port().unwrap();
     let host_header = format!("{}:{}", host, port);
@@ -1666,7 +2043,10 @@ async fn test_presigned_expired_url() {
     let credential = format!("{}/{}/{}/s3/aws4_request", ACCESS_KEY, date_stamp, REGION);
 
     let mut qs_params = vec![
-        ("X-Amz-Algorithm".to_string(), "AWS4-HMAC-SHA256".to_string()),
+        (
+            "X-Amz-Algorithm".to_string(),
+            "AWS4-HMAC-SHA256".to_string(),
+        ),
         ("X-Amz-Credential".to_string(), credential.clone()),
         ("X-Amz-Date".to_string(), amz_date.clone()),
         ("X-Amz-Expires".to_string(), "60".to_string()),
@@ -1686,7 +2066,8 @@ async fn test_presigned_expired_url() {
     let scope = format!("{}/{}/s3/aws4_request", date_stamp, REGION);
     let string_to_sign = format!(
         "AWS4-HMAC-SHA256\n{}\n{}\n{}",
-        amz_date, scope,
+        amz_date,
+        scope,
         hex::encode(Sha256::digest(canonical_request.as_bytes()))
     );
 
@@ -1772,7 +2153,12 @@ async fn test_console_presign_simple_key() {
     // Create bucket and upload object via S3 API
     s3_request("PUT", &format!("{}/cpresign-bucket", base_url), vec![]).await;
     let body = b"console presign test";
-    s3_request("PUT", &format!("{}/cpresign-bucket/test.txt", base_url), body.to_vec()).await;
+    s3_request(
+        "PUT",
+        &format!("{}/cpresign-bucket/test.txt", base_url),
+        body.to_vec(),
+    )
+    .await;
 
     // Login to console API
     let session = console_login(&base_url).await;
@@ -1789,11 +2175,18 @@ async fn test_console_presign_simple_key() {
         .unwrap();
     assert_eq!(resp.status(), 200);
     let json: serde_json::Value = resp.json().await.unwrap();
-    let presigned_url = json["url"].as_str().expect("response should have url field");
+    let presigned_url = json["url"]
+        .as_str()
+        .expect("response should have url field");
 
     // Fetch the presigned URL without any auth — should succeed
     let resp = client().get(presigned_url).send().await.unwrap();
-    assert_eq!(resp.status(), 200, "presigned URL should return 200, got {}", resp.status());
+    assert_eq!(
+        resp.status(),
+        200,
+        "presigned URL should return 200, got {}",
+        resp.status()
+    );
     assert_eq!(resp.bytes().await.unwrap().as_ref(), body);
 }
 
@@ -1825,10 +2218,17 @@ async fn test_console_presign_key_with_spaces() {
         .unwrap();
     assert_eq!(resp.status(), 200);
     let json: serde_json::Value = resp.json().await.unwrap();
-    let presigned_url = json["url"].as_str().expect("response should have url field");
+    let presigned_url = json["url"]
+        .as_str()
+        .expect("response should have url field");
 
     let resp = client().get(presigned_url).send().await.unwrap();
-    assert_eq!(resp.status(), 200, "presigned URL for key with spaces should return 200, got {}", resp.status());
+    assert_eq!(
+        resp.status(),
+        200,
+        "presigned URL for key with spaces should return 200, got {}",
+        resp.status()
+    );
     assert_eq!(resp.bytes().await.unwrap().as_ref(), body);
 }
 
@@ -1858,10 +2258,17 @@ async fn test_console_presign_nested_key() {
         .unwrap();
     assert_eq!(resp.status(), 200);
     let json: serde_json::Value = resp.json().await.unwrap();
-    let presigned_url = json["url"].as_str().expect("response should have url field");
+    let presigned_url = json["url"]
+        .as_str()
+        .expect("response should have url field");
 
     let resp = client().get(presigned_url).send().await.unwrap();
-    assert_eq!(resp.status(), 200, "presigned URL for nested key should return 200, got {}", resp.status());
+    assert_eq!(
+        resp.status(),
+        200,
+        "presigned URL for nested key should return 200, got {}",
+        resp.status()
+    );
     assert_eq!(resp.bytes().await.unwrap().as_ref(), body);
 }
 
@@ -2166,17 +2573,27 @@ async fn test_folder_marker_with_children() {
     .await;
     let body = resp.text().await.unwrap();
     assert!(body.contains("<Prefix>docs/</Prefix>"), "body: {}", body);
-    assert!(!body.contains("readme.txt"), "readme.txt should not appear at root");
+    assert!(
+        !body.contains("readme.txt"),
+        "readme.txt should not appear at root"
+    );
 
     // List inside docs/ — should see readme.txt
     let resp = s3_request(
         "GET",
-        &format!("{}/mybucket?list-type=2&prefix=docs%2F&delimiter=%2F", base_url),
+        &format!(
+            "{}/mybucket?list-type=2&prefix=docs%2F&delimiter=%2F",
+            base_url
+        ),
         vec![],
     )
     .await;
     let body = resp.text().await.unwrap();
-    assert!(body.contains("<Key>docs/readme.txt</Key>"), "body: {}", body);
+    assert!(
+        body.contains("<Key>docs/readme.txt</Key>"),
+        "body: {}",
+        body
+    );
 
     // Delete folder marker — the child object should still exist
     s3_request("DELETE", &format!("{}/mybucket/docs/", base_url), vec![]).await;
@@ -2196,7 +2613,12 @@ async fn test_delete_folder_marker() {
 
     // Create and then delete folder marker
     s3_request("PUT", &format!("{}/mybucket/empty-dir/", base_url), vec![]).await;
-    s3_request("DELETE", &format!("{}/mybucket/empty-dir/", base_url), vec![]).await;
+    s3_request(
+        "DELETE",
+        &format!("{}/mybucket/empty-dir/", base_url),
+        vec![],
+    )
+    .await;
 
     // HeadObject should now return 404
     let resp = s3_request("HEAD", &format!("{}/mybucket/empty-dir/", base_url), vec![]).await;
@@ -2211,7 +2633,9 @@ async fn start_server_ec() -> (String, TempDir) {
     let data_dir = tmp.path().to_str().unwrap().to_string();
 
     // Use 1KB chunk size for easy multi-chunk testing
-    let storage = FilesystemStorage::new(&data_dir, true, 1024, 0).await.unwrap();
+    let storage = FilesystemStorage::new(&data_dir, true, 1024, 0)
+        .await
+        .unwrap();
 
     let config = Config {
         port: 0,
@@ -2237,7 +2661,12 @@ async fn start_server_ec() -> (String, TempDir) {
     let base_url = format!("http://{}", addr);
 
     tokio::spawn(async move {
-        axum::serve(listener, app.into_make_service_with_connect_info::<std::net::SocketAddr>()).await.unwrap();
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await
+        .unwrap();
     });
 
     (base_url, tmp)
@@ -2259,11 +2688,136 @@ async fn test_ec_put_and_get_object() {
     .await;
 
     // GET should return identical data
-    let resp = s3_request("GET", &format!("{}/testbucket/bigfile.bin", base_url), vec![]).await;
+    let resp = s3_request(
+        "GET",
+        &format!("{}/testbucket/bigfile.bin", base_url),
+        vec![],
+    )
+    .await;
     assert_eq!(resp.status(), 200);
     let body = resp.bytes().await.unwrap();
     assert_eq!(body.len(), 3 * 1024);
     assert_eq!(&body[..], &data[..]);
+}
+
+#[tokio::test]
+async fn test_ec_multipart_complete_in_versioned_bucket_preserves_prior_versions() {
+    let (base_url, _tmp) = start_server_ec().await;
+    assert_eq!(
+        s3_request("PUT", &format!("{}/mybucket", base_url), vec![])
+            .await
+            .status(),
+        200
+    );
+    assert_eq!(
+        enable_bucket_versioning(&base_url, "mybucket")
+            .await
+            .status(),
+        200
+    );
+
+    let create_v1 = s3_request(
+        "POST",
+        &format!("{}/mybucket/chunked.bin?uploads=", base_url),
+        vec![],
+    )
+    .await;
+    let upload_id_v1 = extract_xml_tag(&create_v1.text().await.unwrap(), "UploadId").unwrap();
+    let part_v1 = vec![b'a'; 2048];
+    let upload_part_v1 = s3_request(
+        "PUT",
+        &format!(
+            "{}/mybucket/chunked.bin?partNumber=1&uploadId={}",
+            base_url, upload_id_v1
+        ),
+        part_v1.clone(),
+    )
+    .await;
+    let etag_v1 = upload_part_v1
+        .headers()
+        .get("etag")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+    let complete_v1 = s3_request(
+        "POST",
+        &format!("{}/mybucket/chunked.bin?uploadId={}", base_url, upload_id_v1),
+        format!(
+            "<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>{}</ETag></Part></CompleteMultipartUpload>",
+            etag_v1
+        )
+        .into_bytes(),
+    )
+    .await;
+    assert_eq!(complete_v1.status(), 200);
+    let version_id_v1 = complete_v1
+        .headers()
+        .get("x-amz-version-id")
+        .expect("erasure-coded multipart completion should return version id")
+        .to_str()
+        .unwrap()
+        .to_string();
+
+    let create_v2 = s3_request(
+        "POST",
+        &format!("{}/mybucket/chunked.bin?uploads=", base_url),
+        vec![],
+    )
+    .await;
+    let upload_id_v2 = extract_xml_tag(&create_v2.text().await.unwrap(), "UploadId").unwrap();
+    let part_v2 = vec![b'b'; 3072];
+    let upload_part_v2 = s3_request(
+        "PUT",
+        &format!(
+            "{}/mybucket/chunked.bin?partNumber=1&uploadId={}",
+            base_url, upload_id_v2
+        ),
+        part_v2.clone(),
+    )
+    .await;
+    let etag_v2 = upload_part_v2
+        .headers()
+        .get("etag")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+    let complete_v2 = s3_request(
+        "POST",
+        &format!("{}/mybucket/chunked.bin?uploadId={}", base_url, upload_id_v2),
+        format!(
+            "<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>{}</ETag></Part></CompleteMultipartUpload>",
+            etag_v2
+        )
+        .into_bytes(),
+    )
+    .await;
+    assert_eq!(complete_v2.status(), 200);
+    let version_id_v2 = complete_v2
+        .headers()
+        .get("x-amz-version-id")
+        .expect("erasure-coded multipart overwrite should return version id")
+        .to_str()
+        .unwrap()
+        .to_string();
+    assert_ne!(version_id_v1, version_id_v2);
+
+    let current = s3_request("GET", &format!("{}/mybucket/chunked.bin", base_url), vec![]).await;
+    assert_eq!(current.status(), 200);
+    assert_eq!(current.bytes().await.unwrap().as_ref(), part_v2.as_slice());
+
+    let prior = s3_request(
+        "GET",
+        &format!(
+            "{}/mybucket/chunked.bin?versionId={}",
+            base_url, version_id_v1
+        ),
+        vec![],
+    )
+    .await;
+    assert_eq!(prior.status(), 200);
+    assert_eq!(prior.bytes().await.unwrap().as_ref(), part_v1.as_slice());
 }
 
 #[tokio::test]
@@ -2333,10 +2887,20 @@ async fn test_ec_delete_object() {
     let ec_dir = tmp.path().join("buckets/testbucket/todelete.txt.ec");
     assert!(ec_dir.exists(), "EC dir should exist after PUT");
 
-    s3_request("DELETE", &format!("{}/testbucket/todelete.txt", base_url), vec![]).await;
+    s3_request(
+        "DELETE",
+        &format!("{}/testbucket/todelete.txt", base_url),
+        vec![],
+    )
+    .await;
 
     assert!(!ec_dir.exists(), "EC dir should be removed after DELETE");
-    let resp = s3_request("GET", &format!("{}/testbucket/todelete.txt", base_url), vec![]).await;
+    let resp = s3_request(
+        "GET",
+        &format!("{}/testbucket/todelete.txt", base_url),
+        vec![],
+    )
+    .await;
     assert_eq!(resp.status(), 404);
 }
 
@@ -2366,9 +2930,24 @@ async fn test_ec_etag_matches_flat_file() {
     )
     .await;
 
-    let etag_flat = resp_flat.headers().get("etag").unwrap().to_str().unwrap().to_string();
-    let etag_ec = resp_ec.headers().get("etag").unwrap().to_str().unwrap().to_string();
-    assert_eq!(etag_flat, etag_ec, "ETags should match between flat and EC storage");
+    let etag_flat = resp_flat
+        .headers()
+        .get("etag")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+    let etag_ec = resp_ec
+        .headers()
+        .get("etag")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+    assert_eq!(
+        etag_flat, etag_ec,
+        "ETags should match between flat and EC storage"
+    );
 }
 
 #[tokio::test]
@@ -2397,8 +2976,10 @@ async fn test_ec_bitrot_detection() {
             // If we get a response, reading the body should fail or status should be 500
             if resp.status() == 200 {
                 let body_result = resp.bytes().await;
-                assert!(body_result.is_err() || body_result.unwrap() != vec![0xAA; 2048],
-                    "Should not return original uncorrupted data");
+                assert!(
+                    body_result.is_err() || body_result.unwrap() != vec![0xAA; 2048],
+                    "Should not return original uncorrupted data"
+                );
             }
         }
         Err(_) => {
@@ -2437,7 +3018,11 @@ async fn test_ec_list_objects() {
     assert!(body.contains("<Key>file1.txt</Key>"), "body: {}", body);
     assert!(body.contains("<Key>file2.txt</Key>"), "body: {}", body);
     // .ec directories should NOT appear as objects
-    assert!(!body.contains(".ec"), "body should not contain .ec: {}", body);
+    assert!(
+        !body.contains(".ec"),
+        "body should not contain .ec: {}",
+        body
+    );
 }
 
 // --- Checksum tests ---
@@ -2464,23 +3049,45 @@ async fn test_put_object_with_crc32_checksum() {
     .await;
     assert_eq!(resp.status(), 200);
     assert_eq!(
-        resp.headers().get("x-amz-checksum-crc32").unwrap().to_str().unwrap(),
+        resp.headers()
+            .get("x-amz-checksum-crc32")
+            .unwrap()
+            .to_str()
+            .unwrap(),
         crc_b64
     );
 
     // GET should return the checksum header
-    let resp = s3_request("GET", &format!("{}/checksum-bucket/test.txt", base_url), vec![]).await;
+    let resp = s3_request(
+        "GET",
+        &format!("{}/checksum-bucket/test.txt", base_url),
+        vec![],
+    )
+    .await;
     assert_eq!(resp.status(), 200);
     assert_eq!(
-        resp.headers().get("x-amz-checksum-crc32").unwrap().to_str().unwrap(),
+        resp.headers()
+            .get("x-amz-checksum-crc32")
+            .unwrap()
+            .to_str()
+            .unwrap(),
         crc_b64
     );
 
     // HEAD should also return it
-    let resp = s3_request("HEAD", &format!("{}/checksum-bucket/test.txt", base_url), vec![]).await;
+    let resp = s3_request(
+        "HEAD",
+        &format!("{}/checksum-bucket/test.txt", base_url),
+        vec![],
+    )
+    .await;
     assert_eq!(resp.status(), 200);
     assert_eq!(
-        resp.headers().get("x-amz-checksum-crc32").unwrap().to_str().unwrap(),
+        resp.headers()
+            .get("x-amz-checksum-crc32")
+            .unwrap()
+            .to_str()
+            .unwrap(),
         crc_b64
     );
 }
@@ -2500,7 +3107,11 @@ async fn test_put_object_with_wrong_checksum() {
     .await;
     assert_eq!(resp.status(), 400);
     let body = resp.text().await.unwrap();
-    assert!(body.contains("BadDigest"), "expected BadDigest error: {}", body);
+    assert!(
+        body.contains("BadDigest"),
+        "expected BadDigest error: {}",
+        body
+    );
 }
 
 #[tokio::test]
@@ -2521,7 +3132,12 @@ async fn test_put_object_with_algorithm_only() {
     assert_eq!(resp.status(), 200);
 
     // Verify a CRC32C header was returned
-    let checksum = resp.headers().get("x-amz-checksum-crc32c").unwrap().to_str().unwrap();
+    let checksum = resp
+        .headers()
+        .get("x-amz-checksum-crc32c")
+        .unwrap()
+        .to_str()
+        .unwrap();
     assert!(!checksum.is_empty());
 
     // Verify it's the correct value
@@ -2571,7 +3187,11 @@ async fn test_put_object_with_sha256_checksum() {
     .await;
     assert_eq!(resp.status(), 200);
     assert_eq!(
-        resp.headers().get("x-amz-checksum-sha256").unwrap().to_str().unwrap(),
+        resp.headers()
+            .get("x-amz-checksum-sha256")
+            .unwrap()
+            .to_str()
+            .unwrap(),
         hash_b64
     );
 }
@@ -2584,7 +3204,9 @@ async fn start_server_parity(parity_shards: u32) -> (String, TempDir) {
     let data_dir = tmp.path().to_str().unwrap().to_string();
 
     // 100-byte chunks for easy multi-chunk testing
-    let storage = FilesystemStorage::new(&data_dir, true, 100, parity_shards).await.unwrap();
+    let storage = FilesystemStorage::new(&data_dir, true, 100, parity_shards)
+        .await
+        .unwrap();
 
     let config = Config {
         port: 0,
@@ -2610,7 +3232,12 @@ async fn start_server_parity(parity_shards: u32) -> (String, TempDir) {
     let base_url = format!("http://{}", addr);
 
     tokio::spawn(async move {
-        axum::serve(listener, app.into_make_service_with_connect_info::<std::net::SocketAddr>()).await.unwrap();
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await
+        .unwrap();
     });
 
     (base_url, tmp)
@@ -2636,9 +3263,9 @@ async fn test_parity_write_creates_parity_chunks() {
     assert_eq!(entries.len(), 7, "expected 4 data + 2 parity + 1 manifest");
 
     // Verify manifest
-    let manifest: serde_json::Value = serde_json::from_str(
-        &std::fs::read_to_string(ec_dir.join("manifest.json")).unwrap()
-    ).unwrap();
+    let manifest: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(ec_dir.join("manifest.json")).unwrap())
+            .unwrap();
     assert_eq!(manifest["version"], 2);
     assert_eq!(manifest["chunk_count"], 4);
     assert_eq!(manifest["parity_shards"], 2);
@@ -2662,7 +3289,12 @@ async fn test_parity_read_healthy() {
     s3_request("PUT", &format!("{}/parity-test", base_url), vec![]).await;
 
     let data = vec![0xCDu8; 350];
-    s3_request("PUT", &format!("{}/parity-test/file.bin", base_url), data.clone()).await;
+    s3_request(
+        "PUT",
+        &format!("{}/parity-test/file.bin", base_url),
+        data.clone(),
+    )
+    .await;
 
     let resp = s3_request("GET", &format!("{}/parity-test/file.bin", base_url), vec![]).await;
     assert_eq!(resp.status(), 200);
@@ -2677,7 +3309,12 @@ async fn test_parity_recovery_corrupted_chunk() {
     s3_request("PUT", &format!("{}/parity-test", base_url), vec![]).await;
 
     let data = vec![0xEFu8; 350];
-    s3_request("PUT", &format!("{}/parity-test/file.bin", base_url), data.clone()).await;
+    s3_request(
+        "PUT",
+        &format!("{}/parity-test/file.bin", base_url),
+        data.clone(),
+    )
+    .await;
 
     // Corrupt data chunk 1 (overwrite with zeros)
     let chunk_path = tmp.path().join("buckets/parity-test/file.bin.ec/000001");
@@ -2697,7 +3334,12 @@ async fn test_parity_recovery_missing_chunk() {
     s3_request("PUT", &format!("{}/parity-test", base_url), vec![]).await;
 
     let data = vec![0x42u8; 350];
-    s3_request("PUT", &format!("{}/parity-test/file.bin", base_url), data.clone()).await;
+    s3_request(
+        "PUT",
+        &format!("{}/parity-test/file.bin", base_url),
+        data.clone(),
+    )
+    .await;
 
     // Delete data chunk 0
     let chunk_path = tmp.path().join("buckets/parity-test/file.bin.ec/000000");
@@ -2720,14 +3362,17 @@ async fn test_parity_too_many_failures() {
 
     // Delete 3 chunks (more than m=2 parity can handle)
     for i in 0..3 {
-        let chunk_path = tmp.path().join(format!("buckets/parity-test/file.bin.ec/{:06}", i));
+        let chunk_path = tmp
+            .path()
+            .join(format!("buckets/parity-test/file.bin.ec/{:06}", i));
         std::fs::remove_file(&chunk_path).unwrap();
     }
 
     // The server will return an error or drop the connection when RS recovery fails.
     // Since the object is streamed, the error may manifest as a connection reset
     // rather than a clean HTTP error status.
-    let result = s3_request_result("GET", &format!("{}/parity-test/file.bin", base_url), vec![]).await;
+    let result =
+        s3_request_result("GET", &format!("{}/parity-test/file.bin", base_url), vec![]).await;
     match result {
         Err(_) => {} // Connection error — expected
         Ok(resp) => {
@@ -2755,7 +3400,12 @@ async fn test_parity_range_read_degraded() {
         data.extend(std::iter::repeat(i + 1).take(chunk_len));
     }
     assert_eq!(data.len(), 350);
-    s3_request("PUT", &format!("{}/parity-test/file.bin", base_url), data.clone()).await;
+    s3_request(
+        "PUT",
+        &format!("{}/parity-test/file.bin", base_url),
+        data.clone(),
+    )
+    .await;
 
     // Corrupt chunk 1
     let chunk_path = tmp.path().join("buckets/parity-test/file.bin.ec/000001");
@@ -2782,7 +3432,12 @@ async fn test_parity_backward_compat_v1_manifest() {
     s3_request("PUT", &format!("{}/compat-test", base_url), vec![]).await;
 
     let data = vec![0xAAu8; 2048];
-    s3_request("PUT", &format!("{}/compat-test/file.bin", base_url), data.clone()).await;
+    s3_request(
+        "PUT",
+        &format!("{}/compat-test/file.bin", base_url),
+        data.clone(),
+    )
+    .await;
 
     let resp = s3_request("GET", &format!("{}/compat-test/file.bin", base_url), vec![]).await;
     assert_eq!(resp.status(), 200);
@@ -2797,16 +3452,26 @@ async fn test_parity_empty_object() {
     s3_request("PUT", &format!("{}/parity-test", base_url), vec![]).await;
 
     // Empty object — should skip parity
-    s3_request("PUT", &format!("{}/parity-test/empty.bin", base_url), vec![]).await;
+    s3_request(
+        "PUT",
+        &format!("{}/parity-test/empty.bin", base_url),
+        vec![],
+    )
+    .await;
 
     let ec_dir = tmp.path().join("buckets/parity-test/empty.bin.ec");
-    let manifest: serde_json::Value = serde_json::from_str(
-        &std::fs::read_to_string(ec_dir.join("manifest.json")).unwrap()
-    ).unwrap();
+    let manifest: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(ec_dir.join("manifest.json")).unwrap())
+            .unwrap();
     assert_eq!(manifest["version"], 1); // no parity for empty
     assert!(manifest.get("parity_shards").is_none() || manifest["parity_shards"].is_null());
 
-    let resp = s3_request("GET", &format!("{}/parity-test/empty.bin", base_url), vec![]).await;
+    let resp = s3_request(
+        "GET",
+        &format!("{}/parity-test/empty.bin", base_url),
+        vec![],
+    )
+    .await;
     assert_eq!(resp.status(), 200);
     assert_eq!(resp.bytes().await.unwrap().len(), 0);
 }
@@ -2817,17 +3482,28 @@ async fn test_parity_empty_object() {
 async fn test_put_and_get_object_tagging() {
     let (base, _tmp) = start_server().await;
     s3_request("PUT", &format!("{}/tag-bucket", base), vec![]).await;
-    s3_request("PUT", &format!("{}/tag-bucket/obj.txt", base), b"hello".to_vec()).await;
+    s3_request(
+        "PUT",
+        &format!("{}/tag-bucket/obj.txt", base),
+        b"hello".to_vec(),
+    )
+    .await;
 
     let tagging_xml = r#"<Tagging><TagSet><Tag><Key>env</Key><Value>prod</Value></Tag><Tag><Key>team</Key><Value>platform</Value></Tag></TagSet></Tagging>"#;
     let resp = s3_request(
         "PUT",
         &format!("{}/tag-bucket/obj.txt?tagging", base),
         tagging_xml.as_bytes().to_vec(),
-    ).await;
+    )
+    .await;
     assert_eq!(resp.status(), 200);
 
-    let resp = s3_request("GET", &format!("{}/tag-bucket/obj.txt?tagging", base), vec![]).await;
+    let resp = s3_request(
+        "GET",
+        &format!("{}/tag-bucket/obj.txt?tagging", base),
+        vec![],
+    )
+    .await;
     assert_eq!(resp.status(), 200);
     let body = resp.text().await.unwrap();
     assert!(body.contains("<Key>env</Key>"));
@@ -2840,9 +3516,19 @@ async fn test_put_and_get_object_tagging() {
 async fn test_get_object_tagging_no_tags() {
     let (base, _tmp) = start_server().await;
     s3_request("PUT", &format!("{}/notag-bucket", base), vec![]).await;
-    s3_request("PUT", &format!("{}/notag-bucket/obj.txt", base), b"hello".to_vec()).await;
+    s3_request(
+        "PUT",
+        &format!("{}/notag-bucket/obj.txt", base),
+        b"hello".to_vec(),
+    )
+    .await;
 
-    let resp = s3_request("GET", &format!("{}/notag-bucket/obj.txt?tagging", base), vec![]).await;
+    let resp = s3_request(
+        "GET",
+        &format!("{}/notag-bucket/obj.txt?tagging", base),
+        vec![],
+    )
+    .await;
     assert_eq!(resp.status(), 200);
     let body = resp.text().await.unwrap();
     assert!(body.contains("<Tagging>") || body.contains("<TagSet"));
@@ -2853,15 +3539,36 @@ async fn test_get_object_tagging_no_tags() {
 async fn test_delete_object_tagging() {
     let (base, _tmp) = start_server().await;
     s3_request("PUT", &format!("{}/deltag-bucket", base), vec![]).await;
-    s3_request("PUT", &format!("{}/deltag-bucket/obj.txt", base), b"hello".to_vec()).await;
+    s3_request(
+        "PUT",
+        &format!("{}/deltag-bucket/obj.txt", base),
+        b"hello".to_vec(),
+    )
+    .await;
 
-    let tagging_xml = r#"<Tagging><TagSet><Tag><Key>env</Key><Value>prod</Value></Tag></TagSet></Tagging>"#;
-    s3_request("PUT", &format!("{}/deltag-bucket/obj.txt?tagging", base), tagging_xml.as_bytes().to_vec()).await;
+    let tagging_xml =
+        r#"<Tagging><TagSet><Tag><Key>env</Key><Value>prod</Value></Tag></TagSet></Tagging>"#;
+    s3_request(
+        "PUT",
+        &format!("{}/deltag-bucket/obj.txt?tagging", base),
+        tagging_xml.as_bytes().to_vec(),
+    )
+    .await;
 
-    let resp = s3_request("DELETE", &format!("{}/deltag-bucket/obj.txt?tagging", base), vec![]).await;
+    let resp = s3_request(
+        "DELETE",
+        &format!("{}/deltag-bucket/obj.txt?tagging", base),
+        vec![],
+    )
+    .await;
     assert_eq!(resp.status(), 204);
 
-    let resp = s3_request("GET", &format!("{}/deltag-bucket/obj.txt?tagging", base), vec![]).await;
+    let resp = s3_request(
+        "GET",
+        &format!("{}/deltag-bucket/obj.txt?tagging", base),
+        vec![],
+    )
+    .await;
     assert_eq!(resp.status(), 200);
     let body = resp.text().await.unwrap();
     assert!(!body.contains("<Tag>"));
@@ -2872,7 +3579,12 @@ async fn test_get_object_tagging_no_such_key() {
     let (base, _tmp) = start_server().await;
     s3_request("PUT", &format!("{}/nsk-bucket", base), vec![]).await;
 
-    let resp = s3_request("GET", &format!("{}/nsk-bucket/nonexistent.txt?tagging", base), vec![]).await;
+    let resp = s3_request(
+        "GET",
+        &format!("{}/nsk-bucket/nonexistent.txt?tagging", base),
+        vec![],
+    )
+    .await;
     assert_eq!(resp.status(), 404);
     let body = resp.text().await.unwrap();
     assert!(body.contains("NoSuchKey"));
@@ -2882,7 +3594,12 @@ async fn test_get_object_tagging_no_such_key() {
 async fn test_put_object_tagging_too_many_tags() {
     let (base, _tmp) = start_server().await;
     s3_request("PUT", &format!("{}/manytagbucket", base), vec![]).await;
-    s3_request("PUT", &format!("{}/manytagbucket/obj.txt", base), b"data".to_vec()).await;
+    s3_request(
+        "PUT",
+        &format!("{}/manytagbucket/obj.txt", base),
+        b"data".to_vec(),
+    )
+    .await;
 
     let tags: String = (1..=11)
         .map(|i| format!("<Tag><Key>key{}</Key><Value>val{}</Value></Tag>", i, i))
@@ -2892,7 +3609,8 @@ async fn test_put_object_tagging_too_many_tags() {
         "PUT",
         &format!("{}/manytagbucket/obj.txt?tagging", base),
         tagging_xml.into_bytes(),
-    ).await;
+    )
+    .await;
     assert_eq!(resp.status(), 400);
     let body = resp.text().await.unwrap();
     assert!(body.contains("InvalidArgument"));
@@ -2902,15 +3620,24 @@ async fn test_put_object_tagging_too_many_tags() {
 async fn test_put_object_tagging_key_too_long() {
     let (base, _tmp) = start_server().await;
     s3_request("PUT", &format!("{}/longtag-bucket", base), vec![]).await;
-    s3_request("PUT", &format!("{}/longtag-bucket/obj.txt", base), b"data".to_vec()).await;
+    s3_request(
+        "PUT",
+        &format!("{}/longtag-bucket/obj.txt", base),
+        b"data".to_vec(),
+    )
+    .await;
 
     let long_key = "k".repeat(129);
-    let tagging_xml = format!("<Tagging><TagSet><Tag><Key>{}</Key><Value>v</Value></Tag></TagSet></Tagging>", long_key);
+    let tagging_xml = format!(
+        "<Tagging><TagSet><Tag><Key>{}</Key><Value>v</Value></Tag></TagSet></Tagging>",
+        long_key
+    );
     let resp = s3_request(
         "PUT",
         &format!("{}/longtag-bucket/obj.txt?tagging", base),
         tagging_xml.into_bytes(),
-    ).await;
+    )
+    .await;
     assert_eq!(resp.status(), 400);
     let body = resp.text().await.unwrap();
     assert!(body.contains("InvalidArgument"));
@@ -2920,15 +3647,24 @@ async fn test_put_object_tagging_key_too_long() {
 async fn test_put_object_tagging_value_too_long() {
     let (base, _tmp) = start_server().await;
     s3_request("PUT", &format!("{}/longval-bucket", base), vec![]).await;
-    s3_request("PUT", &format!("{}/longval-bucket/obj.txt", base), b"data".to_vec()).await;
+    s3_request(
+        "PUT",
+        &format!("{}/longval-bucket/obj.txt", base),
+        b"data".to_vec(),
+    )
+    .await;
 
     let long_val = "v".repeat(257);
-    let tagging_xml = format!("<Tagging><TagSet><Tag><Key>k</Key><Value>{}</Value></Tag></TagSet></Tagging>", long_val);
+    let tagging_xml = format!(
+        "<Tagging><TagSet><Tag><Key>k</Key><Value>{}</Value></Tag></TagSet></Tagging>",
+        long_val
+    );
     let resp = s3_request(
         "PUT",
         &format!("{}/longval-bucket/obj.txt?tagging", base),
         tagging_xml.into_bytes(),
-    ).await;
+    )
+    .await;
     assert_eq!(resp.status(), 400);
     let body = resp.text().await.unwrap();
     assert!(body.contains("InvalidArgument"));
@@ -2942,25 +3678,46 @@ async fn test_upload_part_copy_full() {
     // Create source bucket and object
     s3_request("PUT", &format!("{}/src-upc", base), vec![]).await;
     let src_data: Vec<u8> = (0u8..255).cycle().take(5 * 1024 * 1024).collect(); // 5 MiB
-    s3_request("PUT", &format!("{}/src-upc/source.bin", base), src_data.clone()).await;
+    s3_request(
+        "PUT",
+        &format!("{}/src-upc/source.bin", base),
+        src_data.clone(),
+    )
+    .await;
 
     // Create destination bucket and start multipart upload
     s3_request("PUT", &format!("{}/dst-upc", base), vec![]).await;
-    let create = s3_request("POST", &format!("{}/dst-upc/dest.bin?uploads=", base), vec![]).await;
+    let create = s3_request(
+        "POST",
+        &format!("{}/dst-upc/dest.bin?uploads=", base),
+        vec![],
+    )
+    .await;
     let upload_id = extract_xml_tag(&create.text().await.unwrap(), "UploadId").unwrap();
 
     // UploadPartCopy: copy full source as part 1
     let resp = s3_request_with_headers(
         "PUT",
-        &format!("{}/dst-upc/dest.bin?partNumber=1&uploadId={}", base, upload_id),
+        &format!(
+            "{}/dst-upc/dest.bin?partNumber=1&uploadId={}",
+            base, upload_id
+        ),
         vec![],
         vec![("x-amz-copy-source", "/src-upc/source.bin")],
-    ).await;
+    )
+    .await;
     assert_eq!(resp.status(), 200, "upload_part_copy should return 200");
     let body = resp.text().await.unwrap();
-    assert!(body.contains("<CopyPartResult>"), "response should be CopyPartResult XML, got: {}", body);
+    assert!(
+        body.contains("<CopyPartResult>"),
+        "response should be CopyPartResult XML, got: {}",
+        body
+    );
     let etag = extract_xml_tag(&body, "ETag").unwrap();
-    assert!(etag.starts_with('"') && etag.ends_with('"'), "ETag should be quoted");
+    assert!(
+        etag.starts_with('"') && etag.ends_with('"'),
+        "ETag should be quoted"
+    );
 
     // Complete the multipart upload
     let complete_xml = format!(
@@ -2971,7 +3728,8 @@ async fn test_upload_part_copy_full() {
         "POST",
         &format!("{}/dst-upc/dest.bin?uploadId={}", base, upload_id),
         complete_xml.into_bytes(),
-    ).await;
+    )
+    .await;
     assert_eq!(complete.status(), 200);
 
     // Verify content matches source
@@ -2992,23 +3750,40 @@ async fn test_upload_part_copy_range() {
     let part2: Vec<u8> = vec![b'B'; 1024];
     let mut src_data = part1.clone();
     src_data.extend_from_slice(&part2);
-    s3_request("PUT", &format!("{}/src-upcr/source.bin", base), src_data.clone()).await;
+    s3_request(
+        "PUT",
+        &format!("{}/src-upcr/source.bin", base),
+        src_data.clone(),
+    )
+    .await;
 
     // Create destination and start multipart upload
     s3_request("PUT", &format!("{}/dst-upcr", base), vec![]).await;
-    let create = s3_request("POST", &format!("{}/dst-upcr/dest.bin?uploads=", base), vec![]).await;
+    let create = s3_request(
+        "POST",
+        &format!("{}/dst-upcr/dest.bin?uploads=", base),
+        vec![],
+    )
+    .await;
     let upload_id = extract_xml_tag(&create.text().await.unwrap(), "UploadId").unwrap();
 
     // Part 1: bytes 0 to (5MiB - 1)
     let r1 = s3_request_with_headers(
         "PUT",
-        &format!("{}/dst-upcr/dest.bin?partNumber=1&uploadId={}", base, upload_id),
+        &format!(
+            "{}/dst-upcr/dest.bin?partNumber=1&uploadId={}",
+            base, upload_id
+        ),
         vec![],
         vec![
             ("x-amz-copy-source", "/src-upcr/source.bin"),
-            ("x-amz-copy-source-range", &format!("bytes=0-{}", 5 * 1024 * 1024 - 1)),
+            (
+                "x-amz-copy-source-range",
+                &format!("bytes=0-{}", 5 * 1024 * 1024 - 1),
+            ),
         ],
-    ).await;
+    )
+    .await;
     assert_eq!(r1.status(), 200);
     let body1 = r1.text().await.unwrap();
     assert!(body1.contains("<CopyPartResult>"));
@@ -3017,13 +3792,20 @@ async fn test_upload_part_copy_range() {
     // Part 2: remaining bytes
     let r2 = s3_request_with_headers(
         "PUT",
-        &format!("{}/dst-upcr/dest.bin?partNumber=2&uploadId={}", base, upload_id),
+        &format!(
+            "{}/dst-upcr/dest.bin?partNumber=2&uploadId={}",
+            base, upload_id
+        ),
         vec![],
         vec![
             ("x-amz-copy-source", "/src-upcr/source.bin"),
-            ("x-amz-copy-source-range", &format!("bytes={}-{}", 5 * 1024 * 1024, src_data.len() - 1)),
+            (
+                "x-amz-copy-source-range",
+                &format!("bytes={}-{}", 5 * 1024 * 1024, src_data.len() - 1),
+            ),
         ],
-    ).await;
+    )
+    .await;
     assert_eq!(r2.status(), 200);
     let body2 = r2.text().await.unwrap();
     assert!(body2.contains("<CopyPartResult>"));
@@ -3041,7 +3823,8 @@ async fn test_upload_part_copy_range() {
         "POST",
         &format!("{}/dst-upcr/dest.bin?uploadId={}", base, upload_id),
         complete_xml.into_bytes(),
-    ).await;
+    )
+    .await;
     assert_eq!(complete.status(), 200);
 
     // Verify reconstructed content matches original source

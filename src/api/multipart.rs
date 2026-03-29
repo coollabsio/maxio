@@ -120,6 +120,9 @@ pub async fn complete_multipart_upload(
     let mut builder = Response::builder()
         .status(StatusCode::OK)
         .header("content-type", "application/xml");
+    if let Some(vid) = &result.version_id {
+        builder = builder.header("x-amz-version-id", vid.as_str());
+    }
     if let (Some(algo), Some(val)) = (&result.checksum_algorithm, &result.checksum_value) {
         builder = builder.header(algo.header_name(), val.as_str());
     }
@@ -233,7 +236,9 @@ pub(super) fn map_storage_err(err: StorageError) -> S3Error {
     match err {
         StorageError::ChecksumMismatch(_) => S3Error::bad_checksum("x-amz-checksum"),
         StorageError::UploadNotFound(upload_id) => S3Error::no_such_upload(&upload_id),
-        StorageError::InvalidKey(msg) if msg.contains("part too small") => S3Error::entity_too_small(),
+        StorageError::InvalidKey(msg) if msg.contains("part too small") => {
+            S3Error::entity_too_small()
+        }
         StorageError::InvalidKey(msg)
             if msg.contains("part")
                 || msg.contains("etag")
@@ -272,11 +277,21 @@ fn parse_complete_parts(xml: &str) -> Result<Vec<(u32, String)>, S3Error> {
             },
             Ok(quick_xml::events::Event::Text(e)) => {
                 if in_part_number {
-                    let value = e.unescape().map_err(|_| S3Error::malformed_xml())?.into_owned();
-                    part_number = Some(value.parse::<u32>().map_err(|_| S3Error::invalid_part("invalid part number"))?);
+                    let value = e
+                        .unescape()
+                        .map_err(|_| S3Error::malformed_xml())?
+                        .into_owned();
+                    part_number = Some(
+                        value
+                            .parse::<u32>()
+                            .map_err(|_| S3Error::invalid_part("invalid part number"))?,
+                    );
                     in_part_number = false;
                 } else if in_etag {
-                    let value = e.unescape().map_err(|_| S3Error::malformed_xml())?.into_owned();
+                    let value = e
+                        .unescape()
+                        .map_err(|_| S3Error::malformed_xml())?
+                        .into_owned();
                     let normalized = if value.starts_with('"') && value.ends_with('"') {
                         value
                     } else {

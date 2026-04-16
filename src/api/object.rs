@@ -12,7 +12,10 @@ use tokio_util::io::ReaderStream;
 use crate::error::S3Error;
 use crate::server::AppState;
 use crate::storage::{ChecksumAlgorithm, StorageError};
-use crate::xml::{response::to_xml, types::{CopyObjectResult, CopyPartResult, Tag, TagSet, Tagging}};
+use crate::xml::{
+    response::to_xml,
+    types::{CopyObjectResult, CopyPartResult, Tag, TagSet, Tagging},
+};
 
 use super::multipart;
 
@@ -104,7 +107,10 @@ pub async fn put_object(
         use md5::Digest;
         use tokio::io::AsyncReadExt;
         let mut buf = Vec::new();
-        reader.read_to_end(&mut buf).await.map_err(S3Error::internal)?;
+        reader
+            .read_to_end(&mut buf)
+            .await
+            .map_err(S3Error::internal)?;
         let computed_hash = md5::Md5::digest(&buf);
         use base64::Engine;
         let computed_md5 = base64::engine::general_purpose::STANDARD.encode(computed_hash);
@@ -157,7 +163,10 @@ fn parse_copy_source(headers: &HeaderMap) -> Result<(String, String), S3Error> {
 }
 
 /// Parse `x-amz-copy-source-range: bytes=start-end` into (start, end) inclusive.
-fn parse_copy_source_range(headers: &HeaderMap, src_size: u64) -> Result<Option<(u64, u64)>, S3Error> {
+fn parse_copy_source_range(
+    headers: &HeaderMap,
+    src_size: u64,
+) -> Result<Option<(u64, u64)>, S3Error> {
     let header = match headers
         .get("x-amz-copy-source-range")
         .and_then(|v| v.to_str().ok())
@@ -300,7 +309,11 @@ async fn copy_object(
             .and_then(|v| v.to_str().ok())
             .unwrap_or("application/octet-stream")
             .to_string(),
-        _ => return Err(S3Error::invalid_argument("invalid x-amz-metadata-directive")),
+        _ => {
+            return Err(S3Error::invalid_argument(
+                "invalid x-amz-metadata-directive",
+            ));
+        }
     };
 
     // Propagate source checksum algorithm so it's recomputed during copy
@@ -392,7 +405,9 @@ fn check_conditions(
 ) -> Option<ConditionalResult> {
     let if_match = headers.get("if-match").and_then(|v| v.to_str().ok());
     let if_none_match = headers.get("if-none-match").and_then(|v| v.to_str().ok());
-    let if_modified_since = headers.get("if-modified-since").and_then(|v| v.to_str().ok());
+    let if_modified_since = headers
+        .get("if-modified-since")
+        .and_then(|v| v.to_str().ok());
     let if_unmodified_since = headers
         .get("if-unmodified-since")
         .and_then(|v| v.to_str().ok());
@@ -564,9 +579,7 @@ pub async fn get_object(
             .unwrap());
     }
 
-    let range_header = headers
-        .get("range")
-        .and_then(|v| v.to_str().ok());
+    let range_header = headers.get("range").and_then(|v| v.to_str().ok());
 
     if let Some(range_str) = range_header {
         let meta = state
@@ -606,7 +619,10 @@ pub async fn get_object(
                     .status(StatusCode::PARTIAL_CONTENT)
                     .header("Content-Type", &meta.content_type)
                     .header("Content-Length", length.to_string())
-                    .header("Content-Range", format!("bytes {}-{}/{}", start, end, meta.size))
+                    .header(
+                        "Content-Range",
+                        format!("bytes {}-{}/{}", start, end, meta.size),
+                    )
                     .header("Accept-Ranges", "bytes")
                     .header("ETag", &meta.etag)
                     .header("Last-Modified", to_http_date(&meta.last_modified))
@@ -770,6 +786,12 @@ pub async fn delete_object(
             .await;
     }
 
+    match state.storage.head_bucket(&bucket).await {
+        Ok(true) => {}
+        Ok(false) => return Err(S3Error::no_such_bucket(&bucket)),
+        Err(e) => return Err(S3Error::internal(e)),
+    }
+
     // Permanent version deletion
     if let Some(version_id) = params.get("versionId") {
         let deleted_meta = state
@@ -789,7 +811,10 @@ pub async fn delete_object(
         return Ok(builder.body(Body::empty()).unwrap());
     }
 
-    let result = state.storage.delete_object(&bucket, &key).await
+    let result = state
+        .storage
+        .delete_object(&bucket, &key)
+        .await
         .map_err(|e| S3Error::internal(e))?;
 
     let mut builder = Response::builder().status(StatusCode::NO_CONTENT);
@@ -810,7 +835,8 @@ pub async fn post_object(
     body: Body,
 ) -> Result<Response<Body>, S3Error> {
     if params.contains_key("uploads") {
-        return multipart::create_multipart_upload(State(state), Path((bucket, key)), headers).await;
+        return multipart::create_multipart_upload(State(state), Path((bucket, key)), headers)
+            .await;
     }
     if params.contains_key("uploadId") {
         return multipart::complete_multipart_upload(
@@ -821,7 +847,9 @@ pub async fn post_object(
         )
         .await;
     }
-    Err(S3Error::not_implemented("Unsupported POST object operation"))
+    Err(S3Error::not_implemented(
+        "Unsupported POST object operation",
+    ))
 }
 
 const DELETE_BODY_MAX: usize = 1024 * 1024;
@@ -832,6 +860,12 @@ pub async fn delete_objects(
     Path(bucket): Path<String>,
     body: Body,
 ) -> Result<Response<Body>, S3Error> {
+    match state.storage.head_bucket(&bucket).await {
+        Ok(true) => {}
+        Ok(false) => return Err(S3Error::no_such_bucket(&bucket)),
+        Err(e) => return Err(S3Error::internal(e)),
+    }
+
     let bytes = axum::body::to_bytes(body, DELETE_BODY_MAX)
         .await
         .map_err(|e| S3Error::internal(e))?;
@@ -875,10 +909,8 @@ pub async fn delete_objects(
         if let Ok((key, delete_result)) = result {
             match delete_result {
                 Ok(dr) => {
-                    let mut entry = format!(
-                        "<Deleted><Key>{}</Key>",
-                        quick_xml::escape::escape(&key)
-                    );
+                    let mut entry =
+                        format!("<Deleted><Key>{}</Key>", quick_xml::escape::escape(&key));
                     if let Some(vid) = &dr.version_id {
                         entry.push_str(&format!("<VersionId>{}</VersionId>", vid));
                     }
@@ -1150,7 +1182,9 @@ pub async fn get_object_tagging(
         .collect();
     tag_entries.sort_by(|a, b| a.key.cmp(&b.key));
 
-    let tagging = Tagging { tag_set: TagSet { tags: tag_entries } };
+    let tagging = Tagging {
+        tag_set: TagSet { tags: tag_entries },
+    };
     let xml = to_xml(&tagging).map_err(S3Error::internal)?;
     Ok(Response::builder()
         .status(StatusCode::OK)
@@ -1207,14 +1241,20 @@ pub async fn put_object_tagging(
     }
 
     if tags.len() > 10 {
-        return Err(S3Error::invalid_argument("Object tags cannot exceed 10 entries"));
+        return Err(S3Error::invalid_argument(
+            "Object tags cannot exceed 10 entries",
+        ));
     }
     for (k, v) in &tags {
         if k.len() > 128 {
-            return Err(S3Error::invalid_argument("Tag key exceeds maximum length of 128 characters"));
+            return Err(S3Error::invalid_argument(
+                "Tag key exceeds maximum length of 128 characters",
+            ));
         }
         if v.len() > 256 {
-            return Err(S3Error::invalid_argument("Tag value exceeds maximum length of 256 characters"));
+            return Err(S3Error::invalid_argument(
+                "Tag value exceeds maximum length of 256 characters",
+            ));
         }
     }
 

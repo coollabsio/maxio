@@ -950,9 +950,6 @@ impl FilesystemStorage {
         key: &str,
     ) -> Result<DeleteResult, StorageError> {
         validate_key(key)?;
-        if !self.head_bucket(bucket).await? {
-            return Err(StorageError::NotFound(bucket.to_string()));
-        }
 
         let versioned = self.is_versioned(bucket).await.unwrap_or(false);
         if versioned {

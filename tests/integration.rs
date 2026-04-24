@@ -1,6 +1,7 @@
 use maxio::config::Config;
 use maxio::server::{self, AppState};
 use maxio::storage::filesystem::FilesystemStorage;
+use maxio::storage::keys::Keyring;
 use std::sync::Arc;
 use tempfile::TempDir;
 
@@ -19,7 +20,8 @@ async fn start_server() -> (String, TempDir) {
     let tmp = TempDir::new().unwrap();
     let data_dir = tmp.path().to_str().unwrap().to_string();
 
-    let storage = FilesystemStorage::new(&data_dir, false, 10 * 1024 * 1024, 0)
+    let keyring = Arc::new(Keyring::load(&data_dir, None).await.unwrap());
+    let storage = FilesystemStorage::new(&data_dir, false, 10 * 1024 * 1024, 0, keyring)
         .await
         .unwrap();
 
@@ -30,6 +32,7 @@ async fn start_server() -> (String, TempDir) {
         access_key: ACCESS_KEY.to_string(),
         secret_key: SECRET_KEY.to_string(),
         region: REGION.to_string(),
+        master_key: None,
         erasure_coding: false,
         chunk_size: 10 * 1024 * 1024,
         parity_shards: 0,
@@ -566,6 +569,103 @@ async fn test_delete_bucket() {
     // Should be gone
     let resp = s3_request("HEAD", &format!("{}/to-delete", base_url), vec![]).await;
     assert_eq!(resp.status(), 404);
+}
+
+// Regression: delete_bucket must succeed after full object lifecycle
+// (put + delete) even when metadata sidecars or empty dirs remain.
+#[tokio::test]
+async fn test_delete_bucket_after_object_lifecycle() {
+    let (base_url, _tmp) = start_server().await;
+
+    s3_request("PUT", &format!("{}/bucket-one", base_url), vec![]).await;
+    let r = s3_request("PUT", &format!("{}/bucket-one/f.txt", base_url), b"x".to_vec()).await;
+    assert_eq!(r.status(), 200);
+    let r = s3_request("DELETE", &format!("{}/bucket-one/f.txt", base_url), vec![]).await;
+    assert_eq!(r.status(), 204);
+
+    let r = s3_request("DELETE", &format!("{}/bucket-one", base_url), vec![]).await;
+    assert_eq!(r.status(), 204, "bucket delete should succeed after object removed");
+
+    let r = s3_request("HEAD", &format!("{}/bucket-one", base_url), vec![]).await;
+    assert_eq!(r.status(), 404);
+}
+
+// Regression: nested keys leave deep directory trees; delete_bucket must
+// sweep empty parents.
+#[tokio::test]
+async fn test_delete_bucket_with_nested_path() {
+    let (base_url, _tmp) = start_server().await;
+
+    s3_request("PUT", &format!("{}/bucket-two", base_url), vec![]).await;
+    let r = s3_request(
+        "PUT",
+        &format!("{}/bucket-two/a/b/c/d.txt", base_url),
+        b"y".to_vec(),
+    )
+    .await;
+    assert_eq!(r.status(), 200);
+    let r = s3_request("DELETE", &format!("{}/bucket-two/a/b/c/d.txt", base_url), vec![]).await;
+    assert_eq!(r.status(), 204);
+
+    let r = s3_request("DELETE", &format!("{}/bucket-two", base_url), vec![]).await;
+    assert_eq!(r.status(), 204, "bucket delete should sweep empty nested dirs");
+}
+
+// Ensure we did not weaken the real emptiness check.
+#[tokio::test]
+async fn test_delete_bucket_rejects_real_object() {
+    let (base_url, _tmp) = start_server().await;
+
+    s3_request("PUT", &format!("{}/bucket-three", base_url), vec![]).await;
+    s3_request("PUT", &format!("{}/bucket-three/stay.txt", base_url), b"z".to_vec()).await;
+
+    let r = s3_request("DELETE", &format!("{}/bucket-three", base_url), vec![]).await;
+    assert_eq!(r.status(), 409);
+
+    // Bucket still exists.
+    let r = s3_request("HEAD", &format!("{}/bucket-three", base_url), vec![]).await;
+    assert_eq!(r.status(), 200);
+}
+
+// Regression: stale nested `.versions/` dir (from past versioning state)
+// must not block bucket deletion. Exercised directly against the storage
+// layer so the test does not depend on the S3 versioning API.
+#[tokio::test]
+async fn test_delete_bucket_sweeps_nested_versions() {
+    let tmp = TempDir::new().unwrap();
+    let data_dir = tmp.path().to_str().unwrap().to_string();
+    let keyring = Arc::new(Keyring::load(&data_dir, None).await.unwrap());
+    let storage = FilesystemStorage::new(&data_dir, false, 10 * 1024 * 1024, 0, keyring)
+        .await
+        .unwrap();
+
+    storage
+        .create_bucket(&maxio::storage::BucketMeta {
+            name: "leftover".to_string(),
+            created_at: "2026-04-16T00:00:00.000Z".to_string(),
+            region: "us-east-1".to_string(),
+            versioning: false,
+            cors_rules: None,
+            encryption_config: None,
+            encryption_required: false,
+            public_read: false,
+            public_list: false,
+        })
+        .await
+        .unwrap();
+
+    // Simulate an orphan `.versions/` dir deep in the tree plus a stray
+    // `.meta.json` sidecar.
+    let bucket_root = tmp.path().join("buckets").join("leftover");
+    let stale_versions = bucket_root.join("photos").join(".versions");
+    tokio::fs::create_dir_all(&stale_versions).await.unwrap();
+    tokio::fs::write(bucket_root.join("orphan.txt.meta.json"), b"{}")
+        .await
+        .unwrap();
+
+    let deleted = storage.delete_bucket("leftover").await.unwrap();
+    assert!(deleted, "delete_bucket should succeed on sweepable artifacts");
+    assert!(!tokio::fs::try_exists(&bucket_root).await.unwrap());
 }
 
 #[tokio::test]
@@ -2558,7 +2658,8 @@ async fn start_server_ec() -> (String, TempDir) {
     let data_dir = tmp.path().to_str().unwrap().to_string();
 
     // Use 1KB chunk size for easy multi-chunk testing
-    let storage = FilesystemStorage::new(&data_dir, true, 1024, 0)
+    let keyring = Arc::new(Keyring::load(&data_dir, None).await.unwrap());
+    let storage = FilesystemStorage::new(&data_dir, true, 1024, 0, keyring)
         .await
         .unwrap();
 
@@ -2569,6 +2670,7 @@ async fn start_server_ec() -> (String, TempDir) {
         access_key: ACCESS_KEY.to_string(),
         secret_key: SECRET_KEY.to_string(),
         region: REGION.to_string(),
+        master_key: None,
         erasure_coding: true,
         chunk_size: 1024,
         parity_shards: 0,
@@ -3009,7 +3111,8 @@ async fn start_server_parity(parity_shards: u32) -> (String, TempDir) {
     let data_dir = tmp.path().to_str().unwrap().to_string();
 
     // 100-byte chunks for easy multi-chunk testing
-    let storage = FilesystemStorage::new(&data_dir, true, 100, parity_shards)
+    let keyring = Arc::new(Keyring::load(&data_dir, None).await.unwrap());
+    let storage = FilesystemStorage::new(&data_dir, true, 100, parity_shards, keyring)
         .await
         .unwrap();
 
@@ -3020,6 +3123,7 @@ async fn start_server_parity(parity_shards: u32) -> (String, TempDir) {
         access_key: ACCESS_KEY.to_string(),
         secret_key: SECRET_KEY.to_string(),
         region: REGION.to_string(),
+        master_key: None,
         erasure_coding: true,
         chunk_size: 100,
         parity_shards,
@@ -3857,4 +3961,1603 @@ async fn test_cors_no_origin_no_cors_headers() {
 
     assert_eq!(resp.status(), 200);
     assert!(!resp.headers().contains_key("access-control-allow-origin"));
+}
+
+// ─── Server-Side Encryption tests ────────────────────────────────────────────
+
+/// SSE-S3: round-trip with server-managed key, verify echoed headers and that
+/// on-disk contents differ from plaintext.
+#[tokio::test]
+async fn test_sse_s3_put_get_roundtrip() {
+    let (base_url, tmp) = start_server().await;
+    s3_request("PUT", &format!("{}/sse-s3-bucket", base_url), vec![]).await;
+
+    let plaintext = b"hello SSE-S3 encrypted world".to_vec();
+    let put = s3_request_with_headers(
+        "PUT",
+        &format!("{}/sse-s3-bucket/foo.txt", base_url),
+        plaintext.clone(),
+        vec![("x-amz-server-side-encryption", "AES256")],
+    )
+    .await;
+    assert_eq!(put.status(), 200);
+    assert_eq!(
+        put.headers()
+            .get("x-amz-server-side-encryption")
+            .and_then(|v| v.to_str().ok()),
+        Some("AES256"),
+        "PUT must echo x-amz-server-side-encryption: AES256"
+    );
+
+    // HEAD echoes the header
+    let head = s3_request("HEAD", &format!("{}/sse-s3-bucket/foo.txt", base_url), vec![]).await;
+    assert_eq!(head.status(), 200);
+    assert_eq!(
+        head.headers()
+            .get("x-amz-server-side-encryption")
+            .and_then(|v| v.to_str().ok()),
+        Some("AES256"),
+    );
+    assert_eq!(
+        head.headers().get("content-length").unwrap(),
+        &plaintext.len().to_string()
+    );
+
+    // GET round-trips
+    let get = s3_request("GET", &format!("{}/sse-s3-bucket/foo.txt", base_url), vec![]).await;
+    assert_eq!(get.status(), 200);
+    let body = get.bytes().await.unwrap();
+    assert_eq!(body.as_ref(), plaintext.as_slice());
+
+    // On-disk bytes must not be plaintext
+    let on_disk = std::fs::read(tmp.path().join("buckets/sse-s3-bucket/foo.txt")).unwrap();
+    assert_ne!(on_disk, plaintext, "on-disk must be ciphertext, not plaintext");
+    assert!(
+        on_disk.len() >= plaintext.len() + 12 + 16,
+        "ciphertext must include 12B nonce + 16B tag overhead"
+    );
+
+    // Sidecar carries encryption block
+    let meta_json =
+        std::fs::read_to_string(tmp.path().join("buckets/sse-s3-bucket/foo.txt.meta.json"))
+            .unwrap();
+    assert!(meta_json.contains("\"mode\": \"sse_s3\""));
+    assert!(meta_json.contains("\"algorithm\": \"AES256\""));
+    assert!(meta_json.contains("\"wrapped_dek\""));
+}
+
+/// SSE-S3: Range GET across frame boundary translates plaintext offset → ciphertext frame.
+#[tokio::test]
+async fn test_sse_s3_range_read() {
+    let (base_url, _tmp) = start_server().await;
+    s3_request("PUT", &format!("{}/sse-range", base_url), vec![]).await;
+
+    // 128 KiB = 2 full 64 KiB frames, so a cross-frame range actually crosses
+    let mut plaintext = Vec::with_capacity(128 * 1024);
+    for i in 0..128 * 1024u32 {
+        plaintext.push((i % 251) as u8);
+    }
+    let put = s3_request_with_headers(
+        "PUT",
+        &format!("{}/sse-range/big.bin", base_url),
+        plaintext.clone(),
+        vec![("x-amz-server-side-encryption", "AES256")],
+    )
+    .await;
+    assert_eq!(put.status(), 200);
+
+    // Full download
+    let full = s3_request("GET", &format!("{}/sse-range/big.bin", base_url), vec![])
+        .await
+        .bytes()
+        .await
+        .unwrap();
+    assert_eq!(full.as_ref(), plaintext.as_slice(), "full SSE-S3 roundtrip");
+
+    // Range within first frame
+    let range1 = s3_request_with_headers(
+        "GET",
+        &format!("{}/sse-range/big.bin", base_url),
+        vec![],
+        vec![("range", "bytes=100-199")],
+    )
+    .await;
+    assert_eq!(range1.status(), 206);
+    assert_eq!(
+        range1.bytes().await.unwrap().as_ref(),
+        &plaintext[100..=199]
+    );
+
+    // Range crossing frame boundary (64KiB = 65536)
+    let range2 = s3_request_with_headers(
+        "GET",
+        &format!("{}/sse-range/big.bin", base_url),
+        vec![],
+        vec![("range", "bytes=65000-66000")],
+    )
+    .await;
+    assert_eq!(range2.status(), 206);
+    assert_eq!(
+        range2.bytes().await.unwrap().as_ref(),
+        &plaintext[65000..=66000]
+    );
+
+    // Suffix range
+    let range3 = s3_request_with_headers(
+        "GET",
+        &format!("{}/sse-range/big.bin", base_url),
+        vec![],
+        vec![("range", "bytes=-1024")],
+    )
+    .await;
+    assert_eq!(range3.status(), 206);
+    assert_eq!(
+        range3.bytes().await.unwrap().as_ref(),
+        &plaintext[plaintext.len() - 1024..]
+    );
+}
+
+/// SSE-C: round-trip with customer-supplied key; wrong key fails; missing key fails.
+#[tokio::test]
+async fn test_sse_c_requires_matching_key() {
+    let (base_url, _tmp) = start_server().await;
+    s3_request("PUT", &format!("{}/sse-c-bucket", base_url), vec![]).await;
+
+    let key = [0x42u8; 32];
+    let b64 = base64::engine::general_purpose::STANDARD;
+    let key_b64 = b64.encode(key);
+    let key_md5 = b64.encode(md5::Md5::digest(&key));
+
+    let plaintext = b"hello SSE-C".to_vec();
+    let put = s3_request_with_headers(
+        "PUT",
+        &format!("{}/sse-c-bucket/obj", base_url),
+        plaintext.clone(),
+        vec![
+            ("x-amz-server-side-encryption-customer-algorithm", "AES256"),
+            ("x-amz-server-side-encryption-customer-key", &key_b64),
+            ("x-amz-server-side-encryption-customer-key-md5", &key_md5),
+        ],
+    )
+    .await;
+    assert_eq!(put.status(), 200);
+    assert_eq!(
+        put.headers()
+            .get("x-amz-server-side-encryption-customer-algorithm")
+            .and_then(|v| v.to_str().ok()),
+        Some("AES256")
+    );
+
+    // GET without customer key headers → error (bytes ≠ plaintext since not decrypted)
+    let get_no_key =
+        s3_request("GET", &format!("{}/sse-c-bucket/obj", base_url), vec![]).await;
+    assert_ne!(
+        get_no_key.status(),
+        200,
+        "SSE-C GET without customer key must not succeed"
+    );
+
+    // GET with wrong key → error
+    let wrong = [0x00u8; 32];
+    let wrong_b64 = b64.encode(wrong);
+    let wrong_md5 = b64.encode(md5::Md5::digest(&wrong));
+    let get_wrong = s3_request_with_headers(
+        "GET",
+        &format!("{}/sse-c-bucket/obj", base_url),
+        vec![],
+        vec![
+            ("x-amz-server-side-encryption-customer-algorithm", "AES256"),
+            ("x-amz-server-side-encryption-customer-key", &wrong_b64),
+            ("x-amz-server-side-encryption-customer-key-md5", &wrong_md5),
+        ],
+    )
+    .await;
+    assert_ne!(get_wrong.status(), 200);
+
+    // GET with correct key succeeds
+    let get_ok = s3_request_with_headers(
+        "GET",
+        &format!("{}/sse-c-bucket/obj", base_url),
+        vec![],
+        vec![
+            ("x-amz-server-side-encryption-customer-algorithm", "AES256"),
+            ("x-amz-server-side-encryption-customer-key", &key_b64),
+            ("x-amz-server-side-encryption-customer-key-md5", &key_md5),
+        ],
+    )
+    .await;
+    assert_eq!(get_ok.status(), 200);
+    assert_eq!(get_ok.bytes().await.unwrap().as_ref(), plaintext.as_slice());
+}
+
+/// Bucket default encryption: plain PUT inherits SSE-S3 from bucket config.
+#[tokio::test]
+async fn test_bucket_default_encryption_inherits() {
+    let (base_url, tmp) = start_server().await;
+    s3_request("PUT", &format!("{}/def-enc", base_url), vec![]).await;
+
+    // put-bucket-encryption (AES256)
+    let cfg_xml = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
+        <ServerSideEncryptionConfiguration>\
+        <Rule><ApplyServerSideEncryptionByDefault><SSEAlgorithm>AES256</SSEAlgorithm>\
+        </ApplyServerSideEncryptionByDefault></Rule>\
+        </ServerSideEncryptionConfiguration>";
+    let put_cfg = s3_request(
+        "PUT",
+        &format!("{}/def-enc?encryption", base_url),
+        cfg_xml.as_bytes().to_vec(),
+    )
+    .await;
+    assert_eq!(put_cfg.status(), 200);
+
+    // get-bucket-encryption roundtrips AES256
+    let get_cfg = s3_request("GET", &format!("{}/def-enc?encryption", base_url), vec![]).await;
+    assert_eq!(get_cfg.status(), 200);
+    let xml_body = get_cfg.text().await.unwrap();
+    assert!(xml_body.contains("<SSEAlgorithm>AES256</SSEAlgorithm>"));
+
+    // Plain PUT (no SSE header) → encrypted via bucket default
+    let put = s3_request(
+        "PUT",
+        &format!("{}/def-enc/auto.txt", base_url),
+        b"inherited".to_vec(),
+    )
+    .await;
+    assert_eq!(put.status(), 200);
+    assert_eq!(
+        put.headers()
+            .get("x-amz-server-side-encryption")
+            .and_then(|v| v.to_str().ok()),
+        Some("AES256")
+    );
+
+    let meta_json =
+        std::fs::read_to_string(tmp.path().join("buckets/def-enc/auto.txt.meta.json")).unwrap();
+    assert!(meta_json.contains("\"mode\": \"sse_s3\""));
+
+    // delete-bucket-encryption
+    let del = s3_request("DELETE", &format!("{}/def-enc?encryption", base_url), vec![]).await;
+    assert_eq!(del.status(), 204);
+
+    // get-bucket-encryption → 404 after delete
+    let get2 = s3_request("GET", &format!("{}/def-enc?encryption", base_url), vec![]).await;
+    assert_eq!(get2.status(), 404);
+}
+
+/// SSE-KMS: header is rejected with InvalidEncryptionAlgorithm (feature removed).
+#[tokio::test]
+async fn test_sse_kms_rejected() {
+    let (base_url, _tmp) = start_server().await;
+    s3_request("PUT", &format!("{}/kms-bucket", base_url), vec![]).await;
+
+    let put = s3_request_with_headers(
+        "PUT",
+        &format!("{}/kms-bucket/obj", base_url),
+        b"payload".to_vec(),
+        vec![("x-amz-server-side-encryption", "aws:kms")],
+    )
+    .await;
+    assert_eq!(put.status(), 400);
+    let body = put.text().await.unwrap();
+    assert!(body.contains("InvalidEncryptionAlgorithmError"), "body: {}", body);
+    assert!(body.contains("AES256"), "body: {}", body);
+}
+
+/// PutBucketEncryption with aws:kms is rejected (AES256 only).
+#[tokio::test]
+async fn test_put_bucket_encryption_kms_rejected() {
+    let (base_url, _tmp) = start_server().await;
+    s3_request("PUT", &format!("{}/kms-def", base_url), vec![]).await;
+
+    let xml_body = b"<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
+        <ServerSideEncryptionConfiguration>\
+        <Rule><ApplyServerSideEncryptionByDefault>\
+        <SSEAlgorithm>aws:kms</SSEAlgorithm>\
+        </ApplyServerSideEncryptionByDefault></Rule>\
+        </ServerSideEncryptionConfiguration>"
+        .to_vec();
+    let resp = s3_request(
+        "PUT",
+        &format!("{}/kms-def?encryption", base_url),
+        xml_body,
+    )
+    .await;
+    assert_eq!(resp.status(), 400);
+    let body = resp.text().await.unwrap();
+    assert!(body.contains("InvalidEncryptionAlgorithmError"), "body: {}", body);
+}
+
+/// Keyring rotate: old objects stay decryptable, new objects use the new key.
+#[tokio::test]
+async fn test_keyring_rotate_preserves_old_objects() {
+    use maxio::storage::keys;
+
+    let (base_url, tmp) = start_server().await;
+    let data_dir = tmp.path().to_str().unwrap().to_string();
+
+    s3_request("PUT", &format!("{}/rotate-bucket", base_url), vec![]).await;
+
+    // PUT object under original key
+    let old_plaintext = b"encrypted with old key".to_vec();
+    let put_old = s3_request_with_headers(
+        "PUT",
+        &format!("{}/rotate-bucket/old.txt", base_url),
+        old_plaintext.clone(),
+        vec![("x-amz-server-side-encryption", "AES256")],
+    )
+    .await;
+    assert_eq!(put_old.status(), 200);
+
+    let meta_old_before =
+        std::fs::read_to_string(tmp.path().join("buckets/rotate-bucket/old.txt.meta.json"))
+            .unwrap();
+
+    // Rotate (server still running — mutates .maxio-keys.json on disk).
+    let result = keys::rotate(&data_dir).await.unwrap();
+    let previous_id = result
+        .previous_active_id
+        .expect("keyring was bootstrapped, so a previous active key must exist");
+    assert_ne!(result.new_active_id, previous_id);
+    assert_eq!(result.total_keys, 2);
+
+    // Old-object metadata untouched: still references the old key id.
+    let meta_old_after =
+        std::fs::read_to_string(tmp.path().join("buckets/rotate-bucket/old.txt.meta.json"))
+            .unwrap();
+    assert_eq!(meta_old_before, meta_old_after);
+    assert!(
+        meta_old_after.contains(&previous_id),
+        "old object should still reference previous key_id {}: {}",
+        previous_id,
+        meta_old_after
+    );
+
+    // Old object still decrypts (server keyring was loaded with the original key;
+    // rotation only changes the on-disk file, so we exercise that explicitly via
+    // a second reload below). The live server still reads it correctly because
+    // the old key is in its in-memory ring.
+    let get_old = s3_request(
+        "GET",
+        &format!("{}/rotate-bucket/old.txt", base_url),
+        vec![],
+    )
+    .await;
+    assert_eq!(get_old.status(), 200);
+    assert_eq!(get_old.bytes().await.unwrap().as_ref(), old_plaintext.as_slice());
+
+    // Reload keyring from disk — simulates a server restart after rotation.
+    let reloaded = keys::Keyring::load(&data_dir, None).await.unwrap();
+    assert_eq!(reloaded.active_id(), result.new_active_id);
+
+    // Both keys must be retained in the reloaded ring, so unwrap of existing
+    // objects still works. Verify by round-tripping the stored EncryptionMeta.
+    #[derive(serde::Deserialize)]
+    struct Meta {
+        encryption: EncMeta,
+    }
+    #[derive(serde::Deserialize)]
+    struct EncMeta {
+        key_id: String,
+        wrapped_dek: String,
+        wrap_nonce: String,
+    }
+    let parsed: Meta = serde_json::from_str(&meta_old_after).unwrap();
+    let wrapped = base64::engine::general_purpose::STANDARD
+        .decode(&parsed.encryption.wrapped_dek)
+        .unwrap();
+    let wrap_nonce = base64::engine::general_purpose::STANDARD
+        .decode(&parsed.encryption.wrap_nonce)
+        .unwrap();
+    let mut nonce_arr = [0u8; 12];
+    nonce_arr.copy_from_slice(&wrap_nonce);
+    reloaded
+        .unwrap_dek(&parsed.encryption.key_id, &wrapped, &nonce_arr)
+        .expect("reloaded keyring should still unwrap DEKs wrapped with the old key");
+
+    // Rotating a second time bumps count to 3 and demotes the current active.
+    let r2 = keys::rotate(&data_dir).await.unwrap();
+    assert_eq!(r2.previous_active_id.as_deref(), Some(result.new_active_id.as_str()));
+    assert_eq!(r2.total_keys, 3);
+}
+
+/// Invalid SSE algorithm is rejected.
+#[tokio::test]
+async fn test_invalid_sse_algorithm_rejected() {
+    let (base_url, _tmp) = start_server().await;
+    s3_request("PUT", &format!("{}/bad-enc", base_url), vec![]).await;
+
+    let put = s3_request_with_headers(
+        "PUT",
+        &format!("{}/bad-enc/obj", base_url),
+        b"x".to_vec(),
+        vec![("x-amz-server-side-encryption", "RC4")],
+    )
+    .await;
+    assert_ne!(put.status(), 200);
+    let body = put.text().await.unwrap();
+    assert!(body.contains("InvalidEncryptionAlgorithm"), "body: {}", body);
+}
+
+/// If bucket encryption config cannot be read (corrupted .bucket.json),
+/// PUT without explicit SSE headers must fail closed (500) — never silently
+/// fall back to plaintext. Object must NOT be written.
+#[tokio::test]
+async fn test_put_object_fails_when_bucket_encryption_unreadable() {
+    let (base_url, tmp) = start_server().await;
+    s3_request("PUT", &format!("{}/corrupt-enc", base_url), vec![]).await;
+
+    // Corrupt the bucket metadata so get_bucket_encryption returns Err
+    let meta_path = tmp.path().join("buckets/corrupt-enc/.bucket.json");
+    std::fs::write(&meta_path, b"{ not valid json").unwrap();
+
+    // Plain PUT (no SSE header) → must 500, not silently store plaintext
+    let put = s3_request(
+        "PUT",
+        &format!("{}/corrupt-enc/safe.txt", base_url),
+        b"should-not-be-written".to_vec(),
+    )
+    .await;
+    assert_eq!(put.status(), 500);
+    let body = put.text().await.unwrap();
+    assert!(body.contains("InternalError"), "body: {}", body);
+
+    // Object file must NOT exist on disk
+    let obj_path = tmp.path().join("buckets/corrupt-enc/safe.txt");
+    assert!(
+        !obj_path.exists(),
+        "object must not be written when encryption config read fails"
+    );
+}
+
+/// Console API upload must fail closed (500) when bucket encryption config
+/// cannot be read. Object file must NOT be written.
+#[tokio::test]
+async fn test_console_upload_fails_when_bucket_encryption_unreadable() {
+    let (base_url, tmp) = start_server().await;
+    s3_request("PUT", &format!("{}/console-corrupt", base_url), vec![]).await;
+
+    // Corrupt bucket metadata
+    let meta_path = tmp.path().join("buckets/console-corrupt/.bucket.json");
+    std::fs::write(&meta_path, b"not { valid json").unwrap();
+
+    let session = console_login(&base_url).await;
+    let resp = client()
+        .put(&format!(
+            "{}/api/buckets/console-corrupt/upload/safe.txt",
+            base_url
+        ))
+        .header("cookie", format!("maxio_session={}", session))
+        .body(b"should-not-be-written".to_vec())
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 500);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    let err = body["error"].as_str().unwrap_or("");
+    assert!(
+        err.contains("failed to read bucket encryption"),
+        "unexpected error: {}",
+        err
+    );
+
+    let obj_path = tmp.path().join("buckets/console-corrupt/safe.txt");
+    assert!(
+        !obj_path.exists(),
+        "object must not be written when encryption config read fails"
+    );
+}
+
+/// Console API create_folder must fail closed (500) when bucket encryption
+/// config cannot be read. Folder marker must NOT be written.
+#[tokio::test]
+async fn test_console_create_folder_fails_when_bucket_encryption_unreadable() {
+    let (base_url, tmp) = start_server().await;
+    s3_request("PUT", &format!("{}/console-corrupt-folder", base_url), vec![]).await;
+
+    let meta_path = tmp.path().join("buckets/console-corrupt-folder/.bucket.json");
+    std::fs::write(&meta_path, b"not { valid json").unwrap();
+
+    let session = console_login(&base_url).await;
+    let resp = client()
+        .post(&format!(
+            "{}/api/buckets/console-corrupt-folder/folders",
+            base_url
+        ))
+        .header("cookie", format!("maxio_session={}", session))
+        .json(&serde_json::json!({"name": "newdir"}))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 500);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    let err = body["error"].as_str().unwrap_or("");
+    assert!(
+        err.contains("failed to read bucket encryption"),
+        "unexpected error: {}",
+        err
+    );
+
+    let folder_marker = tmp.path().join("buckets/console-corrupt-folder/newdir/");
+    assert!(
+        !folder_marker.exists(),
+        "folder marker must not be written when encryption config read fails"
+    );
+}
+
+/// Console API GET/PUT /api/buckets/{b}/encryption round-trips bucket default
+/// encryption config. Toggles enable → disable and verifies both the response
+/// body and the on-disk `.bucket.json` state.
+#[tokio::test]
+async fn test_console_bucket_encryption_endpoint_roundtrip() {
+    let (base_url, tmp) = start_server().await;
+    s3_request("PUT", &format!("{}/cenc-1", base_url), vec![]).await;
+    let session = console_login(&base_url).await;
+
+    // Initial GET → disabled
+    let resp = client()
+        .get(&format!("{}/api/buckets/cenc-1/encryption", base_url))
+        .header("cookie", format!("maxio_session={}", session))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["enabled"], false);
+    assert!(body["algorithm"].is_null());
+    assert!(body["kmsMasterKeyId"].is_null());
+
+    // PUT {enabled: true}
+    let resp = client()
+        .put(&format!("{}/api/buckets/cenc-1/encryption", base_url))
+        .header("cookie", format!("maxio_session={}", session))
+        .json(&serde_json::json!({"enabled": true}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["ok"], true);
+
+    // GET → enabled + AES256
+    let resp = client()
+        .get(&format!("{}/api/buckets/cenc-1/encryption", base_url))
+        .header("cookie", format!("maxio_session={}", session))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["enabled"], true);
+    assert_eq!(body["algorithm"], "AES256");
+    assert!(body["kmsMasterKeyId"].is_null());
+
+    // On-disk persistence
+    let meta =
+        std::fs::read_to_string(tmp.path().join("buckets/cenc-1/.bucket.json")).unwrap();
+    assert!(
+        meta.contains("\"sse_algorithm\": \"AES256\""),
+        "bucket meta missing sse_algorithm: {}",
+        meta
+    );
+
+    // PUT {enabled: false}
+    let resp = client()
+        .put(&format!("{}/api/buckets/cenc-1/encryption", base_url))
+        .header("cookie", format!("maxio_session={}", session))
+        .json(&serde_json::json!({"enabled": false}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    // GET → disabled again
+    let resp = client()
+        .get(&format!("{}/api/buckets/cenc-1/encryption", base_url))
+        .header("cookie", format!("maxio_session={}", session))
+        .send()
+        .await
+        .unwrap();
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["enabled"], false);
+
+    // encryption_config removed from bucket meta
+    let meta =
+        std::fs::read_to_string(tmp.path().join("buckets/cenc-1/.bucket.json")).unwrap();
+    assert!(
+        !meta.contains("encryption_config"),
+        "encryption_config should be removed after disable: {}",
+        meta
+    );
+}
+
+/// Console API upload (`PUT /api/buckets/{b}/upload/{key}`) honors the
+/// bucket's default encryption config. Previously the handler passed `None`
+/// to `put_object`, bypassing the bucket default and writing plaintext.
+#[tokio::test]
+async fn test_console_upload_honors_bucket_default_encryption() {
+    let (base_url, tmp) = start_server().await;
+    s3_request("PUT", &format!("{}/cenc-up", base_url), vec![]).await;
+    let session = console_login(&base_url).await;
+
+    // Enable default encryption via console API
+    let resp = client()
+        .put(&format!("{}/api/buckets/cenc-up/encryption", base_url))
+        .header("cookie", format!("maxio_session={}", session))
+        .json(&serde_json::json!({"enabled": true}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    // Upload via console API
+    let marker = b"plaintext-marker-AAAA".to_vec();
+    let resp = client()
+        .put(&format!(
+            "{}/api/buckets/cenc-up/upload/hello.txt",
+            base_url
+        ))
+        .header("cookie", format!("maxio_session={}", session))
+        .body(marker.clone())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    // Raw on-disk bytes must NOT contain the plaintext marker
+    let on_disk = std::fs::read(tmp.path().join("buckets/cenc-up/hello.txt")).unwrap();
+    assert!(
+        on_disk.windows(marker.len()).all(|w| w != marker.as_slice()),
+        "on-disk bytes should be ciphertext, found plaintext marker"
+    );
+
+    // Sidecar records SSE-S3 mode
+    let meta_json =
+        std::fs::read_to_string(tmp.path().join("buckets/cenc-up/hello.txt.meta.json")).unwrap();
+    assert!(
+        meta_json.contains("\"mode\": \"sse_s3\""),
+        "sidecar missing sse_s3 mode: {}",
+        meta_json
+    );
+
+    // Download via console API returns plaintext
+    let resp = client()
+        .get(&format!(
+            "{}/api/buckets/cenc-up/download/hello.txt",
+            base_url
+        ))
+        .header("cookie", format!("maxio_session={}", session))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let downloaded = resp.bytes().await.unwrap();
+    assert_eq!(downloaded.as_ref(), marker.as_slice());
+}
+
+/// Console API `POST /api/buckets/{b}/folders` resolves bucket default
+/// encryption without crashing when encryption is enabled. Folder markers
+/// are zero-byte objects so no ciphertext assertion is possible; this is a
+/// regression guard for the `create_folder` encryption-lookup fix.
+#[tokio::test]
+async fn test_console_create_folder_succeeds_with_bucket_default_encryption() {
+    let (base_url, tmp) = start_server().await;
+    s3_request("PUT", &format!("{}/cenc-fold", base_url), vec![]).await;
+    let session = console_login(&base_url).await;
+
+    // Enable default encryption
+    let resp = client()
+        .put(&format!("{}/api/buckets/cenc-fold/encryption", base_url))
+        .header("cookie", format!("maxio_session={}", session))
+        .json(&serde_json::json!({"enabled": true}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    // Create folder
+    let resp = client()
+        .post(&format!("{}/api/buckets/cenc-fold/folders", base_url))
+        .header("cookie", format!("maxio_session={}", session))
+        .json(&serde_json::json!({"name": "sub"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["ok"], true);
+
+    // Folder marker persists on disk
+    let marker_meta = tmp.path().join("buckets/cenc-fold/sub/.folder.meta.json");
+    assert!(
+        marker_meta.exists(),
+        "folder marker sidecar missing: {:?}",
+        marker_meta
+    );
+}
+
+// --- Public bucket access ---
+
+fn set_public_on_disk(tmp: &TempDir, bucket: &str, read: bool, list: bool) {
+    let meta_path = tmp.path().join("buckets").join(bucket).join(".bucket.json");
+    let data = std::fs::read_to_string(&meta_path).unwrap();
+    let mut meta: serde_json::Value = serde_json::from_str(&data).unwrap();
+    meta["public_read"] = serde_json::Value::Bool(read);
+    meta["public_list"] = serde_json::Value::Bool(list);
+    std::fs::write(&meta_path, serde_json::to_string_pretty(&meta).unwrap()).unwrap();
+}
+
+#[tokio::test]
+async fn test_public_bucket_anonymous_get() {
+    let (base_url, tmp) = start_server().await;
+
+    // Create bucket + upload an object with signed requests.
+    let resp = s3_request("PUT", &format!("{}/pub-bkt", base_url), vec![]).await;
+    assert_eq!(resp.status(), 200);
+
+    let body = b"hello public".to_vec();
+    let resp = s3_request("PUT", &format!("{}/pub-bkt/hello.txt", base_url), body).await;
+    assert_eq!(resp.status(), 200);
+
+    // Anonymous GET should be 403 before enabling public_read.
+    let resp = client()
+        .get(&format!("{}/pub-bkt/hello.txt", base_url))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 403);
+
+    // Flip public_read on.
+    set_public_on_disk(&tmp, "pub-bkt", true, false);
+
+    // Anonymous GET now succeeds.
+    let resp = client()
+        .get(&format!("{}/pub-bkt/hello.txt", base_url))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(resp.bytes().await.unwrap().as_ref(), b"hello public");
+
+    // Anonymous HEAD also succeeds.
+    let resp = client()
+        .head(&format!("{}/pub-bkt/hello.txt", base_url))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    // Anonymous list is still blocked (public_list still false).
+    let resp = client()
+        .get(&format!("{}/pub-bkt", base_url))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 403);
+
+    // Writes remain blocked.
+    let resp = client()
+        .put(&format!("{}/pub-bkt/blocked.txt", base_url))
+        .body("nope")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 403);
+
+    let resp = client()
+        .delete(&format!("{}/pub-bkt/hello.txt", base_url))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 403);
+}
+
+#[tokio::test]
+async fn test_public_bucket_list_toggle() {
+    let (base_url, tmp) = start_server().await;
+
+    let resp = s3_request("PUT", &format!("{}/pub-list", base_url), vec![]).await;
+    assert_eq!(resp.status(), 200);
+    let resp = s3_request("PUT", &format!("{}/pub-list/a.txt", base_url), b"a".to_vec()).await;
+    assert_eq!(resp.status(), 200);
+
+    // public_list off → anonymous list rejected.
+    let resp = client()
+        .get(&format!("{}/pub-list/?list-type=2", base_url))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 403);
+
+    // Enable public_list, keep public_read off.
+    set_public_on_disk(&tmp, "pub-list", false, true);
+
+    let resp = client()
+        .get(&format!("{}/pub-list/?list-type=2", base_url))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body = resp.text().await.unwrap();
+    assert!(body.contains("a.txt"), "list body missing key: {}", body);
+
+    // Object GET still blocked because public_read is false.
+    let resp = client()
+        .get(&format!("{}/pub-list/a.txt", base_url))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 403);
+}
+
+#[tokio::test]
+async fn test_public_bucket_rejects_mutating_query() {
+    let (base_url, tmp) = start_server().await;
+
+    let resp = s3_request("PUT", &format!("{}/pub-mut", base_url), vec![]).await;
+    assert_eq!(resp.status(), 200);
+
+    // Public read fully enabled.
+    set_public_on_disk(&tmp, "pub-mut", true, true);
+
+    // Anonymous GET ?versioning is a bucket sub-resource read that we deliberately block.
+    let resp = client()
+        .get(&format!("{}/pub-mut?versioning", base_url))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 403);
+
+    // Anonymous POST ?delete remains blocked regardless of method.
+    let resp = client()
+        .post(&format!("{}/pub-mut?delete", base_url))
+        .body("<Delete/>")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 403);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Encryption hardening (Task 1 + Task 2)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Sidecar MAC detects tampering with the object's `size` field.
+#[tokio::test]
+async fn test_sse_s3_sidecar_mac_catches_size_tamper() {
+    let (base_url, tmp) = start_server().await;
+    s3_request("PUT", &format!("{}/mac-bucket", base_url), vec![]).await;
+
+    let plaintext = b"hello integrity-bound world".to_vec();
+    let put = s3_request_with_headers(
+        "PUT",
+        &format!("{}/mac-bucket/obj.txt", base_url),
+        plaintext.clone(),
+        vec![("x-amz-server-side-encryption", "AES256")],
+    )
+    .await;
+    assert_eq!(put.status(), 200);
+
+    // Tamper: shrink size by 1 byte in the sidecar.
+    let meta_path = tmp.path().join("buckets/mac-bucket/obj.txt.meta.json");
+    let meta_str = std::fs::read_to_string(&meta_path).unwrap();
+    let mut meta: serde_json::Value = serde_json::from_str(&meta_str).unwrap();
+    let original = meta["size"].as_u64().unwrap();
+    meta["size"] = serde_json::json!(original - 1);
+    std::fs::write(&meta_path, serde_json::to_string_pretty(&meta).unwrap()).unwrap();
+
+    let get = s3_request("GET", &format!("{}/mac-bucket/obj.txt", base_url), vec![]).await;
+    assert_eq!(get.status(), 400, "size tamper must be rejected by MAC");
+    let body = get.text().await.unwrap();
+    assert!(
+        body.contains("sidecar_mac") || body.contains("integrity"),
+        "body: {}",
+        body
+    );
+}
+
+/// Sidecar MAC detects wrapped_dek swap between two SSE-S3 objects.
+#[tokio::test]
+async fn test_sse_s3_sidecar_mac_catches_wrapped_dek_swap() {
+    let (base_url, tmp) = start_server().await;
+    s3_request("PUT", &format!("{}/swap-bucket", base_url), vec![]).await;
+
+    for name in ["a.txt", "b.txt"] {
+        let put = s3_request_with_headers(
+            "PUT",
+            &format!("{}/swap-bucket/{}", base_url, name),
+            format!("payload-{}", name).into_bytes(),
+            vec![("x-amz-server-side-encryption", "AES256")],
+        )
+        .await;
+        assert_eq!(put.status(), 200);
+    }
+
+    let meta_a_path = tmp.path().join("buckets/swap-bucket/a.txt.meta.json");
+    let meta_b_path = tmp.path().join("buckets/swap-bucket/b.txt.meta.json");
+    let meta_a_str = std::fs::read_to_string(&meta_a_path).unwrap();
+    let meta_b_str = std::fs::read_to_string(&meta_b_path).unwrap();
+    let mut meta_a: serde_json::Value = serde_json::from_str(&meta_a_str).unwrap();
+    let meta_b: serde_json::Value = serde_json::from_str(&meta_b_str).unwrap();
+
+    // Copy b's wrapped_dek + wrap_nonce into a's sidecar (leaving a's data intact).
+    meta_a["encryption"]["wrapped_dek"] = meta_b["encryption"]["wrapped_dek"].clone();
+    meta_a["encryption"]["wrap_nonce"] = meta_b["encryption"]["wrap_nonce"].clone();
+    std::fs::write(&meta_a_path, serde_json::to_string_pretty(&meta_a).unwrap()).unwrap();
+
+    let get = s3_request("GET", &format!("{}/swap-bucket/a.txt", base_url), vec![]).await;
+    assert_eq!(get.status(), 400, "wrapped_dek swap must be rejected by MAC");
+}
+
+/// AAD binds to bucket/key: copying the ciphertext file of object A onto the
+/// path of object B (same bucket) must not decrypt cleanly under B's sidecar.
+#[tokio::test]
+async fn test_sse_s3_aad_catches_cross_key_ciphertext_swap() {
+    let (base_url, tmp) = start_server().await;
+    s3_request("PUT", &format!("{}/aad-bucket", base_url), vec![]).await;
+
+    let plaintext = b"aad cross key test 0123456789abcdef".to_vec();
+    for name in ["left.bin", "right.bin"] {
+        let put = s3_request_with_headers(
+            "PUT",
+            &format!("{}/aad-bucket/{}", base_url, name),
+            plaintext.clone(),
+            vec![("x-amz-server-side-encryption", "AES256")],
+        )
+        .await;
+        assert_eq!(put.status(), 200);
+    }
+
+    // Overwrite left.bin's ciphertext bytes with right.bin's — same DEK/nonce_prefix
+    // they do not share (fresh per object), so this really exercises the AAD binding.
+    let left_data_path = tmp.path().join("buckets/aad-bucket/left.bin");
+    let right_data_path = tmp.path().join("buckets/aad-bucket/right.bin");
+    let right_bytes = std::fs::read(&right_data_path).unwrap();
+    std::fs::write(&left_data_path, &right_bytes).unwrap();
+
+    let get = s3_request("GET", &format!("{}/aad-bucket/left.bin", base_url), vec![]).await;
+    // Decryptor fails mid-stream after headers flushed; client sees 200 but
+    // the body bytes do NOT match the original plaintext (either truncated or
+    // garbled). The invariant we care about is that the attacker's swapped
+    // ciphertext never yields valid plaintext under the victim's sidecar.
+    let body_result = get.bytes().await;
+    let retrieved = body_result.unwrap_or_default();
+    assert_ne!(
+        retrieved.as_ref(),
+        plaintext.as_slice(),
+        "cross-key ciphertext must not authenticate under victim's key/AAD"
+    );
+}
+
+/// Multipart SSE-S3: part files on disk contain ciphertext (nonce at offset 0),
+/// not plaintext. Confirms Task 2 encrypts parts before they touch disk.
+#[tokio::test]
+async fn test_multipart_sse_s3_parts_encrypted_on_disk() {
+    let (base_url, tmp) = start_server().await;
+    s3_request("PUT", &format!("{}/mp-sse", base_url), vec![]).await;
+
+    // Create multipart upload with SSE-S3.
+    let init = s3_request_with_headers(
+        "POST",
+        &format!("{}/mp-sse/big.bin?uploads", base_url),
+        vec![],
+        vec![("x-amz-server-side-encryption", "AES256")],
+    )
+    .await;
+    assert_eq!(init.status(), 200);
+    let init_body = init.text().await.unwrap();
+    let upload_id = init_body
+        .split("<UploadId>")
+        .nth(1)
+        .and_then(|s| s.split("</UploadId>").next())
+        .expect("UploadId in response")
+        .to_string();
+
+    // Upload one part with a distinctive plaintext pattern.
+    let pattern: Vec<u8> = (0..5 * 1024 * 1024).map(|i| (i % 251) as u8).collect();
+    let part_url = format!(
+        "{}/mp-sse/big.bin?partNumber=1&uploadId={}",
+        base_url, upload_id
+    );
+    let put_part = s3_request("PUT", &part_url, pattern.clone()).await;
+    assert_eq!(put_part.status(), 200);
+    let etag = put_part
+        .headers()
+        .get("etag")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+
+    // On-disk part file: first 12 bytes should be nonce (not plaintext pattern),
+    // and the whole file must NOT equal the plaintext.
+    let part_path = tmp
+        .path()
+        .join(format!("buckets/mp-sse/.uploads/{}/1", upload_id));
+    let on_disk = std::fs::read(&part_path).unwrap();
+    assert_ne!(on_disk, pattern, "part file must be ciphertext on disk");
+    assert!(
+        on_disk.len() >= pattern.len() + 12 + 16,
+        "ciphertext must include nonce + GCM tag overhead"
+    );
+
+    // Complete and verify round-trip.
+    let complete_body = format!(
+        "<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>{}</ETag></Part></CompleteMultipartUpload>",
+        etag
+    );
+    let complete = s3_request(
+        "POST",
+        &format!("{}/mp-sse/big.bin?uploadId={}", base_url, upload_id),
+        complete_body.into_bytes(),
+    )
+    .await;
+    assert_eq!(complete.status(), 200);
+
+    let get = s3_request("GET", &format!("{}/mp-sse/big.bin", base_url), vec![]).await;
+    assert_eq!(get.status(), 200);
+    let body = get.bytes().await.unwrap();
+    assert_eq!(body.as_ref(), pattern.as_slice(), "round-trip bytes match");
+}
+
+/// Multipart SSE-C: initializing with one key and completing with a different
+/// one yields HTTP 400 and explicit "SSE-C key changed" error. Without this
+/// check, the server would silently accept the swap and re-encrypt with the
+/// new key — corrupting the trust model.
+#[tokio::test]
+async fn test_multipart_sse_c_key_change_rejected() {
+    use base64::Engine;
+    use md5::Digest;
+
+    let (base_url, _tmp) = start_server().await;
+    s3_request("PUT", &format!("{}/mp-ssec", base_url), vec![]).await;
+
+    let key_a = [0x42u8; 32];
+    let key_b = [0x99u8; 32];
+    let b64 = base64::engine::general_purpose::STANDARD;
+    let key_a_b64 = b64.encode(key_a);
+    let key_a_md5 = b64.encode(md5::Md5::digest(key_a));
+    let key_b_b64 = b64.encode(key_b);
+    let key_b_md5 = b64.encode(md5::Md5::digest(key_b));
+
+    let init = s3_request_with_headers(
+        "POST",
+        &format!("{}/mp-ssec/o.bin?uploads", base_url),
+        vec![],
+        vec![
+            ("x-amz-server-side-encryption-customer-algorithm", "AES256"),
+            ("x-amz-server-side-encryption-customer-key", &key_a_b64),
+            ("x-amz-server-side-encryption-customer-key-md5", &key_a_md5),
+        ],
+    )
+    .await;
+    assert_eq!(init.status(), 200);
+    let init_body = init.text().await.unwrap();
+    let upload_id = init_body
+        .split("<UploadId>")
+        .nth(1)
+        .and_then(|s| s.split("</UploadId>").next())
+        .expect("UploadId in response")
+        .to_string();
+
+    let pattern: Vec<u8> = (0..5 * 1024 * 1024).map(|i| (i % 251) as u8).collect();
+    let put_part = s3_request_with_headers(
+        "PUT",
+        &format!(
+            "{}/mp-ssec/o.bin?partNumber=1&uploadId={}",
+            base_url, upload_id
+        ),
+        pattern,
+        vec![
+            ("x-amz-server-side-encryption-customer-algorithm", "AES256"),
+            ("x-amz-server-side-encryption-customer-key", &key_a_b64),
+            ("x-amz-server-side-encryption-customer-key-md5", &key_a_md5),
+        ],
+    )
+    .await;
+    assert_eq!(put_part.status(), 200);
+    let etag = put_part
+        .headers()
+        .get("etag")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+
+    // Complete with the WRONG key — must be rejected.
+    let complete_body = format!(
+        "<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>{}</ETag></Part></CompleteMultipartUpload>",
+        etag
+    );
+    let complete = s3_request_with_headers(
+        "POST",
+        &format!("{}/mp-ssec/o.bin?uploadId={}", base_url, upload_id),
+        complete_body.into_bytes(),
+        vec![
+            ("x-amz-server-side-encryption-customer-algorithm", "AES256"),
+            ("x-amz-server-side-encryption-customer-key", &key_b_b64),
+            ("x-amz-server-side-encryption-customer-key-md5", &key_b_md5),
+        ],
+    )
+    .await;
+    assert_eq!(complete.status(), 400);
+    let body = complete.text().await.unwrap();
+    assert!(
+        body.contains("SSE-C key changed") || body.contains("MD5 mismatch"),
+        "body: {}",
+        body
+    );
+}
+
+/// Bucket `encryption_required` flag auto-flips on first encrypted PUT, and
+/// subsequent sidecar-strip of `encryption` field → 400 (prevents plaintext
+/// bypass via sidecar tamper).
+#[tokio::test]
+async fn test_sse_s3_sidecar_strip_encryption_rejected() {
+    let (base_url, tmp) = start_server().await;
+    s3_request("PUT", &format!("{}/strip-bucket", base_url), vec![]).await;
+
+    let plaintext = b"plaintext bypass probe".to_vec();
+    let put = s3_request_with_headers(
+        "PUT",
+        &format!("{}/strip-bucket/x.txt", base_url),
+        plaintext.clone(),
+        vec![("x-amz-server-side-encryption", "AES256")],
+    )
+    .await;
+    assert_eq!(put.status(), 200);
+
+    // First encrypted PUT must flip `encryption_required` to true.
+    let bucket_meta_str =
+        std::fs::read_to_string(tmp.path().join("buckets/strip-bucket/.bucket.json")).unwrap();
+    assert!(
+        bucket_meta_str.contains("\"encryption_required\": true"),
+        "bucket meta: {}",
+        bucket_meta_str
+    );
+
+    // Tamper: strip `encryption` field from object sidecar.
+    let meta_path = tmp.path().join("buckets/strip-bucket/x.txt.meta.json");
+    let meta_str = std::fs::read_to_string(&meta_path).unwrap();
+    let mut meta: serde_json::Value = serde_json::from_str(&meta_str).unwrap();
+    meta.as_object_mut().unwrap().remove("encryption");
+    std::fs::write(&meta_path, serde_json::to_string_pretty(&meta).unwrap()).unwrap();
+
+    let get = s3_request("GET", &format!("{}/strip-bucket/x.txt", base_url), vec![]).await;
+    assert_eq!(
+        get.status(),
+        400,
+        "bucket.encryption_required must reject objects with missing encryption meta"
+    );
+}
+
+/// SSE-C headers on a non-SSE object → 400 InvalidArgument (matches AWS).
+#[tokio::test]
+async fn test_sse_c_headers_on_plaintext_rejected() {
+    use base64::Engine;
+    use md5::Digest;
+
+    let (base_url, _tmp) = start_server().await;
+    s3_request("PUT", &format!("{}/plain-bucket", base_url), vec![]).await;
+
+    let put = s3_request(
+        "PUT",
+        &format!("{}/plain-bucket/plain.txt", base_url),
+        b"no encryption here".to_vec(),
+    )
+    .await;
+    assert_eq!(put.status(), 200);
+
+    let key = [0x55u8; 32];
+    let b64 = base64::engine::general_purpose::STANDARD;
+    let key_b64 = b64.encode(key);
+    let key_md5 = b64.encode(md5::Md5::digest(key));
+
+    let get = s3_request_with_headers(
+        "GET",
+        &format!("{}/plain-bucket/plain.txt", base_url),
+        vec![],
+        vec![
+            ("x-amz-server-side-encryption-customer-algorithm", "AES256"),
+            ("x-amz-server-side-encryption-customer-key", &key_b64),
+            ("x-amz-server-side-encryption-customer-key-md5", &key_md5),
+        ],
+    )
+    .await;
+    assert_eq!(get.status(), 400);
+    let body = get.text().await.unwrap();
+    assert!(
+        body.contains("SSE-C headers supplied"),
+        "body: {}",
+        body
+    );
+}
+
+/// Multipart `part.encrypted` flag flipped in on-disk meta is caught at
+/// `Complete` — prevents "part meta says plaintext, ciphertext on disk gets
+/// served as plaintext bytes" attack.
+#[tokio::test]
+async fn test_multipart_part_encrypted_flag_tamper_rejected() {
+    let (base_url, tmp) = start_server().await;
+    s3_request("PUT", &format!("{}/part-flip", base_url), vec![]).await;
+
+    let init = s3_request_with_headers(
+        "POST",
+        &format!("{}/part-flip/o.bin?uploads", base_url),
+        vec![],
+        vec![("x-amz-server-side-encryption", "AES256")],
+    )
+    .await;
+    assert_eq!(init.status(), 200);
+    let init_body = init.text().await.unwrap();
+    let upload_id = init_body
+        .split("<UploadId>")
+        .nth(1)
+        .and_then(|s| s.split("</UploadId>").next())
+        .expect("UploadId")
+        .to_string();
+
+    let pattern: Vec<u8> = vec![0xABu8; 5 * 1024 * 1024];
+    let put_part = s3_request(
+        "PUT",
+        &format!(
+            "{}/part-flip/o.bin?partNumber=1&uploadId={}",
+            base_url, upload_id
+        ),
+        pattern,
+    )
+    .await;
+    assert_eq!(put_part.status(), 200);
+    let etag = put_part
+        .headers()
+        .get("etag")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+
+    // Flip `encrypted: true` → `false` in part meta.
+    let part_meta_path = tmp
+        .path()
+        .join(format!("buckets/part-flip/.uploads/{}/1.meta.json", upload_id));
+    let pm_str = std::fs::read_to_string(&part_meta_path).unwrap();
+    let mut pm: serde_json::Value = serde_json::from_str(&pm_str).unwrap();
+    pm["encrypted"] = serde_json::json!(false);
+    std::fs::write(&part_meta_path, serde_json::to_string_pretty(&pm).unwrap()).unwrap();
+
+    let complete_body = format!(
+        "<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>{}</ETag></Part></CompleteMultipartUpload>",
+        etag
+    );
+    let complete = s3_request(
+        "POST",
+        &format!("{}/part-flip/o.bin?uploadId={}", base_url, upload_id),
+        complete_body.into_bytes(),
+    )
+    .await;
+    assert_eq!(complete.status(), 400);
+    let body = complete.text().await.unwrap();
+    assert!(body.contains("encryption flag"), "body: {}", body);
+}
+
+/// Versioned SSE-S3: ?versionId GET decrypts correctly (Task 2 fix — previously
+/// returned raw ciphertext).
+#[tokio::test]
+async fn test_sse_s3_versioned_get_decrypts() {
+    let (base_url, _tmp) = start_server().await;
+    s3_request("PUT", &format!("{}/ver-sse", base_url), vec![]).await;
+    // Enable versioning.
+    let vxml =
+        b"<?xml version=\"1.0\"?><VersioningConfiguration><Status>Enabled</Status></VersioningConfiguration>"
+            .to_vec();
+    s3_request(
+        "PUT",
+        &format!("{}/ver-sse?versioning", base_url),
+        vxml,
+    )
+    .await;
+
+    let plaintext = b"versioned encrypted payload".to_vec();
+    let put = s3_request_with_headers(
+        "PUT",
+        &format!("{}/ver-sse/v.bin", base_url),
+        plaintext.clone(),
+        vec![("x-amz-server-side-encryption", "AES256")],
+    )
+    .await;
+    assert_eq!(put.status(), 200);
+    let version_id = put
+        .headers()
+        .get("x-amz-version-id")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+
+    // Overwrite with a second version so the first becomes historical.
+    s3_request_with_headers(
+        "PUT",
+        &format!("{}/ver-sse/v.bin", base_url),
+        b"replacement".to_vec(),
+        vec![("x-amz-server-side-encryption", "AES256")],
+    )
+    .await;
+
+    // GET by explicit versionId — must decrypt, not return ciphertext.
+    let get = s3_request(
+        "GET",
+        &format!("{}/ver-sse/v.bin?versionId={}", base_url, version_id),
+        vec![],
+    )
+    .await;
+    assert_eq!(get.status(), 200);
+    let body = get.bytes().await.unwrap();
+    assert_eq!(
+        body.as_ref(),
+        plaintext.as_slice(),
+        "versioned GET must decrypt"
+    );
+}
+
+/// Multipart SSE-C: UploadPart with a mismatched customer key is rejected on
+/// the part upload itself (not just at Complete). Closes the "keyA init, keyB
+/// upload" gap alongside the Complete check.
+#[tokio::test]
+async fn test_multipart_sse_c_part_key_mismatch_rejected() {
+    use base64::Engine;
+    use md5::Digest;
+
+    let (base_url, _tmp) = start_server().await;
+    s3_request("PUT", &format!("{}/mp-ssec-part", base_url), vec![]).await;
+
+    let key_a = [0x11u8; 32];
+    let key_b = [0xEEu8; 32];
+    let b64 = base64::engine::general_purpose::STANDARD;
+    let key_a_b64 = b64.encode(key_a);
+    let key_a_md5 = b64.encode(md5::Md5::digest(key_a));
+    let key_b_b64 = b64.encode(key_b);
+    let key_b_md5 = b64.encode(md5::Md5::digest(key_b));
+
+    let init = s3_request_with_headers(
+        "POST",
+        &format!("{}/mp-ssec-part/o.bin?uploads", base_url),
+        vec![],
+        vec![
+            ("x-amz-server-side-encryption-customer-algorithm", "AES256"),
+            ("x-amz-server-side-encryption-customer-key", &key_a_b64),
+            ("x-amz-server-side-encryption-customer-key-md5", &key_a_md5),
+        ],
+    )
+    .await;
+    assert_eq!(init.status(), 200);
+    let init_body = init.text().await.unwrap();
+    let upload_id = init_body
+        .split("<UploadId>")
+        .nth(1)
+        .and_then(|s| s.split("</UploadId>").next())
+        .expect("UploadId in response")
+        .to_string();
+
+    // UploadPart with key B → must be rejected.
+    let pattern: Vec<u8> = vec![0u8; 5 * 1024 * 1024];
+    let put_part = s3_request_with_headers(
+        "PUT",
+        &format!(
+            "{}/mp-ssec-part/o.bin?partNumber=1&uploadId={}",
+            base_url, upload_id
+        ),
+        pattern,
+        vec![
+            ("x-amz-server-side-encryption-customer-algorithm", "AES256"),
+            ("x-amz-server-side-encryption-customer-key", &key_b_b64),
+            ("x-amz-server-side-encryption-customer-key-md5", &key_b_md5),
+        ],
+    )
+    .await;
+    assert_eq!(put_part.status(), 400);
+    let body = put_part.text().await.unwrap();
+    assert!(body.contains("MD5 mismatch"), "body: {}", body);
+}
+
+/// Tampering with `chunk_size` in the sidecar changes frame boundary math on
+/// reads. The sidecar MAC covers `chunk_size`, so the attack is rejected
+/// before any ciphertext is read.
+#[tokio::test]
+async fn test_sse_s3_chunk_size_tamper_rejected() {
+    let (base_url, tmp) = start_server().await;
+    s3_request("PUT", &format!("{}/chunk-tamper", base_url), vec![]).await;
+
+    let plaintext = b"chunk-size tamper probe".to_vec();
+    let put = s3_request_with_headers(
+        "PUT",
+        &format!("{}/chunk-tamper/x.bin", base_url),
+        plaintext,
+        vec![("x-amz-server-side-encryption", "AES256")],
+    )
+    .await;
+    assert_eq!(put.status(), 200);
+
+    let meta_path = tmp.path().join("buckets/chunk-tamper/x.bin.meta.json");
+    let meta_str = std::fs::read_to_string(&meta_path).unwrap();
+    let mut meta: serde_json::Value = serde_json::from_str(&meta_str).unwrap();
+    meta["encryption"]["chunk_size"] = serde_json::json!(128u32);
+    std::fs::write(&meta_path, serde_json::to_string_pretty(&meta).unwrap()).unwrap();
+
+    let get = s3_request("GET", &format!("{}/chunk-tamper/x.bin", base_url), vec![]).await;
+    assert_eq!(
+        get.status(),
+        400,
+        "chunk_size tamper must be caught by sidecar MAC"
+    );
+}
+
+/// Tampering with `version_id` in the sidecar changes the AAD input used for
+/// frame decryption. Even if the MAC did not cover it (which it does), the
+/// GCM auth tag binds to the original version_id via the AAD scheme.
+#[tokio::test]
+async fn test_sse_s3_version_id_tamper_rejected() {
+    let (base_url, tmp) = start_server().await;
+    s3_request("PUT", &format!("{}/vid-tamper", base_url), vec![]).await;
+    let vxml =
+        b"<?xml version=\"1.0\"?><VersioningConfiguration><Status>Enabled</Status></VersioningConfiguration>"
+            .to_vec();
+    s3_request("PUT", &format!("{}/vid-tamper?versioning", base_url), vxml).await;
+
+    let plaintext = b"version-id-tamper probe".to_vec();
+    let put = s3_request_with_headers(
+        "PUT",
+        &format!("{}/vid-tamper/x.bin", base_url),
+        plaintext,
+        vec![("x-amz-server-side-encryption", "AES256")],
+    )
+    .await;
+    assert_eq!(put.status(), 200);
+
+    let meta_path = tmp.path().join("buckets/vid-tamper/x.bin.meta.json");
+    let meta_str = std::fs::read_to_string(&meta_path).unwrap();
+    let mut meta: serde_json::Value = serde_json::from_str(&meta_str).unwrap();
+    meta["version_id"] = serde_json::json!("FORGED_VERSION_ID");
+    std::fs::write(&meta_path, serde_json::to_string_pretty(&meta).unwrap()).unwrap();
+
+    let get = s3_request("GET", &format!("{}/vid-tamper/x.bin", base_url), vec![]).await;
+    assert_eq!(
+        get.status(),
+        400,
+        "version_id tamper must be caught (MAC and/or AAD)"
+    );
+}
+
+/// Swapping ciphertext between two versions of the same key still fails: the
+/// AAD builder captures the *current* version's `version_id`, so a file
+/// written under a different version_id cannot authenticate.
+#[tokio::test]
+async fn test_sse_s3_cross_version_ciphertext_swap_rejected() {
+    let (base_url, tmp) = start_server().await;
+    s3_request("PUT", &format!("{}/ver-swap", base_url), vec![]).await;
+    let vxml =
+        b"<?xml version=\"1.0\"?><VersioningConfiguration><Status>Enabled</Status></VersioningConfiguration>"
+            .to_vec();
+    s3_request("PUT", &format!("{}/ver-swap?versioning", base_url), vxml).await;
+
+    // Write two versions, equal length so a byte-swap does not change file size.
+    let plaintext_a = vec![0xAAu8; 4096];
+    let plaintext_b = vec![0xBBu8; 4096];
+    let put_a = s3_request_with_headers(
+        "PUT",
+        &format!("{}/ver-swap/k.bin", base_url),
+        plaintext_a.clone(),
+        vec![("x-amz-server-side-encryption", "AES256")],
+    )
+    .await;
+    assert_eq!(put_a.status(), 200);
+    let vid_a = put_a
+        .headers()
+        .get("x-amz-version-id")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+
+    let put_b = s3_request_with_headers(
+        "PUT",
+        &format!("{}/ver-swap/k.bin", base_url),
+        plaintext_b.clone(),
+        vec![("x-amz-server-side-encryption", "AES256")],
+    )
+    .await;
+    assert_eq!(put_b.status(), 200);
+    let vid_b = put_b
+        .headers()
+        .get("x-amz-version-id")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+
+    // Overwrite version A's data file with version B's ciphertext bytes.
+    let ver_a_data = tmp
+        .path()
+        .join(format!("buckets/ver-swap/.versions/k.bin/{}.data", vid_a));
+    let ver_b_data = tmp
+        .path()
+        .join(format!("buckets/ver-swap/.versions/k.bin/{}.data", vid_b));
+    let b_bytes = std::fs::read(&ver_b_data).unwrap();
+    std::fs::write(&ver_a_data, &b_bytes).unwrap();
+
+    let get = s3_request(
+        "GET",
+        &format!("{}/ver-swap/k.bin?versionId={}", base_url, vid_a),
+        vec![],
+    )
+    .await;
+    // Decryptor fails mid-stream on AAD mismatch; assertion: bytes returned
+    // do NOT equal plaintext_a (the attacker's goal was to substitute B's data
+    // for A's without detection).
+    let body = get.bytes().await.unwrap_or_default();
+    assert_ne!(
+        body.as_ref(),
+        plaintext_a.as_slice(),
+        "cross-version ciphertext swap must not authenticate"
+    );
+    assert_ne!(
+        body.as_ref(),
+        plaintext_b.as_slice(),
+        "cross-version swap must not yield B's plaintext either"
+    );
+}
+
+/// 0-byte SSE-S3 object: PUT + GET round-trip. Sidecar MAC + AAD path must
+/// handle the empty-frame edge case without erroring.
+#[tokio::test]
+async fn test_sse_s3_empty_object_round_trip() {
+    let (base_url, tmp) = start_server().await;
+    s3_request("PUT", &format!("{}/empty-sse", base_url), vec![]).await;
+
+    let put = s3_request_with_headers(
+        "PUT",
+        &format!("{}/empty-sse/zero.bin", base_url),
+        vec![],
+        vec![("x-amz-server-side-encryption", "AES256")],
+    )
+    .await;
+    assert_eq!(put.status(), 200);
+
+    // On-disk data file must be 0 bytes (no frames emitted for empty input).
+    let on_disk = std::fs::read(tmp.path().join("buckets/empty-sse/zero.bin")).unwrap();
+    assert_eq!(on_disk.len(), 0, "empty SSE object writes no frames");
+
+    // Sidecar still carries encryption block + MAC.
+    let meta_str =
+        std::fs::read_to_string(tmp.path().join("buckets/empty-sse/zero.bin.meta.json")).unwrap();
+    assert!(meta_str.contains("\"sidecar_mac\""));
+
+    let get = s3_request("GET", &format!("{}/empty-sse/zero.bin", base_url), vec![]).await;
+    assert_eq!(get.status(), 200);
+    assert_eq!(get.headers().get("content-length").unwrap(), "0");
+    let body = get.bytes().await.unwrap();
+    assert_eq!(body.len(), 0, "GET must return 0 bytes");
+}
+
+/// Erasure coding + SSE are mutually exclusive. PUT with both must return 400
+/// so users cannot silently lose either integrity property.
+#[tokio::test]
+async fn test_ec_plus_encryption_returns_400() {
+    let (base_url, _tmp) = start_server_ec().await;
+    s3_request("PUT", &format!("{}/ec-enc", base_url), vec![]).await;
+
+    let put = s3_request_with_headers(
+        "PUT",
+        &format!("{}/ec-enc/x.bin", base_url),
+        b"ec-plus-sse not allowed".to_vec(),
+        vec![("x-amz-server-side-encryption", "AES256")],
+    )
+    .await;
+    assert_eq!(put.status(), 400);
+    let body = put.text().await.unwrap();
+    assert!(
+        body.contains("erasure coding") || body.contains("encryption"),
+        "body: {}",
+        body
+    );
 }

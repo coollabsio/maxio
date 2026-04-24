@@ -19,6 +19,7 @@
     name: string
     createdAt: string
     versioning: boolean
+    encryption: boolean
   }
 
   let buckets = $state<Bucket[]>([])
@@ -152,6 +153,7 @@
         <Table.Row>
           <Table.Head>Name</Table.Head>
           <Table.Head>Versioning</Table.Head>
+          <Table.Head>Encryption</Table.Head>
           <Table.Head>Created</Table.Head>
           <Table.Head class="w-20"></Table.Head>
         </Table.Row>
@@ -164,7 +166,14 @@
               {#if bucket.versioning}
                 <span class="inline-flex items-center rounded-sm bg-green-500/10 px-1.5 py-0.5 text-[11px] font-medium text-green-500">Enabled</span>
               {:else}
-                <span class="text-xs text-muted-foreground">Off</span>
+                <span class="text-xs text-muted-foreground">Disabled</span>
+              {/if}
+            </Table.Cell>
+            <Table.Cell>
+              {#if bucket.encryption}
+                <span class="inline-flex items-center rounded-sm bg-green-500/10 px-1.5 py-0.5 text-[11px] font-medium text-green-500">Enabled</span>
+              {:else}
+                <span class="text-xs text-muted-foreground">Disabled</span>
               {/if}
             </Table.Cell>
             <Table.Cell class="text-muted-foreground">{formatDate(bucket.createdAt)}</Table.Cell>

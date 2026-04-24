@@ -258,7 +258,12 @@ pub async fn list_buckets(State(state): State<AppState>) -> impl IntoResponse {
     match state.storage.list_buckets().await {
         Ok(buckets) => {
             let list: Vec<serde_json::Value> = buckets.into_iter().map(|b| {
-                serde_json::json!({ "name": b.name, "createdAt": b.created_at, "versioning": b.versioning })
+                serde_json::json!({
+                    "name": b.name,
+                    "createdAt": b.created_at,
+                    "versioning": b.versioning,
+                    "encryption": b.encryption_config.is_some(),
+                })
             }).collect();
             (StatusCode::OK, Json(serde_json::json!({ "buckets": list }))).into_response()
         }
@@ -288,6 +293,10 @@ pub async fn create_bucket(
         region: state.config.region.clone(),
         versioning: false,
         cors_rules: None,
+        encryption_config: None,
+        encryption_required: false,
+        public_read: false,
+        public_list: false,
     };
 
     match state.storage.create_bucket(&meta).await {
@@ -448,9 +457,23 @@ pub async fn upload_object(
         stream.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e)),
     );
 
+    let encryption = match state.storage.get_bucket_encryption(&bucket).await {
+        Ok(Some(cfg)) => Some(crate::api::object::encryption_from_bucket_default(&cfg)),
+        Ok(None) => None,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "error": format!("failed to read bucket encryption: {}", e)
+                })),
+            )
+                .into_response();
+        }
+    };
+
     match state
         .storage
-        .put_object(&bucket, &key, content_type, Box::pin(reader), None)
+        .put_object(&bucket, &key, content_type, Box::pin(reader), None, encryption)
         .await
     {
         Ok(result) => (
@@ -506,7 +529,7 @@ pub async fn download_object(
     State(state): State<AppState>,
     Path((bucket, key)): Path<(String, String)>,
 ) -> Response {
-    let (reader, meta) = match state.storage.get_object(&bucket, &key).await {
+    let (reader, meta) = match state.storage.get_object(&bucket, &key, None).await {
         Ok(r) => r,
         Err(_) => {
             return (
@@ -682,6 +705,19 @@ pub async fn create_folder(
     }
 
     let key = format!("{}/", name);
+    let encryption = match state.storage.get_bucket_encryption(&bucket).await {
+        Ok(Some(cfg)) => Some(crate::api::object::encryption_from_bucket_default(&cfg)),
+        Ok(None) => None,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "error": format!("failed to read bucket encryption: {}", e)
+                })),
+            )
+                .into_response();
+        }
+    };
     match state
         .storage
         .put_object(
@@ -690,6 +726,7 @@ pub async fn create_folder(
             "application/x-directory",
             Box::pin(tokio::io::empty()),
             None,
+            encryption,
         )
         .await
     {
@@ -731,6 +768,106 @@ pub async fn set_versioning(
     Json(body): Json<SetVersioningRequest>,
 ) -> impl IntoResponse {
     match state.storage.set_versioning(&bucket, body.enabled).await {
+        Ok(()) => (StatusCode::OK, Json(serde_json::json!({"ok": true}))).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": e.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+pub async fn get_encryption(
+    State(state): State<AppState>,
+    Path(bucket): Path<String>,
+) -> impl IntoResponse {
+    match state.storage.get_bucket_encryption(&bucket).await {
+        Ok(Some(cfg)) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "enabled": true,
+                "algorithm": cfg.sse_algorithm,
+            })),
+        )
+            .into_response(),
+        Ok(None) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "enabled": false,
+                "algorithm": null,
+            })),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": e.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+#[derive(serde::Deserialize)]
+pub struct SetEncryptionRequest {
+    enabled: bool,
+}
+
+pub async fn set_encryption(
+    State(state): State<AppState>,
+    Path(bucket): Path<String>,
+    Json(body): Json<SetEncryptionRequest>,
+) -> impl IntoResponse {
+    let result = if body.enabled {
+        let cfg = crate::storage::BucketEncryptionConfig {
+            sse_algorithm: "AES256".to_string(),
+        };
+        state.storage.put_bucket_encryption(&bucket, cfg).await
+    } else {
+        state.storage.delete_bucket_encryption(&bucket).await
+    };
+    match result {
+        Ok(()) => (StatusCode::OK, Json(serde_json::json!({"ok": true}))).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": e.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+pub async fn get_public(
+    State(state): State<AppState>,
+    Path(bucket): Path<String>,
+) -> impl IntoResponse {
+    match state.storage.get_bucket_public(&bucket).await {
+        Ok((read, list)) => (
+            StatusCode::OK,
+            Json(serde_json::json!({"read": read, "list": list})),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": e.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+#[derive(serde::Deserialize)]
+pub struct SetPublicRequest {
+    read: bool,
+    list: bool,
+}
+
+pub async fn set_public(
+    State(state): State<AppState>,
+    Path(bucket): Path<String>,
+    Json(body): Json<SetPublicRequest>,
+) -> impl IntoResponse {
+    match state
+        .storage
+        .set_bucket_public(&bucket, body.read, body.list)
+        .await
+    {
         Ok(()) => (StatusCode::OK, Json(serde_json::json!({"ok": true}))).into_response(),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -811,7 +948,7 @@ pub async fn download_version(
 ) -> Response {
     let (reader, meta) = match state
         .storage
-        .get_object_version(&bucket, &key, &version_id)
+        .get_object_version(&bucket, &key, &version_id, None)
         .await
     {
         Ok(r) => r,
@@ -863,6 +1000,10 @@ pub fn console_router(state: AppState) -> Router<AppState> {
         .route("/buckets/{bucket}/presign/{*key}", get(presign_object))
         .route("/buckets/{bucket}/versioning", get(get_versioning))
         .route("/buckets/{bucket}/versioning", put(set_versioning))
+        .route("/buckets/{bucket}/encryption", get(get_encryption))
+        .route("/buckets/{bucket}/encryption", put(set_encryption))
+        .route("/buckets/{bucket}/public", get(get_public))
+        .route("/buckets/{bucket}/public", put(set_public))
         .route("/buckets/{bucket}/versions", get(list_versions))
         .route(
             "/buckets/{bucket}/versions/{version_id}/objects/{*key}",

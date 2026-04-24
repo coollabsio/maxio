@@ -9,7 +9,7 @@ use axum::{
 
 use crate::error::S3Error;
 use crate::server::AppState;
-use crate::storage::{BucketMeta, CorsRule, StorageError};
+use crate::storage::{BucketEncryptionConfig, BucketMeta, CorsRule, StorageError};
 use crate::xml::{response::to_xml, types::*};
 
 pub async fn list_buckets(State(state): State<AppState>) -> Result<Response<Body>, S3Error> {
@@ -60,6 +60,10 @@ pub async fn create_bucket(
         region: state.config.region.clone(),
         versioning: false,
         cors_rules: None,
+        encryption_config: None,
+        encryption_required: false,
+        public_read: false,
+        public_list: false,
     };
 
     let created = state
@@ -104,6 +108,9 @@ pub async fn delete_bucket(
     if params.contains_key("cors") {
         return delete_bucket_cors(state, bucket).await;
     }
+    if params.contains_key("encryption") {
+        return delete_bucket_encryption(state, bucket).await;
+    }
     match state.storage.delete_bucket(&bucket).await {
         Ok(true) => Ok(Response::builder()
             .status(StatusCode::NO_CONTENT)
@@ -126,6 +133,9 @@ pub async fn handle_bucket_put(
     }
     if params.contains_key("cors") {
         return put_bucket_cors(state, bucket, body).await;
+    }
+    if params.contains_key("encryption") {
+        return put_bucket_encryption(state, bucket, body).await;
     }
     create_bucket(State(state), Path(bucket)).await
 }
@@ -313,6 +323,107 @@ async fn delete_bucket_cors(
         .status(StatusCode::NO_CONTENT)
         .body(Body::empty())
         .unwrap())
+}
+
+// --- Bucket default encryption ---------------------------------------------
+
+async fn put_bucket_encryption(
+    state: AppState,
+    bucket: String,
+    body: Body,
+) -> Result<Response<Body>, S3Error> {
+    match state.storage.head_bucket(&bucket).await {
+        Ok(true) => {}
+        Ok(false) => return Err(S3Error::no_such_bucket(&bucket)),
+        Err(e) => return Err(S3Error::internal(e)),
+    }
+
+    let body_bytes = axum::body::to_bytes(body, 64 * 1024)
+        .await
+        .map_err(S3Error::internal)?;
+    let body_str = String::from_utf8_lossy(&body_bytes);
+
+    // Minimal XML parsing: <ServerSideEncryptionConfiguration><Rule>
+    //   <ApplyServerSideEncryptionByDefault>
+    //     <SSEAlgorithm>AES256</SSEAlgorithm>
+    //   </ApplyServerSideEncryptionByDefault>
+    // </Rule></ServerSideEncryptionConfiguration>
+    let sse_algorithm = extract_xml_tag(&body_str, "SSEAlgorithm")
+        .ok_or_else(S3Error::malformed_xml)?;
+    if sse_algorithm != "AES256" {
+        return Err(S3Error::invalid_encryption_algorithm());
+    }
+    let cfg = BucketEncryptionConfig {
+        sse_algorithm,
+    };
+    state
+        .storage
+        .put_bucket_encryption(&bucket, cfg)
+        .await
+        .map_err(S3Error::internal)?;
+
+    Ok(Response::builder()
+        .status(StatusCode::OK)
+        .body(Body::empty())
+        .unwrap())
+}
+
+pub async fn get_bucket_encryption(
+    state: AppState,
+    bucket: String,
+) -> Result<Response<Body>, S3Error> {
+    let cfg = state
+        .storage
+        .get_bucket_encryption(&bucket)
+        .await
+        .map_err(|e| match e {
+            StorageError::NotFound(_) => S3Error::no_such_bucket(&bucket),
+            e => S3Error::internal(e),
+        })?;
+    let cfg = cfg.ok_or_else(|| S3Error::no_such_bucket_encryption(&bucket))?;
+
+    let xml = format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
+         <ServerSideEncryptionConfiguration>\
+         <Rule><ApplyServerSideEncryptionByDefault>\
+         <SSEAlgorithm>{}</SSEAlgorithm>\
+         </ApplyServerSideEncryptionByDefault></Rule>\
+         </ServerSideEncryptionConfiguration>",
+        cfg.sse_algorithm
+    );
+    Ok(Response::builder()
+        .status(StatusCode::OK)
+        .header("content-type", "application/xml")
+        .body(Body::from(xml))
+        .unwrap())
+}
+
+async fn delete_bucket_encryption(
+    state: AppState,
+    bucket: String,
+) -> Result<Response<Body>, S3Error> {
+    match state.storage.head_bucket(&bucket).await {
+        Ok(true) => {}
+        Ok(false) => return Err(S3Error::no_such_bucket(&bucket)),
+        Err(e) => return Err(S3Error::internal(e)),
+    }
+    state
+        .storage
+        .delete_bucket_encryption(&bucket)
+        .await
+        .map_err(S3Error::internal)?;
+    Ok(Response::builder()
+        .status(StatusCode::NO_CONTENT)
+        .body(Body::empty())
+        .unwrap())
+}
+
+fn extract_xml_tag(xml: &str, tag: &str) -> Option<String> {
+    let open = format!("<{}>", tag);
+    let close = format!("</{}>", tag);
+    let start = xml.find(&open)? + open.len();
+    let end = xml[start..].find(&close)?;
+    Some(xml[start..start + end].trim().to_string())
 }
 
 fn validate_bucket_name(name: &str) -> Result<(), S3Error> {

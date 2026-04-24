@@ -27,6 +27,16 @@ pub async fn auth_middleware(
         return handle_presigned(&state, &method, &query, request, next).await;
     }
 
+    let has_auth_header = request.headers().get("authorization").is_some();
+
+    // Anonymous public-bucket access: no auth header, safe method, bucket flagged public.
+    if !has_auth_header
+        && is_public_bypass_allowed(&state, &method, request.uri().path(), &query).await
+    {
+        tracing::debug!("Public bucket bypass for {} {}", method, request.uri().path());
+        return Ok(next.run(request).await);
+    }
+
     let auth_header = match request.headers().get("authorization") {
         Some(h) => h
             .to_str()
@@ -121,6 +131,67 @@ pub async fn auth_middleware(
     let response = next.run(request).await;
     tracing::debug!("{} {} -> {}", method, uri, response.status());
     Ok(response)
+}
+
+/// Returns true when the request targets a public-bucket resource and is a safe read.
+/// Bypass rules:
+///   - Method must be GET, HEAD, or OPTIONS.
+///   - Path must be `/{bucket}` (list) or `/{bucket}/{key}` (object).
+///   - For bucket-level path: `public_list` must be true.
+///   - For object path: `public_read` must be true.
+///   - Query must not contain mutating sub-resources (`delete`, `uploads`, `tagging`,
+///     `versioning`, `cors`, `encryption`, `policy`, `acl`).
+async fn is_public_bypass_allowed(state: &AppState, method: &str, path: &str, query: &str) -> bool {
+    match method {
+        "GET" | "HEAD" | "OPTIONS" => {}
+        _ => return false,
+    }
+
+    // Reject mutating sub-resource queries that could trigger a POST-like action on GET.
+    for forbidden in [
+        "delete", "uploads", "tagging", "versioning", "cors", "encryption", "policy", "acl",
+    ] {
+        if has_query_key(query, forbidden) {
+            return false;
+        }
+    }
+
+    let trimmed = path.trim_start_matches('/');
+    if trimmed.is_empty() {
+        return false; // root listing always requires auth
+    }
+
+    let (bucket, rest) = match trimmed.split_once('/') {
+        Some((b, r)) => (b, r),
+        None => (trimmed, ""),
+    };
+
+    if bucket.is_empty() {
+        return false;
+    }
+
+    let (public_read, public_list) = match state.storage.get_bucket_public(bucket).await {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+
+    if rest.is_empty() {
+        // Bucket-level request: list/head bucket, location, etc.
+        public_list
+    } else {
+        // Object-level request.
+        public_read
+    }
+}
+
+fn has_query_key(query: &str, key: &str) -> bool {
+    for pair in query.split('&') {
+        let name = pair.split('=').next().unwrap_or("");
+        if name.eq_ignore_ascii_case(key) {
+            return true;
+        }
+    }
+    false
 }
 
 async fn handle_presigned(

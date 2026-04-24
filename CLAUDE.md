@@ -55,12 +55,7 @@ Defaults: port 9000, access/secret `maxioadmin`/`maxioadmin`, region `us-east-1`
 # 1. Unit + integration tests (always run first, no server needed)
 cargo test
 
-# 2. mc integration tests (start server, run tests, stop server)
-cargo build && RUST_LOG=info ./target/debug/maxio --data-dir /tmp/maxio-test --port 9876 &
-./tests/mc_test.sh 9876 /tmp/maxio-test
-kill %1 && rm -rf /tmp/maxio-test
-
-# 3. AWS CLI integration tests (start server, run tests, stop server)
+# 2. AWS CLI integration tests (start server, run tests, stop server)
 cargo build && RUST_LOG=info ./target/debug/maxio --data-dir /tmp/maxio-test --port 9876 &
 ./tests/aws_cli_test.sh 9876 /tmp/maxio-test
 kill %1 && rm -rf /tmp/maxio-test
@@ -219,10 +214,6 @@ aws --endpoint-url http://localhost:9000 s3 rb s3://test-bucket
 ```bash
 # Unit + integration tests (no server needed)
 cargo test
-
-# mc integration tests (requires running server)
-RUST_LOG=debug cargo watch -x 'run -- --data-dir ./data' &
-./tests/mc_test.sh
 
 # AWS CLI integration tests (requires running server)
 ./tests/aws_cli_test.sh

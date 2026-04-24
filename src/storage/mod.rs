@@ -1,5 +1,7 @@
 pub mod chunk_reader;
+pub mod crypto;
 pub mod filesystem;
+pub mod keys;
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -75,6 +77,17 @@ pub struct BucketMeta {
     pub versioning: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cors_rules: Option<Vec<CorsRule>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub encryption_config: Option<BucketEncryptionConfig>,
+    /// Sticky flag flipped on the first encrypted PUT or by `PutBucketEncryption`.
+    /// Once true, every GET in this bucket requires `meta.encryption.is_some()` —
+    /// blocks sidecar `encryption` field stripping as a path to plaintext reads.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub encryption_required: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub public_read: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub public_list: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -98,6 +111,8 @@ pub struct ObjectMeta {
     pub tags: Option<HashMap<String, String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub part_sizes: Option<Vec<u64>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub encryption: Option<EncryptionMeta>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -109,18 +124,27 @@ pub struct MultipartUploadMeta {
     pub initiated: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub checksum_algorithm: Option<ChecksumAlgorithm>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub encryption_spec: Option<UploadEncryptionSpec>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PartMeta {
     pub part_number: u32,
     pub etag: String,
+    /// Plaintext byte length of the part (what the client uploaded).
     pub size: u64,
     pub last_modified: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub checksum_algorithm: Option<ChecksumAlgorithm>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub checksum_value: Option<String>,
+    /// `true` when the on-disk part file is encrypted with an upload-scoped DEK.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub encrypted: bool,
+    /// Disk size of the part including nonce + GCM tag overhead (encrypted only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ciphertext_size: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -164,6 +188,95 @@ pub struct ChunkInfo {
     pub kind: ChunkKind,
 }
 
+/// Encryption mode for server-side encryption.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EncryptionMode {
+    SseS3,
+    SseC,
+}
+
+/// Encryption metadata stored per-object in the `.meta.json` sidecar.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EncryptionMeta {
+    /// "AES256"
+    pub algorithm: String,
+    pub mode: EncryptionMode,
+    /// Master key ID used to wrap the DEK (SSE-S3)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key_id: Option<String>,
+    /// Base64-encoded wrapped (encrypted) DEK — absent for SSE-C
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wrapped_dek: Option<String>,
+    /// Base64-encoded 12-byte nonce used when wrapping the DEK
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wrap_nonce: Option<String>,
+    /// Base64-encoded MD5 of the customer-supplied key (SSE-C only)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub customer_key_md5: Option<String>,
+    /// Base64-encoded 4-byte per-object nonce prefix (informational)
+    pub nonce_prefix: String,
+    /// Plaintext bytes per frame (always FRAME_CHUNK_SIZE = 65536 in v1)
+    pub chunk_size: u32,
+    /// Hex-encoded HMAC-SHA256 of the immutable portion of `ObjectMeta` keyed
+    /// by the DEK. Binds the sidecar to the object; tampering with `size`,
+    /// `wrapped_dek`, `nonce_prefix`, `key`, etc. yields a MAC mismatch on GET.
+    #[serde(default)]
+    pub sidecar_mac: String,
+}
+
+/// Ephemeral encryption specification supplied by the API handler for a PUT.
+/// The customer key (SSE-C) is held in a `Zeroizing` wrapper so it is scrubbed
+/// from memory when the request is dropped.
+pub struct EncryptionRequest {
+    pub mode: EncryptionMode,
+    /// Customer-supplied key (SSE-C only); never persisted, zeroed on drop.
+    pub customer_key: Option<zeroize::Zeroizing<[u8; 32]>>,
+}
+
+impl EncryptionRequest {
+    pub fn sse_s3() -> Self {
+        Self { mode: EncryptionMode::SseS3, customer_key: None }
+    }
+    pub fn sse_c(key: [u8; 32]) -> Self {
+        Self {
+            mode: EncryptionMode::SseC,
+            customer_key: Some(zeroize::Zeroizing::new(key)),
+        }
+    }
+}
+
+/// Bucket-level default encryption configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BucketEncryptionConfig {
+    /// Always "AES256"
+    pub sse_algorithm: String,
+}
+
+/// Compact encryption specification stored in `MultipartUploadMeta` so that
+/// `upload_part` and `complete_multipart_upload` can encrypt/decrypt parts
+/// with an upload-scoped DEK.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UploadEncryptionSpec {
+    pub mode: EncryptionMode,
+    /// SSE-C: base64 MD5 of customer key (for validation only; key not stored).
+    /// Every `UploadPart` call must present a key that matches this MD5.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub customer_key_md5: Option<String>,
+    /// SSE-S3: base64-encoded DEK wrapped by the active master, used to encrypt
+    /// every part of this upload. `None` for SSE-C.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upload_dek_wrapped: Option<String>,
+    /// Base64 12-byte GCM nonce used when wrapping the upload DEK.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upload_dek_wrap_nonce: Option<String>,
+    /// ID of the master key that wrapped the upload DEK.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upload_dek_key_id: Option<String>,
+    /// Base64 4-byte nonce prefix used for all frames across every part.
+    pub upload_nonce_prefix: String,
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum StorageError {
     #[error("IO error: {0}")]
@@ -182,4 +295,10 @@ pub enum StorageError {
     VersionNotFound(String),
     #[error("Checksum mismatch: {0}")]
     ChecksumMismatch(String),
+    #[error("Encryption error: {0}")]
+    EncryptionError(String),
+    #[error("Decryption error: {0}")]
+    DecryptionError(String),
+    #[error("Integrity error: {0}")]
+    IntegrityError(String),
 }

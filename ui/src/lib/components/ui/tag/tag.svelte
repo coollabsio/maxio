@@ -7,17 +7,17 @@
 		class: className,
 		children,
 		...restProps
-	}: WithElementRef<HTMLAttributes<HTMLTableRowElement>> = $props();
+	}: WithElementRef<HTMLAttributes<HTMLSpanElement>> = $props();
 </script>
 
-<tr
+<span
 	bind:this={ref}
-	data-slot="table-row"
+	data-slot="tag"
 	class={cn(
-		"border-b border-neutral-200 dark:border-coolgray-200 transition-colors hover:bg-neutral-100 dark:hover:bg-coolgray-300 data-[state=selected]:bg-neutral-100 dark:data-[state=selected]:bg-coolgray-300",
+		"inline-flex items-center px-2 py-1 text-xs font-bold rounded-sm text-neutral-500 bg-neutral-100 hover:bg-neutral-200 dark:bg-coolgray-100 dark:hover:bg-coolgray-300 cursor-pointer",
 		className
 	)}
 	{...restProps}
 >
 	{@render children?.()}
-</tr>
+</span>

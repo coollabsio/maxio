@@ -1,6 +1,8 @@
 <script lang="ts">
   import { Button } from "$lib/components/ui/button";
   import { Input } from "$lib/components/ui/input";
+  import { Callout } from "$lib/components/ui/callout";
+  import { Highlighted } from "$lib/components/ui/highlighted";
   import Eye from "lucide-svelte/icons/eye";
   import EyeOff from "lucide-svelte/icons/eye-off";
 
@@ -42,13 +44,13 @@
 <div class="flex min-h-screen w-full items-center justify-center bg-background">
   <div class="w-full max-w-lg px-6">
     <!-- Title -->
-    <h1 class="mb-10 text-center text-4xl font-bold text-foreground">MaxIO</h1>
+    <h1 class="mb-10 text-center text-4xl font-bold">MaxIO</h1>
 
     <form onsubmit={handleSubmit} class="flex flex-col gap-6">
       <!-- Access Key -->
       <div class="flex flex-col gap-1.5">
         <label for="accessKey" class="text-sm text-muted-foreground">
-          Access Key <span class="text-primary">*</span>
+          Access Key <Highlighted>*</Highlighted>
         </label>
         <Input
           id="accessKey"
@@ -62,7 +64,7 @@
       <!-- Secret Key -->
       <div class="flex flex-col gap-1.5">
         <label for="secretKey" class="text-sm text-muted-foreground">
-          Secret Key <span class="text-primary">*</span>
+          Secret Key <Highlighted>*</Highlighted>
         </label>
         <div class="relative">
           <Input
@@ -88,7 +90,7 @@
       </div>
 
       {#if error}
-        <p class="text-sm text-destructive">{error}</p>
+        <Callout type="danger">{error}</Callout>
       {/if}
 
       <!-- Login button — large highlighted style -->

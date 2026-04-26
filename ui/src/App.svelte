@@ -181,14 +181,13 @@
       <div class="flex flex-1 flex-col gap-0.5 p-2">
         <button
           onclick={goHome}
-          class="flex h-9 w-full items-center rounded-sm text-left text-sm font-medium transition-colors overflow-hidden"
+          class="flex h-9 w-full items-center rounded-sm text-left text-sm font-medium transition-colors overflow-hidden bg-neutral-200 text-black dark:bg-coolgray-200 dark:text-warning hover:bg-neutral-300 dark:hover:bg-coolgray-100"
           class:gap-3={!collapsed}
           class:px-3={!collapsed}
           class:justify-center={collapsed}
-          style="background: var(--cool-sidebar-active-bg); color: var(--cool-sidebar-active-fg);"
           title="Buckets"
         >
-          <Home class="size-4 shrink-0" />
+          <Home class="size-6 shrink-0" />
           {#if !collapsed}<span class="whitespace-nowrap">Buckets</span>{/if}
         </button>
       </div>

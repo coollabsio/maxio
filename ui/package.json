@@ -22,6 +22,8 @@
   },
   "dependencies": {
     "bits-ui": "^2.15.7",
+    "@fontsource/geist-mono": "^5.2.5",
+    "@fontsource/geist-sans": "^5.2.5",
     "clsx": "^2.1.1",
     "lucide-svelte": "^0.574.0",
     "svelte-sonner": "^1.0.7",

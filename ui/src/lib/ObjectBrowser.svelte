@@ -107,6 +107,10 @@
     return lastSlash >= 0 ? trimmed.slice(lastSlash + 1) : trimmed
   }
 
+  function encodeObjectKey(key: string): string {
+    return key.split('/').map(encodeURIComponent).join('/')
+  }
+
   function formatSize(bytes: number): string {
     if (bytes < 1024) return `${bytes} B`
     if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`
@@ -136,7 +140,7 @@
   })
 
   function downloadUrl(key: string): string {
-    return `/api/buckets/${encodeURIComponent(bucket)}/download/${key}`
+    return `/api/buckets/${encodeURIComponent(bucket)}/download/${encodeObjectKey(key)}`
   }
 
   async function handleUpload() {
@@ -151,7 +155,7 @@
     try {
       for (const file of inputFiles) {
         const key = `${prefix}${file.name}`
-        const res = await fetch(`/api/buckets/${encodeURIComponent(bucket)}/upload/${key}`, {
+        const res = await fetch(`/api/buckets/${encodeURIComponent(bucket)}/upload/${encodeObjectKey(key)}`, {
           method: 'PUT',
           headers: { 'Content-Type': file.type || 'application/octet-stream' },
           body: file,
@@ -184,7 +188,7 @@
     e.stopPropagation()
     if (!confirm(`Delete "${displayName(key)}"?`)) return
     try {
-      const res = await fetch(`/api/buckets/${encodeURIComponent(bucket)}/objects/${key}`, { method: 'DELETE' })
+      const res = await fetch(`/api/buckets/${encodeURIComponent(bucket)}/objects/${encodeObjectKey(key)}`, { method: 'DELETE' })
       if (res.ok) {
         toast.success(`"${displayName(key)}" deleted`)
         await fetchObjects()
@@ -213,7 +217,7 @@
   async function shareObject(key: string, expires: number) {
     shareMenuKey = null
     try {
-      const res = await fetch(`/api/buckets/${encodeURIComponent(bucket)}/presign/${key}?expires=${expires}`)
+      const res = await fetch(`/api/buckets/${encodeURIComponent(bucket)}/presign/${encodeObjectKey(key)}?expires=${expires}`)
       if (!res.ok) {
         const data = await res.json()
         console.error('Presign failed:', res.status, data)
@@ -263,7 +267,7 @@
     e.stopPropagation()
     if (!confirm(`Delete empty folder "${displayName(folderPrefix)}"?`)) return
     try {
-      const res = await fetch(`/api/buckets/${encodeURIComponent(bucket)}/objects/${folderPrefix}`, { method: 'DELETE' })
+      const res = await fetch(`/api/buckets/${encodeURIComponent(bucket)}/objects/${encodeObjectKey(folderPrefix)}`, { method: 'DELETE' })
       if (res.ok) {
         toast.success(`Folder "${displayName(folderPrefix)}" deleted`)
         await fetchObjects()

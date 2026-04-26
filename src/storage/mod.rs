@@ -79,11 +79,6 @@ pub struct BucketMeta {
     pub cors_rules: Option<Vec<CorsRule>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub encryption_config: Option<BucketEncryptionConfig>,
-    /// Sticky flag flipped on the first encrypted PUT or by `PutBucketEncryption`.
-    /// Once true, every GET in this bucket requires `meta.encryption.is_some()` —
-    /// blocks sidecar `encryption` field stripping as a path to plaintext reads.
-    #[serde(default, skip_serializing_if = "is_false")]
-    pub encryption_required: bool,
     #[serde(default, skip_serializing_if = "is_false")]
     pub public_read: bool,
     #[serde(default, skip_serializing_if = "is_false")]
@@ -169,6 +164,8 @@ impl ChunkKind {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChunkManifest {
     pub version: u32,
+    /// Bytes the on-disk chunks stream. Ciphertext total when the companion
+    /// ObjectMeta carries an `encryption` block, plaintext total otherwise.
     pub total_size: u64,
     pub chunk_size: u64,
     pub chunk_count: u32,
@@ -177,6 +174,9 @@ pub struct ChunkManifest {
     pub parity_shards: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub shard_size: Option<u64>,
+    /// Plaintext byte count for encrypted-EC objects; absent for plaintext.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plaintext_size: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

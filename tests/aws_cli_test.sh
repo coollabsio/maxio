@@ -684,6 +684,148 @@ assert "delete SSE bucket" $AWS s3api delete-bucket --bucket "$ENC_BUCKET"
 assert "delete default-encryption bucket" $AWS s3api delete-bucket --bucket "$DEFAULT_BUCKET"
 assert "delete MP SSE bucket" $AWS s3api delete-bucket --bucket "$MP_BUCKET"
 
+# --- EC + SSE composition ---
+echo ""
+echo "--- EC + SSE composition tests ---"
+EC_SSE_BUCKET="ec-sse-$$"
+assert "create ec+sse bucket" $AWS s3api create-bucket --bucket "$EC_SSE_BUCKET"
+
+# Probe: plaintext PUT; presence of .ec/ directory indicates server has EC on.
+echo "probe" > "$TMPDIR/ec-sse-probe.txt"
+$AWS s3 cp "$TMPDIR/ec-sse-probe.txt" "s3://$EC_SSE_BUCKET/probe.txt" > /dev/null
+EC_SSE_PROBE_DIR="$DATA_DIR/buckets/$EC_SSE_BUCKET/probe.txt.ec"
+$AWS s3 rm "s3://$EC_SSE_BUCKET/probe.txt" > /dev/null 2>&1 || true
+
+if [ -d "$EC_SSE_PROBE_DIR" ]; then
+    # 1. Small object — EC + SSE-S3 round-trip
+    echo "hello ec+sse-s3" > "$TMPDIR/ec-sse-s3.txt"
+    $AWS s3api put-object --bucket "$EC_SSE_BUCKET" --key small.txt \
+        --body "$TMPDIR/ec-sse-s3.txt" --server-side-encryption AES256 > /dev/null
+    assert_file_exists "EC+SSE small chunks dir" "$DATA_DIR/buckets/$EC_SSE_BUCKET/small.txt.ec"
+    assert_file_exists "EC+SSE small manifest" "$DATA_DIR/buckets/$EC_SSE_BUCKET/small.txt.ec/manifest.json"
+    if grep -q '"mode": "sse_s3"' "$DATA_DIR/buckets/$EC_SSE_BUCKET/small.txt.meta.json" 2>/dev/null; then
+        green "PASS: EC+SSE small meta has mode=sse_s3"; PASS=$((PASS+1))
+    else
+        red "FAIL: EC+SSE small meta missing mode=sse_s3"; FAIL=$((FAIL+1))
+    fi
+    DISK_HEX=$(head -c 12 "$DATA_DIR/buckets/$EC_SSE_BUCKET/small.txt.ec/000000" 2>/dev/null | od -An -tx1 | tr -d ' \n')
+    PLAIN_HEX=$(head -c 12 "$TMPDIR/ec-sse-s3.txt" | od -An -tx1 | tr -d ' \n')
+    if [ "$DISK_HEX" != "$PLAIN_HEX" ] && [ -n "$DISK_HEX" ]; then
+        green "PASS: EC+SSE chunk contents are ciphertext"; PASS=$((PASS+1))
+    else
+        red "FAIL: EC+SSE chunk 000000 appears to be plaintext (disk=$DISK_HEX plain=$PLAIN_HEX)"; FAIL=$((FAIL+1))
+    fi
+    $AWS s3api get-object --bucket "$EC_SSE_BUCKET" --key small.txt "$TMPDIR/ec-sse-s3-out.txt" > /dev/null
+    if cmp -s "$TMPDIR/ec-sse-s3.txt" "$TMPDIR/ec-sse-s3-out.txt"; then
+        green "PASS: EC+SSE-S3 small round-trip"; PASS=$((PASS+1))
+    else
+        red "FAIL: EC+SSE-S3 small round-trip differs"; FAIL=$((FAIL+1))
+    fi
+
+    # 2. Large object — EC + SSE-S3 multi-chunk multi-frame round-trip (8 MiB)
+    dd if=/dev/urandom of="$TMPDIR/ec-sse-big.bin" bs=1M count=8 status=none
+    assert "EC+SSE-S3 large PUT" $AWS s3 cp "$TMPDIR/ec-sse-big.bin" \
+        "s3://$EC_SSE_BUCKET/big.bin" --sse AES256
+    assert "EC+SSE-S3 large GET" $AWS s3 cp "s3://$EC_SSE_BUCKET/big.bin" "$TMPDIR/ec-sse-big.out"
+    assert_eq "EC+SSE-S3 large md5 matches" \
+        "$(md5sum "$TMPDIR/ec-sse-big.bin" | cut -d' ' -f1)" \
+        "$(md5sum "$TMPDIR/ec-sse-big.out" | cut -d' ' -f1)"
+
+    # 3. Range read across chunk + frame boundaries
+    RNG_START=1000000; RNG_END=1009999
+    $AWS s3api get-object --bucket "$EC_SSE_BUCKET" --key big.bin \
+        --range "bytes=${RNG_START}-${RNG_END}" "$TMPDIR/ec-sse-range.out" > /dev/null
+    dd if="$TMPDIR/ec-sse-big.bin" of="$TMPDIR/ec-sse-range.expect" \
+        bs=1 skip=$RNG_START count=10000 status=none
+    if cmp -s "$TMPDIR/ec-sse-range.out" "$TMPDIR/ec-sse-range.expect"; then
+        green "PASS: EC+SSE-S3 range read"; PASS=$((PASS+1))
+    else
+        red "FAIL: EC+SSE-S3 range read differs"; FAIL=$((FAIL+1))
+    fi
+
+    # 4. SSE-C + EC round-trip
+    EC_SSEC_KEY=$(openssl rand 32 | base64)
+    EC_SSEC_MD5=$(echo -n "$EC_SSEC_KEY" | base64 -d | openssl dgst -md5 -binary | base64)
+    echo "hello ec+sse-c" > "$TMPDIR/ec-sse-c.txt"
+    $AWS s3api put-object --bucket "$EC_SSE_BUCKET" --key ssec.txt \
+        --body "$TMPDIR/ec-sse-c.txt" \
+        --sse-customer-algorithm AES256 \
+        --sse-customer-key "$EC_SSEC_KEY" --sse-customer-key-md5 "$EC_SSEC_MD5" > /dev/null
+    $AWS s3api get-object --bucket "$EC_SSE_BUCKET" --key ssec.txt \
+        --sse-customer-algorithm AES256 \
+        --sse-customer-key "$EC_SSEC_KEY" --sse-customer-key-md5 "$EC_SSEC_MD5" \
+        "$TMPDIR/ec-sse-c.out" > /dev/null
+    if cmp -s "$TMPDIR/ec-sse-c.txt" "$TMPDIR/ec-sse-c.out"; then
+        green "PASS: EC+SSE-C round-trip"; PASS=$((PASS+1))
+    else
+        red "FAIL: EC+SSE-C round-trip differs"; FAIL=$((FAIL+1))
+    fi
+    assert_fail "EC+SSE-C GET without key fails" \
+        $AWS s3api get-object --bucket "$EC_SSE_BUCKET" --key ssec.txt "$TMPDIR/ec-sse-c-nokey"
+
+    # 5. Bucket-default encryption + EC
+    $AWS s3api put-bucket-encryption --bucket "$EC_SSE_BUCKET" \
+        --server-side-encryption-configuration \
+        '{"Rules":[{"ApplyServerSideEncryptionByDefault":{"SSEAlgorithm":"AES256"}}]}' > /dev/null
+    echo "default ec+sse" > "$TMPDIR/ec-default.txt"
+    DEF_OUT=$($AWS s3api put-object --bucket "$EC_SSE_BUCKET" --key default.txt \
+        --body "$TMPDIR/ec-default.txt" 2>&1)
+    assert_eq "EC+bucket-default PUT echoes AES256" "AES256" \
+        "$(echo "$DEF_OUT" | grep -o '"ServerSideEncryption": "[^"]*"' | cut -d'"' -f4)"
+    $AWS s3api get-object --bucket "$EC_SSE_BUCKET" --key default.txt "$TMPDIR/ec-default.out" > /dev/null
+    if cmp -s "$TMPDIR/ec-default.txt" "$TMPDIR/ec-default.out"; then
+        green "PASS: EC+bucket-default round-trip"; PASS=$((PASS+1))
+    else
+        red "FAIL: EC+bucket-default round-trip differs"; FAIL=$((FAIL+1))
+    fi
+    $AWS s3api delete-bucket-encryption --bucket "$EC_SSE_BUCKET" > /dev/null
+
+    # 6. Corruption + RS recovery under encryption (only if parity present)
+    MANIFEST_JSON="$DATA_DIR/buckets/$EC_SSE_BUCKET/big.bin.ec/manifest.json"
+    PARITY_COUNT=$(python3 -c "import json,sys; m=json.load(open(sys.argv[1])); print(m.get('parity_shards') or 0)" "$MANIFEST_JSON" 2>/dev/null || echo 0)
+    if [ "$PARITY_COUNT" -gt 0 ]; then
+        CHUNK0="$DATA_DIR/buckets/$EC_SSE_BUCKET/big.bin.ec/000000"
+        SZ=$(stat -f%z "$CHUNK0" 2>/dev/null || stat -c%s "$CHUNK0")
+        dd if=/dev/zero of="$CHUNK0" bs=1 count=$SZ conv=notrunc status=none
+        assert "EC+SSE GET recovers from one zeroed chunk via RS" \
+            $AWS s3 cp "s3://$EC_SSE_BUCKET/big.bin" "$TMPDIR/ec-sse-recover.out"
+        assert_eq "EC+SSE recovered content md5 matches original" \
+            "$(md5sum "$TMPDIR/ec-sse-big.bin" | cut -d' ' -f1)" \
+            "$(md5sum "$TMPDIR/ec-sse-recover.out" | cut -d' ' -f1)"
+
+        # 7. Bit-flip one ciphertext byte AND patch manifest SHA — AEAD must
+        #    still reject even when chunk integrity check is bypassed.
+        python3 - "$MANIFEST_JSON" "$DATA_DIR/buckets/$EC_SSE_BUCKET/big.bin.ec/000001" <<'PY'
+import json, sys, hashlib
+mf, chunk = sys.argv[1], sys.argv[2]
+with open(chunk, "rb") as f: data = bytearray(f.read())
+data[10] ^= 0xFF
+with open(chunk, "wb") as f: f.write(data)
+m = json.load(open(mf))
+m["chunks"][1]["sha256"] = hashlib.sha256(data).hexdigest()
+json.dump(m, open(mf, "w"))
+PY
+        assert_fail "EC+SSE GET rejects AEAD-tampered chunk (even with matching SHA)" \
+            $AWS s3 cp "s3://$EC_SSE_BUCKET/big.bin" "$TMPDIR/ec-sse-tampered.out"
+    else
+        green "INFO: skipping EC+SSE RS-recovery tests (server has parity_shards=0)"
+    fi
+
+    # Cleanup
+    $AWS s3 rm "s3://$EC_SSE_BUCKET/small.txt" > /dev/null 2>&1 || true
+    $AWS s3 rm "s3://$EC_SSE_BUCKET/big.bin"   > /dev/null 2>&1 || true
+    $AWS s3api delete-object --bucket "$EC_SSE_BUCKET" --key ssec.txt \
+        --sse-customer-algorithm AES256 \
+        --sse-customer-key "$EC_SSEC_KEY" --sse-customer-key-md5 "$EC_SSEC_MD5" \
+        > /dev/null 2>&1 || true
+    $AWS s3 rm "s3://$EC_SSE_BUCKET/default.txt" > /dev/null 2>&1 || true
+
+    green "INFO: EC + SSE composition tests ran (server has EC enabled)"
+else
+    green "INFO: EC + SSE composition tests skipped (server has EC disabled)"
+fi
+assert "delete ec+sse bucket" $AWS s3api delete-bucket --bucket "$EC_SSE_BUCKET"
+
 # --- Encryption transition: plaintext → enable → disable ---
 echo ""
 echo "--- Encryption transition tests ---"

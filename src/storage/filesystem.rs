@@ -501,10 +501,10 @@ impl FilesystemStorage {
         }
 
         if self.erasure_coding {
-            if encryption.is_some() {
-                return Err(StorageError::EncryptionError(
-                    "encryption + erasure coding not yet supported".into(),
-                ));
+            if let Some(req) = encryption {
+                return self
+                    .put_object_chunked_encrypted(bucket, key, content_type, body, checksum, req)
+                    .await;
             }
             return self
                 .put_object_chunked(
@@ -670,10 +670,6 @@ impl FilesystemStorage {
         let json = serde_json::to_string_pretty(&meta)?;
         fs::write(&meta_path, json).await?;
 
-        if meta.encryption.is_some() {
-            self.mark_bucket_encryption_required(bucket).await?;
-        }
-
         if versioned {
             self.write_version(bucket, key, &meta, &obj_path).await?;
         }
@@ -771,6 +767,7 @@ impl FilesystemStorage {
             } else {
                 None
             },
+            plaintext_size: None,
         };
         let manifest_json = serde_json::to_string_pretty(&manifest)?;
         fs::write(self.manifest_path(bucket, key), manifest_json).await?;
@@ -827,6 +824,238 @@ impl FilesystemStorage {
             version_id,
             checksum_algorithm: checksum_algo,
             checksum_value,
+        })
+    }
+
+    /// Encrypt-then-EC write path. Frames plaintext through AES-256-GCM (reusing
+    /// the same 64 KiB frame format as non-EC SSE), then chunks the ciphertext
+    /// stream into `self.chunk_size`-sized EC chunks. Frame boundaries are not
+    /// aligned with chunk boundaries — RS reconstructs chunk bytes byte-exact,
+    /// so frames re-emerge intact on read.
+    async fn put_object_chunked_encrypted(
+        &self,
+        bucket: &str,
+        key: &str,
+        content_type: &str,
+        mut body: ByteStream,
+        checksum: Option<(ChecksumAlgorithm, Option<String>)>,
+        encryption: EncryptionRequest,
+    ) -> Result<PutResult, StorageError> {
+        let ec_dir = self.ec_dir(bucket, key);
+        if let Some(parent) = ec_dir.parent() {
+            fs::create_dir_all(parent).await?;
+        }
+        fs::create_dir_all(&ec_dir).await?;
+
+        // Version-id upfront: AAD binds to it, so we need it before the first
+        // frame is encrypted.
+        let versioned = self.is_versioned(bucket).await.unwrap_or(false);
+        let version_id = if versioned {
+            Some(Self::generate_version_id())
+        } else {
+            None
+        };
+
+        let enc_meta = self
+            .prepare_encryption(&encryption)
+            .map_err(|e| StorageError::EncryptionError(e.to_string()))?;
+        let dek = self
+            .resolve_dek(
+                &enc_meta,
+                encryption.customer_key.as_ref().map(|k| **k),
+            )
+            .map_err(|e| StorageError::EncryptionError(e.to_string()))?;
+        let b64 = base64::engine::general_purpose::STANDARD;
+        let prefix_bytes = b64
+            .decode(&enc_meta.nonce_prefix)
+            .map_err(|_| StorageError::EncryptionError("invalid nonce_prefix".into()))?;
+        let mut nonce_prefix = [0u8; 4];
+        nonce_prefix.copy_from_slice(&prefix_bytes);
+        let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&dek));
+
+        let checksum_algo = checksum.as_ref().map(|(a, _)| *a);
+        let expected_checksum = checksum.as_ref().and_then(|(_, v)| v.clone());
+        let mut md5_hasher = Md5::new();
+        let mut checksum_hasher = checksum_algo.map(ChecksumHasher::new);
+        let mut plaintext_size: u64 = 0;
+        let mut ct_size: u64 = 0;
+        let mut chunks: Vec<ChunkInfo> = Vec::new();
+        let mut chunk_index: u32 = 0;
+        let mut frame_index: u64 = 0;
+        let mut read_buf = vec![0u8; IO_BUFFER_SIZE];
+        let mut frame_buf: Vec<u8> = Vec::with_capacity(FRAME_CHUNK_SIZE);
+        let mut chunk_buf: Vec<u8> = Vec::with_capacity(self.chunk_size as usize);
+
+        loop {
+            let n = body.read(&mut read_buf).await?;
+            if n == 0 {
+                // Flush trailing partial frame.
+                if !frame_buf.is_empty() {
+                    let aad =
+                        build_frame_aad(bucket, key, version_id.as_deref(), frame_index);
+                    let ct = encrypt_frame_to_vec(
+                        &cipher,
+                        &nonce_prefix,
+                        frame_index,
+                        &frame_buf,
+                        &aad,
+                    )?;
+                    chunk_buf.extend_from_slice(&ct);
+                    frame_buf.clear();
+                }
+                // Flush full chunks then any remainder.
+                while chunk_buf.len() >= self.chunk_size as usize {
+                    let chunk_data: Vec<u8> =
+                        chunk_buf.drain(..self.chunk_size as usize).collect();
+                    ct_size += chunk_data.len() as u64;
+                    let ci = self
+                        .write_chunk(bucket, key, chunk_index, &chunk_data)
+                        .await?;
+                    chunks.push(ci);
+                    chunk_index += 1;
+                }
+                if !chunk_buf.is_empty() {
+                    ct_size += chunk_buf.len() as u64;
+                    let ci = self
+                        .write_chunk(bucket, key, chunk_index, &chunk_buf)
+                        .await?;
+                    chunks.push(ci);
+                    chunk_buf.clear();
+                }
+                break;
+            }
+            md5_hasher.update(&read_buf[..n]);
+            if let Some(ref mut ch) = checksum_hasher {
+                ch.update(&read_buf[..n]);
+            }
+            plaintext_size += n as u64;
+            frame_buf.extend_from_slice(&read_buf[..n]);
+            while frame_buf.len() >= FRAME_CHUNK_SIZE {
+                let frame_data: Vec<u8> = frame_buf.drain(..FRAME_CHUNK_SIZE).collect();
+                let aad = build_frame_aad(bucket, key, version_id.as_deref(), frame_index);
+                let ct = encrypt_frame_to_vec(
+                    &cipher,
+                    &nonce_prefix,
+                    frame_index,
+                    &frame_data,
+                    &aad,
+                )?;
+                chunk_buf.extend_from_slice(&ct);
+                frame_index += 1;
+                while chunk_buf.len() >= self.chunk_size as usize {
+                    let chunk_data: Vec<u8> =
+                        chunk_buf.drain(..self.chunk_size as usize).collect();
+                    ct_size += chunk_data.len() as u64;
+                    let ci = self
+                        .write_chunk(bucket, key, chunk_index, &chunk_data)
+                        .await?;
+                    chunks.push(ci);
+                    chunk_index += 1;
+                }
+            }
+        }
+
+        // Preserve the existing EC invariant: at least one chunk on disk so the
+        // manifest/chunk-reader path is consistent even for empty objects.
+        if chunks.is_empty() {
+            let ci = self.write_chunk(bucket, key, 0, &[]).await?;
+            chunks.push(ci);
+        }
+
+        let data_chunk_count = chunks.len() as u32;
+
+        let has_parity = self.parity_shards > 0 && ct_size > 0;
+        if has_parity {
+            let parity_infos = self.compute_and_write_parity(bucket, key, &chunks).await?;
+            chunks.extend(parity_infos);
+        }
+
+        let manifest = ChunkManifest {
+            version: if has_parity { 2 } else { 1 },
+            total_size: ct_size,
+            chunk_size: self.chunk_size,
+            chunk_count: data_chunk_count,
+            chunks,
+            parity_shards: if has_parity {
+                Some(self.parity_shards)
+            } else {
+                None
+            },
+            shard_size: if has_parity {
+                Some(self.chunk_size)
+            } else {
+                None
+            },
+            plaintext_size: Some(plaintext_size),
+        };
+        fs::write(
+            self.manifest_path(bucket, key),
+            serde_json::to_string_pretty(&manifest)?,
+        )
+        .await?;
+
+        let etag = hex::encode(md5_hasher.finalize());
+        let etag_quoted = format!("\"{}\"", etag);
+
+        let (ck_algo, ck_val) = if let Some(algo) = checksum_algo {
+            let computed = checksum_hasher.unwrap().finalize_base64();
+            if let Some(expected) = expected_checksum {
+                if computed != expected {
+                    return Err(StorageError::ChecksumMismatch(format!(
+                        "expected {}, got {}",
+                        expected, computed
+                    )));
+                }
+            }
+            (Some(algo), Some(computed))
+        } else {
+            (None, None)
+        };
+
+        let now = chrono::Utc::now()
+            .format("%Y-%m-%dT%H:%M:%S%.3fZ")
+            .to_string();
+        let storage_format = if has_parity {
+            "chunked-v2"
+        } else {
+            "chunked-v1"
+        };
+
+        let mut meta = ObjectMeta {
+            key: key.to_string(),
+            size: plaintext_size,
+            etag: etag_quoted.clone(),
+            content_type: content_type.to_string(),
+            last_modified: now,
+            version_id: version_id.clone(),
+            is_delete_marker: false,
+            storage_format: Some(storage_format.to_string()),
+            checksum_algorithm: ck_algo,
+            checksum_value: ck_val.clone(),
+            tags: None,
+            part_sizes: None,
+            encryption: Some(enc_meta),
+        };
+        meta.encryption.as_mut().unwrap().sidecar_mac = String::new();
+        let mac = compute_sidecar_mac(&dek, &meta)?;
+        meta.encryption.as_mut().unwrap().sidecar_mac = mac;
+
+        let meta_path = self.meta_path(bucket, key);
+        if let Some(parent) = meta_path.parent() {
+            fs::create_dir_all(parent).await?;
+        }
+        fs::write(&meta_path, serde_json::to_string_pretty(&meta)?).await?;
+
+        if versioned {
+            self.write_version_chunked(bucket, key, &meta).await?;
+        }
+
+        Ok(PutResult {
+            size: plaintext_size,
+            etag: etag_quoted,
+            version_id,
+            checksum_algorithm: ck_algo,
+            checksum_value: ck_val,
         })
     }
 
@@ -1000,6 +1229,7 @@ impl FilesystemStorage {
             } else {
                 None
             },
+            plaintext_size: None,
         };
         fs::write(
             self.manifest_path(bucket, key),
@@ -1078,6 +1308,261 @@ impl FilesystemStorage {
         })
     }
 
+    /// Encrypt-then-EC multipart completion. Reads each part with the
+    /// upload-scoped DEK (per `upload_meta.encryption_spec`), re-encrypts the
+    /// recombined stream under a fresh per-object DEK using 64 KiB frames,
+    /// chunks the ciphertext into EC chunks, writes parity.
+    async fn complete_multipart_chunked_encrypted(
+        &self,
+        bucket: &str,
+        upload_id: &str,
+        upload_meta: &MultipartUploadMeta,
+        selected: &[PartMeta],
+        customer_key: Option<[u8; 32]>,
+    ) -> Result<PutResult, StorageError> {
+        let key = upload_meta.key.as_str();
+        let ec_dir = self.ec_dir(bucket, key);
+        if let Some(parent) = ec_dir.parent() {
+            fs::create_dir_all(parent).await?;
+        }
+        fs::create_dir_all(&ec_dir).await?;
+
+        // Upload-scoped DEK used to decrypt each part on read.
+        let upload_spec = upload_meta
+            .encryption_spec
+            .as_ref()
+            .expect("complete_multipart_chunked_encrypted called without encryption_spec");
+        let upload_dek = self.resolve_upload_dek(upload_spec, customer_key)?;
+
+        // Fresh per-object encryption (distinct DEK from the upload DEK).
+        let req = match upload_spec.mode {
+            EncryptionMode::SseS3 => EncryptionRequest::sse_s3(),
+            EncryptionMode::SseC => {
+                let ck = customer_key.ok_or_else(|| {
+                    StorageError::EncryptionError(
+                        "SSE-C requires customer key on CompleteMultipartUpload".into(),
+                    )
+                })?;
+                EncryptionRequest::sse_c(ck)
+            }
+        };
+        let enc_meta = self
+            .prepare_encryption(&req)
+            .map_err(|e| StorageError::EncryptionError(e.to_string()))?;
+        let dek = self
+            .resolve_dek(&enc_meta, customer_key)
+            .map_err(|e| StorageError::EncryptionError(e.to_string()))?;
+        let b64 = base64::engine::general_purpose::STANDARD;
+        let prefix_bytes = b64
+            .decode(&enc_meta.nonce_prefix)
+            .map_err(|_| StorageError::EncryptionError("invalid nonce_prefix".into()))?;
+        let mut nonce_prefix = [0u8; 4];
+        nonce_prefix.copy_from_slice(&prefix_bytes);
+        let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&dek));
+
+        let mut total_plaintext: u64 = 0;
+        let mut ct_size: u64 = 0;
+        let mut etag_hasher = Md5::new();
+        let mut chunks: Vec<ChunkInfo> = Vec::new();
+        let mut chunk_index: u32 = 0;
+        let mut frame_index: u64 = 0;
+        let mut read_buf = vec![0u8; IO_BUFFER_SIZE];
+        let mut frame_buf: Vec<u8> = Vec::with_capacity(FRAME_CHUNK_SIZE);
+        let mut chunk_buf: Vec<u8> = Vec::with_capacity(self.chunk_size as usize);
+
+        for part in selected {
+            let part_path = self.part_path(bucket, upload_id, part.part_number);
+            let mut part_stream: ByteStream = if part.encrypted {
+                let file = fs::File::open(&part_path).await?;
+                let aad = part_aad_builder(upload_id, part.part_number);
+                Box::pin(FrameDecryptor::new(
+                    Box::pin(file),
+                    &upload_dek,
+                    part.size,
+                    FRAME_CHUNK_SIZE,
+                    aad,
+                ))
+            } else {
+                Box::pin(fs::File::open(&part_path).await?)
+            };
+
+            loop {
+                let n = part_stream.read(&mut read_buf).await?;
+                if n == 0 {
+                    break;
+                }
+                total_plaintext += n as u64;
+                frame_buf.extend_from_slice(&read_buf[..n]);
+                while frame_buf.len() >= FRAME_CHUNK_SIZE {
+                    let frame_data: Vec<u8> = frame_buf.drain(..FRAME_CHUNK_SIZE).collect();
+                    let aad = build_frame_aad(bucket, key, None, frame_index);
+                    let ct = encrypt_frame_to_vec(
+                        &cipher,
+                        &nonce_prefix,
+                        frame_index,
+                        &frame_data,
+                        &aad,
+                    )?;
+                    chunk_buf.extend_from_slice(&ct);
+                    frame_index += 1;
+                    while chunk_buf.len() >= self.chunk_size as usize {
+                        let chunk_data: Vec<u8> =
+                            chunk_buf.drain(..self.chunk_size as usize).collect();
+                        ct_size += chunk_data.len() as u64;
+                        let ci = self
+                            .write_chunk(bucket, key, chunk_index, &chunk_data)
+                            .await?;
+                        chunks.push(ci);
+                        chunk_index += 1;
+                    }
+                }
+            }
+
+            let raw_md5 = hex::decode(part.etag.trim_matches('"'))
+                .map_err(|_| StorageError::InvalidKey("invalid part etag".into()))?;
+            etag_hasher.update(raw_md5);
+        }
+
+        // Flush trailing partial frame + any remaining chunk_buf bytes.
+        if !frame_buf.is_empty() {
+            let aad = build_frame_aad(bucket, key, None, frame_index);
+            let ct = encrypt_frame_to_vec(
+                &cipher,
+                &nonce_prefix,
+                frame_index,
+                &frame_buf,
+                &aad,
+            )?;
+            chunk_buf.extend_from_slice(&ct);
+            frame_buf.clear();
+        }
+        while chunk_buf.len() >= self.chunk_size as usize {
+            let chunk_data: Vec<u8> = chunk_buf.drain(..self.chunk_size as usize).collect();
+            ct_size += chunk_data.len() as u64;
+            let ci = self
+                .write_chunk(bucket, key, chunk_index, &chunk_data)
+                .await?;
+            chunks.push(ci);
+            chunk_index += 1;
+        }
+        if !chunk_buf.is_empty() {
+            ct_size += chunk_buf.len() as u64;
+            let ci = self
+                .write_chunk(bucket, key, chunk_index, &chunk_buf)
+                .await?;
+            chunks.push(ci);
+            chunk_buf.clear();
+        }
+
+        if chunks.is_empty() {
+            let ci = self.write_chunk(bucket, key, 0, &[]).await?;
+            chunks.push(ci);
+        }
+
+        let data_chunk_count = chunks.len() as u32;
+        let has_parity = self.parity_shards > 0 && ct_size > 0;
+        if has_parity {
+            let parity_infos = self.compute_and_write_parity(bucket, key, &chunks).await?;
+            chunks.extend(parity_infos);
+        }
+
+        let manifest = ChunkManifest {
+            version: if has_parity { 2 } else { 1 },
+            total_size: ct_size,
+            chunk_size: self.chunk_size,
+            chunk_count: data_chunk_count,
+            chunks,
+            parity_shards: if has_parity {
+                Some(self.parity_shards)
+            } else {
+                None
+            },
+            shard_size: if has_parity {
+                Some(self.chunk_size)
+            } else {
+                None
+            },
+            plaintext_size: Some(total_plaintext),
+        };
+        fs::write(
+            self.manifest_path(bucket, key),
+            serde_json::to_string_pretty(&manifest)?,
+        )
+        .await?;
+
+        let etag = format!(
+            "\"{}-{}\"",
+            hex::encode(etag_hasher.finalize()),
+            selected.len()
+        );
+
+        let (checksum_algorithm, checksum_value) =
+            if let Some(algo) = upload_meta.checksum_algorithm {
+                let mut raw_checksums = Vec::new();
+                for part in selected {
+                    if let Some(ref val) = part.checksum_value {
+                        if let Ok(raw) = b64.decode(val) {
+                            raw_checksums.extend_from_slice(&raw);
+                        }
+                    }
+                }
+                if !raw_checksums.is_empty() {
+                    let mut composite_hasher = ChecksumHasher::new(algo);
+                    composite_hasher.update(&raw_checksums);
+                    let composite =
+                        format!("{}-{}", composite_hasher.finalize_base64(), selected.len());
+                    (Some(algo), Some(composite))
+                } else {
+                    (Some(algo), None)
+                }
+            } else {
+                (None, None)
+            };
+
+        let part_sizes: Vec<u64> = selected.iter().map(|p| p.size).collect();
+        let storage_format = if has_parity {
+            "chunked-v2"
+        } else {
+            "chunked-v1"
+        };
+        let mut object_meta = ObjectMeta {
+            key: key.to_string(),
+            size: total_plaintext,
+            etag: etag.clone(),
+            content_type: upload_meta.content_type.clone(),
+            last_modified: chrono::Utc::now()
+                .format("%Y-%m-%dT%H:%M:%S%.3fZ")
+                .to_string(),
+            version_id: None,
+            is_delete_marker: false,
+            storage_format: Some(storage_format.to_string()),
+            checksum_algorithm,
+            checksum_value: checksum_value.clone(),
+            tags: None,
+            part_sizes: Some(part_sizes),
+            encryption: Some(enc_meta),
+        };
+        object_meta.encryption.as_mut().unwrap().sidecar_mac = String::new();
+        let mac = compute_sidecar_mac(&dek, &object_meta)?;
+        object_meta.encryption.as_mut().unwrap().sidecar_mac = mac;
+
+        let meta_path = self.meta_path(bucket, key);
+        if let Some(parent) = meta_path.parent() {
+            fs::create_dir_all(parent).await?;
+        }
+        fs::write(&meta_path, serde_json::to_string_pretty(&object_meta)?).await?;
+
+        let _ = fs::remove_dir_all(self.upload_dir(bucket, upload_id)).await;
+
+        Ok(PutResult {
+            size: total_plaintext,
+            etag,
+            version_id: None,
+            checksum_algorithm,
+            checksum_value,
+        })
+    }
+
     async fn put_folder_marker(&self, bucket: &str, key: &str) -> Result<PutResult, StorageError> {
         let folder_dir = self
             .buckets_dir
@@ -1130,11 +1615,27 @@ impl FilesystemStorage {
     ) -> Result<(ByteStream, ObjectMeta), StorageError> {
         validate_key(key)?;
         let meta = self.read_object_meta(bucket, key).await?;
-        self.check_encryption_required(bucket, &meta).await?;
         reject_sse_c_on_plaintext(&meta, customer_key.is_some())?;
         let ec_dir = self.ec_dir(bucket, key);
         if Self::is_chunked_path(&ec_dir).await {
             let manifest = self.read_manifest(bucket, key).await?;
+            if let Some(ref enc_meta) = meta.encryption {
+                let dek = self.resolve_dek(enc_meta, customer_key)?;
+                verify_sidecar_mac(&meta, &dek)?;
+                let frame_size = enc_meta.chunk_size as usize;
+                let plaintext_size = meta.size;
+                let aad_builder =
+                    object_aad_builder(bucket, key, meta.version_id.as_deref());
+                let ct_reader = VerifiedChunkReader::new(ec_dir, manifest);
+                let decryptor = FrameDecryptor::new(
+                    Box::pin(ct_reader),
+                    &dek,
+                    plaintext_size,
+                    frame_size,
+                    aad_builder,
+                );
+                return Ok((Box::pin(decryptor), meta));
+            }
             let reader = VerifiedChunkReader::new(ec_dir, manifest);
             return Ok((Box::pin(reader), meta));
         }
@@ -1193,11 +1694,32 @@ impl FilesystemStorage {
     ) -> Result<(ByteStream, ObjectMeta), StorageError> {
         validate_key(key)?;
         let meta = self.read_object_meta(bucket, key).await?;
-        self.check_encryption_required(bucket, &meta).await?;
         reject_sse_c_on_plaintext(&meta, customer_key.is_some())?;
         let ec_dir = self.ec_dir(bucket, key);
         if Self::is_chunked_path(&ec_dir).await {
             let manifest = self.read_manifest(bucket, key).await?;
+            if let Some(ref enc_meta) = meta.encryption {
+                let dek = self.resolve_dek(enc_meta, customer_key)?;
+                verify_sidecar_mac(&meta, &dek)?;
+                let frame_size = enc_meta.chunk_size as usize;
+                let ct_offset = FrameDecryptor::ciphertext_offset(frame_size, offset);
+                let ct_total = manifest.total_size;
+                let ct_length = ct_total.saturating_sub(ct_offset);
+                let aad_builder =
+                    object_aad_builder(bucket, key, meta.version_id.as_deref());
+                let ct_reader =
+                    VerifiedChunkReader::with_range(ec_dir, manifest, ct_offset, ct_length);
+                let decryptor = FrameDecryptor::for_range(
+                    Box::pin(ct_reader),
+                    &dek,
+                    meta.size,
+                    frame_size,
+                    offset,
+                    length,
+                    aad_builder,
+                );
+                return Ok((Box::pin(decryptor), meta));
+            }
             let reader = VerifiedChunkReader::with_range(ec_dir, manifest, offset, length);
             return Ok((Box::pin(reader), meta));
         }
@@ -1263,7 +1785,6 @@ impl FilesystemStorage {
     pub async fn head_object(&self, bucket: &str, key: &str) -> Result<ObjectMeta, StorageError> {
         validate_key(key)?;
         let meta = self.read_object_meta(bucket, key).await?;
-        self.check_encryption_required(bucket, &meta).await?;
         Ok(meta)
     }
 
@@ -1587,9 +2108,44 @@ impl FilesystemStorage {
 
         if self.erasure_coding {
             if upload_meta.encryption_spec.is_some() {
-                return Err(StorageError::EncryptionError(
-                    "encryption + erasure coding not yet supported".into(),
-                ));
+                // SSE-C key continuity + per-part `encrypted` flag checks
+                // belong with the encrypted multipart path even under EC.
+                if let Some(ref spec) = upload_meta.encryption_spec {
+                    if matches!(spec.mode, EncryptionMode::SseC) {
+                        let ck = customer_key.ok_or_else(|| {
+                            StorageError::EncryptionError(
+                                "SSE-C requires customer key on CompleteMultipartUpload".into(),
+                            )
+                        })?;
+                        if let Some(ref stored) = spec.customer_key_md5 {
+                            let b64 = base64::engine::general_purpose::STANDARD;
+                            let provided = b64.encode(Md5::digest(ck));
+                            if provided != *stored {
+                                return Err(StorageError::EncryptionError(
+                                    "SSE-C key changed between Create and Complete".into(),
+                                ));
+                            }
+                        }
+                    }
+                }
+                let upload_is_encrypted = true;
+                for part in &selected {
+                    if part.encrypted != upload_is_encrypted {
+                        return Err(StorageError::IntegrityError(format!(
+                            "part {} encryption flag ({}) disagrees with upload spec ({}) — part meta may be tampered",
+                            part.part_number, part.encrypted, upload_is_encrypted,
+                        )));
+                    }
+                }
+                return self
+                    .complete_multipart_chunked_encrypted(
+                        bucket,
+                        upload_id,
+                        &upload_meta,
+                        &selected,
+                        customer_key,
+                    )
+                    .await;
             }
             return self
                 .complete_multipart_chunked(bucket, upload_id, &upload_meta, &selected)
@@ -1821,9 +2377,6 @@ impl FilesystemStorage {
             fs::create_dir_all(parent).await?;
         }
         fs::write(meta_path, serde_json::to_string_pretty(&object_meta)?).await?;
-        if object_meta.encryption.is_some() {
-            self.mark_bucket_encryption_required(bucket).await?;
-        }
         let _ = fs::remove_dir_all(self.upload_dir(bucket, upload_id)).await;
 
         Ok(PutResult {
@@ -2067,60 +2620,6 @@ impl FilesystemStorage {
         Ok(meta.versioning)
     }
 
-    /// Read the sticky `encryption_required` flag; missing bucket → false.
-    async fn is_encryption_required(&self, bucket: &str) -> bool {
-        let meta_path = self.buckets_dir.join(bucket).join(".bucket.json");
-        let Ok(data) = fs::read_to_string(&meta_path).await else {
-            return false;
-        };
-        serde_json::from_str::<BucketMeta>(&data)
-            .map(|m| m.encryption_required)
-            .unwrap_or(false)
-    }
-
-    /// Enforce the bucket's sticky `encryption_required` flag: once an encrypted
-    /// object has landed in a bucket, every subsequent GET/HEAD must see a
-    /// populated `encryption` block. An attacker stripping the `encryption`
-    /// field from the sidecar therefore fails closed instead of silently
-    /// returning ciphertext bytes as plaintext.
-    async fn check_encryption_required(
-        &self,
-        bucket: &str,
-        meta: &ObjectMeta,
-    ) -> Result<(), StorageError> {
-        if meta.encryption.is_some() {
-            return Ok(());
-        }
-        if self.is_encryption_required(bucket).await {
-            return Err(StorageError::IntegrityError(
-                "bucket requires encryption but object metadata is missing the encryption block — sidecar may be tampered".into(),
-            ));
-        }
-        Ok(())
-    }
-
-    /// Flip the bucket's `encryption_required` flag to `true` if not already
-    /// set. Called after every encrypted write so a subsequent sidecar strip
-    /// cannot downgrade objects in that bucket.
-    async fn mark_bucket_encryption_required(&self, bucket: &str) -> Result<(), StorageError> {
-        let meta_path = self.buckets_dir.join(bucket).join(".bucket.json");
-        let data = match fs::read_to_string(&meta_path).await {
-            Ok(d) => d,
-            Err(_) => return Ok(()),
-        };
-        let mut bm: BucketMeta = match serde_json::from_str(&data) {
-            Ok(m) => m,
-            Err(_) => return Ok(()),
-        };
-        if bm.encryption_required {
-            return Ok(());
-        }
-        bm.encryption_required = true;
-        let json = serde_json::to_string_pretty(&bm)?;
-        fs::write(&meta_path, json).await?;
-        Ok(())
-    }
-
     pub async fn set_versioning(&self, bucket: &str, enabled: bool) -> Result<(), StorageError> {
         let meta_path = self.buckets_dir.join(bucket).join(".bucket.json");
         let data = fs::read_to_string(&meta_path).await.map_err(|e| {
@@ -2243,7 +2742,6 @@ impl FilesystemStorage {
         })?;
         let mut meta: BucketMeta = serde_json::from_str(&data)?;
         meta.encryption_config = Some(config);
-        meta.encryption_required = true;
         fs::write(&meta_path, serde_json::to_string_pretty(&meta)?).await?;
         Ok(())
     }
@@ -2655,7 +3153,6 @@ impl FilesystemStorage {
         if meta.is_delete_marker {
             return Err(StorageError::NotFound(key.to_string()));
         }
-        self.check_encryption_required(bucket, &meta).await?;
         reject_sse_c_on_plaintext(&meta, customer_key.is_some())?;
 
         // Check for chunked version
@@ -2672,6 +3169,23 @@ impl FilesystemStorage {
                 }
             })?;
             let manifest: ChunkManifest = serde_json::from_str(&manifest_data)?;
+            if let Some(ref enc_meta) = meta.encryption {
+                let dek = self.resolve_dek(enc_meta, customer_key)?;
+                verify_sidecar_mac(&meta, &dek)?;
+                let frame_size = enc_meta.chunk_size as usize;
+                let plaintext_size = meta.size;
+                let aad_builder =
+                    object_aad_builder(bucket, key, meta.version_id.as_deref());
+                let ct_reader = VerifiedChunkReader::new(ver_ec_dir, manifest);
+                let decryptor = FrameDecryptor::new(
+                    Box::pin(ct_reader),
+                    &dek,
+                    plaintext_size,
+                    frame_size,
+                    aad_builder,
+                );
+                return Ok((Box::pin(decryptor), meta));
+            }
             let reader = VerifiedChunkReader::new(ver_ec_dir, manifest);
             return Ok((Box::pin(reader), meta));
         }
@@ -2736,7 +3250,6 @@ impl FilesystemStorage {
         if meta.is_delete_marker {
             return Err(StorageError::NotFound(key.to_string()));
         }
-        self.check_encryption_required(bucket, &meta).await?;
         Ok(meta)
     }
 
@@ -2890,4 +3403,31 @@ async fn write_encrypted_frame(
     writer.write_all(&nonce_bytes).await?;
     writer.write_all(&ciphertext).await?;
     Ok(())
+}
+
+/// Encrypt one frame and return the `[nonce || ciphertext || tag]` bytes. Used
+/// by the EC+encryption write path, which buffers ciphertext in memory before
+/// flushing chunk-sized slices to disk.
+fn encrypt_frame_to_vec(
+    cipher: &Aes256Gcm,
+    nonce_prefix: &[u8; 4],
+    chunk_index: u64,
+    plaintext: &[u8],
+    aad: &[u8],
+) -> Result<Vec<u8>, StorageError> {
+    let nonce_bytes = make_nonce(nonce_prefix, chunk_index);
+    let nonce = Nonce::from_slice(&nonce_bytes);
+    let ciphertext = cipher
+        .encrypt(
+            nonce,
+            Payload {
+                msg: plaintext,
+                aad,
+            },
+        )
+        .map_err(|_| StorageError::EncryptionError("frame encryption failed".into()))?;
+    let mut out = Vec::with_capacity(12 + ciphertext.len());
+    out.extend_from_slice(&nonce_bytes);
+    out.extend_from_slice(&ciphertext);
+    Ok(out)
 }

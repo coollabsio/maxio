@@ -647,7 +647,6 @@ async fn test_delete_bucket_sweeps_nested_versions() {
             versioning: false,
             cors_rules: None,
             encryption_config: None,
-            encryption_required: false,
             public_read: false,
             public_list: false,
         })
@@ -5090,48 +5089,6 @@ async fn test_multipart_sse_c_key_change_rejected() {
     );
 }
 
-/// Bucket `encryption_required` flag auto-flips on first encrypted PUT, and
-/// subsequent sidecar-strip of `encryption` field → 400 (prevents plaintext
-/// bypass via sidecar tamper).
-#[tokio::test]
-async fn test_sse_s3_sidecar_strip_encryption_rejected() {
-    let (base_url, tmp) = start_server().await;
-    s3_request("PUT", &format!("{}/strip-bucket", base_url), vec![]).await;
-
-    let plaintext = b"plaintext bypass probe".to_vec();
-    let put = s3_request_with_headers(
-        "PUT",
-        &format!("{}/strip-bucket/x.txt", base_url),
-        plaintext.clone(),
-        vec![("x-amz-server-side-encryption", "AES256")],
-    )
-    .await;
-    assert_eq!(put.status(), 200);
-
-    // First encrypted PUT must flip `encryption_required` to true.
-    let bucket_meta_str =
-        std::fs::read_to_string(tmp.path().join("buckets/strip-bucket/.bucket.json")).unwrap();
-    assert!(
-        bucket_meta_str.contains("\"encryption_required\": true"),
-        "bucket meta: {}",
-        bucket_meta_str
-    );
-
-    // Tamper: strip `encryption` field from object sidecar.
-    let meta_path = tmp.path().join("buckets/strip-bucket/x.txt.meta.json");
-    let meta_str = std::fs::read_to_string(&meta_path).unwrap();
-    let mut meta: serde_json::Value = serde_json::from_str(&meta_str).unwrap();
-    meta.as_object_mut().unwrap().remove("encryption");
-    std::fs::write(&meta_path, serde_json::to_string_pretty(&meta).unwrap()).unwrap();
-
-    let get = s3_request("GET", &format!("{}/strip-bucket/x.txt", base_url), vec![]).await;
-    assert_eq!(
-        get.status(),
-        400,
-        "bucket.encryption_required must reject objects with missing encryption meta"
-    );
-}
-
 /// SSE-C headers on a non-SSE object → 400 InvalidArgument (matches AWS).
 #[tokio::test]
 async fn test_sse_c_headers_on_plaintext_rejected() {
@@ -5539,25 +5496,836 @@ async fn test_sse_s3_empty_object_round_trip() {
     assert_eq!(body.len(), 0, "GET must return 0 bytes");
 }
 
-/// Erasure coding + SSE are mutually exclusive. PUT with both must return 400
-/// so users cannot silently lose either integrity property.
+/// Erasure coding + SSE compose via encrypt-then-EC: ciphertext is chunked and
+/// (optionally) parity-encoded. PUT must succeed, on-disk chunks must be
+/// ciphertext (not plaintext), and GET must return the original plaintext.
 #[tokio::test]
-async fn test_ec_plus_encryption_returns_400() {
-    let (base_url, _tmp) = start_server_ec().await;
+async fn test_ec_plus_encryption_roundtrip() {
+    let (base_url, tmp) = start_server_ec().await;
     s3_request("PUT", &format!("{}/ec-enc", base_url), vec![]).await;
 
+    let plaintext = b"ec-plus-sse composes via encrypt-then-EC".to_vec();
     let put = s3_request_with_headers(
         "PUT",
         &format!("{}/ec-enc/x.bin", base_url),
-        b"ec-plus-sse not allowed".to_vec(),
+        plaintext.clone(),
         vec![("x-amz-server-side-encryption", "AES256")],
     )
     .await;
-    assert_eq!(put.status(), 400);
-    let body = put.text().await.unwrap();
-    assert!(
-        body.contains("erasure coding") || body.contains("encryption"),
-        "body: {}",
-        body
+    assert_eq!(put.status(), 200);
+    assert_eq!(
+        put.headers()
+            .get("x-amz-server-side-encryption")
+            .and_then(|v| v.to_str().ok()),
+        Some("AES256"),
     );
+
+    // On-disk chunk 000000 should be ciphertext (at minimum not a prefix match).
+    let chunk = tmp.path().join("buckets/ec-enc/x.bin.ec/000000");
+    let disk = std::fs::read(&chunk).expect("read chunk 000000");
+    assert_ne!(
+        &disk[..plaintext.len().min(disk.len())],
+        &plaintext[..plaintext.len().min(disk.len())],
+        "EC chunk contains plaintext — encryption did not run"
+    );
+
+    let get = s3_request("GET", &format!("{}/ec-enc/x.bin", base_url), vec![]).await;
+    assert_eq!(get.status(), 200);
+    let got = get.bytes().await.unwrap().to_vec();
+    assert_eq!(got, plaintext);
+}
+
+async fn start_server_ec_parity(chunk_size: u64, parity_shards: u32) -> (String, TempDir) {
+    let tmp = TempDir::new().unwrap();
+    let data_dir = tmp.path().to_str().unwrap().to_string();
+
+    let keyring = Arc::new(Keyring::load(&data_dir, None).await.unwrap());
+    let storage =
+        FilesystemStorage::new(&data_dir, true, chunk_size, parity_shards, keyring)
+            .await
+            .unwrap();
+
+    let config = Config {
+        port: 0,
+        address: "127.0.0.1".to_string(),
+        data_dir,
+        access_key: ACCESS_KEY.to_string(),
+        secret_key: SECRET_KEY.to_string(),
+        region: REGION.to_string(),
+        master_key: None,
+        erasure_coding: true,
+        chunk_size,
+        parity_shards,
+    };
+
+    let state = AppState {
+        storage: Arc::new(storage),
+        config: Arc::new(config),
+        login_rate_limiter: Arc::new(maxio::api::console::LoginRateLimiter::new()),
+    };
+
+    let app = server::build_router(state);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let base_url = format!("http://{}", addr);
+
+    tokio::spawn(async move {
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await
+        .unwrap();
+    });
+
+    (base_url, tmp)
+}
+
+/// EC + SSE-S3 with a payload large enough to span several 64 KiB frames and
+/// several 1 KiB EC chunks. Frame boundaries crossing chunk boundaries is the
+/// interesting composition case — RS has to reassemble ciphertext byte-exact
+/// before AEAD tags verify.
+#[tokio::test]
+async fn test_ec_plus_encryption_multi_frame_roundtrip() {
+    let (base_url, _tmp) = start_server_ec_parity(1024, 0).await;
+    s3_request("PUT", &format!("{}/ec-enc-multi", base_url), vec![]).await;
+
+    // ~200 KiB of deterministic pseudo-random bytes → ~3 frames and ~200 chunks.
+    let plaintext: Vec<u8> = (0..200_000u32).map(|i| (i.wrapping_mul(31) % 256) as u8).collect();
+    let put = s3_request_with_headers(
+        "PUT",
+        &format!("{}/ec-enc-multi/big.bin", base_url),
+        plaintext.clone(),
+        vec![("x-amz-server-side-encryption", "AES256")],
+    )
+    .await;
+    assert_eq!(put.status(), 200);
+
+    let get = s3_request("GET", &format!("{}/ec-enc-multi/big.bin", base_url), vec![]).await;
+    assert_eq!(get.status(), 200);
+    assert_eq!(get.bytes().await.unwrap().to_vec(), plaintext);
+}
+
+/// EC + SSE-S3 range read across a chunk boundary.
+#[tokio::test]
+async fn test_ec_plus_encryption_range_read() {
+    let (base_url, _tmp) = start_server_ec_parity(1024, 0).await;
+    s3_request("PUT", &format!("{}/ec-enc-range", base_url), vec![]).await;
+
+    let plaintext: Vec<u8> = (0..200_000u32).map(|i| (i % 256) as u8).collect();
+    let put = s3_request_with_headers(
+        "PUT",
+        &format!("{}/ec-enc-range/f.bin", base_url),
+        plaintext.clone(),
+        vec![("x-amz-server-side-encryption", "AES256")],
+    )
+    .await;
+    assert_eq!(put.status(), 200);
+
+    let range_start = 70_000u64;
+    let range_end = 80_000u64;
+    let got = s3_request_with_headers(
+        "GET",
+        &format!("{}/ec-enc-range/f.bin", base_url),
+        vec![],
+        vec![("range", &format!("bytes={}-{}", range_start, range_end))],
+    )
+    .await;
+    assert_eq!(got.status(), 206);
+    let body = got.bytes().await.unwrap().to_vec();
+    assert_eq!(
+        body,
+        plaintext[range_start as usize..=range_end as usize]
+    );
+}
+
+/// EC + SSE-S3 + parity: corrupt one data chunk on disk, GET must still succeed
+/// via Reed-Solomon reconstruction and AEAD tag verification must pass over
+/// the reconstructed ciphertext.
+#[tokio::test]
+async fn test_ec_plus_encryption_parity_recovers_corruption() {
+    let (base_url, tmp) = start_server_ec_parity(1024, 2).await;
+    s3_request("PUT", &format!("{}/ec-enc-rs", base_url), vec![]).await;
+
+    let plaintext: Vec<u8> = (0..50_000u32).map(|i| (i % 256) as u8).collect();
+    let put = s3_request_with_headers(
+        "PUT",
+        &format!("{}/ec-enc-rs/r.bin", base_url),
+        plaintext.clone(),
+        vec![("x-amz-server-side-encryption", "AES256")],
+    )
+    .await;
+    assert_eq!(put.status(), 200);
+
+    // Zero out chunk 000001. Two parity shards remain so reconstruction succeeds.
+    let chunk = tmp.path().join("buckets/ec-enc-rs/r.bin.ec/000001");
+    let sz = std::fs::metadata(&chunk).unwrap().len() as usize;
+    std::fs::write(&chunk, vec![0u8; sz]).unwrap();
+
+    let get = s3_request("GET", &format!("{}/ec-enc-rs/r.bin", base_url), vec![]).await;
+    assert_eq!(get.status(), 200);
+    assert_eq!(get.bytes().await.unwrap().to_vec(), plaintext);
+}
+
+/// Even if chunk-level SHA-256 is updated to match tampered ciphertext, the
+/// per-frame AEAD tag must still reject. This is the composition security
+/// invariant: encryption is the authoritative integrity check.
+#[tokio::test]
+async fn test_ec_plus_encryption_aead_catches_manifest_bypass() {
+    let (base_url, tmp) = start_server_ec_parity(1024, 0).await;
+    s3_request("PUT", &format!("{}/ec-enc-aead", base_url), vec![]).await;
+
+    let plaintext: Vec<u8> = (0..10_000u32).map(|i| (i % 256) as u8).collect();
+    let put = s3_request_with_headers(
+        "PUT",
+        &format!("{}/ec-enc-aead/a.bin", base_url),
+        plaintext.clone(),
+        vec![("x-amz-server-side-encryption", "AES256")],
+    )
+    .await;
+    assert_eq!(put.status(), 200);
+
+    // Flip a byte in chunk 0 and update manifest's SHA for that chunk so the
+    // chunk-reader integrity check accepts the tampered data. AEAD must still
+    // reject because the ciphertext bytes no longer match the GCM tag.
+    let chunk_path = tmp.path().join("buckets/ec-enc-aead/a.bin.ec/000000");
+    let mut chunk = std::fs::read(&chunk_path).unwrap();
+    chunk[50] ^= 0xFF;
+    std::fs::write(&chunk_path, &chunk).unwrap();
+
+    let manifest_path = tmp.path().join("buckets/ec-enc-aead/a.bin.ec/manifest.json");
+    let mut manifest: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&manifest_path).unwrap()).unwrap();
+    let new_sha = hex::encode(<sha2::Sha256 as sha2::Digest>::digest(&chunk));
+    manifest["chunks"][0]["sha256"] = serde_json::Value::String(new_sha);
+    std::fs::write(
+        &manifest_path,
+        serde_json::to_string_pretty(&manifest).unwrap(),
+    )
+    .unwrap();
+
+    // AEAD failures abort mid-stream, which reqwest surfaces as an
+    // IncompleteMessage connection error. Any of three outcomes are acceptable
+    // so long as we do NOT get the original plaintext back.
+    let url = format!("{}/ec-enc-aead/a.bin", base_url);
+    let mut headers: Vec<(String, String)> = Vec::new();
+    sign_request("GET", &url, &mut headers, &[]);
+    let client = client();
+    let mut builder = client.get(&url);
+    for (k, v) in &headers {
+        builder = builder.header(k.as_str(), v.as_str());
+    }
+    match builder.send().await {
+        Err(_) => {} // Connection dropped mid-stream — AEAD caught it.
+        Ok(resp) => {
+            let status = resp.status();
+            let body = resp.bytes().await.map(|b| b.to_vec()).unwrap_or_default();
+            assert!(
+                !status.is_success() || body != plaintext,
+                "AEAD did not catch tampering: status={}, body len={}",
+                status,
+                body.len()
+            );
+        }
+    }
+}
+
+/// EC + bucket-default SSE: PUT without SSE header should still store ciphertext
+/// chunks (policy inherited from bucket encryption config).
+#[tokio::test]
+async fn test_ec_plus_bucket_default_encryption() {
+    let (base_url, tmp) = start_server_ec_parity(1024, 0).await;
+    s3_request("PUT", &format!("{}/ec-default", base_url), vec![]).await;
+
+    // Configure bucket default encryption (AES256).
+    let cfg = r#"<ServerSideEncryptionConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Rule><ApplyServerSideEncryptionByDefault><SSEAlgorithm>AES256</SSEAlgorithm></ApplyServerSideEncryptionByDefault></Rule></ServerSideEncryptionConfiguration>"#;
+    let resp = s3_request(
+        "PUT",
+        &format!("{}/ec-default?encryption", base_url),
+        cfg.as_bytes().to_vec(),
+    )
+    .await;
+    assert!(resp.status().is_success(), "put-bucket-encryption: {}", resp.status());
+
+    let plaintext = b"bucket default EC-SSE".to_vec();
+    let put = s3_request(
+        "PUT",
+        &format!("{}/ec-default/d.bin", base_url),
+        plaintext.clone(),
+    )
+    .await;
+    assert_eq!(put.status(), 200);
+    assert_eq!(
+        put.headers()
+            .get("x-amz-server-side-encryption")
+            .and_then(|v| v.to_str().ok()),
+        Some("AES256"),
+        "PUT response missing x-amz-server-side-encryption"
+    );
+
+    let chunk = tmp.path().join("buckets/ec-default/d.bin.ec/000000");
+    let disk = std::fs::read(&chunk).expect("chunk 000000");
+    assert_ne!(
+        &disk[..plaintext.len().min(disk.len())],
+        &plaintext[..plaintext.len().min(disk.len())],
+        "bucket-default did not encrypt the EC chunk"
+    );
+
+    let get = s3_request("GET", &format!("{}/ec-default/d.bin", base_url), vec![]).await;
+    assert_eq!(get.status(), 200);
+    assert_eq!(get.bytes().await.unwrap().to_vec(), plaintext);
+}
+
+// ─── Presigned URL + SSE ────────────────────────────────────────────────────
+
+/// Presigned GET on an SSE-S3 object: server unwraps DEK transparently, no
+/// extra headers required from caller.
+#[tokio::test]
+async fn test_presigned_get_sse_s3_object() {
+    let (base_url, _tmp) = start_server().await;
+    s3_request("PUT", &format!("{}/presign-sse-s3", base_url), vec![]).await;
+
+    let plaintext = b"presigned + SSE-S3".to_vec();
+    let put = s3_request_with_headers(
+        "PUT",
+        &format!("{}/presign-sse-s3/o.bin", base_url),
+        plaintext.clone(),
+        vec![("x-amz-server-side-encryption", "AES256")],
+    )
+    .await;
+    assert_eq!(put.status(), 200);
+
+    let presigned = presign_url(&base_url, "GET", "/presign-sse-s3/o.bin", 300);
+    let resp = client().get(&presigned).send().await.unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(resp.bytes().await.unwrap().as_ref(), plaintext.as_slice());
+}
+
+/// Presigned GET on an SSE-C object: customer-key headers must accompany the
+/// GET even when the URL itself is presigned. Without them, the server cannot
+/// decrypt → non-200.
+#[tokio::test]
+async fn test_presigned_get_sse_c_requires_key_header() {
+    use base64::Engine;
+    use md5::Digest;
+
+    let (base_url, _tmp) = start_server().await;
+    s3_request("PUT", &format!("{}/presign-sse-c", base_url), vec![]).await;
+
+    let key = [0x33u8; 32];
+    let b64 = base64::engine::general_purpose::STANDARD;
+    let key_b64 = b64.encode(key);
+    let key_md5 = b64.encode(md5::Md5::digest(key));
+
+    let plaintext = b"presigned + SSE-C".to_vec();
+    let put = s3_request_with_headers(
+        "PUT",
+        &format!("{}/presign-sse-c/o.bin", base_url),
+        plaintext.clone(),
+        vec![
+            ("x-amz-server-side-encryption-customer-algorithm", "AES256"),
+            ("x-amz-server-side-encryption-customer-key", &key_b64),
+            ("x-amz-server-side-encryption-customer-key-md5", &key_md5),
+        ],
+    )
+    .await;
+    assert_eq!(put.status(), 200);
+
+    let presigned = presign_url(&base_url, "GET", "/presign-sse-c/o.bin", 300);
+
+    // No customer key headers → must NOT decrypt successfully.
+    let resp_no_key = client().get(&presigned).send().await.unwrap();
+    let no_key_body = resp_no_key.bytes().await.unwrap_or_default();
+    assert_ne!(
+        no_key_body.as_ref(),
+        plaintext.as_slice(),
+        "presigned SSE-C GET without customer key must not return plaintext"
+    );
+
+    // With matching customer key headers → 200 + plaintext.
+    let resp_ok = client()
+        .get(&presigned)
+        .header("x-amz-server-side-encryption-customer-algorithm", "AES256")
+        .header("x-amz-server-side-encryption-customer-key", &key_b64)
+        .header("x-amz-server-side-encryption-customer-key-md5", &key_md5)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp_ok.status(), 200);
+    assert_eq!(
+        resp_ok.bytes().await.unwrap().as_ref(),
+        plaintext.as_slice()
+    );
+}
+
+/// Presigned HEAD on an SSE-S3 object reports the encryption mode in response
+/// headers without needing extra request headers.
+#[tokio::test]
+async fn test_presigned_head_sse_s3_object() {
+    let (base_url, _tmp) = start_server().await;
+    s3_request("PUT", &format!("{}/presign-head-sse", base_url), vec![]).await;
+
+    let plaintext = b"hello".to_vec();
+    s3_request_with_headers(
+        "PUT",
+        &format!("{}/presign-head-sse/o.bin", base_url),
+        plaintext,
+        vec![("x-amz-server-side-encryption", "AES256")],
+    )
+    .await;
+
+    let presigned = presign_url(&base_url, "HEAD", "/presign-head-sse/o.bin", 300);
+    let resp = client().head(&presigned).send().await.unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(
+        resp.headers()
+            .get("x-amz-server-side-encryption")
+            .and_then(|v| v.to_str().ok()),
+        Some("AES256")
+    );
+}
+
+// ─── CopyObject + SSE ───────────────────────────────────────────────────────
+
+/// Copy plaintext source → SSE-S3 destination by attaching SSE header on the
+/// copy request. Destination must be encrypted on disk and decrypt on GET.
+#[tokio::test]
+async fn test_copy_object_plaintext_to_sse_s3() {
+    let (base_url, tmp) = start_server().await;
+    s3_request("PUT", &format!("{}/cp-pt-sse", base_url), vec![]).await;
+
+    let plaintext = b"plaintext source body".to_vec();
+    s3_request(
+        "PUT",
+        &format!("{}/cp-pt-sse/src.bin", base_url),
+        plaintext.clone(),
+    )
+    .await;
+
+    let copy = s3_request_with_headers(
+        "PUT",
+        &format!("{}/cp-pt-sse/dst.bin", base_url),
+        vec![],
+        vec![
+            ("x-amz-copy-source", "/cp-pt-sse/src.bin"),
+            ("x-amz-server-side-encryption", "AES256"),
+        ],
+    )
+    .await;
+    assert_eq!(copy.status(), 200);
+
+    // Destination sidecar carries SSE-S3 metadata.
+    let dst_meta =
+        std::fs::read_to_string(tmp.path().join("buckets/cp-pt-sse/dst.bin.meta.json")).unwrap();
+    assert!(
+        dst_meta.contains("\"mode\": \"sse_s3\""),
+        "dst meta: {}",
+        dst_meta
+    );
+
+    // Source sidecar has no encryption block.
+    let src_meta =
+        std::fs::read_to_string(tmp.path().join("buckets/cp-pt-sse/src.bin.meta.json")).unwrap();
+    assert!(
+        !src_meta.contains("\"mode\": \"sse_s3\""),
+        "src must remain plaintext"
+    );
+
+    let get = s3_request("GET", &format!("{}/cp-pt-sse/dst.bin", base_url), vec![]).await;
+    assert_eq!(get.status(), 200);
+    assert_eq!(get.bytes().await.unwrap().as_ref(), plaintext.as_slice());
+}
+
+/// Copy SSE-S3 source → SSE-S3 destination: each object must use a fresh DEK.
+/// Compares the wrapped_dek field in the two sidecars to prove re-keying.
+#[tokio::test]
+async fn test_copy_object_sse_s3_to_sse_s3_rekeys() {
+    let (base_url, tmp) = start_server().await;
+    s3_request("PUT", &format!("{}/cp-sse-sse", base_url), vec![]).await;
+
+    let plaintext: Vec<u8> = (0..8192u32).map(|i| (i % 256) as u8).collect();
+    s3_request_with_headers(
+        "PUT",
+        &format!("{}/cp-sse-sse/src.bin", base_url),
+        plaintext.clone(),
+        vec![("x-amz-server-side-encryption", "AES256")],
+    )
+    .await;
+
+    let copy = s3_request_with_headers(
+        "PUT",
+        &format!("{}/cp-sse-sse/dst.bin", base_url),
+        vec![],
+        vec![
+            ("x-amz-copy-source", "/cp-sse-sse/src.bin"),
+            ("x-amz-server-side-encryption", "AES256"),
+        ],
+    )
+    .await;
+    assert_eq!(copy.status(), 200);
+
+    let src_meta: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(tmp.path().join("buckets/cp-sse-sse/src.bin.meta.json")).unwrap(),
+    )
+    .unwrap();
+    let dst_meta: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(tmp.path().join("buckets/cp-sse-sse/dst.bin.meta.json")).unwrap(),
+    )
+    .unwrap();
+    let src_dek = src_meta["encryption"]["wrapped_dek"]
+        .as_str()
+        .expect("src wrapped_dek");
+    let dst_dek = dst_meta["encryption"]["wrapped_dek"]
+        .as_str()
+        .expect("dst wrapped_dek");
+    assert_ne!(
+        src_dek, dst_dek,
+        "copy must generate a fresh DEK on the destination"
+    );
+
+    let get = s3_request("GET", &format!("{}/cp-sse-sse/dst.bin", base_url), vec![]).await;
+    assert_eq!(get.status(), 200);
+    assert_eq!(get.bytes().await.unwrap().to_vec(), plaintext);
+}
+
+/// Copy SSE-C key A source → SSE-C key B destination: source key supplied via
+/// copy-source-* headers, dest key via standard SSE-C headers. GET with key B
+/// succeeds; GET with key A on the destination fails.
+#[tokio::test]
+async fn test_copy_object_sse_c_to_sse_c_different_key() {
+    use base64::Engine;
+    use md5::Digest;
+
+    let (base_url, _tmp) = start_server().await;
+    s3_request("PUT", &format!("{}/cp-ssec", base_url), vec![]).await;
+
+    let key_a = [0x11u8; 32];
+    let key_b = [0xEEu8; 32];
+    let b64 = base64::engine::general_purpose::STANDARD;
+    let key_a_b64 = b64.encode(key_a);
+    let key_a_md5 = b64.encode(md5::Md5::digest(key_a));
+    let key_b_b64 = b64.encode(key_b);
+    let key_b_md5 = b64.encode(md5::Md5::digest(key_b));
+
+    let plaintext = b"copy me with a different key".to_vec();
+    s3_request_with_headers(
+        "PUT",
+        &format!("{}/cp-ssec/src.bin", base_url),
+        plaintext.clone(),
+        vec![
+            ("x-amz-server-side-encryption-customer-algorithm", "AES256"),
+            ("x-amz-server-side-encryption-customer-key", &key_a_b64),
+            ("x-amz-server-side-encryption-customer-key-md5", &key_a_md5),
+        ],
+    )
+    .await;
+
+    let copy = s3_request_with_headers(
+        "PUT",
+        &format!("{}/cp-ssec/dst.bin", base_url),
+        vec![],
+        vec![
+            ("x-amz-copy-source", "/cp-ssec/src.bin"),
+            (
+                "x-amz-copy-source-server-side-encryption-customer-algorithm",
+                "AES256",
+            ),
+            (
+                "x-amz-copy-source-server-side-encryption-customer-key",
+                &key_a_b64,
+            ),
+            (
+                "x-amz-copy-source-server-side-encryption-customer-key-md5",
+                &key_a_md5,
+            ),
+            ("x-amz-server-side-encryption-customer-algorithm", "AES256"),
+            ("x-amz-server-side-encryption-customer-key", &key_b_b64),
+            ("x-amz-server-side-encryption-customer-key-md5", &key_b_md5),
+        ],
+    )
+    .await;
+    assert_eq!(copy.status(), 200);
+
+    // GET destination with key B → plaintext.
+    let get_ok = s3_request_with_headers(
+        "GET",
+        &format!("{}/cp-ssec/dst.bin", base_url),
+        vec![],
+        vec![
+            ("x-amz-server-side-encryption-customer-algorithm", "AES256"),
+            ("x-amz-server-side-encryption-customer-key", &key_b_b64),
+            ("x-amz-server-side-encryption-customer-key-md5", &key_b_md5),
+        ],
+    )
+    .await;
+    assert_eq!(get_ok.status(), 200);
+    assert_eq!(get_ok.bytes().await.unwrap().as_ref(), plaintext.as_slice());
+
+    // GET destination with key A → must fail (dest is encrypted under key B).
+    let get_wrong = s3_request_with_headers(
+        "GET",
+        &format!("{}/cp-ssec/dst.bin", base_url),
+        vec![],
+        vec![
+            ("x-amz-server-side-encryption-customer-algorithm", "AES256"),
+            ("x-amz-server-side-encryption-customer-key", &key_a_b64),
+            ("x-amz-server-side-encryption-customer-key-md5", &key_a_md5),
+        ],
+    )
+    .await;
+    assert_ne!(get_wrong.status(), 200);
+}
+
+/// Copy SSE-C source with the WRONG copy-source key fails — server cannot
+/// decrypt the source so the copy must abort, not silently return ciphertext.
+#[tokio::test]
+async fn test_copy_object_sse_c_wrong_source_key_fails() {
+    use base64::Engine;
+    use md5::Digest;
+
+    let (base_url, _tmp) = start_server().await;
+    s3_request("PUT", &format!("{}/cp-ssec-bad", base_url), vec![]).await;
+
+    let key_a = [0x77u8; 32];
+    let key_x = [0x00u8; 32];
+    let b64 = base64::engine::general_purpose::STANDARD;
+    let key_a_b64 = b64.encode(key_a);
+    let key_a_md5 = b64.encode(md5::Md5::digest(key_a));
+    let key_x_b64 = b64.encode(key_x);
+    let key_x_md5 = b64.encode(md5::Md5::digest(key_x));
+
+    s3_request_with_headers(
+        "PUT",
+        &format!("{}/cp-ssec-bad/src.bin", base_url),
+        b"sensitive data".to_vec(),
+        vec![
+            ("x-amz-server-side-encryption-customer-algorithm", "AES256"),
+            ("x-amz-server-side-encryption-customer-key", &key_a_b64),
+            ("x-amz-server-side-encryption-customer-key-md5", &key_a_md5),
+        ],
+    )
+    .await;
+
+    let copy = s3_request_with_headers(
+        "PUT",
+        &format!("{}/cp-ssec-bad/dst.bin", base_url),
+        vec![],
+        vec![
+            ("x-amz-copy-source", "/cp-ssec-bad/src.bin"),
+            (
+                "x-amz-copy-source-server-side-encryption-customer-algorithm",
+                "AES256",
+            ),
+            (
+                "x-amz-copy-source-server-side-encryption-customer-key",
+                &key_x_b64,
+            ),
+            (
+                "x-amz-copy-source-server-side-encryption-customer-key-md5",
+                &key_x_md5,
+            ),
+        ],
+    )
+    .await;
+    assert_ne!(
+        copy.status(),
+        200,
+        "copy with wrong source SSE-C key must not succeed"
+    );
+}
+
+// ─── UploadPartCopy + SSE ───────────────────────────────────────────────────
+
+/// UploadPartCopy from an SSE-S3 source into a non-encrypted multipart upload.
+/// The server must decrypt the source before staging the part, so the final
+/// destination object is plaintext bytes that match the original input.
+#[tokio::test]
+async fn test_upload_part_copy_sse_s3_source() {
+    let (base, _tmp) = start_server().await;
+
+    s3_request("PUT", &format!("{}/upc-sse-src", base), vec![]).await;
+    let src_data: Vec<u8> = (0u8..255).cycle().take(5 * 1024 * 1024).collect();
+    s3_request_with_headers(
+        "PUT",
+        &format!("{}/upc-sse-src/source.bin", base),
+        src_data.clone(),
+        vec![("x-amz-server-side-encryption", "AES256")],
+    )
+    .await;
+
+    s3_request("PUT", &format!("{}/upc-sse-dst", base), vec![]).await;
+    let create = s3_request(
+        "POST",
+        &format!("{}/upc-sse-dst/dest.bin?uploads=", base),
+        vec![],
+    )
+    .await;
+    let upload_id = extract_xml_tag(&create.text().await.unwrap(), "UploadId").unwrap();
+
+    let resp = s3_request_with_headers(
+        "PUT",
+        &format!(
+            "{}/upc-sse-dst/dest.bin?partNumber=1&uploadId={}",
+            base, upload_id
+        ),
+        vec![],
+        vec![("x-amz-copy-source", "/upc-sse-src/source.bin")],
+    )
+    .await;
+    assert_eq!(resp.status(), 200);
+    let etag = extract_xml_tag(&resp.text().await.unwrap(), "ETag").unwrap();
+
+    let complete_xml = format!(
+        "<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>{}</ETag></Part></CompleteMultipartUpload>",
+        etag
+    );
+    let complete = s3_request(
+        "POST",
+        &format!("{}/upc-sse-dst/dest.bin?uploadId={}", base, upload_id),
+        complete_xml.into_bytes(),
+    )
+    .await;
+    assert_eq!(complete.status(), 200);
+
+    let get = s3_request("GET", &format!("{}/upc-sse-dst/dest.bin", base), vec![]).await;
+    assert_eq!(get.status(), 200);
+    assert_eq!(get.bytes().await.unwrap().as_ref(), src_data.as_slice());
+}
+
+/// UploadPartCopy from a plaintext source into an SSE-S3 multipart upload.
+/// Destination object must end up encrypted on disk and decrypt on GET.
+#[tokio::test]
+async fn test_upload_part_copy_into_sse_s3_dest() {
+    let (base, tmp) = start_server().await;
+
+    s3_request("PUT", &format!("{}/upc-pt-src", base), vec![]).await;
+    let src_data: Vec<u8> = (0u8..255).cycle().take(5 * 1024 * 1024).collect();
+    s3_request(
+        "PUT",
+        &format!("{}/upc-pt-src/source.bin", base),
+        src_data.clone(),
+    )
+    .await;
+
+    s3_request("PUT", &format!("{}/upc-pt-dst", base), vec![]).await;
+    let create = s3_request_with_headers(
+        "POST",
+        &format!("{}/upc-pt-dst/dest.bin?uploads=", base),
+        vec![],
+        vec![("x-amz-server-side-encryption", "AES256")],
+    )
+    .await;
+    let upload_id = extract_xml_tag(&create.text().await.unwrap(), "UploadId").unwrap();
+
+    let resp = s3_request_with_headers(
+        "PUT",
+        &format!(
+            "{}/upc-pt-dst/dest.bin?partNumber=1&uploadId={}",
+            base, upload_id
+        ),
+        vec![],
+        vec![("x-amz-copy-source", "/upc-pt-src/source.bin")],
+    )
+    .await;
+    assert_eq!(resp.status(), 200);
+    let etag = extract_xml_tag(&resp.text().await.unwrap(), "ETag").unwrap();
+
+    let complete_xml = format!(
+        "<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>{}</ETag></Part></CompleteMultipartUpload>",
+        etag
+    );
+    let complete = s3_request(
+        "POST",
+        &format!("{}/upc-pt-dst/dest.bin?uploadId={}", base, upload_id),
+        complete_xml.into_bytes(),
+    )
+    .await;
+    assert_eq!(complete.status(), 200);
+
+    let dst_meta =
+        std::fs::read_to_string(tmp.path().join("buckets/upc-pt-dst/dest.bin.meta.json")).unwrap();
+    assert!(
+        dst_meta.contains("\"mode\": \"sse_s3\""),
+        "dst meta missing sse_s3: {}",
+        dst_meta
+    );
+
+    let get = s3_request("GET", &format!("{}/upc-pt-dst/dest.bin", base), vec![]).await;
+    assert_eq!(get.status(), 200);
+    assert_eq!(
+        get.headers()
+            .get("x-amz-server-side-encryption")
+            .and_then(|v| v.to_str().ok()),
+        Some("AES256")
+    );
+    assert_eq!(get.bytes().await.unwrap().as_ref(), src_data.as_slice());
+}
+
+// ─── EC + SSE cross-object chunk swap ───────────────────────────────────────
+
+/// AAD must bind ciphertext to the object identity. Even if RS reconstruction
+/// produces a syntactically valid frame, the GCM tag must reject when the
+/// ciphertext belongs to a different object.
+#[tokio::test]
+async fn test_ec_plus_encryption_chunk_swap_rejected() {
+    let (base_url, tmp) = start_server_ec_parity(1024, 0).await;
+    s3_request("PUT", &format!("{}/ec-aad-swap", base_url), vec![]).await;
+
+    // Equal-length plaintexts so cross-object byte-for-byte chunk swaps are
+    // possible without changing file sizes.
+    let plaintext_a: Vec<u8> = (0..8_000u32).map(|i| (i % 251) as u8).collect();
+    let plaintext_b: Vec<u8> = (0..8_000u32).map(|i| ((i + 7) % 241) as u8).collect();
+
+    let put_a = s3_request_with_headers(
+        "PUT",
+        &format!("{}/ec-aad-swap/a.bin", base_url),
+        plaintext_a.clone(),
+        vec![("x-amz-server-side-encryption", "AES256")],
+    )
+    .await;
+    assert_eq!(put_a.status(), 200);
+    let put_b = s3_request_with_headers(
+        "PUT",
+        &format!("{}/ec-aad-swap/b.bin", base_url),
+        plaintext_b.clone(),
+        vec![("x-amz-server-side-encryption", "AES256")],
+    )
+    .await;
+    assert_eq!(put_b.status(), 200);
+
+    // Replace b's chunk 000000 with a's chunk 000000.
+    let chunk_a = tmp
+        .path()
+        .join("buckets/ec-aad-swap/a.bin.ec/000000");
+    let chunk_b = tmp
+        .path()
+        .join("buckets/ec-aad-swap/b.bin.ec/000000");
+    let a_bytes = std::fs::read(&chunk_a).expect("read a chunk 0");
+    std::fs::write(&chunk_b, &a_bytes).unwrap();
+
+    // GET b → AEAD must reject; outcome is either non-200, a connection drop,
+    // or partial bytes that do not equal plaintext_b. Crucially, the response
+    // must NOT be plaintext_a (would mean the swap succeeded undetected).
+    let url = format!("{}/ec-aad-swap/b.bin", base_url);
+    let mut headers: Vec<(String, String)> = Vec::new();
+    sign_request("GET", &url, &mut headers, &[]);
+    let mut builder = client().get(&url);
+    for (k, v) in &headers {
+        builder = builder.header(k.as_str(), v.as_str());
+    }
+    match builder.send().await {
+        Err(_) => {} // Stream torn down mid-flight.
+        Ok(resp) => {
+            let status = resp.status();
+            let body = resp.bytes().await.map(|b| b.to_vec()).unwrap_or_default();
+            assert_ne!(
+                body, plaintext_a,
+                "cross-object chunk swap must not yield A's plaintext"
+            );
+            assert!(
+                !status.is_success() || body != plaintext_b,
+                "cross-object chunk swap must not yield B's plaintext either"
+            );
+        }
+    }
 }

@@ -294,7 +294,6 @@ pub async fn create_bucket(
         versioning: false,
         cors_rules: None,
         encryption_config: None,
-        encryption_required: false,
         public_read: false,
         public_list: false,
     };

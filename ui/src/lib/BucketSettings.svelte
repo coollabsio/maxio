@@ -1,6 +1,7 @@
 <script lang="ts">
   import { onMount } from 'svelte'
   import { toast } from '$lib/toast'
+  import { Callout } from '$lib/components/ui/callout'
 
   interface Props {
     bucket: string
@@ -66,9 +67,13 @@
 
 <div class="flex flex-col gap-6 max-w-2xl">
   {#if error}
-    <div class="rounded-sm border border-destructive/50 bg-destructive/10 px-4 py-2 text-sm text-destructive">
-      {error}
-    </div>
+    <Callout type="danger">{error}</Callout>
+  {/if}
+
+  {#if versioningEnabled && !loading}
+    <Callout type="warning" title="Disabling versioning is destructive">
+      Turning versioning off permanently deletes all non-current versions. Only the latest version of each object remains.
+    </Callout>
   {/if}
 
   <div class="flex flex-col gap-4">

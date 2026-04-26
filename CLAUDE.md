@@ -265,9 +265,9 @@ The web console (`ui/`) follows the Coolify design system. The full specificatio
 - **Stack**: Svelte 5, Vite, Tailwind CSS v4, shadcn-svelte components
 - **Theme**: Class-based dark mode (`.dark` on `<html>`), with light/dark CSS variable swap in `ui/src/app.css`
 - **Accent colors**: Coollabs purple `#6b16ed` (light) / warning yellow `#fcd452` (dark). Brand purple (`--color-brand`) is always `#6b16ed` regardless of theme
-- **Font**: Inter (Google Fonts)
+- **Font**: Geist Sans + Geist Mono via `@fontsource/geist-sans` / `@fontsource/geist-mono` (Inter fallback)
 - **Inputs**: Inset box-shadow system (4px colored left bar on focus), no standard borders — see `.input-cool` in `app.css`
-- **Buttons**: `border-2`, `h-8`, `rounded-sm`. Variants: `default`, `destructive`, `outline`, `secondary`, `ghost`, `link`, `brand`
+- **Buttons**: `border-2`, `h-8`, `rounded-sm`. Variants: `default`, `highlighted`, `destructive`, `outline`, `secondary`, `ghost`, `link`, `brand`
 - **Border radius**: `0.125rem` (2px) everywhere — set via `--radius` in `@theme inline`
 - **Sidebar**: Collapsible 224px → 56px icon-only, uses `--cool-sidebar-*` CSS variables
 

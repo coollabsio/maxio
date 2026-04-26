@@ -10,19 +10,20 @@
 <Toaster
   {theme}
   position="bottom-right"
-  richColors
   closeButton
   duration={4000}
   toastOptions={{
     classes: {
-      toast: 'group !rounded-sm !shadow-lg !font-sans !text-sm !bg-[var(--cool-bg-card)] !text-[var(--cool-fg)] !border !border-[var(--cool-border)]',
-      title: '!font-medium',
-      description: '!text-[var(--cool-fg-muted)]',
-      success: '!border-l-4 !border-l-[var(--cool-success)]',
-      error: '!border-l-4 !border-l-[var(--cool-error)]',
-      warning: '!border-l-4 !border-l-[#f59e0b]',
-      info: '!border-l-4 !border-l-[var(--cool-accent)]',
-      closeButton: '!bg-[var(--cool-bg-card)] !border-[var(--cool-border)] !text-[var(--cool-fg-muted)] hover:!text-[var(--cool-fg)]',
+      toast:
+        'group !rounded-sm !font-sans !text-sm !bg-white dark:!bg-coolgray-100 !text-black dark:!text-white !border dark:!border-coolgray-200 !border-neutral-200 !shadow-[0_5px_15px_-3px_rgb(0_0_0_/_0.08)]',
+      title: '!font-semibold',
+      description: '!text-neutral-500 dark:!text-neutral-400',
+      success: '!border-l-4 !border-l-green-500 [&_[data-icon]]:!text-green-500',
+      error: '!border-l-4 !border-l-red-500 [&_[data-icon]]:!text-red-500',
+      warning: '!border-l-4 !border-l-orange-400 [&_[data-icon]]:!text-orange-400',
+      info: '!border-l-4 !border-l-blue-500 [&_[data-icon]]:!text-blue-500',
+      closeButton:
+        '!bg-white dark:!bg-coolgray-100 !border-neutral-200 dark:!border-coolgray-200 !text-neutral-500 hover:!text-black dark:hover:!text-white',
     },
   }}
 />

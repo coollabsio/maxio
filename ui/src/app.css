@@ -1,5 +1,14 @@
 @import "tailwindcss";
 
+@import "@fontsource/geist-sans/400.css";
+@import "@fontsource/geist-sans/500.css";
+@import "@fontsource/geist-sans/600.css";
+@import "@fontsource/geist-sans/700.css";
+@import "@fontsource/geist-mono/400.css";
+@import "@fontsource/geist-mono/500.css";
+
+@custom-variant dark (&:where(.dark, .dark *));
+
 /* ==============================================
    COOLIFY DESIGN TOKENS
    Light mode = :root, Dark mode = .dark on <html>
@@ -91,6 +100,7 @@
   --color-destructive-foreground: #ffffff;
 
   --color-success: var(--cool-success);
+  --color-error: var(--cool-error);
 
   /* Brand — always coollabs purple, does not swap with dark mode */
   --color-brand: #6b16ed;
@@ -114,12 +124,40 @@
   --color-sidebar-active: var(--cool-sidebar-active-bg);
   --color-sidebar-active-foreground: var(--cool-sidebar-active-fg);
 
+  /* Coollabs (brand) scale */
+  --color-coollabs: #6b16ed;
+  --color-coollabs-50: #f5f0ff;
+  --color-coollabs-100: #7317ff;
+  --color-coollabs-200: #5a12c7;
+  --color-coollabs-300: #4a0fa3;
+
+  /* Warning scale — used for dark-mode accent + callouts */
+  --color-warning: #fcd452;
+  --color-warning-50: #fefce8;
+  --color-warning-100: #fef9c3;
+  --color-warning-200: #fef08a;
+  --color-warning-300: #fde047;
+  --color-warning-400: #fcd452;
+  --color-warning-500: #facc15;
+  --color-warning-600: #ca8a04;
+  --color-warning-700: #a16207;
+  --color-warning-800: #854d0e;
+  --color-warning-900: #713f12;
+
+  /* Coolgray scale — dark mode background hierarchy */
+  --color-base: #101010;
+  --color-coolgray-100: #181818;
+  --color-coolgray-200: #202020;
+  --color-coolgray-300: #242424;
+  --color-coolgray-400: #282828;
+  --color-coolgray-500: #323232;
+
   --radius: 0.125rem;
 
-  --font-sans: "Inter", ui-sans-serif, system-ui, sans-serif, "Apple Color Emoji",
-    "Segoe UI Emoji", "Segoe UI Symbol", "Noto Color Emoji";
-  --font-mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono",
-    "Courier New", monospace;
+  --font-sans: "Geist", "Geist Sans", Inter, ui-sans-serif, system-ui, sans-serif,
+    "Apple Color Emoji", "Segoe UI Emoji", "Segoe UI Symbol", "Noto Color Emoji";
+  --font-mono: "Geist Mono", ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas,
+    "Liberation Mono", "Courier New", monospace;
 }
 
 /* ==============================================
@@ -136,15 +174,50 @@ body {
 }
 
 @layer base {
-  * {
-    @apply border-border;
+  *,
+  ::after,
+  ::before,
+  ::backdrop,
+  ::file-selector-button {
+    border-color: var(--color-coolgray-200, var(--color-border, currentcolor));
+  }
+  :root *,
+  :root ::after,
+  :root ::before {
+    border-color: var(--color-border);
+  }
+  .dark *,
+  .dark ::after,
+  .dark ::before {
+    border-color: var(--color-coolgray-200);
+  }
+
+  h1 {
+    @apply text-3xl font-bold text-black dark:text-white;
+  }
+  h2 {
+    @apply text-xl font-bold text-black dark:text-white;
+  }
+  h3 {
+    @apply text-lg font-bold text-black dark:text-white;
+  }
+  h4 {
+    @apply text-base font-bold text-black dark:text-white;
   }
 }
 
-/* Scrollbar */
-::-webkit-scrollbar { width: 6px; height: 6px; }
-::-webkit-scrollbar-track { background: var(--cool-bg-card-hover); }
-::-webkit-scrollbar-thumb { background: var(--cool-accent); border-radius: 3px; }
+/* Scrollbar — thumb always coollabs-100 per spec */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+::-webkit-scrollbar-track {
+  background: var(--cool-bg-card-hover);
+}
+::-webkit-scrollbar-thumb {
+  background: var(--color-coollabs-100);
+  border-radius: 3px;
+}
 
 /* ==============================================
    COOLIFY INPUT — inset box-shadow system

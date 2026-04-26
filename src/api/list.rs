@@ -38,6 +38,10 @@ pub async fn handle_bucket_get(
         return super::bucket::get_bucket_cors(state, bucket).await;
     }
 
+    if params.contains_key("encryption") {
+        return super::bucket::get_bucket_encryption(state, bucket).await;
+    }
+
     if params.contains_key("versions") {
         return list_object_versions(state, bucket, params).await;
     }

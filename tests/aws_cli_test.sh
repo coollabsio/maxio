@@ -429,6 +429,18 @@ assert "delete empty bucket" $AWS s3 rb "s3://$BUCKET"
 assert_file_not_exists "bucket dir gone from disk" "$DATA_DIR/buckets/$BUCKET"
 assert_fail "head deleted bucket" $AWS s3api head-bucket --bucket "$BUCKET"
 
+# --- Reject rb on non-empty bucket ---
+NON_EMPTY_BUCKET="nonempty-$$"
+assert "create non-empty test bucket" $AWS s3api create-bucket --bucket "$NON_EMPTY_BUCKET"
+echo "stay" > "$TMPDIR/stay.txt"
+assert "put object into non-empty bucket" $AWS s3 cp "$TMPDIR/stay.txt" "s3://$NON_EMPTY_BUCKET/stay.txt"
+assert_fail "rb on non-empty bucket rejected" \
+    $AWS s3api delete-bucket --bucket "$NON_EMPTY_BUCKET"
+assert "head-bucket still succeeds after failed rb" \
+    $AWS s3api head-bucket --bucket "$NON_EMPTY_BUCKET"
+$AWS s3 rm "s3://$NON_EMPTY_BUCKET/stay.txt" > /dev/null
+assert "rb succeeds after emptying" $AWS s3api delete-bucket --bucket "$NON_EMPTY_BUCKET"
+
 # --- CORS tests ---
 CORS_BUCKET="cors-test-$$"
 assert "create cors test bucket" $AWS s3api create-bucket --bucket "$CORS_BUCKET"
@@ -496,6 +508,740 @@ assert_fail "get-bucket-cors fails after delete" \
 # Cleanup CORS test buckets
 assert "delete cors test bucket" $AWS s3api delete-bucket --bucket "$CORS_BUCKET"
 assert "delete no-cors test bucket" $AWS s3api delete-bucket --bucket "$NOCORS_BUCKET"
+
+# --- Server-Side Encryption (SSE) ---
+echo ""
+echo "--- SSE tests ---"
+ENC_BUCKET="enc-$$"
+assert "create SSE bucket" $AWS s3api create-bucket --bucket "$ENC_BUCKET"
+
+# SSE-S3 (AES256)
+echo "hello sse-s3" > "$TMPDIR/sse-s3.txt"
+SSE_S3_OUT=$($AWS s3api put-object --bucket "$ENC_BUCKET" --key sse-s3.txt \
+    --body "$TMPDIR/sse-s3.txt" --server-side-encryption AES256 2>&1)
+assert_eq "SSE-S3 PUT echoes ServerSideEncryption=AES256" \
+    "AES256" "$(echo "$SSE_S3_OUT" | grep -o '"ServerSideEncryption": "[^"]*"' | cut -d'"' -f4)"
+
+# Verify on-disk content != plaintext
+DISK_BYTES=$(head -c 12 "$DATA_DIR/buckets/$ENC_BUCKET/sse-s3.txt" 2>/dev/null | od -An -tx1 | tr -d ' \n')
+PLAIN_HEX=$(head -c 12 "$TMPDIR/sse-s3.txt" 2>/dev/null | od -An -tx1 | tr -d ' \n')
+if [ "$DISK_BYTES" != "$PLAIN_HEX" ] && [ -n "$DISK_BYTES" ]; then
+    green "PASS: SSE-S3 on-disk is ciphertext (not plaintext)"
+    PASS=$((PASS + 1))
+else
+    red "FAIL: SSE-S3 on-disk matches plaintext (disk=$DISK_BYTES plain=$PLAIN_HEX)"
+    FAIL=$((FAIL + 1))
+fi
+
+# Metadata sidecar carries encryption block
+if grep -q '"mode": "sse_s3"' "$DATA_DIR/buckets/$ENC_BUCKET/sse-s3.txt.meta.json" 2>/dev/null; then
+    green "PASS: SSE-S3 meta.json has mode=sse_s3"
+    PASS=$((PASS + 1))
+else
+    red "FAIL: SSE-S3 meta.json missing mode=sse_s3"
+    FAIL=$((FAIL + 1))
+fi
+
+# HEAD echoes the header
+HEAD_OUT=$($AWS s3api head-object --bucket "$ENC_BUCKET" --key sse-s3.txt 2>&1)
+assert_eq "SSE-S3 HEAD echoes ServerSideEncryption=AES256" \
+    "AES256" "$(echo "$HEAD_OUT" | grep -o '"ServerSideEncryption": "[^"]*"' | cut -d'"' -f4)"
+
+# GET roundtrip
+$AWS s3api get-object --bucket "$ENC_BUCKET" --key sse-s3.txt "$TMPDIR/sse-s3-out.txt" > /dev/null
+if cmp -s "$TMPDIR/sse-s3.txt" "$TMPDIR/sse-s3-out.txt"; then
+    green "PASS: SSE-S3 GET roundtrip matches"
+    PASS=$((PASS + 1))
+else
+    red "FAIL: SSE-S3 GET roundtrip differs"
+    FAIL=$((FAIL + 1))
+fi
+
+# Range GET across ciphertext frame boundary is only meaningful > 64K — do a
+# small range check that still exercises FrameDecryptor range translation.
+RANGE_OUT=$($AWS s3api get-object --bucket "$ENC_BUCKET" --key sse-s3.txt \
+    --range "bytes=0-4" "$TMPDIR/sse-s3-range.txt" 2>&1 || true)
+assert_eq "SSE-S3 range GET returns first 5 bytes" "hello" "$(cat "$TMPDIR/sse-s3-range.txt")"
+
+# SSE-C (customer-supplied key)
+SSEC_KEY_B64=$(openssl rand 32 | base64)
+SSEC_KEY_MD5=$(echo -n "$SSEC_KEY_B64" | base64 -d | openssl dgst -md5 -binary | base64)
+echo "hello sse-c" > "$TMPDIR/sse-c.txt"
+SSE_C_OUT=$($AWS s3api put-object --bucket "$ENC_BUCKET" --key sse-c.txt \
+    --body "$TMPDIR/sse-c.txt" \
+    --sse-customer-algorithm AES256 \
+    --sse-customer-key "$SSEC_KEY_B64" \
+    --sse-customer-key-md5 "$SSEC_KEY_MD5" 2>&1)
+assert_eq "SSE-C PUT echoes SSECustomerAlgorithm=AES256" \
+    "AES256" "$(echo "$SSE_C_OUT" | grep -o '"SSECustomerAlgorithm": "[^"]*"' | cut -d'"' -f4)"
+
+# GET without key must fail
+assert_fail "SSE-C GET without customer key fails" \
+    $AWS s3api get-object --bucket "$ENC_BUCKET" --key sse-c.txt "$TMPDIR/sse-c-nokey.txt"
+
+# GET with wrong key must fail
+WRONG_KEY=$(openssl rand 32 | base64)
+WRONG_MD5=$(echo -n "$WRONG_KEY" | base64 -d | openssl dgst -md5 -binary | base64)
+assert_fail "SSE-C GET with wrong key fails" \
+    $AWS s3api get-object --bucket "$ENC_BUCKET" --key sse-c.txt \
+    --sse-customer-algorithm AES256 \
+    --sse-customer-key "$WRONG_KEY" \
+    --sse-customer-key-md5 "$WRONG_MD5" \
+    "$TMPDIR/sse-c-wrong.txt"
+
+# GET with correct key succeeds
+$AWS s3api get-object --bucket "$ENC_BUCKET" --key sse-c.txt \
+    --sse-customer-algorithm AES256 \
+    --sse-customer-key "$SSEC_KEY_B64" \
+    --sse-customer-key-md5 "$SSEC_KEY_MD5" \
+    "$TMPDIR/sse-c-out.txt" > /dev/null
+if cmp -s "$TMPDIR/sse-c.txt" "$TMPDIR/sse-c-out.txt"; then
+    green "PASS: SSE-C GET with correct key matches"
+    PASS=$((PASS + 1))
+else
+    red "FAIL: SSE-C GET with correct key differs"
+    FAIL=$((FAIL + 1))
+fi
+
+# Bucket default encryption → unencrypted-request PUT gets encrypted anyway
+DEFAULT_BUCKET="enc-default-$$"
+assert "create default-encryption bucket" $AWS s3api create-bucket --bucket "$DEFAULT_BUCKET"
+assert "put-bucket-encryption AES256" $AWS s3api put-bucket-encryption \
+    --bucket "$DEFAULT_BUCKET" \
+    --server-side-encryption-configuration \
+    '{"Rules":[{"ApplyServerSideEncryptionByDefault":{"SSEAlgorithm":"AES256"}}]}'
+
+# get-bucket-encryption roundtrip
+GET_ENC_OUT=$($AWS s3api get-bucket-encryption --bucket "$DEFAULT_BUCKET" 2>&1)
+assert_eq "get-bucket-encryption returns AES256" \
+    "AES256" "$(echo "$GET_ENC_OUT" | grep -o '"SSEAlgorithm": "[^"]*"' | cut -d'"' -f4)"
+
+# Plain PUT (no SSE headers) should be encrypted via bucket default
+echo "inherit default" > "$TMPDIR/default.txt"
+DEF_PUT_OUT=$($AWS s3api put-object --bucket "$DEFAULT_BUCKET" --key default.txt \
+    --body "$TMPDIR/default.txt" 2>&1)
+assert_eq "bucket-default PUT echoes ServerSideEncryption=AES256" \
+    "AES256" "$(echo "$DEF_PUT_OUT" | grep -o '"ServerSideEncryption": "[^"]*"' | cut -d'"' -f4)"
+if grep -q '"mode": "sse_s3"' "$DATA_DIR/buckets/$DEFAULT_BUCKET/default.txt.meta.json" 2>/dev/null; then
+    green "PASS: bucket-default meta.json has mode=sse_s3"
+    PASS=$((PASS + 1))
+else
+    red "FAIL: bucket-default meta.json missing mode=sse_s3"
+    FAIL=$((FAIL + 1))
+fi
+
+# delete-bucket-encryption
+assert "delete-bucket-encryption" \
+    $AWS s3api delete-bucket-encryption --bucket "$DEFAULT_BUCKET"
+assert_fail "get-bucket-encryption fails after delete" \
+    $AWS s3api get-bucket-encryption --bucket "$DEFAULT_BUCKET"
+
+# SSE-KMS is rejected (feature removed — AES256 only)
+echo "hello sse-kms" > "$TMPDIR/sse-kms.txt"
+KMS_OUT=$($AWS s3api put-object --bucket "$ENC_BUCKET" --key sse-kms.txt \
+    --body "$TMPDIR/sse-kms.txt" --server-side-encryption aws:kms 2>&1 || true)
+if echo "$KMS_OUT" | grep -q "InvalidEncryptionAlgorithm"; then
+    green "PASS: PUT with --server-side-encryption aws:kms rejected"
+    PASS=$((PASS + 1))
+else
+    red "FAIL: expected InvalidEncryptionAlgorithm for aws:kms, got: $KMS_OUT"
+    FAIL=$((FAIL + 1))
+fi
+
+# SSE multipart upload (> 5 MiB part so it exercises complete-multipart encryption path)
+MP_BUCKET="enc-mp-$$"
+assert "create MP SSE bucket" $AWS s3api create-bucket --bucket "$MP_BUCKET"
+dd if=/dev/urandom of="$TMPDIR/mp.bin" bs=1M count=6 2>/dev/null
+assert "multipart PUT with SSE-S3 (uses cp for simplicity)" \
+    $AWS s3 cp "$TMPDIR/mp.bin" "s3://$MP_BUCKET/mp.bin" --sse AES256
+$AWS s3 cp "s3://$MP_BUCKET/mp.bin" "$TMPDIR/mp-out.bin" > /dev/null
+if cmp -s "$TMPDIR/mp.bin" "$TMPDIR/mp-out.bin"; then
+    green "PASS: SSE-S3 multipart roundtrip matches"
+    PASS=$((PASS + 1))
+else
+    red "FAIL: SSE-S3 multipart roundtrip differs"
+    FAIL=$((FAIL + 1))
+fi
+
+# Invalid SSE algorithm must be rejected (InvalidEncryptionAlgorithm)
+BAD_ALGO_OUT=$($AWS s3api put-object --bucket "$ENC_BUCKET" --key bad-algo.txt \
+    --body "$TMPDIR/sse-s3.txt" --server-side-encryption AES512 2>&1 || true)
+if echo "$BAD_ALGO_OUT" | grep -q "InvalidEncryptionAlgorithm"; then
+    green "PASS: PUT with bogus server-side-encryption algorithm rejected"
+    PASS=$((PASS + 1))
+else
+    red "FAIL: bogus SSE algorithm not rejected — got: $BAD_ALGO_OUT"
+    FAIL=$((FAIL + 1))
+fi
+
+# Cleanup SSE objects + buckets
+$AWS s3 rm "s3://$ENC_BUCKET/sse-s3.txt" > /dev/null || true
+$AWS s3 rm "s3://$ENC_BUCKET/sse-c.txt" > /dev/null || true
+$AWS s3 rm "s3://$ENC_BUCKET/sse-kms.txt" > /dev/null || true
+$AWS s3 rm "s3://$DEFAULT_BUCKET/default.txt" > /dev/null || true
+$AWS s3 rm "s3://$MP_BUCKET/mp.bin" > /dev/null || true
+assert "delete SSE bucket" $AWS s3api delete-bucket --bucket "$ENC_BUCKET"
+assert "delete default-encryption bucket" $AWS s3api delete-bucket --bucket "$DEFAULT_BUCKET"
+assert "delete MP SSE bucket" $AWS s3api delete-bucket --bucket "$MP_BUCKET"
+
+# --- Encryption transition: plaintext → enable → disable ---
+echo ""
+echo "--- Encryption transition tests ---"
+TRANS_BUCKET="enc-trans-$$"
+assert "create transition bucket (no encryption)" \
+    $AWS s3api create-bucket --bucket "$TRANS_BUCKET"
+
+# 1. Plaintext PUT before encryption is configured
+echo "plaintext-before" > "$TMPDIR/before.txt"
+assert "PUT file-A (plaintext, no bucket encryption)" \
+    $AWS s3api put-object --bucket "$TRANS_BUCKET" --key before.txt \
+    --body "$TMPDIR/before.txt"
+assert_eq "before.txt stored as plaintext on disk" \
+    "plaintext-before" "$(cat "$DATA_DIR/buckets/$TRANS_BUCKET/before.txt")"
+if grep -q '"mode"' "$DATA_DIR/buckets/$TRANS_BUCKET/before.txt.meta.json" 2>/dev/null; then
+    red "FAIL: before.txt meta.json unexpectedly has encryption mode"
+    FAIL=$((FAIL + 1))
+else
+    green "PASS: before.txt meta.json has no encryption mode"
+    PASS=$((PASS + 1))
+fi
+
+# 2. Enable bucket default encryption (AES256 / SSE-S3)
+assert "enable bucket default encryption" $AWS s3api put-bucket-encryption \
+    --bucket "$TRANS_BUCKET" \
+    --server-side-encryption-configuration \
+    '{"Rules":[{"ApplyServerSideEncryptionByDefault":{"SSEAlgorithm":"AES256"}}]}'
+
+# 3. Upload file-B (inherits bucket default → encrypted)
+echo "encrypted-after" > "$TMPDIR/after.txt"
+AFTER_PUT_OUT=$($AWS s3api put-object --bucket "$TRANS_BUCKET" --key after.txt \
+    --body "$TMPDIR/after.txt" 2>&1)
+assert_eq "after.txt PUT echoes ServerSideEncryption=AES256" \
+    "AES256" "$(echo "$AFTER_PUT_OUT" | grep -o '"ServerSideEncryption": "[^"]*"' | cut -d'"' -f4)"
+if grep -q '"mode": "sse_s3"' "$DATA_DIR/buckets/$TRANS_BUCKET/after.txt.meta.json" 2>/dev/null; then
+    green "PASS: after.txt meta.json has mode=sse_s3"
+    PASS=$((PASS + 1))
+else
+    red "FAIL: after.txt meta.json missing mode=sse_s3"
+    FAIL=$((FAIL + 1))
+fi
+
+# 4. Both files readable while encryption enabled
+$AWS s3api get-object --bucket "$TRANS_BUCKET" --key before.txt \
+    "$TMPDIR/before-enc-on.txt" > /dev/null
+assert_eq "before.txt readable (encryption enabled)" \
+    "plaintext-before" "$(cat "$TMPDIR/before-enc-on.txt")"
+$AWS s3api get-object --bucket "$TRANS_BUCKET" --key after.txt \
+    "$TMPDIR/after-enc-on.txt" > /dev/null
+assert_eq "after.txt readable (encryption enabled)" \
+    "encrypted-after" "$(cat "$TMPDIR/after-enc-on.txt")"
+
+# 5. Disable bucket default encryption
+assert "disable bucket default encryption" \
+    $AWS s3api delete-bucket-encryption --bucket "$TRANS_BUCKET"
+assert_fail "get-bucket-encryption fails after disable" \
+    $AWS s3api get-bucket-encryption --bucket "$TRANS_BUCKET"
+
+# 6. Both files STILL readable after disable
+$AWS s3api get-object --bucket "$TRANS_BUCKET" --key before.txt \
+    "$TMPDIR/before-enc-off.txt" > /dev/null
+assert_eq "before.txt readable (encryption disabled)" \
+    "plaintext-before" "$(cat "$TMPDIR/before-enc-off.txt")"
+$AWS s3api get-object --bucket "$TRANS_BUCKET" --key after.txt \
+    "$TMPDIR/after-enc-off.txt" > /dev/null
+assert_eq "after.txt readable (encryption disabled)" \
+    "encrypted-after" "$(cat "$TMPDIR/after-enc-off.txt")"
+
+# Cleanup
+$AWS s3 rm "s3://$TRANS_BUCKET/before.txt" > /dev/null || true
+$AWS s3 rm "s3://$TRANS_BUCKET/after.txt" > /dev/null || true
+assert "delete transition bucket" $AWS s3api delete-bucket --bucket "$TRANS_BUCKET"
+
+# --- Keyring rotation (CLI) ---
+echo ""
+echo "--- Keyring rotate CLI tests ---"
+
+# Locate the maxio binary (script runs against a pre-started server, so the
+# binary path isn't passed in — try both debug and release).
+MAXIO_BIN=""
+for candidate in ./target/debug/maxio ./target/release/maxio; do
+    if [ -x "$candidate" ]; then
+        MAXIO_BIN="$candidate"
+        break
+    fi
+done
+
+if [ -z "$MAXIO_BIN" ]; then
+    red "SKIP: keyring rotate tests (./target/debug/maxio and ./target/release/maxio not found)"
+else
+    KEYRING_FILE="$DATA_DIR/.maxio-keys.json"
+
+    # Bucket + object before rotation (running server's active key wraps the DEK).
+    ROT_BUCKET="rotate-$$"
+    assert "create rotate bucket" $AWS s3api create-bucket --bucket "$ROT_BUCKET"
+    echo "before rotation" > "$TMPDIR/pre.txt"
+    PRE_OUT=$($AWS s3api put-object --bucket "$ROT_BUCKET" --key pre.txt \
+        --body "$TMPDIR/pre.txt" --server-side-encryption AES256 2>&1)
+    assert_eq "pre-rotation PUT got AES256" \
+        "AES256" "$(echo "$PRE_OUT" | grep -o '"ServerSideEncryption": "[^"]*"' | cut -d'"' -f4)"
+
+    PRE_KEY_ID=$(grep -o '"key_id": "[^"]*"' \
+        "$DATA_DIR/buckets/$ROT_BUCKET/pre.txt.meta.json" | cut -d'"' -f4)
+    if [ -n "$PRE_KEY_ID" ]; then
+        green "PASS: pre.txt meta.json records key_id=$PRE_KEY_ID"
+        PASS=$((PASS + 1))
+    else
+        red "FAIL: pre.txt meta.json missing key_id"
+        FAIL=$((FAIL + 1))
+    fi
+
+    # `keyring list` before rotate shows one active key.
+    LIST_BEFORE=$("$MAXIO_BIN" keyring list --data-dir "$DATA_DIR" 2>&1)
+    YES_COUNT_BEFORE=$(echo "$LIST_BEFORE" | awk 'NR>1 && $3=="yes"{n++} END{print n+0}')
+    assert_eq "pre-rotate: exactly 1 active key" "1" "$YES_COUNT_BEFORE"
+
+    # Run the rotate CLI.
+    ROTATE_OUT=$("$MAXIO_BIN" keyring rotate --data-dir "$DATA_DIR" 2>&1)
+    if echo "$ROTATE_OUT" | grep -q "keyring rotated"; then
+        green "PASS: rotate CLI output contains 'keyring rotated'"
+        PASS=$((PASS + 1))
+    else
+        red "FAIL: rotate CLI output missing 'keyring rotated' — got: $ROTATE_OUT"
+        FAIL=$((FAIL + 1))
+    fi
+
+    NEW_KEY_ID=$(echo "$ROTATE_OUT" | grep "new active key id:" | awk '{print $NF}')
+    if [ -n "$NEW_KEY_ID" ] && [ "$NEW_KEY_ID" != "$PRE_KEY_ID" ]; then
+        green "PASS: rotate produced a new distinct key_id $NEW_KEY_ID"
+        PASS=$((PASS + 1))
+    else
+        red "FAIL: rotate key_id=$NEW_KEY_ID vs pre=$PRE_KEY_ID"
+        FAIL=$((FAIL + 1))
+    fi
+
+    # File perms 0600 (Unix only).
+    if [ "$(uname)" != "MINGW"* ] && [ "$(uname)" != "CYGWIN"* ]; then
+        PERMS=$(stat -f '%Lp' "$KEYRING_FILE" 2>/dev/null || stat -c '%a' "$KEYRING_FILE")
+        assert_eq "keyring file perms are 600 after rotate" "600" "$PERMS"
+    fi
+
+    # `keyring list` after: still exactly 1 active, total count is 2.
+    LIST_AFTER=$("$MAXIO_BIN" keyring list --data-dir "$DATA_DIR" 2>&1)
+    YES_COUNT_AFTER=$(echo "$LIST_AFTER" | awk 'NR>1 && $3=="yes"{n++} END{print n+0}')
+    NO_COUNT_AFTER=$(echo "$LIST_AFTER" | awk 'NR>1 && $3=="no"{n++} END{print n+0}')
+    assert_eq "post-rotate: exactly 1 active key" "1" "$YES_COUNT_AFTER"
+    assert_eq "post-rotate: previous key demoted (1 inactive)" "1" "$NO_COUNT_AFTER"
+
+    # Old object remains decryptable via the live server (its in-memory ring
+    # still has the old active key). This verifies that writing a new key to
+    # disk does NOT break the currently-running server's reads.
+    $AWS s3api get-object --bucket "$ROT_BUCKET" --key pre.txt \
+        "$TMPDIR/pre-out.txt" > /dev/null
+    if cmp -s "$TMPDIR/pre.txt" "$TMPDIR/pre-out.txt"; then
+        green "PASS: pre-rotation object still readable from live server after rotate"
+        PASS=$((PASS + 1))
+    else
+        red "FAIL: pre-rotation object corrupted after rotate"
+        FAIL=$((FAIL + 1))
+    fi
+
+    # Second rotate → 3 keys total, 1 active.
+    "$MAXIO_BIN" keyring rotate --data-dir "$DATA_DIR" > /dev/null
+    LIST_FINAL=$("$MAXIO_BIN" keyring list --data-dir "$DATA_DIR" 2>&1)
+    TOTAL_FINAL=$(echo "$LIST_FINAL" | awk 'NR>1' | wc -l | tr -d ' ')
+    assert_eq "second rotate: 3 keys total" "3" "$TOTAL_FINAL"
+
+    # NOTE: verifying decryption AFTER a full restart (so the new key becomes
+    # the in-memory active key while the old keys remain for unwrap) is covered
+    # by the Rust integration test `test_keyring_rotate_preserves_old_objects`.
+    # This shell test cannot restart the caller-owned server process.
+
+    $AWS s3 rm "s3://$ROT_BUCKET/pre.txt" > /dev/null || true
+    assert "delete rotate bucket" $AWS s3api delete-bucket --bucket "$ROT_BUCKET"
+fi
+
+# --- Object tagging ---
+echo ""
+echo "--- Object tagging tests ---"
+TAG_BUCKET="tag-$$"
+assert "create tag bucket" $AWS s3api create-bucket --bucket "$TAG_BUCKET"
+echo "tagged" > "$TMPDIR/tag.txt"
+assert "put object for tagging" $AWS s3api put-object \
+    --bucket "$TAG_BUCKET" --key tag.txt --body "$TMPDIR/tag.txt"
+
+# put-object-tagging
+assert "put-object-tagging 2 tags" $AWS s3api put-object-tagging \
+    --bucket "$TAG_BUCKET" --key tag.txt \
+    --tagging 'TagSet=[{Key=env,Value=prod},{Key=app,Value=maxio}]'
+
+# get-object-tagging roundtrip
+TAG_GET=$($AWS s3api get-object-tagging --bucket "$TAG_BUCKET" --key tag.txt 2>&1)
+assert_eq "get-object-tagging sees env=prod" "prod" \
+    "$(echo "$TAG_GET" | python3 -c 'import sys,json; d=json.load(sys.stdin); print(next((t["Value"] for t in d.get("TagSet",[]) if t["Key"]=="env"), ""))' 2>/dev/null)"
+assert_eq "get-object-tagging sees app=maxio" "maxio" \
+    "$(echo "$TAG_GET" | python3 -c 'import sys,json; d=json.load(sys.stdin); print(next((t["Value"] for t in d.get("TagSet",[]) if t["Key"]=="app"), ""))' 2>/dev/null)"
+
+# Storage sidecar carries tags
+if grep -q '"tags"' "$DATA_DIR/buckets/$TAG_BUCKET/tag.txt.meta.json"; then
+    green "PASS: tag.txt.meta.json records tags"
+    PASS=$((PASS + 1))
+else
+    red "FAIL: tag.txt.meta.json missing tags"
+    FAIL=$((FAIL + 1))
+fi
+
+# delete-object-tagging → empty tag set
+assert "delete-object-tagging" $AWS s3api delete-object-tagging \
+    --bucket "$TAG_BUCKET" --key tag.txt
+TAG_AFTER=$($AWS s3api get-object-tagging --bucket "$TAG_BUCKET" --key tag.txt 2>&1)
+TAG_AFTER_COUNT=$(echo "$TAG_AFTER" | python3 -c 'import sys,json; print(len(json.load(sys.stdin).get("TagSet",[])))' 2>/dev/null)
+assert_eq "get-object-tagging empty after delete" "0" "$TAG_AFTER_COUNT"
+
+# NOTE: `put-object --tagging 'env=prod&...'` (x-amz-tagging header on PUT) is
+# not yet implemented in MaxIO — only the separate PutObjectTagging API works.
+# When that header lands, add an assertion here that verifies tags are set by
+# PUT+header in one request.
+
+$AWS s3 rm "s3://$TAG_BUCKET/tag.txt" > /dev/null || true
+assert "delete tag bucket" $AWS s3api delete-bucket --bucket "$TAG_BUCKET"
+
+# --- Batch DeleteObjects ---
+echo ""
+echo "--- Batch DeleteObjects tests ---"
+BATCH_BUCKET="batch-$$"
+assert "create batch bucket" $AWS s3api create-bucket --bucket "$BATCH_BUCKET"
+echo "a" > "$TMPDIR/a.txt"
+echo "b" > "$TMPDIR/b.txt"
+echo "c" > "$TMPDIR/c.txt"
+$AWS s3 cp "$TMPDIR/a.txt" "s3://$BATCH_BUCKET/a.txt" > /dev/null
+$AWS s3 cp "$TMPDIR/b.txt" "s3://$BATCH_BUCKET/b.txt" > /dev/null
+$AWS s3 cp "$TMPDIR/c.txt" "s3://$BATCH_BUCKET/c.txt" > /dev/null
+
+DEL_OUT=$($AWS s3api delete-objects --bucket "$BATCH_BUCKET" \
+    --delete 'Objects=[{Key=a.txt},{Key=b.txt},{Key=c.txt}]' 2>&1)
+DEL_COUNT=$(echo "$DEL_OUT" | python3 -c 'import sys,json; print(len(json.load(sys.stdin).get("Deleted",[])))' 2>/dev/null)
+assert_eq "delete-objects removed 3" "3" "$DEL_COUNT"
+assert_file_not_exists "a.txt gone" "$DATA_DIR/buckets/$BATCH_BUCKET/a.txt"
+assert_file_not_exists "b.txt gone" "$DATA_DIR/buckets/$BATCH_BUCKET/b.txt"
+assert_file_not_exists "c.txt gone" "$DATA_DIR/buckets/$BATCH_BUCKET/c.txt"
+assert_file_not_exists "a.txt.meta.json gone" "$DATA_DIR/buckets/$BATCH_BUCKET/a.txt.meta.json"
+
+# Batch delete with one missing key — still returns 200; S3 treats missing as deleted.
+echo "x" > "$TMPDIR/x.txt"
+$AWS s3 cp "$TMPDIR/x.txt" "s3://$BATCH_BUCKET/x.txt" > /dev/null
+DEL_MIX=$($AWS s3api delete-objects --bucket "$BATCH_BUCKET" \
+    --delete 'Objects=[{Key=x.txt},{Key=does-not-exist.txt}]' 2>&1)
+DEL_MIX_COUNT=$(echo "$DEL_MIX" | python3 -c 'import sys,json; d=json.load(sys.stdin); print(len(d.get("Deleted",[])))' 2>/dev/null)
+if [ "$DEL_MIX_COUNT" -ge 1 ]; then
+    green "PASS: delete-objects handles mixed existing + missing keys"
+    PASS=$((PASS + 1))
+else
+    red "FAIL: delete-objects mixed gave Deleted=$DEL_MIX_COUNT"
+    FAIL=$((FAIL + 1))
+fi
+
+assert "delete batch bucket" $AWS s3api delete-bucket --bucket "$BATCH_BUCKET"
+
+# --- Versioning ---
+echo ""
+echo "--- Versioning tests ---"
+VER_BUCKET="ver-$$"
+assert "create version bucket" $AWS s3api create-bucket --bucket "$VER_BUCKET"
+assert "put-bucket-versioning Enabled" $AWS s3api put-bucket-versioning \
+    --bucket "$VER_BUCKET" --versioning-configuration 'Status=Enabled'
+
+VER_STATUS=$($AWS s3api get-bucket-versioning --bucket "$VER_BUCKET" 2>&1)
+assert_eq "get-bucket-versioning returns Enabled" "Enabled" \
+    "$(echo "$VER_STATUS" | grep -o '"Status": "[^"]*"' | cut -d'"' -f4)"
+
+# Three PUTs of same key → three versions
+echo "v1" > "$TMPDIR/v1.txt"
+echo "v2" > "$TMPDIR/v2.txt"
+echo "v3" > "$TMPDIR/v3.txt"
+V1_VID=$($AWS s3api put-object --bucket "$VER_BUCKET" --key obj --body "$TMPDIR/v1.txt" 2>&1 | grep -o '"VersionId": "[^"]*"' | cut -d'"' -f4)
+V2_VID=$($AWS s3api put-object --bucket "$VER_BUCKET" --key obj --body "$TMPDIR/v2.txt" 2>&1 | grep -o '"VersionId": "[^"]*"' | cut -d'"' -f4)
+V3_VID=$($AWS s3api put-object --bucket "$VER_BUCKET" --key obj --body "$TMPDIR/v3.txt" 2>&1 | grep -o '"VersionId": "[^"]*"' | cut -d'"' -f4)
+if [ -n "$V1_VID" ] && [ -n "$V2_VID" ] && [ -n "$V3_VID" ] \
+    && [ "$V1_VID" != "$V2_VID" ] && [ "$V2_VID" != "$V3_VID" ]; then
+    green "PASS: three distinct VersionIds returned"
+    PASS=$((PASS + 1))
+else
+    red "FAIL: VersionIds v1=$V1_VID v2=$V2_VID v3=$V3_VID"
+    FAIL=$((FAIL + 1))
+fi
+
+# list-object-versions shows all 3
+VER_LIST=$($AWS s3api list-object-versions --bucket "$VER_BUCKET" 2>&1)
+VER_LIST_COUNT=$(echo "$VER_LIST" | python3 -c 'import sys,json; print(len(json.load(sys.stdin).get("Versions",[])))' 2>/dev/null)
+assert_eq "list-object-versions returns 3 versions" "3" "$VER_LIST_COUNT"
+
+# get-object --version-id returns historical content
+$AWS s3api get-object --bucket "$VER_BUCKET" --key obj --version-id "$V1_VID" \
+    "$TMPDIR/v1-out.txt" > /dev/null 2>&1
+if [ "$(cat "$TMPDIR/v1-out.txt" 2>/dev/null)" = "v1" ]; then
+    green "PASS: get-object --version-id retrieves old v1 content"
+    PASS=$((PASS + 1))
+else
+    red "FAIL: get-object --version-id returned $(cat "$TMPDIR/v1-out.txt" 2>/dev/null)"
+    FAIL=$((FAIL + 1))
+fi
+
+# delete-object (no version-id) creates a delete marker
+DEL_MARKER=$($AWS s3api delete-object --bucket "$VER_BUCKET" --key obj 2>&1)
+assert_eq "delete-object returns DeleteMarker=true" "true" \
+    "$(echo "$DEL_MARKER" | grep -o '"DeleteMarker": [a-z]*' | awk '{print $2}')"
+
+VER_LIST_AFTER=$($AWS s3api list-object-versions --bucket "$VER_BUCKET" 2>&1)
+DM_COUNT=$(echo "$VER_LIST_AFTER" | python3 -c 'import sys,json; print(len(json.load(sys.stdin).get("DeleteMarkers",[])))' 2>/dev/null)
+assert_eq "list-object-versions shows 1 DeleteMarker" "1" "$DM_COUNT"
+
+# delete-object --version-id hard-deletes a specific version
+assert "delete-object --version-id hard-delete v1" $AWS s3api delete-object \
+    --bucket "$VER_BUCKET" --key obj --version-id "$V1_VID"
+VER_LIST_FINAL=$($AWS s3api list-object-versions --bucket "$VER_BUCKET" 2>&1)
+VER_FINAL_COUNT=$(echo "$VER_LIST_FINAL" | python3 -c 'import sys,json; print(len(json.load(sys.stdin).get("Versions",[])))' 2>/dev/null)
+assert_eq "post hard-delete: 2 versions remain" "2" "$VER_FINAL_COUNT"
+
+# Suspend versioning
+assert "put-bucket-versioning Suspended" $AWS s3api put-bucket-versioning \
+    --bucket "$VER_BUCKET" --versioning-configuration 'Status=Suspended'
+
+# Cleanup all remaining versions
+for vid in $(echo "$VER_LIST_FINAL" | python3 -c 'import sys,json; [print(v["VersionId"]) for v in json.load(sys.stdin).get("Versions",[])+json.load(open("/dev/stdin")).get("DeleteMarkers",[])]' 2>/dev/null || echo ""); do
+    $AWS s3api delete-object --bucket "$VER_BUCKET" --key obj --version-id "$vid" > /dev/null 2>&1 || true
+done
+# Fallback — delete everything
+$AWS s3 rm "s3://$VER_BUCKET" --recursive > /dev/null 2>&1 || true
+# remove any lingering version files on disk (versioning tests leave .versions/ dirs)
+rm -rf "$DATA_DIR/buckets/$VER_BUCKET"
+$AWS s3api delete-bucket --bucket "$VER_BUCKET" > /dev/null 2>&1 || true
+
+# --- ListObjectsV1 pagination ---
+echo ""
+echo "--- ListObjectsV1 pagination tests ---"
+PAG_BUCKET="pag-$$"
+assert "create pagination bucket" $AWS s3api create-bucket --bucket "$PAG_BUCKET"
+for i in 0 1 2 3 4 5 6; do
+    echo "obj$i" > "$TMPDIR/obj$i.txt"
+    $AWS s3 cp "$TMPDIR/obj$i.txt" "s3://$PAG_BUCKET/obj$i" > /dev/null
+done
+
+PAGE1=$($AWS s3api list-objects --bucket "$PAG_BUCKET" --max-keys 3 2>&1)
+PAGE1_COUNT=$(echo "$PAGE1" | python3 -c 'import sys,json; print(len(json.load(sys.stdin).get("Contents",[])))' 2>/dev/null)
+assert_eq "list-objects v1 page 1 returns 3" "3" "$PAGE1_COUNT"
+PAGE1_TRUNC=$(echo "$PAGE1" | grep -o '"IsTruncated": [a-z]*' | awk '{print $2}')
+assert_eq "list-objects v1 page 1 IsTruncated=true" "true" "$PAGE1_TRUNC"
+NEXT_MARKER=$(echo "$PAGE1" | python3 -c 'import sys,json; d=json.load(sys.stdin); print(d.get("NextMarker") or d["Contents"][-1]["Key"])' 2>/dev/null)
+
+PAGE2=$($AWS s3api list-objects --bucket "$PAG_BUCKET" --max-keys 3 --marker "$NEXT_MARKER" 2>&1)
+PAGE2_COUNT=$(echo "$PAGE2" | python3 -c 'import sys,json; print(len(json.load(sys.stdin).get("Contents",[])))' 2>/dev/null)
+assert_eq "list-objects v1 page 2 returns 3" "3" "$PAGE2_COUNT"
+
+$AWS s3 rm "s3://$PAG_BUCKET" --recursive > /dev/null
+assert "delete pagination bucket" $AWS s3api delete-bucket --bucket "$PAG_BUCKET"
+
+# --- GetBucketLocation ---
+echo ""
+echo "--- GetBucketLocation test ---"
+LOC_BUCKET="loc-$$"
+assert "create loc bucket" $AWS s3api create-bucket --bucket "$LOC_BUCKET"
+LOC=$($AWS s3api get-bucket-location --bucket "$LOC_BUCKET" 2>&1)
+# LocationConstraint is "us-east-1" or null-equivalent
+LOC_VAL=$(echo "$LOC" | grep -o '"LocationConstraint": "[^"]*"' | cut -d'"' -f4)
+if [ "$LOC_VAL" = "us-east-1" ] || [ -z "$LOC_VAL" ]; then
+    green "PASS: get-bucket-location returned '$LOC_VAL'"
+    PASS=$((PASS + 1))
+else
+    red "FAIL: get-bucket-location returned '$LOC_VAL'"
+    FAIL=$((FAIL + 1))
+fi
+assert "delete loc bucket" $AWS s3api delete-bucket --bucket "$LOC_BUCKET"
+
+# --- Cross-bucket CopyObject ---
+echo ""
+echo "--- Cross-bucket CopyObject test ---"
+SRC_BUCKET="src-$$"
+DST_BUCKET="dst-$$"
+assert "create src bucket" $AWS s3api create-bucket --bucket "$SRC_BUCKET"
+assert "create dst bucket" $AWS s3api create-bucket --bucket "$DST_BUCKET"
+echo "cross-bucket content" > "$TMPDIR/xcopy.txt"
+$AWS s3 cp "$TMPDIR/xcopy.txt" "s3://$SRC_BUCKET/src-key" > /dev/null
+assert "cross-bucket copy-object" $AWS s3api copy-object \
+    --bucket "$DST_BUCKET" --key dst-key \
+    --copy-source "$SRC_BUCKET/src-key"
+$AWS s3api get-object --bucket "$DST_BUCKET" --key dst-key "$TMPDIR/xcopy-out.txt" > /dev/null
+if cmp -s "$TMPDIR/xcopy.txt" "$TMPDIR/xcopy-out.txt"; then
+    green "PASS: cross-bucket copy preserves content"
+    PASS=$((PASS + 1))
+else
+    red "FAIL: cross-bucket copy differs"
+    FAIL=$((FAIL + 1))
+fi
+$AWS s3 rm "s3://$SRC_BUCKET/src-key" > /dev/null
+$AWS s3 rm "s3://$DST_BUCKET/dst-key" > /dev/null
+assert "delete src bucket" $AWS s3api delete-bucket --bucket "$SRC_BUCKET"
+assert "delete dst bucket" $AWS s3api delete-bucket --bucket "$DST_BUCKET"
+
+# --- CopyObject with SSE-C source ---
+echo ""
+echo "--- CopyObject with SSE-C source test ---"
+SSEC_SRC="ssec-src-$$"
+SSEC_DST="ssec-dst-$$"
+assert "create ssec-src" $AWS s3api create-bucket --bucket "$SSEC_SRC"
+assert "create ssec-dst" $AWS s3api create-bucket --bucket "$SSEC_DST"
+
+SSEC_KEY=$(openssl rand 32 | base64)
+SSEC_MD5=$(echo -n "$SSEC_KEY" | base64 -d | openssl dgst -md5 -binary | base64)
+echo "ssec copy payload" > "$TMPDIR/ssec-src.txt"
+$AWS s3api put-object --bucket "$SSEC_SRC" --key srcobj --body "$TMPDIR/ssec-src.txt" \
+    --sse-customer-algorithm AES256 \
+    --sse-customer-key "$SSEC_KEY" \
+    --sse-customer-key-md5 "$SSEC_MD5" > /dev/null
+
+# Copy without providing source key → must fail
+assert_fail "copy without copy-source SSE-C key fails" \
+    $AWS s3api copy-object --bucket "$SSEC_DST" --key dstobj \
+    --copy-source "$SSEC_SRC/srcobj"
+
+# Copy WITH source key → destination becomes plaintext (no dst SSE specified)
+assert "copy with copy-source SSE-C key succeeds" \
+    $AWS s3api copy-object --bucket "$SSEC_DST" --key dstobj \
+    --copy-source "$SSEC_SRC/srcobj" \
+    --copy-source-sse-customer-algorithm AES256 \
+    --copy-source-sse-customer-key "$SSEC_KEY" \
+    --copy-source-sse-customer-key-md5 "$SSEC_MD5"
+
+# Destination is plaintext → plain GET works
+$AWS s3api get-object --bucket "$SSEC_DST" --key dstobj "$TMPDIR/ssec-dst.txt" > /dev/null 2>&1
+if cmp -s "$TMPDIR/ssec-src.txt" "$TMPDIR/ssec-dst.txt"; then
+    green "PASS: copy-source SSE-C roundtrip content match"
+    PASS=$((PASS + 1))
+else
+    red "FAIL: copy-source SSE-C roundtrip content differs"
+    FAIL=$((FAIL + 1))
+fi
+
+$AWS s3 rm "s3://$SSEC_DST/dstobj" > /dev/null 2>&1 || true
+# Force-remove SSE-C source (regular s3 rm doesn't need the key, only GET does)
+$AWS s3 rm "s3://$SSEC_SRC/srcobj" > /dev/null 2>&1 || true
+assert "delete ssec-src bucket" $AWS s3api delete-bucket --bucket "$SSEC_SRC"
+assert "delete ssec-dst bucket" $AWS s3api delete-bucket --bucket "$SSEC_DST"
+
+# --- Presigned URLs ---
+echo ""
+echo "--- Presigned URL tests ---"
+PRE_BUCKET="presign-$$"
+assert "create presign bucket" $AWS s3api create-bucket --bucket "$PRE_BUCKET"
+echo "presigned content" > "$TMPDIR/presign.txt"
+$AWS s3 cp "$TMPDIR/presign.txt" "s3://$PRE_BUCKET/obj" > /dev/null
+
+PRESIGN_URL=$($AWS s3 presign "s3://$PRE_BUCKET/obj" --expires-in 3600 2>&1)
+if echo "$PRESIGN_URL" | grep -q "X-Amz-Signature"; then
+    green "PASS: s3 presign returns signed URL"
+    PASS=$((PASS + 1))
+else
+    red "FAIL: s3 presign output missing signature: $PRESIGN_URL"
+    FAIL=$((FAIL + 1))
+fi
+
+# Curl the presigned URL without any AWS creds → should succeed
+(unset AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY; curl -s "$PRESIGN_URL" -o "$TMPDIR/presign-out.txt")
+if cmp -s "$TMPDIR/presign.txt" "$TMPDIR/presign-out.txt"; then
+    green "PASS: presigned URL GET works without credentials"
+    PASS=$((PASS + 1))
+else
+    red "FAIL: presigned URL GET content mismatch"
+    FAIL=$((FAIL + 1))
+fi
+
+# Expired presigned URL → 403
+EXPIRED_URL=$($AWS s3 presign "s3://$PRE_BUCKET/obj" --expires-in 1 2>&1)
+sleep 2
+EXPIRED_STATUS=$(curl -s -o /dev/null -w "%{http_code}" "$EXPIRED_URL")
+if [ "$EXPIRED_STATUS" = "403" ]; then
+    green "PASS: expired presigned URL returns 403"
+    PASS=$((PASS + 1))
+else
+    red "FAIL: expired presigned URL returned $EXPIRED_STATUS (expected 403)"
+    FAIL=$((FAIL + 1))
+fi
+
+$AWS s3 rm "s3://$PRE_BUCKET/obj" > /dev/null
+assert "delete presign bucket" $AWS s3api delete-bucket --bucket "$PRE_BUCKET"
+
+# --- SSE-C edge cases ---
+echo ""
+echo "--- SSE-C edge case tests ---"
+SSEC_EDGE_BUCKET="ssec-edge-$$"
+assert "create ssec-edge bucket" $AWS s3api create-bucket --bucket "$SSEC_EDGE_BUCKET"
+echo "edge" > "$TMPDIR/edge.txt"
+
+# 31-byte key → must fail (32 required)
+SHORT_KEY=$(openssl rand 31 | base64)
+SHORT_MD5=$(echo -n "$SHORT_KEY" | base64 -d | openssl dgst -md5 -binary | base64)
+assert_fail "PUT with 31-byte SSE-C key rejected" \
+    $AWS s3api put-object --bucket "$SSEC_EDGE_BUCKET" --key short.txt \
+    --body "$TMPDIR/edge.txt" \
+    --sse-customer-algorithm AES256 \
+    --sse-customer-key "$SHORT_KEY" \
+    --sse-customer-key-md5 "$SHORT_MD5"
+
+# Correct key but wrong MD5 → must fail
+GOOD_KEY=$(openssl rand 32 | base64)
+assert_fail "PUT with wrong SSE-C MD5 rejected" \
+    $AWS s3api put-object --bucket "$SSEC_EDGE_BUCKET" --key badmd5.txt \
+    --body "$TMPDIR/edge.txt" \
+    --sse-customer-algorithm AES256 \
+    --sse-customer-key "$GOOD_KEY" \
+    --sse-customer-key-md5 "AAAAAAAAAAAAAAAAAAAAAA=="
+
+assert "delete ssec-edge bucket" $AWS s3api delete-bucket --bucket "$SSEC_EDGE_BUCKET"
+
+# --- Object key edge cases ---
+echo ""
+echo "--- Object key edge case tests ---"
+KEY_BUCKET="keys-$$"
+assert "create keys bucket" $AWS s3api create-bucket --bucket "$KEY_BUCKET"
+echo "edge" > "$TMPDIR/edge.txt"
+
+# NOTE: MaxIO's filesystem backend stores the key as an on-disk path, so
+# key length is ultimately bounded by the OS filesystem limits:
+#   - Per-component: NAME_MAX (255 bytes on ext4/APFS) — minus `.meta.json`
+#     suffix (10 bytes) for the sidecar, so ≤ 245 bytes per single-component key
+#   - Total path:    PATH_MAX (1024 bytes on APFS) including `{data_dir}/buckets/{bucket}/`
+#
+# The S3 spec allows 1024-byte UTF-8 keys; MaxIO enforces that upper bound in
+# `validate_key`, but actually storing a 1024-byte key requires a short
+# data_dir and a short bucket name on systems with PATH_MAX = 1024. We test
+# the MaxIO-enforced contract (1025 rejection) and a comfortably-safe key.
+
+# 240-byte single-component key (room for `.meta.json` suffix under NAME_MAX)
+MAX_KEY_SINGLE=$(python3 -c 'print("a"*240)')
+assert "PUT with 240-byte single-component key" $AWS s3api put-object \
+    --bucket "$KEY_BUCKET" --key "$MAX_KEY_SINGLE" --body "$TMPDIR/edge.txt"
+assert "GET with 240-byte single-component key" $AWS s3api get-object \
+    --bucket "$KEY_BUCKET" --key "$MAX_KEY_SINGLE" "$TMPDIR/maxkey-out.txt"
+
+# 1025-byte key — rejected by MaxIO's validate_key (>1024) regardless of FS
+OVER_KEY=$(python3 -c 'k="/".join(["a"*200]*5 + ["a"*25]); print(k[:1025])')
+assert_fail "PUT with 1025-byte key rejected" \
+    $AWS s3api put-object --bucket "$KEY_BUCKET" --key "$OVER_KEY" --body "$TMPDIR/edge.txt"
+
+# Unicode + space key
+UNICODE_KEY="日本語 file.txt"
+assert "PUT unicode+space key" $AWS s3api put-object \
+    --bucket "$KEY_BUCKET" --key "$UNICODE_KEY" --body "$TMPDIR/edge.txt"
+$AWS s3api get-object --bucket "$KEY_BUCKET" --key "$UNICODE_KEY" "$TMPDIR/unicode-out.txt" > /dev/null
+if cmp -s "$TMPDIR/edge.txt" "$TMPDIR/unicode-out.txt"; then
+    green "PASS: unicode+space key roundtrip"
+    PASS=$((PASS + 1))
+else
+    red "FAIL: unicode+space key roundtrip mismatch"
+    FAIL=$((FAIL + 1))
+fi
+
+$AWS s3 rm "s3://$KEY_BUCKET" --recursive > /dev/null 2>&1 || true
+assert "delete keys bucket" $AWS s3api delete-bucket --bucket "$KEY_BUCKET"
 
 # --- Summary ---
 echo ""

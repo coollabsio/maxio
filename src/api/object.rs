@@ -11,10 +11,189 @@ use tokio_util::io::ReaderStream;
 
 use crate::error::S3Error;
 use crate::server::AppState;
-use crate::storage::{ChecksumAlgorithm, StorageError};
-use crate::xml::{response::to_xml, types::{CopyObjectResult, CopyPartResult, Tag, TagSet, Tagging}};
+use crate::storage::{
+    BucketEncryptionConfig, ChecksumAlgorithm, EncryptionMode, EncryptionRequest,
+    UploadEncryptionSpec, StorageError,
+};
+use crate::xml::{
+    response::to_xml,
+    types::{CopyObjectResult, CopyPartResult, Tag, TagSet, Tagging},
+};
 
 use super::multipart;
+
+/// Parse SSE request headers into an EncryptionRequest + optional customer key.
+/// Returns `Ok(None)` if no SSE headers are present.
+pub(crate) fn extract_sse_request(
+    headers: &HeaderMap,
+) -> Result<Option<EncryptionRequest>, S3Error> {
+    // SSE-C: customer-supplied key
+    if let Some(algo) = headers
+        .get("x-amz-server-side-encryption-customer-algorithm")
+        .and_then(|v| v.to_str().ok())
+    {
+        if algo != "AES256" {
+            return Err(S3Error::invalid_encryption_algorithm());
+        }
+        let key_b64 = headers
+            .get("x-amz-server-side-encryption-customer-key")
+            .and_then(|v| v.to_str().ok())
+            .ok_or_else(|| {
+                S3Error::invalid_argument("missing x-amz-server-side-encryption-customer-key")
+            })?;
+        use base64::Engine;
+        let raw = base64::engine::general_purpose::STANDARD
+            .decode(key_b64)
+            .map_err(|_| S3Error::invalid_argument("invalid SSE-C key base64"))?;
+        if raw.len() != 32 {
+            return Err(S3Error::invalid_argument("SSE-C key must be 32 bytes"));
+        }
+        let mut key = [0u8; 32];
+        key.copy_from_slice(&raw);
+        // Validate optional MD5
+        if let Some(md5_b64) = headers
+            .get("x-amz-server-side-encryption-customer-key-md5")
+            .and_then(|v| v.to_str().ok())
+        {
+            use md5::Digest;
+            let computed = base64::engine::general_purpose::STANDARD
+                .encode(md5::Md5::digest(&key));
+            if computed != md5_b64 {
+                return Err(S3Error::invalid_argument("SSE-C key MD5 mismatch"));
+            }
+        }
+        return Ok(Some(EncryptionRequest::sse_c(key)));
+    }
+
+    // SSE-S3
+    if let Some(sse) = headers
+        .get("x-amz-server-side-encryption")
+        .and_then(|v| v.to_str().ok())
+    {
+        return match sse {
+            "AES256" => Ok(Some(EncryptionRequest::sse_s3())),
+            _ => Err(S3Error::invalid_encryption_algorithm()),
+        };
+    }
+    Ok(None)
+}
+
+/// Extract a CopyObject source SSE-C key from the `x-amz-copy-source-server-side-encryption-customer-*` headers.
+pub(crate) fn extract_copy_source_customer_key(
+    headers: &HeaderMap,
+) -> Result<Option<[u8; 32]>, S3Error> {
+    let algo = match headers
+        .get("x-amz-copy-source-server-side-encryption-customer-algorithm")
+        .and_then(|v| v.to_str().ok())
+    {
+        Some(a) => a,
+        None => return Ok(None),
+    };
+    if algo != "AES256" {
+        return Err(S3Error::invalid_encryption_algorithm());
+    }
+    let key_b64 = headers
+        .get("x-amz-copy-source-server-side-encryption-customer-key")
+        .and_then(|v| v.to_str().ok())
+        .ok_or_else(|| {
+            S3Error::invalid_argument(
+                "missing x-amz-copy-source-server-side-encryption-customer-key",
+            )
+        })?;
+    use base64::Engine;
+    let raw = base64::engine::general_purpose::STANDARD
+        .decode(key_b64)
+        .map_err(|_| S3Error::invalid_argument("invalid copy-source SSE-C key base64"))?;
+    if raw.len() != 32 {
+        return Err(S3Error::invalid_argument(
+            "copy-source SSE-C key must be 32 bytes",
+        ));
+    }
+    let mut key = [0u8; 32];
+    key.copy_from_slice(&raw);
+    Ok(Some(key))
+}
+
+/// Extract only a customer-supplied SSE-C key for GET/HEAD/CopyObject source paths.
+pub(crate) fn extract_customer_key(headers: &HeaderMap) -> Result<Option<[u8; 32]>, S3Error> {
+    let algo = match headers
+        .get("x-amz-server-side-encryption-customer-algorithm")
+        .and_then(|v| v.to_str().ok())
+    {
+        Some(a) => a,
+        None => return Ok(None),
+    };
+    if algo != "AES256" {
+        return Err(S3Error::invalid_encryption_algorithm());
+    }
+    let key_b64 = headers
+        .get("x-amz-server-side-encryption-customer-key")
+        .and_then(|v| v.to_str().ok())
+        .ok_or_else(|| {
+            S3Error::invalid_argument("missing x-amz-server-side-encryption-customer-key")
+        })?;
+    use base64::Engine;
+    let raw = base64::engine::general_purpose::STANDARD
+        .decode(key_b64)
+        .map_err(|_| S3Error::invalid_argument("invalid SSE-C key base64"))?;
+    if raw.len() != 32 {
+        return Err(S3Error::invalid_argument("SSE-C key must be 32 bytes"));
+    }
+    let mut key = [0u8; 32];
+    key.copy_from_slice(&raw);
+    Ok(Some(key))
+}
+
+/// Build an EncryptionRequest from a bucket-level default encryption config.
+pub(crate) fn encryption_from_bucket_default(
+    _cfg: &BucketEncryptionConfig,
+) -> EncryptionRequest {
+    EncryptionRequest::sse_s3()
+}
+
+/// Convert an EncryptionRequest into the compact UploadEncryptionSpec that is
+/// persisted for the duration of a multipart upload.
+pub(crate) fn spec_from_request(req: &EncryptionRequest) -> UploadEncryptionSpec {
+    let customer_key_md5 = req.customer_key.as_ref().map(|ck| {
+        use md5::Digest;
+        use base64::Engine;
+        base64::engine::general_purpose::STANDARD.encode(md5::Md5::digest(&**ck))
+    });
+    UploadEncryptionSpec {
+        mode: req.mode.clone(),
+        customer_key_md5,
+        upload_dek_wrapped: None,
+        upload_dek_wrap_nonce: None,
+        upload_dek_key_id: None,
+        // Populated inside `create_multipart_upload` alongside the wrapped DEK.
+        upload_nonce_prefix: String::new(),
+    }
+}
+
+/// Attach SSE response headers to match the encryption that was applied.
+pub(crate) fn add_sse_headers(
+    mut builder: http::response::Builder,
+    enc: &Option<crate::storage::EncryptionMeta>,
+) -> http::response::Builder {
+    if let Some(em) = enc {
+        match em.mode {
+            EncryptionMode::SseS3 => {
+                builder = builder.header("x-amz-server-side-encryption", "AES256");
+            }
+            EncryptionMode::SseC => {
+                builder = builder
+                    .header("x-amz-server-side-encryption-customer-algorithm", "AES256");
+                if let Some(ref md5) = em.customer_key_md5 {
+                    builder = builder.header(
+                        "x-amz-server-side-encryption-customer-key-md5",
+                        md5.as_str(),
+                    );
+                }
+            }
+        }
+    }
+    builder
+}
 
 /// Extract checksum algorithm and optional expected value from request headers.
 pub(crate) fn extract_checksum(headers: &HeaderMap) -> Option<(ChecksumAlgorithm, Option<String>)> {
@@ -104,7 +283,10 @@ pub async fn put_object(
         use md5::Digest;
         use tokio::io::AsyncReadExt;
         let mut buf = Vec::new();
-        reader.read_to_end(&mut buf).await.map_err(S3Error::internal)?;
+        reader
+            .read_to_end(&mut buf)
+            .await
+            .map_err(S3Error::internal)?;
         let computed_hash = md5::Md5::digest(&buf);
         use base64::Engine;
         let computed_md5 = base64::engine::general_purpose::STANDARD.encode(computed_hash);
@@ -116,13 +298,33 @@ pub async fn put_object(
 
     let checksum = extract_checksum(&headers);
 
+    // Resolve encryption: explicit request headers win over bucket default.
+    let mut encryption = extract_sse_request(&headers)?;
+    if encryption.is_none() {
+        match state.storage.get_bucket_encryption(&bucket).await {
+            Ok(Some(cfg)) => encryption = Some(encryption_from_bucket_default(&cfg)),
+            Ok(None) => {}
+            Err(e) => return Err(S3Error::internal(e)),
+        }
+    }
+    let applied_mode = encryption.as_ref().map(|e| e.mode.clone());
+    let applied_ck_md5 = encryption.as_ref().and_then(|e| {
+        e.customer_key.as_ref().map(|ck| {
+            use md5::Digest;
+            use base64::Engine;
+            base64::engine::general_purpose::STANDARD.encode(md5::Md5::digest(&**ck))
+        })
+    });
+
     let result = state
         .storage
-        .put_object(&bucket, &key, content_type, reader, checksum)
+        .put_object(&bucket, &key, content_type, reader, checksum, encryption)
         .await
         .map_err(|e| match e {
             StorageError::InvalidKey(msg) => S3Error::invalid_argument(&msg),
             StorageError::ChecksumMismatch(_) => S3Error::bad_checksum("x-amz-checksum"),
+            StorageError::EncryptionError(msg) => S3Error::invalid_argument(&msg),
+            StorageError::IntegrityError(msg) => S3Error::invalid_argument(&msg),
             _ => S3Error::internal(e),
         })?;
 
@@ -135,6 +337,20 @@ pub async fn put_object(
     }
     if let (Some(algo), Some(val)) = (&result.checksum_algorithm, &result.checksum_value) {
         builder = builder.header(algo.header_name(), val.as_str());
+    }
+    // Echo SSE headers matching what was applied.
+    match applied_mode {
+        Some(EncryptionMode::SseS3) => {
+            builder = builder.header("x-amz-server-side-encryption", "AES256");
+        }
+        Some(EncryptionMode::SseC) => {
+            builder =
+                builder.header("x-amz-server-side-encryption-customer-algorithm", "AES256");
+            if let Some(md5) = applied_ck_md5 {
+                builder = builder.header("x-amz-server-side-encryption-customer-key-md5", md5);
+            }
+        }
+        None => {}
     }
     Ok(builder.body(Body::empty()).unwrap())
 }
@@ -157,7 +373,10 @@ fn parse_copy_source(headers: &HeaderMap) -> Result<(String, String), S3Error> {
 }
 
 /// Parse `x-amz-copy-source-range: bytes=start-end` into (start, end) inclusive.
-fn parse_copy_source_range(headers: &HeaderMap, src_size: u64) -> Result<Option<(u64, u64)>, S3Error> {
+fn parse_copy_source_range(
+    headers: &HeaderMap,
+    src_size: u64,
+) -> Result<Option<(u64, u64)>, S3Error> {
     let header = match headers
         .get("x-amz-copy-source-range")
         .and_then(|v| v.to_str().ok())
@@ -214,11 +433,12 @@ async fn upload_part_copy(
 
     let range = parse_copy_source_range(&headers, src_meta.size)?;
 
+    let src_ck = extract_customer_key(&headers)?;
     let reader = match range {
         None => {
             let (r, _) = state
                 .storage
-                .get_object(&src_bucket, &src_key)
+                .get_object(&src_bucket, &src_key, src_ck)
                 .await
                 .map_err(|e| match e {
                     StorageError::NotFound(_) => S3Error::no_such_key(&src_key),
@@ -230,7 +450,7 @@ async fn upload_part_copy(
         Some((start, end)) => {
             let (r, _) = state
                 .storage
-                .get_object_range(&src_bucket, &src_key, start, end - start + 1)
+                .get_object_range(&src_bucket, &src_key, start, end - start + 1, src_ck)
                 .await
                 .map_err(|e| match e {
                     StorageError::NotFound(_) => S3Error::no_such_key(&src_key),
@@ -242,9 +462,10 @@ async fn upload_part_copy(
     };
 
     let checksum = extract_checksum(&headers);
+    let dst_ck = extract_customer_key(&headers)?;
     let part = state
         .storage
-        .upload_part(&bucket, upload_id, part_number, reader, checksum)
+        .upload_part(&bucket, upload_id, part_number, reader, checksum, dst_ck)
         .await
         .map_err(multipart::map_storage_err)?;
 
@@ -276,10 +497,11 @@ async fn copy_object(
         Err(e) => return Err(S3Error::internal(e)),
     }
 
-    // Get source object
+    // Get source object. SSE-C copy source key arrives in copy-source-* headers.
+    let src_ck = extract_copy_source_customer_key(&headers)?;
     let (reader, src_meta) = state
         .storage
-        .get_object(src_bucket, src_key)
+        .get_object(src_bucket, src_key, src_ck)
         .await
         .map_err(|e| match e {
             StorageError::NotFound(_) => S3Error::no_such_key(src_key),
@@ -300,19 +522,33 @@ async fn copy_object(
             .and_then(|v| v.to_str().ok())
             .unwrap_or("application/octet-stream")
             .to_string(),
-        _ => return Err(S3Error::invalid_argument("invalid x-amz-metadata-directive")),
+        _ => {
+            return Err(S3Error::invalid_argument(
+                "invalid x-amz-metadata-directive",
+            ));
+        }
     };
 
     // Propagate source checksum algorithm so it's recomputed during copy
     let checksum = src_meta.checksum_algorithm.map(|algo| (algo, None));
 
+    // Destination may request its own SSE; fall back to bucket default.
+    let mut encryption = extract_sse_request(&headers)?;
+    if encryption.is_none() {
+        if let Ok(Some(cfg)) = state.storage.get_bucket_encryption(&bucket).await {
+            encryption = Some(encryption_from_bucket_default(&cfg));
+        }
+    }
+
     // Write destination
     let result = state
         .storage
-        .put_object(&bucket, &key, &content_type, reader, checksum)
+        .put_object(&bucket, &key, &content_type, reader, checksum, encryption)
         .await
         .map_err(|e| match e {
             StorageError::InvalidKey(msg) => S3Error::invalid_argument(&msg),
+            StorageError::EncryptionError(msg) => S3Error::invalid_argument(&msg),
+            StorageError::IntegrityError(msg) => S3Error::invalid_argument(&msg),
             _ => S3Error::internal(e),
         })?;
 
@@ -392,7 +628,9 @@ fn check_conditions(
 ) -> Option<ConditionalResult> {
     let if_match = headers.get("if-match").and_then(|v| v.to_str().ok());
     let if_none_match = headers.get("if-none-match").and_then(|v| v.to_str().ok());
-    let if_modified_since = headers.get("if-modified-since").and_then(|v| v.to_str().ok());
+    let if_modified_since = headers
+        .get("if-modified-since")
+        .and_then(|v| v.to_str().ok());
     let if_unmodified_since = headers
         .get("if-unmodified-since")
         .and_then(|v| v.to_str().ok());
@@ -511,6 +749,8 @@ pub async fn get_object(
         return multipart::list_parts(State(state), Path((bucket, key)), Query(params)).await;
     }
 
+    let customer_key = extract_customer_key(&headers)?;
+
     if let Some(part_num_str) = params.get("partNumber") {
         let part_num: u32 = part_num_str
             .parse()
@@ -540,10 +780,12 @@ pub async fn get_object(
 
         let (reader, _) = state
             .storage
-            .get_object_range(&bucket, &key, offset, length)
+            .get_object_range(&bucket, &key, offset, length, customer_key)
             .await
             .map_err(|e| match e {
                 StorageError::NotFound(_) => S3Error::no_such_key(&key),
+                StorageError::DecryptionError(msg) => S3Error::invalid_argument(&msg),
+                StorageError::IntegrityError(msg) => S3Error::invalid_argument(&msg),
                 _ => S3Error::internal(e),
             })?;
 
@@ -564,9 +806,7 @@ pub async fn get_object(
             .unwrap());
     }
 
-    let range_header = headers
-        .get("range")
-        .and_then(|v| v.to_str().ok());
+    let range_header = headers.get("range").and_then(|v| v.to_str().ok());
 
     if let Some(range_str) = range_header {
         let meta = state
@@ -592,10 +832,11 @@ pub async fn get_object(
                 let length = end - start + 1;
                 let (reader, _) = state
                     .storage
-                    .get_object_range(&bucket, &key, start, length)
+                    .get_object_range(&bucket, &key, start, length, customer_key)
                     .await
                     .map_err(|e| match e {
                         StorageError::NotFound(_) => S3Error::no_such_key(&key),
+                        StorageError::DecryptionError(msg) => S3Error::invalid_argument(&msg),
                         _ => S3Error::internal(e),
                     })?;
 
@@ -606,7 +847,10 @@ pub async fn get_object(
                     .status(StatusCode::PARTIAL_CONTENT)
                     .header("Content-Type", &meta.content_type)
                     .header("Content-Length", length.to_string())
-                    .header("Content-Range", format!("bytes {}-{}/{}", start, end, meta.size))
+                    .header(
+                        "Content-Range",
+                        format!("bytes {}-{}/{}", start, end, meta.size),
+                    )
                     .header("Accept-Ranges", "bytes")
                     .header("ETag", &meta.etag)
                     .header("Last-Modified", to_http_date(&meta.last_modified))
@@ -625,22 +869,26 @@ pub async fn get_object(
     let (reader, meta) = if let Some(version_id) = params.get("versionId") {
         state
             .storage
-            .get_object_version(&bucket, &key, version_id)
+            .get_object_version(&bucket, &key, version_id, customer_key)
             .await
             .map_err(|e| match e {
                 StorageError::VersionNotFound(_) => S3Error::no_such_version(version_id),
                 StorageError::NotFound(_) => S3Error::no_such_key(&key),
                 StorageError::InvalidKey(msg) => S3Error::invalid_argument(&msg),
+                StorageError::DecryptionError(msg) => S3Error::invalid_argument(&msg),
+                StorageError::IntegrityError(msg) => S3Error::invalid_argument(&msg),
                 _ => S3Error::internal(e),
             })?
     } else {
         state
             .storage
-            .get_object(&bucket, &key)
+            .get_object(&bucket, &key, customer_key)
             .await
             .map_err(|e| match e {
                 StorageError::NotFound(_) => S3Error::no_such_key(&key),
                 StorageError::InvalidKey(msg) => S3Error::invalid_argument(&msg),
+                StorageError::DecryptionError(msg) => S3Error::invalid_argument(&msg),
+                StorageError::IntegrityError(msg) => S3Error::invalid_argument(&msg),
                 _ => S3Error::internal(e),
             })?
     };
@@ -668,6 +916,7 @@ pub async fn get_object(
         builder = builder.header("x-amz-version-id", vid.as_str());
     }
     builder = add_checksum_header(builder, &meta);
+    builder = add_sse_headers(builder, &meta.encryption);
     Ok(builder.body(body).unwrap())
 }
 
@@ -753,6 +1002,7 @@ pub async fn head_object(
         builder = builder.header("x-amz-version-id", vid.as_str());
     }
     builder = add_checksum_header(builder, &meta);
+    builder = add_sse_headers(builder, &meta.encryption);
     Ok(builder.body(Body::empty()).unwrap())
 }
 
@@ -768,6 +1018,12 @@ pub async fn delete_object(
     if params.contains_key("uploadId") {
         return multipart::abort_multipart_upload(State(state), Path((bucket, key)), Query(params))
             .await;
+    }
+
+    match state.storage.head_bucket(&bucket).await {
+        Ok(true) => {}
+        Ok(false) => return Err(S3Error::no_such_bucket(&bucket)),
+        Err(e) => return Err(S3Error::internal(e)),
     }
 
     // Permanent version deletion
@@ -789,7 +1045,10 @@ pub async fn delete_object(
         return Ok(builder.body(Body::empty()).unwrap());
     }
 
-    let result = state.storage.delete_object(&bucket, &key).await
+    let result = state
+        .storage
+        .delete_object(&bucket, &key)
+        .await
         .map_err(|e| S3Error::internal(e))?;
 
     let mut builder = Response::builder().status(StatusCode::NO_CONTENT);
@@ -810,18 +1069,22 @@ pub async fn post_object(
     body: Body,
 ) -> Result<Response<Body>, S3Error> {
     if params.contains_key("uploads") {
-        return multipart::create_multipart_upload(State(state), Path((bucket, key)), headers).await;
+        return multipart::create_multipart_upload(State(state), Path((bucket, key)), headers)
+            .await;
     }
     if params.contains_key("uploadId") {
         return multipart::complete_multipart_upload(
             State(state),
             Path((bucket, key)),
             Query(params),
+            headers,
             body,
         )
         .await;
     }
-    Err(S3Error::not_implemented("Unsupported POST object operation"))
+    Err(S3Error::not_implemented(
+        "Unsupported POST object operation",
+    ))
 }
 
 const DELETE_BODY_MAX: usize = 1024 * 1024;
@@ -832,6 +1095,12 @@ pub async fn delete_objects(
     Path(bucket): Path<String>,
     body: Body,
 ) -> Result<Response<Body>, S3Error> {
+    match state.storage.head_bucket(&bucket).await {
+        Ok(true) => {}
+        Ok(false) => return Err(S3Error::no_such_bucket(&bucket)),
+        Err(e) => return Err(S3Error::internal(e)),
+    }
+
     let bytes = axum::body::to_bytes(body, DELETE_BODY_MAX)
         .await
         .map_err(|e| S3Error::internal(e))?;
@@ -875,10 +1144,8 @@ pub async fn delete_objects(
         if let Ok((key, delete_result)) = result {
             match delete_result {
                 Ok(dr) => {
-                    let mut entry = format!(
-                        "<Deleted><Key>{}</Key>",
-                        quick_xml::escape::escape(&key)
-                    );
+                    let mut entry =
+                        format!("<Deleted><Key>{}</Key>", quick_xml::escape::escape(&key));
                     if let Some(vid) = &dr.version_id {
                         entry.push_str(&format!("<VersionId>{}</VersionId>", vid));
                     }
@@ -931,6 +1198,7 @@ mod tests {
             checksum_value: None,
             tags: None,
             part_sizes: None,
+            encryption: None,
         }
     }
 
@@ -1150,7 +1418,9 @@ pub async fn get_object_tagging(
         .collect();
     tag_entries.sort_by(|a, b| a.key.cmp(&b.key));
 
-    let tagging = Tagging { tag_set: TagSet { tags: tag_entries } };
+    let tagging = Tagging {
+        tag_set: TagSet { tags: tag_entries },
+    };
     let xml = to_xml(&tagging).map_err(S3Error::internal)?;
     Ok(Response::builder()
         .status(StatusCode::OK)
@@ -1207,14 +1477,20 @@ pub async fn put_object_tagging(
     }
 
     if tags.len() > 10 {
-        return Err(S3Error::invalid_argument("Object tags cannot exceed 10 entries"));
+        return Err(S3Error::invalid_argument(
+            "Object tags cannot exceed 10 entries",
+        ));
     }
     for (k, v) in &tags {
         if k.len() > 128 {
-            return Err(S3Error::invalid_argument("Tag key exceeds maximum length of 128 characters"));
+            return Err(S3Error::invalid_argument(
+                "Tag key exceeds maximum length of 128 characters",
+            ));
         }
         if v.len() > 256 {
-            return Err(S3Error::invalid_argument("Tag value exceeds maximum length of 256 characters"));
+            return Err(S3Error::invalid_argument(
+                "Tag value exceeds maximum length of 256 characters",
+            ));
         }
     }
 

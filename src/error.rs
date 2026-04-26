@@ -32,6 +32,8 @@ pub enum S3ErrorCode {
     NoSuchCORSConfiguration,
     PreconditionFailed,
     SignatureDoesNotMatch,
+    InvalidEncryptionAlgorithm,
+    ServerSideEncryptionConfigurationNotFound,
 }
 
 impl S3ErrorCode {
@@ -58,6 +60,10 @@ impl S3ErrorCode {
             Self::PreconditionFailed => "PreconditionFailed",
             Self::NoSuchCORSConfiguration => "NoSuchCORSConfiguration",
             Self::SignatureDoesNotMatch => "SignatureDoesNotMatch",
+            Self::InvalidEncryptionAlgorithm => "InvalidEncryptionAlgorithmError",
+            Self::ServerSideEncryptionConfigurationNotFound => {
+                "ServerSideEncryptionConfigurationNotFoundError"
+            }
         }
     }
 
@@ -71,7 +77,8 @@ impl S3ErrorCode {
             | Self::NoSuchKey
             | Self::NoSuchUpload
             | Self::NoSuchVersion
-            | Self::NoSuchCORSConfiguration => StatusCode::NOT_FOUND,
+            | Self::NoSuchCORSConfiguration
+            | Self::ServerSideEncryptionConfigurationNotFound => StatusCode::NOT_FOUND,
             Self::BucketAlreadyOwnedByYou | Self::BucketNotEmpty => StatusCode::CONFLICT,
             Self::InternalError => StatusCode::INTERNAL_SERVER_ERROR,
             Self::InvalidRange => StatusCode::RANGE_NOT_SATISFIABLE,
@@ -262,6 +269,23 @@ impl S3Error {
             code: S3ErrorCode::PreconditionFailed,
             message: "At least one of the pre-conditions you specified did not hold.".into(),
             resource: None,
+        }
+    }
+
+    pub fn invalid_encryption_algorithm() -> Self {
+        Self {
+            code: S3ErrorCode::InvalidEncryptionAlgorithm,
+            message: "The encryption request you specified is not valid. Supported value: AES256."
+                .into(),
+            resource: None,
+        }
+    }
+
+    pub fn no_such_bucket_encryption(bucket: &str) -> Self {
+        Self {
+            code: S3ErrorCode::ServerSideEncryptionConfigurationNotFound,
+            message: "The server side encryption configuration was not found.".into(),
+            resource: Some(format!("/{}", bucket)),
         }
     }
 }

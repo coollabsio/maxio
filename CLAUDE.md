@@ -55,12 +55,7 @@ Defaults: port 9000, access/secret `maxioadmin`/`maxioadmin`, region `us-east-1`
 # 1. Unit + integration tests (always run first, no server needed)
 cargo test
 
-# 2. mc integration tests (start server, run tests, stop server)
-cargo build && RUST_LOG=info ./target/debug/maxio --data-dir /tmp/maxio-test --port 9876 &
-./tests/mc_test.sh 9876 /tmp/maxio-test
-kill %1 && rm -rf /tmp/maxio-test
-
-# 3. AWS CLI integration tests (start server, run tests, stop server)
+# 2. AWS CLI integration tests (start server, run tests, stop server)
 cargo build && RUST_LOG=info ./target/debug/maxio --data-dir /tmp/maxio-test --port 9876 &
 ./tests/aws_cli_test.sh 9876 /tmp/maxio-test
 kill %1 && rm -rf /tmp/maxio-test
@@ -220,10 +215,6 @@ aws --endpoint-url http://localhost:9000 s3 rb s3://test-bucket
 # Unit + integration tests (no server needed)
 cargo test
 
-# mc integration tests (requires running server)
-RUST_LOG=debug cargo watch -x 'run -- --data-dir ./data' &
-./tests/mc_test.sh
-
 # AWS CLI integration tests (requires running server)
 ./tests/aws_cli_test.sh
 ```
@@ -265,9 +256,9 @@ The web console (`ui/`) follows the Coolify design system. The full specificatio
 - **Stack**: Svelte 5, Vite, Tailwind CSS v4, shadcn-svelte components
 - **Theme**: Class-based dark mode (`.dark` on `<html>`), with light/dark CSS variable swap in `ui/src/app.css`
 - **Accent colors**: Coollabs purple `#6b16ed` (light) / warning yellow `#fcd452` (dark). Brand purple (`--color-brand`) is always `#6b16ed` regardless of theme
-- **Font**: Inter (Google Fonts)
+- **Font**: Geist Sans + Geist Mono via `@fontsource/geist-sans` / `@fontsource/geist-mono` (Inter fallback)
 - **Inputs**: Inset box-shadow system (4px colored left bar on focus), no standard borders — see `.input-cool` in `app.css`
-- **Buttons**: `border-2`, `h-8`, `rounded-sm`. Variants: `default`, `destructive`, `outline`, `secondary`, `ghost`, `link`, `brand`
+- **Buttons**: `border-2`, `h-8`, `rounded-sm`. Variants: `default`, `highlighted`, `destructive`, `outline`, `secondary`, `ghost`, `link`, `brand`
 - **Border radius**: `0.125rem` (2px) everywhere — set via `--radius` in `@theme inline`
 - **Sidebar**: Collapsible 224px → 56px icon-only, uses `--cool-sidebar-*` CSS variables
 

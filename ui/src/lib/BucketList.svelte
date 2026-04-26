@@ -2,7 +2,8 @@
   import { onMount } from 'svelte'
   import * as Table from '$lib/components/ui/table'
   import { Button } from '$lib/components/ui/button'
-  import { Input } from '$lib/components/ui/input'
+  import { Callout } from '$lib/components/ui/callout'
+  import { Badge } from '$lib/components/ui/badge'
   import Database from 'lucide-svelte/icons/database'
   import Plus from 'lucide-svelte/icons/plus'
   import Trash2 from 'lucide-svelte/icons/trash-2'
@@ -19,6 +20,7 @@
     name: string
     createdAt: string
     versioning: boolean
+    encryption: boolean
   }
 
   let buckets = $state<Bucket[]>([])
@@ -109,9 +111,7 @@
 
 <div class="flex flex-col gap-4">
   {#if error}
-    <div class="rounded-sm border border-destructive/50 bg-destructive/10 px-4 py-2 text-sm text-destructive">
-      {error}
-    </div>
+    <Callout type="danger">{error}</Callout>
   {/if}
 
   <div class="flex items-center gap-2">
@@ -142,16 +142,19 @@
   {#if loading && buckets.length === 0}
     <p class="text-sm text-muted-foreground">Loading...</p>
   {:else if buckets.length === 0 && !error}
-    <div class="flex flex-col items-center gap-2 py-12 text-muted-foreground">
-      <Database class="size-10 opacity-30" />
-      <p class="text-sm">No buckets yet</p>
-    </div>
+    <Callout type="info">
+      <span class="inline-flex items-center gap-2">
+        <Database class="size-4 opacity-70" />
+        No buckets yet — create your first bucket to get started.
+      </span>
+    </Callout>
   {:else}
     <Table.Root>
       <Table.Header>
         <Table.Row>
           <Table.Head>Name</Table.Head>
           <Table.Head>Versioning</Table.Head>
+          <Table.Head>Encryption</Table.Head>
           <Table.Head>Created</Table.Head>
           <Table.Head class="w-20"></Table.Head>
         </Table.Row>
@@ -162,9 +165,16 @@
             <Table.Cell class="font-medium">{bucket.name}</Table.Cell>
             <Table.Cell>
               {#if bucket.versioning}
+                <Badge variant="success" label="Enabled" />
+              {:else}
+                <span class="text-xs text-muted-foreground">Disabled</span>
+              {/if}
+            </Table.Cell>
+            <Table.Cell>
+              {#if bucket.encryption}
                 <span class="inline-flex items-center rounded-sm bg-green-500/10 px-1.5 py-0.5 text-[11px] font-medium text-green-500">Enabled</span>
               {:else}
-                <span class="text-xs text-muted-foreground">Off</span>
+                <span class="text-xs text-muted-foreground">Disabled</span>
               {/if}
             </Table.Cell>
             <Table.Cell class="text-muted-foreground">{formatDate(bucket.createdAt)}</Table.Cell>

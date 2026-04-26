@@ -2,6 +2,7 @@
   import { onMount } from 'svelte'
   import * as Table from '$lib/components/ui/table'
   import { Button } from '$lib/components/ui/button'
+  import { Callout } from '$lib/components/ui/callout'
   import Folder from 'lucide-svelte/icons/folder'
   import FileIcon from 'lucide-svelte/icons/file'
   import Download from 'lucide-svelte/icons/download'
@@ -306,9 +307,7 @@
 
 <div class="flex flex-col gap-4">
   {#if error}
-    <div class="rounded-sm border border-destructive/50 bg-destructive/10 px-4 py-2 text-sm text-destructive">
-      {error}
-    </div>
+    <Callout type="danger">{error}</Callout>
   {/if}
 
   <div class="flex items-center gap-2">
@@ -349,10 +348,12 @@
   {#if loading && files.length === 0 && prefixes.length === 0}
     <p class="text-sm text-muted-foreground">Loading...</p>
   {:else if files.length === 0 && prefixes.length === 0 && !error}
-    <div class="flex flex-col items-center gap-2 py-12 text-muted-foreground">
-      <Folder class="size-10 opacity-30" />
-      <p class="text-sm">Empty</p>
-    </div>
+    <Callout type="info">
+      <span class="inline-flex items-center gap-2">
+        <Folder class="size-4 opacity-70" />
+        This location is empty — upload a file or create a folder to get started.
+      </span>
+    </Callout>
   {:else}
     <Table.Root>
       <Table.Header>

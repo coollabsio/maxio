@@ -55,6 +55,8 @@ rust-embed = "8"
 mime_guess = "2"
 rand = "0.10.0"
 reed-solomon-erasure = "6"
+aes-gcm = "0.10"
+zeroize = { version = "1", features = ["derive"] }
 
 [dev-dependencies]
 reqwest = { version = "0.12", features = ["json"] }

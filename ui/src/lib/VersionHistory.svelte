@@ -2,6 +2,7 @@
   import { onMount } from 'svelte'
   import * as Table from '$lib/components/ui/table'
   import { Button } from '$lib/components/ui/button'
+  import { Callout } from '$lib/components/ui/callout'
   import Download from 'lucide-svelte/icons/download'
   import Trash2 from 'lucide-svelte/icons/trash-2'
   import Tag from 'lucide-svelte/icons/tag'
@@ -103,7 +104,7 @@
   </div>
 
   {#if error}
-    <div class="px-4 py-2 text-sm text-destructive">{error}</div>
+    <div class="p-4"><Callout type="danger">{error}</Callout></div>
   {/if}
 
   {#if loading}

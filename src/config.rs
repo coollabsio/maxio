@@ -47,6 +47,11 @@ pub struct Config {
     #[arg(long, env = "MAXIO_REGION", default_value_t = default_region())]
     pub region: String,
 
+    /// Master key for SSE-S3 encryption (base64-encoded 32 bytes).
+    /// When set, takes precedence over the keyring file for new writes.
+    #[arg(long, env = "MAXIO_MASTER_KEY")]
+    pub master_key: Option<String>,
+
     /// Enable erasure coding with per-chunk integrity checksums
     #[arg(long, env = "MAXIO_ERASURE_CODING", default_value = "false")]
     pub erasure_coding: bool,

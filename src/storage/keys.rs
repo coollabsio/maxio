@@ -291,3 +291,89 @@ fn decode_32(s: &str) -> anyhow::Result<[u8; 32]> {
 fn now_iso() -> String {
     chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    fn rand_key_b64() -> (String, [u8; 32]) {
+        let mut k = [0u8; 32];
+        rand::rng().fill(&mut k[..]);
+        (B64.encode(k), k)
+    }
+
+    #[tokio::test]
+    async fn override_with_master_key_preserves_bootstrap_key() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().to_str().unwrap().to_string();
+
+        // Bootstrap (None) — generates a key, writes .maxio-keys.json.
+        let bootstrap = Keyring::load(&dir, None).await.unwrap();
+        let bootstrap_id = bootstrap.active_id().to_string();
+
+        // Wrap a DEK under the bootstrap key.
+        let dek = Keyring::generate_dek();
+        let (wrapped, nonce) = bootstrap.wrap_dek(&bootstrap_id, &dek).unwrap();
+
+        // Reload with explicit MAXIO_MASTER_KEY — operator takes over.
+        let (new_b64, _) = rand_key_b64();
+        let reloaded = Keyring::load(&dir, Some(&new_b64)).await.unwrap();
+
+        // Active key is the new one.
+        assert_ne!(reloaded.active_id(), bootstrap_id);
+
+        // Old key still in ring → old DEK unwraps.
+        let recovered = reloaded
+            .unwrap_dek(&bootstrap_id, &wrapped, &nonce)
+            .unwrap();
+        assert_eq!(recovered, dek);
+    }
+
+    #[tokio::test]
+    async fn override_with_no_keyring_file_succeeds() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().to_str().unwrap().to_string();
+
+        let (b64, raw) = rand_key_b64();
+        let kr = Keyring::load(&dir, Some(&b64)).await.unwrap();
+
+        assert_eq!(kr.active_id(), &key_id_from_bytes(&raw));
+
+        // Round-trip wrap/unwrap proves the key is usable.
+        let dek = Keyring::generate_dek();
+        let (w, n) = kr.wrap_dek(kr.active_id(), &dek).unwrap();
+        assert_eq!(kr.unwrap_dek(kr.active_id(), &w, &n).unwrap(), dek);
+    }
+
+    #[tokio::test]
+    async fn override_with_invalid_base64_errors() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().to_str().unwrap().to_string();
+        let err = Keyring::load(&dir, Some("not-base64!@#$"))
+            .await
+            .err()
+            .expect("invalid base64 must fail");
+        assert!(
+            err.to_string().contains("base64-encoded 32 bytes"),
+            "unexpected error: {}",
+            err
+        );
+    }
+
+    #[tokio::test]
+    async fn override_with_wrong_length_errors() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().to_str().unwrap().to_string();
+        let short = B64.encode([0u8; 16]);
+        let err = Keyring::load(&dir, Some(&short))
+            .await
+            .err()
+            .expect("16-byte key must fail");
+        assert!(
+            err.to_string().contains("exactly 32 bytes"),
+            "unexpected error: {}",
+            err
+        );
+    }
+}

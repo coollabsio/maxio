@@ -20,7 +20,8 @@ MaxIO is a lightweight, single-binary S3-compatible object storage server writte
 - **Pure Filesystem Storage** — No database. Buckets are directories, objects are files, metadata in `.meta.json` sidecars
 - **AWS Signature V4** — Compatible with `mc`, AWS CLI, and any S3 SDK
 - **Web Console** — Built-in UI at `/ui/` for browsing, uploading, and managing objects
-- **S3 API Coverage** — ListBuckets, CreateBucket, HeadBucket, DeleteBucket, GetBucketLocation, ListObjectsV1/V2, ListObjectVersions, PutObject, GetObject, HeadObject, DeleteObject, DeleteObjects (batch), CopyObject, Multipart Upload (including UploadPartCopy), Object Tagging, CORS, Versioning
+- **S3 API Coverage** — ListBuckets, CreateBucket, HeadBucket, DeleteBucket, GetBucketLocation, ListObjectsV1/V2, ListObjectVersions, PutObject, GetObject, HeadObject, DeleteObject, DeleteObjects (batch), CopyObject, Multipart Upload (including UploadPartCopy), Object Tagging, CORS, Versioning, GetBucketEncryption, PutBucketEncryption, DeleteBucketEncryption
+- **Server-Side Encryption** — AES-256-GCM at rest with per-object Data Encryption Keys, sidecar HMAC-SHA256 integrity binding, and AAD-bound frames. Supports SSE-S3 (server-managed keyring with rotatable master key), SSE-C (customer-supplied keys), bucket default encryption, and composes with Erasure Coding (encrypt-then-EC)
 - **Conditional Requests** — `If-Match`, `If-None-Match`, `If-Modified-Since`, `If-Unmodified-Since` headers (RFC 7232)
 - **Range Requests** — HTTP 206 Partial Content support via `Range` header on GetObject
 - **Checksum Verification** — CRC32, CRC32C, SHA-1, and SHA-256 checksums on upload with automatic validation and persistent storage
@@ -133,6 +134,7 @@ Open `http://localhost:9000/ui/` in your browser. Default credentials: `maxioadm
 | `MAXIO_ERASURE_CODING` | `--erasure-coding` | `false` | Enable erasure coding with per-chunk integrity checksums |
 | `MAXIO_CHUNK_SIZE` | `--chunk-size` | `10485760` (10MB) | Chunk size in bytes for erasure coding |
 | `MAXIO_PARITY_SHARDS` | `--parity-shards` | `0` | Number of parity shards per object (requires `--erasure-coding`, 0 = no parity) |
+| `MAXIO_MASTER_KEY` | `--master-key` | _(auto-generated)_ | Base64-encoded 32-byte SSE-S3 master key. If unset, a key is generated and stored under `<data-dir>/.keyring.json`. Provide explicitly to control key rotation |
 
 ## Usage
 
@@ -162,11 +164,34 @@ aws --endpoint-url http://localhost:9000 s3 rm s3://my-bucket/file.txt
 aws --endpoint-url http://localhost:9000 s3 rb s3://my-bucket
 ```
 
+### Server-Side Encryption
+
+```bash
+# SSE-S3 (server-managed key) — encrypt a single upload
+aws --endpoint-url http://localhost:9000 s3 cp file.txt s3://my-bucket/file.txt \
+  --sse AES256
+
+# Set bucket default encryption — every subsequent upload is encrypted
+aws --endpoint-url http://localhost:9000 s3api put-bucket-encryption \
+  --bucket my-bucket \
+  --server-side-encryption-configuration \
+    '{"Rules":[{"ApplyServerSideEncryptionByDefault":{"SSEAlgorithm":"AES256"}}]}'
+
+# SSE-C (customer-supplied key) — caller manages the key
+KEY=$(openssl rand 32 | base64)
+KEY_MD5=$(echo -n "$KEY" | base64 -d | openssl dgst -md5 -binary | base64)
+aws --endpoint-url http://localhost:9000 s3api put-object \
+  --bucket my-bucket --key secret.bin --body secret.bin \
+  --sse-customer-algorithm AES256 \
+  --sse-customer-key "$KEY" \
+  --sse-customer-key-md5 "$KEY_MD5"
+```
+
 ## Roadmap
 
 - ~~Multipart upload~~, ~~presigned URLs~~, ~~CopyObject~~
 - ~~CORS~~, ~~Range headers~~
-- ~~Versioning~~, lifecycle rules
+- ~~Versioning~~, lifecycle rules, ~~server-side encryption (SSE-S3, SSE-C)~~
 - Multi-user support
 - Distributed mode, ~~erasure coding~~, replication
 

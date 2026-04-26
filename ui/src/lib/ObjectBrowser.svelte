@@ -108,7 +108,7 @@
   }
 
   function encodeObjectKey(key: string): string {
-    return encodeURIComponent(key)
+    return key.split('/').map(encodeURIComponent).join('/')
   }
 
   function formatSize(bytes: number): string {

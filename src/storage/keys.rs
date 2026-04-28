@@ -18,6 +18,8 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use tokio::fs;
+#[cfg(not(unix))]
+use tracing::warn;
 
 const B64: base64::engine::GeneralPurpose = base64::engine::general_purpose::STANDARD;
 
@@ -106,6 +108,14 @@ impl Keyring {
                     let mut perms = fs::metadata(&file_path).await?.permissions();
                     perms.set_mode(0o600);
                     fs::set_permissions(&file_path, perms).await?;
+                }
+                #[cfg(not(unix))]
+                {
+                    warn!(
+                        path = %file_path,
+                        "SSE-S3 keyring created without owner-only file permissions on this platform — \
+                         restrict ACLs manually so only the maxio service account can read it"
+                    );
                 }
                 kr
             };
@@ -251,6 +261,14 @@ pub async fn rotate(data_dir: &str) -> anyhow::Result<RotateResult> {
         let mut perms = fs::metadata(&tmp_path).await?.permissions();
         perms.set_mode(0o600);
         fs::set_permissions(&tmp_path, perms).await?;
+    }
+    #[cfg(not(unix))]
+    {
+        warn!(
+            path = %file_path,
+            "SSE-S3 keyring rotated without owner-only file permissions on this platform — \
+             verify ACLs restrict access to the maxio service account"
+        );
     }
     fs::rename(&tmp_path, &file_path).await?;
 

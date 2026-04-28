@@ -571,6 +571,7 @@ async fn copy_object(
     if let Some(vid) = &result.version_id {
         builder = builder.header("x-amz-version-id", vid.as_str());
     }
+    builder = add_sse_headers(builder, &dst_meta.encryption);
     Ok(builder.body(Body::from(xml)).unwrap())
 }
 

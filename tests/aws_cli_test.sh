@@ -1269,6 +1269,95 @@ $AWS s3 rm "s3://$SSEC_SRC/srcobj" > /dev/null 2>&1 || true
 assert "delete ssec-src bucket" $AWS s3api delete-bucket --bucket "$SSEC_SRC"
 assert "delete ssec-dst bucket" $AWS s3api delete-bucket --bucket "$SSEC_DST"
 
+# --- CopyObject SSE-C source → SSE-S3 destination (reencryption) ---
+echo ""
+echo "--- CopyObject reencryption (SSE-C → SSE-S3) test ---"
+REENC_SRC="reenc-src-$$"
+REENC_DST="reenc-dst-$$"
+assert "create reenc-src" $AWS s3api create-bucket --bucket "$REENC_SRC"
+assert "create reenc-dst" $AWS s3api create-bucket --bucket "$REENC_DST"
+
+REENC_KEY=$(openssl rand 32 | base64)
+REENC_MD5=$(echo -n "$REENC_KEY" | base64 -d | openssl dgst -md5 -binary | base64)
+echo "reencryption payload" > "$TMPDIR/reenc-src.txt"
+$AWS s3api put-object --bucket "$REENC_SRC" --key srcobj --body "$TMPDIR/reenc-src.txt" \
+    --sse-customer-algorithm AES256 \
+    --sse-customer-key "$REENC_KEY" \
+    --sse-customer-key-md5 "$REENC_MD5" > /dev/null
+
+# Copy SSE-C source → SSE-S3 destination: server decrypts source with customer
+# key, re-encrypts under SSE-S3 master key.
+REENC_OUT=$($AWS s3api copy-object --bucket "$REENC_DST" --key dstobj \
+    --copy-source "$REENC_SRC/srcobj" \
+    --copy-source-sse-customer-algorithm AES256 \
+    --copy-source-sse-customer-key "$REENC_KEY" \
+    --copy-source-sse-customer-key-md5 "$REENC_MD5" \
+    --server-side-encryption AES256 2>&1)
+assert_eq "reencryption copy response shows SSE=AES256" \
+    "AES256" "$(echo "$REENC_OUT" | python3 -c 'import sys,json; print(json.load(sys.stdin).get("ServerSideEncryption",""))')"
+
+# GET destination with no customer key (SSE-S3 is server-managed)
+REENC_HEAD=$($AWS s3api head-object --bucket "$REENC_DST" --key dstobj 2>&1)
+assert_eq "reencrypted dst HEAD shows SSE=AES256" \
+    "AES256" "$(echo "$REENC_HEAD" | python3 -c 'import sys,json; print(json.load(sys.stdin).get("ServerSideEncryption",""))')"
+
+$AWS s3api get-object --bucket "$REENC_DST" --key dstobj "$TMPDIR/reenc-dst.txt" > /dev/null
+if cmp -s "$TMPDIR/reenc-src.txt" "$TMPDIR/reenc-dst.txt"; then
+    green "PASS: reencryption (SSE-C→SSE-S3) content matches"
+    PASS=$((PASS + 1))
+else
+    red "FAIL: reencryption (SSE-C→SSE-S3) content differs"
+    FAIL=$((FAIL + 1))
+fi
+
+$AWS s3 rm "s3://$REENC_DST/dstobj" > /dev/null 2>&1 || true
+$AWS s3 rm "s3://$REENC_SRC/srcobj" > /dev/null 2>&1 || true
+assert "delete reenc-src bucket" $AWS s3api delete-bucket --bucket "$REENC_SRC"
+assert "delete reenc-dst bucket" $AWS s3api delete-bucket --bucket "$REENC_DST"
+
+# --- SSE-C + Range read ---
+echo ""
+echo "--- SSE-C + Range read test ---"
+SSEC_RANGE_BUCKET="ssec-range-$$"
+assert "create ssec-range bucket" $AWS s3api create-bucket --bucket "$SSEC_RANGE_BUCKET"
+
+RANGE_KEY=$(openssl rand 32 | base64)
+RANGE_MD5=$(echo -n "$RANGE_KEY" | base64 -d | openssl dgst -md5 -binary | base64)
+
+# 1 MiB random payload — exceeds the 65,536-byte frame size so the range read
+# crosses at least one encryption-frame boundary.
+dd if=/dev/urandom of="$TMPDIR/ssec-range.bin" bs=1024 count=1024 2>/dev/null
+$AWS s3api put-object --bucket "$SSEC_RANGE_BUCKET" --key big.bin \
+    --body "$TMPDIR/ssec-range.bin" \
+    --sse-customer-algorithm AES256 \
+    --sse-customer-key "$RANGE_KEY" \
+    --sse-customer-key-md5 "$RANGE_MD5" > /dev/null
+
+# Range read with correct customer key → bytes must match local slice
+$AWS s3api get-object --bucket "$SSEC_RANGE_BUCKET" --key big.bin \
+    --range "bytes=70000-130000" \
+    --sse-customer-algorithm AES256 \
+    --sse-customer-key "$RANGE_KEY" \
+    --sse-customer-key-md5 "$RANGE_MD5" \
+    "$TMPDIR/ssec-range-out.bin" > /dev/null
+dd if="$TMPDIR/ssec-range.bin" of="$TMPDIR/ssec-range-expected.bin" \
+    bs=1 skip=70000 count=60001 2>/dev/null
+if cmp -s "$TMPDIR/ssec-range-out.bin" "$TMPDIR/ssec-range-expected.bin"; then
+    green "PASS: SSE-C range read across frame boundary matches"
+    PASS=$((PASS + 1))
+else
+    red "FAIL: SSE-C range read across frame boundary differs"
+    FAIL=$((FAIL + 1))
+fi
+
+# Range read without customer key must fail
+assert_fail "SSE-C range GET without customer key fails" \
+    $AWS s3api get-object --bucket "$SSEC_RANGE_BUCKET" --key big.bin \
+    --range "bytes=0-99" "$TMPDIR/ssec-range-nokey.bin"
+
+$AWS s3 rm "s3://$SSEC_RANGE_BUCKET/big.bin" > /dev/null 2>&1 || true
+assert "delete ssec-range bucket" $AWS s3api delete-bucket --bucket "$SSEC_RANGE_BUCKET"
+
 # --- Presigned URLs ---
 echo ""
 echo "--- Presigned URL tests ---"

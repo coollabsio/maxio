@@ -138,6 +138,9 @@ This runs both processes concurrently (Ctrl+C kills both):
 | GetBucketCors | GET | `/{bucket}?cors` |
 | PutBucketCors | PUT | `/{bucket}?cors` |
 | DeleteBucketCors | DELETE | `/{bucket}?cors` |
+| GetBucketEncryption | GET | `/{bucket}?encryption` |
+| PutBucketEncryption | PUT | `/{bucket}?encryption` |
+| DeleteBucketEncryption | DELETE | `/{bucket}?encryption` |
 | CreateMultipartUpload | POST | `/{bucket}/{key}?uploads` |
 | UploadPart | PUT | `/{bucket}/{key}?partNumber=N&uploadId=X` |
 | UploadPartCopy | PUT | `/{bucket}/{key}?partNumber=N&uploadId=X` (with `x-amz-copy-source` header) |
@@ -161,6 +164,30 @@ This runs both processes concurrently (Ctrl+C kills both):
 | `/api/buckets/{bucket}/upload/{key}` | PUT | cookie | Upload object |
 | `/api/buckets/{bucket}/download/{key}` | GET | cookie | Download object |
 | `/api/buckets/{bucket}/presign/{key}` | GET | cookie | Generate presigned URL (`?expires=SECONDS`, default 3600, max 604800) |
+
+### Server-Side Encryption (SSE)
+
+MaxIO supports **SSE-S3** (server-managed keys) and **SSE-C** (customer-supplied keys) using AES-256-GCM with per-frame nonces (65,536-byte chunks). SSE-KMS is intentionally not supported and rejected with `InvalidEncryptionAlgorithm`.
+
+- **Per-object DEK**: Each object gets a fresh 256-bit Data Encryption Key. For SSE-S3, the DEK is wrapped by the active master key (AES-256-GCM) and stored alongside the object metadata. For SSE-C, the DEK is wrapped by the customer-supplied key submitted on every read.
+- **Sidecar integrity**: HMAC-SHA256 binds encryption metadata (key id, wrapped DEK, nonce prefix) to the object — tampering with the sidecar causes decryption to fail.
+- **Erasure coding composition**: When EC is enabled, plaintext is encrypted first, then the ciphertext is sharded across EC chunks. Range reads work transparently across encrypted EC chunks.
+- **Bucket default encryption**: `PutBucketEncryption` / `GetBucketEncryption` / `DeleteBucketEncryption` set a per-bucket default. Explicit `x-amz-server-side-encryption` headers on PUT override the default.
+- **Multipart**: One DEK per multipart session. SSE-C parts must submit the same customer key (validated via MD5) on every part.
+
+#### Master Key Management
+
+| Concern | Behavior |
+|---|---|
+| Bootstrap | First server start auto-generates a 32-byte master key in `<data-dir>/.maxio-keys.json` (file mode 0600 on Unix). Back this file up — losing it makes all SSE-S3 objects unrecoverable |
+| Override | Set `MAXIO_MASTER_KEY` (or `--master-key`) to a base64-encoded 32-byte key. Bypasses the on-disk keyring file |
+| Rotation | `maxio keyring rotate --data-dir <dir>` generates a new active key and demotes the previous active key (retained so existing objects keep decrypting). Restart the server to begin encrypting new objects with the new key. Existing objects remain readable; they do not get rewritten |
+| Inspection | `maxio keyring list --data-dir <dir>` prints key ids, creation times, and active flag (never the raw key material) |
+| Windows | `0600` file mode is only enforced on Unix — on Windows, restrict ACLs manually or use full-disk encryption |
+
+#### Backup & Recovery
+
+The `.maxio-keys.json` file is the single source of truth for SSE-S3 decryption. **Back it up offline** at the same time as the data directory. Loss of all keys in the ring = permanent data loss for SSE-S3 objects (this is by design — there is no escrow). For disaster recovery, copy the keyring file to the new host before restoring object data.
 
 ### Frontend Error Logging
 

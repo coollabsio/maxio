@@ -134,7 +134,7 @@ Open `http://localhost:9000/ui/` in your browser. Default credentials: `maxioadm
 | `MAXIO_ERASURE_CODING` | `--erasure-coding` | `false` | Enable erasure coding with per-chunk integrity checksums |
 | `MAXIO_CHUNK_SIZE` | `--chunk-size` | `10485760` (10MB) | Chunk size in bytes for erasure coding |
 | `MAXIO_PARITY_SHARDS` | `--parity-shards` | `0` | Number of parity shards per object (requires `--erasure-coding`, 0 = no parity) |
-| `MAXIO_MASTER_KEY` | `--master-key` | _(auto-generated)_ | Base64-encoded 32-byte SSE-S3 master key. If unset, a key is generated and stored under `<data-dir>/.keyring.json`. Provide explicitly to control key rotation |
+| `MAXIO_MASTER_KEY` | `--master-key` | _(auto-generated)_ | Base64-encoded 32-byte SSE-S3 master key. If unset, a key is generated and stored under `<data-dir>/.maxio-keys.json`. Provide explicitly to control key rotation |
 
 ## Usage
 

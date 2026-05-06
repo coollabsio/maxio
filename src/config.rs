@@ -21,6 +21,10 @@ fn default_region() -> String {
         .unwrap_or_else(|| "us-east-1".to_string())
 }
 
+fn default_default_buckets() -> Option<String> {
+    first_env_value(&["MINIO_DEFAULT_BUCKETS"])
+}
+
 #[derive(Args, Debug, Clone)]
 pub struct Config {
     /// Port to listen on
@@ -63,4 +67,9 @@ pub struct Config {
     /// Number of parity shards for erasure coding (0 = no parity, requires --erasure-coding)
     #[arg(long, env = "MAXIO_PARITY_SHARDS", default_value = "0")]
     pub parity_shards: u32,
+
+    /// Comma-separated list of bucket names to create on first boot
+    /// (MAXIO_DEFAULT_BUCKETS, MINIO_DEFAULT_BUCKETS)
+    #[arg(long, env = "MAXIO_DEFAULT_BUCKETS", default_value_t = default_default_buckets().unwrap_or_default())]
+    pub default_buckets: String,
 }

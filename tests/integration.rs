@@ -36,6 +36,7 @@ async fn start_server() -> (String, TempDir) {
         erasure_coding: false,
         chunk_size: 10 * 1024 * 1024,
         parity_shards: 0,
+        default_buckets: String::new(),
     };
 
     let state = AppState {
@@ -80,7 +81,6 @@ fn sign_request(method: &str, url: &str, headers: &mut Vec<(String, String)>, bo
     headers.push(("x-amz-date".to_string(), amz_date.clone()));
     headers.push(("x-amz-content-sha256".to_string(), payload_hash.clone()));
 
-    // Sort signed headers
     headers.sort_by(|a, b| a.0.cmp(&b.0));
 
     let signed_headers: Vec<&str> = headers.iter().map(|(k, _)| k.as_str()).collect();
@@ -91,7 +91,6 @@ fn sign_request(method: &str, url: &str, headers: &mut Vec<(String, String)>, bo
         .map(|(k, v)| format!("{}:{}\n", k, v.trim()))
         .collect();
 
-    // Normalize query string: sort params and ensure key=value format
     let canonical_qs = if query.is_empty() {
         String::new()
     } else {
@@ -126,7 +125,6 @@ fn sign_request(method: &str, url: &str, headers: &mut Vec<(String, String)>, bo
         hex::encode(Sha256::digest(canonical_request.as_bytes()))
     );
 
-    // Derive signing key
     let key = format!("AWS4{}", SECRET_KEY);
     let mut mac = HmacSha256::new_from_slice(key.as_bytes()).unwrap();
     mac.update(date_stamp.as_bytes());
@@ -154,6 +152,170 @@ fn sign_request(method: &str, url: &str, headers: &mut Vec<(String, String)>, bo
     );
     headers.push(("authorization".to_string(), auth));
 }
+
+// ---- Default buckets tests ----
+
+async fn start_server_with_default_buckets(default_buckets: &str) -> (String, TempDir) {
+    let tmp = TempDir::new().unwrap();
+    let data_dir = tmp.path().to_str().unwrap().to_string();
+
+    let keyring = Arc::new(Keyring::load(&data_dir, None).await.unwrap());
+    let storage = FilesystemStorage::new(&data_dir, false, 10 * 1024 * 1024, 0, keyring)
+        .await
+        .unwrap();
+
+    maxio::storage::provision_default_buckets(&storage, default_buckets, REGION).await;
+
+    let config = Config {
+        port: 0,
+        address: "127.0.0.1".to_string(),
+        data_dir: data_dir.clone(),
+        access_key: ACCESS_KEY.to_string(),
+        secret_key: SECRET_KEY.to_string(),
+        region: REGION.to_string(),
+        master_key: None,
+        erasure_coding: false,
+        chunk_size: 10 * 1024 * 1024,
+        parity_shards: 0,
+        default_buckets: default_buckets.to_string(),
+    };
+
+    let state = AppState {
+        storage: Arc::new(storage),
+        config: Arc::new(config),
+        login_rate_limiter: Arc::new(maxio::api::console::LoginRateLimiter::new()),
+    };
+
+    let app = server::build_router(state);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let base_url = format!("http://{}", addr);
+
+    tokio::spawn(async move {
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await
+        .unwrap();
+    });
+
+    (base_url, tmp)
+}
+
+#[tokio::test]
+async fn test_default_buckets_created_on_boot() {
+    let (base_url, _tmp) = start_server_with_default_buckets("alpha,beta,gamma").await;
+
+    // All buckets should exist
+    let resp = s3_request("HEAD", &format!("{}/alpha", base_url), vec![]).await;
+    assert_eq!(resp.status(), 200);
+    let resp = s3_request("HEAD", &format!("{}/beta", base_url), vec![]).await;
+    assert_eq!(resp.status(), 200);
+    let resp = s3_request("HEAD", &format!("{}/gamma", base_url), vec![]).await;
+    assert_eq!(resp.status(), 200);
+
+    // List should include default buckets
+    let resp = s3_request("GET", &format!("{}/", base_url), vec![]).await;
+    assert_eq!(resp.status(), 200);
+    let body = resp.text().await.unwrap();
+    assert!(body.contains("<Name>alpha</Name>"));
+    assert!(body.contains("<Name>beta</Name>"));
+    assert!(body.contains("<Name>gamma</Name>"));
+}
+
+#[tokio::test]
+async fn test_default_buckets_skip_existing() {
+    let tmp = TempDir::new().unwrap();
+    let data_dir = tmp.path().to_str().unwrap().to_string();
+
+    let keyring = Arc::new(Keyring::load(&data_dir, None).await.unwrap());
+    let storage = FilesystemStorage::new(&data_dir, false, 10 * 1024 * 1024, 0, keyring)
+        .await
+        .unwrap();
+
+    // First provision: creates the bucket
+    maxio::storage::provision_default_buckets(&storage, "existing", REGION).await;
+    // Second provision: must be idempotent — no error, no duplicate
+    maxio::storage::provision_default_buckets(&storage, "existing", REGION).await;
+
+    let config = Config {
+        port: 0,
+        address: "127.0.0.1".to_string(),
+        data_dir: data_dir.clone(),
+        access_key: ACCESS_KEY.to_string(),
+        secret_key: SECRET_KEY.to_string(),
+        region: REGION.to_string(),
+        master_key: None,
+        erasure_coding: false,
+        chunk_size: 10 * 1024 * 1024,
+        parity_shards: 0,
+        default_buckets: String::new(),
+    };
+    let state = AppState {
+        storage: Arc::new(storage),
+        config: Arc::new(config),
+        login_rate_limiter: Arc::new(maxio::api::console::LoginRateLimiter::new()),
+    };
+    let app = server::build_router(state);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let base_url = format!("http://{}", addr);
+    tokio::spawn(async move {
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await
+        .unwrap();
+    });
+
+    let resp = s3_request("HEAD", &format!("{}/existing", base_url), vec![]).await;
+    assert_eq!(resp.status(), 200);
+
+    let resp = s3_request("GET", &format!("{}/", base_url), vec![]).await;
+    assert_eq!(resp.status(), 200);
+    let body = resp.text().await.unwrap();
+    assert!(body.contains("<Name>existing</Name>"));
+}
+
+#[tokio::test]
+async fn test_default_buckets_skips_invalid_names() {
+    // "INVALID" has uppercase letters, "b..a" has consecutive dots — both invalid S3 names
+    let (base_url, _tmp) = start_server_with_default_buckets("INVALID,valid,b..a").await;
+
+    // "INVALID" has uppercase → skipped, bucket does not exist
+    let resp = s3_request("HEAD", &format!("{}/INVALID", base_url), vec![]).await;
+    assert_eq!(resp.status(), 404);
+
+    // "valid" should exist
+    let resp = s3_request("HEAD", &format!("{}/valid", base_url), vec![]).await;
+    assert_eq!(resp.status(), 200);
+
+    // "b..a" has consecutive dots → skipped, bucket does not exist
+    let resp = s3_request("HEAD", &format!("{}/b..a", base_url), vec![]).await;
+    assert_eq!(resp.status(), 404);
+}
+
+#[tokio::test]
+async fn test_empty_default_buckets() {
+    let (base_url, _tmp) = start_server_with_default_buckets("").await;
+
+    // No default buckets should exist
+    let resp = s3_request("GET", &format!("{}/", base_url), vec![]).await;
+    assert_eq!(resp.status(), 200);
+    let body = resp.text().await.unwrap();
+    assert!(!body.contains("<Name>"), "No buckets should be listed");
+}
+
+#[tokio::test]
+async fn test_default_buckets_single() {
+    let (base_url, _tmp) = start_server_with_default_buckets("only-one").await;
+
+    let resp = s3_request("HEAD", &format!("{}/only-one", base_url), vec![]).await;
+    assert_eq!(resp.status(), 200);
+}
+
 
 fn client() -> reqwest::Client {
     reqwest::Client::new()
@@ -2673,6 +2835,7 @@ async fn start_server_ec() -> (String, TempDir) {
         erasure_coding: true,
         chunk_size: 1024,
         parity_shards: 0,
+        default_buckets: String::new(),
     };
 
     let state = AppState {
@@ -3126,6 +3289,7 @@ async fn start_server_parity(parity_shards: u32) -> (String, TempDir) {
         erasure_coding: true,
         chunk_size: 100,
         parity_shards,
+        default_buckets: String::new(),
     };
 
     let state = AppState {
@@ -5556,6 +5720,7 @@ async fn start_server_ec_parity(chunk_size: u64, parity_shards: u32) -> (String,
         erasure_coding: true,
         chunk_size,
         parity_shards,
+        default_buckets: String::new(),
     };
 
     let state = AppState {

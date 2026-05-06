@@ -9,7 +9,7 @@ use axum::{
 
 use crate::error::S3Error;
 use crate::server::AppState;
-use crate::storage::{BucketEncryptionConfig, BucketMeta, CorsRule, StorageError};
+use crate::storage::{is_valid_bucket_name, BucketEncryptionConfig, BucketMeta, CorsRule, StorageError};
 use crate::xml::{response::to_xml, types::*};
 
 pub async fn list_buckets(State(state): State<AppState>) -> Result<Response<Body>, S3Error> {
@@ -426,19 +426,9 @@ fn extract_xml_tag(xml: &str, tag: &str) -> Option<String> {
 }
 
 fn validate_bucket_name(name: &str) -> Result<(), S3Error> {
-    if name.len() < 3 || name.len() > 63 {
-        return Err(S3Error::invalid_bucket_name(name));
+    if is_valid_bucket_name(name) {
+        Ok(())
+    } else {
+        Err(S3Error::invalid_bucket_name(name))
     }
-    if !name
-        .chars()
-        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '.')
-    {
-        return Err(S3Error::invalid_bucket_name(name));
-    }
-    if !name.as_bytes()[0].is_ascii_alphanumeric()
-        || !name.as_bytes()[name.len() - 1].is_ascii_alphanumeric()
-    {
-        return Err(S3Error::invalid_bucket_name(name));
-    }
-    Ok(())
 }

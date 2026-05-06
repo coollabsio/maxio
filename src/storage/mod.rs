@@ -277,6 +277,68 @@ pub struct UploadEncryptionSpec {
     pub upload_nonce_prefix: String,
 }
 
+/// Returns `true` if `name` is a valid S3 bucket name.
+pub fn is_valid_bucket_name(name: &str) -> bool {
+    if name.len() < 3 || name.len() > 63 {
+        return false;
+    }
+    if !name.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '.') {
+        return false;
+    }
+    let first = name.chars().next().unwrap();
+    let last = name.chars().last().unwrap();
+    if !first.is_ascii_alphanumeric() || !last.is_ascii_alphanumeric() {
+        return false;
+    }
+    if name.contains("..") {
+        return false;
+    }
+    let parts: Vec<&str> = name.split('.').collect();
+    if parts.len() == 4 && parts.iter().all(|p| p.parse::<u8>().is_ok()) {
+        return false;
+    }
+    true
+}
+
+/// Create each bucket in `default_buckets` (comma-separated) if it does not
+/// already exist. Invalid S3 names are logged and skipped; errors are non-fatal.
+pub async fn provision_default_buckets(
+    storage: &filesystem::FilesystemStorage,
+    default_buckets: &str,
+    region: &str,
+) {
+    if default_buckets.is_empty() {
+        return;
+    }
+    for bucket_name in default_buckets.split(',') {
+        let bucket_name = bucket_name.trim();
+        if bucket_name.is_empty() {
+            continue;
+        }
+        if !is_valid_bucket_name(bucket_name) {
+            tracing::warn!("Skipping invalid default bucket name: '{}'", bucket_name);
+            continue;
+        }
+        let meta = BucketMeta {
+            name: bucket_name.to_string(),
+            created_at: chrono::Utc::now()
+                .format("%Y-%m-%dT%H:%M:%S%.3fZ")
+                .to_string(),
+            region: region.to_string(),
+            versioning: false,
+            cors_rules: None,
+            encryption_config: None,
+            public_read: false,
+            public_list: false,
+        };
+        match storage.create_bucket(&meta).await {
+            Ok(true) => tracing::info!("Created default bucket: {}", bucket_name),
+            Ok(false) => tracing::info!("Default bucket already exists: {}", bucket_name),
+            Err(e) => tracing::warn!("Failed to create default bucket '{}': {}", bucket_name, e),
+        }
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum StorageError {
     #[error("IO error: {0}")]

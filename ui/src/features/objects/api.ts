@@ -1,5 +1,6 @@
 import { apiClient } from '@/api/client'
 import * as sdk from '@/api/generated/sdk.gen'
+import { guessContentType } from '@/lib/mime'
 
 export async function listObjects(bucket: string, prefix: string) {
   const { data } = await sdk.listObjects({
@@ -11,13 +12,16 @@ export async function listObjects(bucket: string, prefix: string) {
   return data
 }
 
-/** Streams the raw file as the request body, with the file's own content type. */
+/**
+ * Streams the raw file as the request body. The content type is the browser's, falling back to a guess from the
+ * file name (browsers leave `file.type` empty for source files, dotfiles and many config formats).
+ */
 export async function uploadObject(bucket: string, key: string, file: File) {
   const { data } = await sdk.uploadObject({
     client: apiClient,
     path: { bucket, key },
     body: file,
-    headers: { 'Content-Type': file.type || 'application/octet-stream' },
+    headers: { 'Content-Type': file.type || guessContentType(file.name) || 'application/octet-stream' },
     throwOnError: true,
   })
   return data

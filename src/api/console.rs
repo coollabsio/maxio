@@ -515,6 +515,8 @@ pub struct ObjectSummary {
     size: u64,
     last_modified: String,
     etag: String,
+    /// Stored `Content-Type` of the object (what download/preview will serve).
+    content_type: String,
 }
 
 #[derive(Serialize, ToSchema)]
@@ -568,6 +570,7 @@ pub async fn list_objects(
                 size: obj.size,
                 last_modified: obj.last_modified.clone(),
                 etag: obj.etag.clone(),
+                content_type: obj.content_type.clone(),
             });
         }
     }

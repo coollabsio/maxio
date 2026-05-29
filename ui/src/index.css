@@ -231,6 +231,13 @@ body {
   color: var(--cool-fg-dim);
 }
 
+/* While a file preview is open, keep text selection inside the preview body
+   instead of bleeding into the page behind the modal. The preview content
+   re-enables selection via `select-text`. */
+body.preview-open {
+  user-select: none;
+}
+
 @layer base {
   *,
   ::after,

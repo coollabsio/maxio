@@ -38,6 +38,7 @@ async fn start_server() -> (String, TempDir) {
         chunk_size: 10 * 1024 * 1024,
         parity_shards: 0,
         default_buckets: String::new(),
+        public_buckets: String::new(),
         max_console_body_bytes: 1024 * 1024,
         ..Config::default()
     };

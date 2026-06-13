@@ -753,6 +753,69 @@ pub async fn provision_default_buckets(
     }
 }
 
+/// For each bucket in `public_buckets` (comma-separated): create it if missing,
+/// then flag it anonymous public-read (read = true, list = false). This is the
+/// equivalent of `mc anonymous set download`.
+///
+/// Runs after `provision_default_buckets`, so a bucket may appear in both lists.
+/// Invalid names, including the reserved buckets `maxio` and `ui`, are skipped.
+/// Errors are non-fatal. Removing a name from the list does not make that
+/// bucket private again.
+pub async fn provision_public_buckets(
+    storage: &filesystem::FilesystemStorage,
+    public_buckets: &str,
+    region: &str,
+) {
+    if public_buckets.is_empty() {
+        return;
+    }
+    for bucket_name in public_buckets.split(',') {
+        let bucket_name = bucket_name.trim();
+        if bucket_name.is_empty() {
+            continue;
+        }
+        if !is_valid_bucket_name(bucket_name) {
+            tracing::warn!("Skipping invalid public bucket name: '{}'", bucket_name);
+            continue;
+        }
+        let meta = BucketMeta {
+            name: bucket_name.to_string(),
+            created_at: chrono::Utc::now()
+                .format("%Y-%m-%dT%H:%M:%S%.3fZ")
+                .to_string(),
+            region: region.to_string(),
+            versioning: false,
+            cors_rules: None,
+            encryption_config: None,
+            public_read: true,
+            public_list: false,
+            versioning_suspended: false,
+            tags: None,
+            lifecycle: None,
+        };
+        match storage.create_bucket(&meta).await {
+            Ok(true) => tracing::info!("Created public bucket: {}", bucket_name),
+            Ok(false) => match storage.get_bucket_public(bucket_name).await {
+                Ok((_read, list)) => match storage.set_bucket_public(bucket_name, true, list).await
+                {
+                    Ok(()) => {
+                        tracing::info!("Enabled public-read on existing bucket: {}", bucket_name)
+                    }
+                    Err(e) => {
+                        tracing::warn!("Failed to flag bucket '{}' public-read: {}", bucket_name, e)
+                    }
+                },
+                Err(e) => tracing::warn!(
+                    "Failed to read public flags for bucket '{}': {}",
+                    bucket_name,
+                    e
+                ),
+            },
+            Err(e) => tracing::warn!("Failed to create public bucket '{}': {}", bucket_name, e),
+        }
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum StorageError {
     #[error("IO error: {0}")]

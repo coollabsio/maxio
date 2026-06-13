@@ -228,8 +228,9 @@ fn redact_header_value(name: &str) -> &'static str {
 ///   - Path must be `/{bucket}` (list) or `/{bucket}/{key}` (object).
 ///   - For bucket-level path: `public_list` must be true.
 ///   - For object path: `public_read` must be true.
-///   - Query must not contain mutating sub-resources (`delete`, `uploads`, `tagging`,
-///     `versioning`, `cors`, `encryption`, `policy`, `acl`).
+///   - Query must not contain subresources (`delete`, `uploads`, `uploadId`,
+///     `tagging`, `versioning`, `cors`, `encryption`, `policy`, `acl`).
+///     `partNumber` is an object read and stays allowed. `uploadId` is not.
 async fn is_public_bypass_allowed(state: &AppState, method: &str, path: &str, query: &str) -> bool {
     match method {
         "GET" | "HEAD" | "OPTIONS" => {}
@@ -237,7 +238,8 @@ async fn is_public_bypass_allowed(state: &AppState, method: &str, path: &str, qu
     }
 
     // Anonymous access covers plain listing and object reads only. Any other
-    // query key (a subresource such as ?policy, ?versions, ?acl) needs auth.
+    // query key (a subresource such as ?policy, ?versions, ?acl, ?uploadId)
+    // needs auth. `partNumber` is on the allowlist on purpose.
     if !query
         .split('&')
         .map(|pair| pair.split('=').next().unwrap_or(""))

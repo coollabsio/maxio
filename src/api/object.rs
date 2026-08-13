@@ -295,6 +295,18 @@ pub async fn put_object(
 
     let checksum = extract_checksum(&headers);
 
+    // S3 conditional writes: when the caller sends If-Match / If-None-Match,
+    // evaluate them atomically against the current object (fencing support).
+    let if_match = headers
+        .get("if-match")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
+    let if_none_match = headers
+        .get("if-none-match")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
+    let conditional = if_match.is_some() || if_none_match.is_some();
+
     // Resolve encryption: explicit request headers win over bucket default.
     let mut encryption = extract_sse_request(&headers)?;
     if encryption.is_none() {
@@ -313,17 +325,34 @@ pub async fn put_object(
         })
     });
 
-    let result = state
-        .storage
-        .put_object(&bucket, &key, content_type, reader, checksum, encryption)
-        .await
-        .map_err(|e| match e {
-            StorageError::InvalidKey(msg) => S3Error::invalid_argument(&msg),
-            StorageError::ChecksumMismatch(_) => S3Error::bad_checksum("x-amz-checksum"),
-            StorageError::EncryptionError(msg) => S3Error::invalid_argument(&msg),
-            StorageError::IntegrityError(msg) => S3Error::invalid_argument(&msg),
-            _ => S3Error::internal(e),
-        })?;
+    let result = if conditional {
+        state
+            .storage
+            .put_object_conditional(
+                &bucket,
+                &key,
+                content_type,
+                reader,
+                checksum,
+                encryption,
+                if_match.as_deref(),
+                if_none_match.as_deref(),
+            )
+            .await
+    } else {
+        state
+            .storage
+            .put_object(&bucket, &key, content_type, reader, checksum, encryption)
+            .await
+    }
+    .map_err(|e| match e {
+        StorageError::InvalidKey(msg) => S3Error::invalid_argument(&msg),
+        StorageError::ChecksumMismatch(_) => S3Error::bad_checksum("x-amz-checksum"),
+        StorageError::EncryptionError(msg) => S3Error::invalid_argument(&msg),
+        StorageError::IntegrityError(msg) => S3Error::invalid_argument(&msg),
+        StorageError::PreconditionFailed(_) => S3Error::precondition_failed(),
+        _ => S3Error::internal(e),
+    })?;
 
     let mut builder = Response::builder()
         .status(StatusCode::OK)

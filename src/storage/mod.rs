@@ -379,6 +379,8 @@ pub enum StorageError {
     ChecksumMismatch(String),
     #[error("Encryption error: {0}")]
     EncryptionError(String),
+    #[error("Precondition failed: {0}")]
+    PreconditionFailed(String),
     #[error("Decryption error: {0}")]
     DecryptionError(String),
     #[error("Integrity error: {0}")]

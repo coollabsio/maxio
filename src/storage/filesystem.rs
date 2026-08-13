@@ -69,6 +69,27 @@ pub struct FilesystemStorage {
     chunk_size: u64,
     parity_shards: u32,
     keyring: Arc<Keyring>,
+    /// Serializes conditional PutObject evaluation + write per object key so
+    /// that two concurrent compare-and-swap writers cannot both pass.
+    put_locks: std::sync::Mutex<
+        std::collections::HashMap<String, Arc<tokio::sync::Mutex<()>>>,
+    >,
+}
+
+/// Returns true if `header_value` (If-Match / If-None-Match) matches the
+/// object's current ETag. Handles `*`, quoted/unquoted ETags, and lists.
+fn etag_matches(header_value: &str, object_etag: &str) -> bool {
+    let value = header_value.trim();
+    if value == "*" {
+        return true;
+    }
+    let obj = object_etag.trim_matches('"');
+    for part in value.split(',') {
+        if part.trim().trim_matches('"') == obj {
+            return true;
+        }
+    }
+    false
 }
 
 /// Validate that an object key does not contain path traversal components.
@@ -293,7 +314,65 @@ impl FilesystemStorage {
             chunk_size,
             parity_shards,
             keyring,
+            put_locks: std::sync::Mutex::new(std::collections::HashMap::new()),
         })
+    }
+
+    /// S3 conditional write: evaluate `If-None-Match` / `If-Match` against the
+    /// current object while holding a per-key lock, then write. The lock makes
+    /// the check-and-write atomic within this process, so two concurrent
+    /// compare-and-swap writers cannot both succeed (celld-style fencing).
+    ///
+    /// Semantics follow AWS S3 conditional writes: failure yields
+    /// `StorageError::PreconditionFailed` (mapped to HTTP 412), never 304.
+    /// `If-None-Match: *` therefore fails whenever the object already exists,
+    /// and `If-Match` fails when the object is absent or its ETag differs.
+    pub async fn put_object_conditional(
+        &self,
+        bucket: &str,
+        key: &str,
+        content_type: &str,
+        body: ByteStream,
+        checksum: Option<(ChecksumAlgorithm, Option<String>)>,
+        encryption: Option<EncryptionRequest>,
+        if_match: Option<&str>,
+        if_none_match: Option<&str>,
+    ) -> Result<PutResult, StorageError> {
+        let lock_name = format!("{bucket}/{key}");
+        let lock = {
+            let mut locks = self.put_locks.lock().unwrap();
+            locks
+                .entry(lock_name)
+                .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+                .clone()
+        };
+        let _guard = lock.lock().await;
+
+        let current = self.read_object_meta(bucket, key).await.ok();
+
+        if let Some(value) = if_none_match {
+            if let Some(meta) = &current {
+                if etag_matches(value, &meta.etag) {
+                    return Err(StorageError::PreconditionFailed(format!(
+                        "If-None-Match condition failed for {bucket}/{key}"
+                    )));
+                }
+            }
+        }
+        if let Some(value) = if_match {
+            let satisfied = match &current {
+                Some(meta) => etag_matches(value, &meta.etag),
+                None => false,
+            };
+            if !satisfied {
+                return Err(StorageError::PreconditionFailed(format!(
+                    "If-Match condition failed for {bucket}/{key}"
+                )));
+            }
+        }
+
+        self.put_object(bucket, key, content_type, body, checksum, encryption)
+            .await
     }
 
     // --- Bucket operations ---

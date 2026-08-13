@@ -6902,3 +6902,101 @@ async fn test_ec_plus_encryption_chunk_swap_rejected() {
         }
     }
 }
+
+// ── Conditional writes (If-Match / If-None-Match on PutObject) ──────────────
+//
+// AWS S3 conditional writes (Nov 2024): a failing precondition on PUT returns
+// 412 PreconditionFailed — never 304 — and leaves the object untouched. These
+// semantics are what coordination clients such as celld (self-hosted Durable
+// Objects) depend on for fencing: one compare-and-swap decides ownership.
+
+async fn put_with_condition(
+    base_url: &str,
+    bucket: &str,
+    key: &str,
+    body: &[u8],
+    condition: Option<(&str, &str)>,
+) -> reqwest::Response {
+    let extra = match condition {
+        Some((k, v)) => vec![(k, v)],
+        None => vec![],
+    };
+    s3_request_with_headers(
+        "PUT",
+        &format!("{}/{}/{}", base_url, bucket, key),
+        body.to_vec(),
+        extra,
+    )
+    .await
+}
+
+async fn head_etag(base_url: &str, bucket: &str, key: &str) -> String {
+    let resp = s3_request("HEAD", &format!("{}/{}/{}", base_url, bucket, key), vec![]).await;
+    assert_eq!(resp.status(), 200);
+    resp.headers()
+        .get("etag")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string()
+}
+
+#[tokio::test]
+async fn test_put_if_none_match_star_creates_then_conflicts() {
+    let (base_url, _tmp) = start_server().await;
+    s3_request("PUT", &format!("{}/cond-writes", base_url), vec![]).await;
+
+    // Create-if-absent on a missing key succeeds.
+    let resp = put_with_condition(&base_url, "cond-writes", "obj", b"v1", Some(("if-none-match", "*"))).await;
+    assert_eq!(resp.status(), 200);
+
+    // The same conditional write on the now-existing key fails with 412.
+    let resp = put_with_condition(&base_url, "cond-writes", "obj", b"v2", Some(("if-none-match", "*"))).await;
+    assert_eq!(resp.status(), 412);
+    let body = resp.text().await.unwrap();
+    assert!(body.contains("PreconditionFailed"), "got {body}");
+
+    // The failed write must not have modified the object.
+    let resp = s3_request("GET", &format!("{}/cond-writes/obj", base_url), vec![]).await;
+    assert_eq!(resp.text().await.unwrap(), "v1");
+}
+
+#[tokio::test]
+async fn test_put_if_match_compares_etag() {
+    let (base_url, _tmp) = start_server().await;
+    s3_request("PUT", &format!("{}/cond-writes", base_url), vec![]).await;
+    put_with_condition(&base_url, "cond-writes", "obj", b"v1", None).await;
+
+    // If-Match against a missing object fails.
+    let resp =
+        put_with_condition(&base_url, "cond-writes", "absent", b"x", Some(("if-match", "\"anything\""))).await;
+    assert_eq!(resp.status(), 412);
+
+    // If-Match with a stale ETag fails.
+    let resp = put_with_condition(&base_url, "cond-writes", "obj", b"v2", Some(("if-match", "\"stale\""))).await;
+    assert_eq!(resp.status(), 412);
+
+    // If-Match with the current ETag succeeds (compare-and-swap).
+    let etag = head_etag(&base_url, "cond-writes", "obj").await;
+    let resp = put_with_condition(&base_url, "cond-writes", "obj", b"v2", Some(("if-match", &etag))).await;
+    assert_eq!(resp.status(), 200);
+
+    let resp = s3_request("GET", &format!("{}/cond-writes/obj", base_url), vec![]).await;
+    assert_eq!(resp.text().await.unwrap(), "v2");
+}
+
+#[tokio::test]
+async fn test_concurrent_conditional_creates_have_exactly_one_winner() {
+    let (base_url, _tmp) = start_server().await;
+    s3_request("PUT", &format!("{}/cond-writes", base_url), vec![]).await;
+
+    // Two racing create-if-absent writes on the same key: the per-key lock must
+    // serialize check-and-write so exactly one wins.
+    let (a, b) = tokio::join!(
+        put_with_condition(&base_url, "cond-writes", "race", b"a", Some(("if-none-match", "*"))),
+        put_with_condition(&base_url, "cond-writes", "race", b"b", Some(("if-none-match", "*"))),
+    );
+    let mut statuses = vec![a.status().as_u16(), b.status().as_u16()];
+    statuses.sort_unstable();
+    assert_eq!(statuses, vec![200, 412], "exactly one writer may win");
+}

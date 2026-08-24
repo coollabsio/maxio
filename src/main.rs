@@ -160,6 +160,7 @@ async fn main() -> anyhow::Result<()> {
     .await?;
 
     storage::provision_default_buckets(&storage, &config.default_buckets, &config.region).await;
+    storage::provision_public_buckets(&storage, &config.public_buckets, &config.region).await;
 
     let state = server::AppState {
         storage: Arc::new(storage),

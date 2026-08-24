@@ -46,6 +46,7 @@ async fn start_server() -> (String, TempDir) {
         chunk_size: 10 * 1024 * 1024,
         parity_shards: 0,
         default_buckets: String::new(),
+        public_buckets: String::new(),
         max_console_body_bytes: 1024 * 1024,
     };
 
@@ -190,6 +191,7 @@ async fn start_server_with_default_buckets(default_buckets: &str) -> (String, Te
         chunk_size: 10 * 1024 * 1024,
         parity_shards: 0,
         default_buckets: default_buckets.to_string(),
+        public_buckets: String::new(),
         max_console_body_bytes: 1024 * 1024,
     };
 
@@ -266,6 +268,7 @@ async fn test_default_buckets_skip_existing() {
         chunk_size: 10 * 1024 * 1024,
         parity_shards: 0,
         default_buckets: String::new(),
+        public_buckets: String::new(),
         max_console_body_bytes: 1024 * 1024,
     };
     let state = AppState {
@@ -293,6 +296,101 @@ async fn test_default_buckets_skip_existing() {
     assert_eq!(resp.status(), 200);
     let body = resp.text().await.unwrap();
     assert!(body.contains("<Name>existing</Name>"));
+}
+
+#[tokio::test]
+async fn test_public_buckets_created_and_flagged_read_only() {
+    let tmp = TempDir::new().unwrap();
+    let data_dir = tmp.path().to_str().unwrap().to_string();
+
+    let keyring = Arc::new(Keyring::load(&data_dir, None).await.unwrap());
+    let storage = FilesystemStorage::new(&data_dir, false, 10 * 1024 * 1024, 0, keyring)
+        .await
+        .unwrap();
+
+    // Provision a public bucket that does not yet exist: it is created on demand
+    // and flagged public-read (but not public-list).
+    maxio::storage::provision_public_buckets(&storage, "media", REGION).await;
+
+    assert!(storage.head_bucket("media").await.unwrap());
+    let (read, list) = storage.get_bucket_public("media").await.unwrap();
+    assert!(read, "public bucket must be anonymously readable");
+    assert!(!list, "public bucket must not be anonymously listable");
+}
+
+#[tokio::test]
+async fn test_public_buckets_flip_existing_private_bucket() {
+    let tmp = TempDir::new().unwrap();
+    let data_dir = tmp.path().to_str().unwrap().to_string();
+
+    let keyring = Arc::new(Keyring::load(&data_dir, None).await.unwrap());
+    let storage = FilesystemStorage::new(&data_dir, false, 10 * 1024 * 1024, 0, keyring)
+        .await
+        .unwrap();
+
+    // A bucket created privately (e.g. via default buckets) is not public…
+    maxio::storage::provision_default_buckets(&storage, "assets", REGION).await;
+    let (read, _) = storage.get_bucket_public("assets").await.unwrap();
+    assert!(!read, "default bucket starts private");
+
+    // …and provisioning it as public flips the existing metadata, idempotently.
+    maxio::storage::provision_public_buckets(&storage, "assets", REGION).await;
+    maxio::storage::provision_public_buckets(&storage, "assets", REGION).await;
+    let (read, list) = storage.get_bucket_public("assets").await.unwrap();
+    assert!(read, "existing bucket flipped to public-read");
+    assert!(!list, "public-list stays disabled");
+}
+
+#[tokio::test]
+async fn test_public_buckets_preserve_existing_public_list() {
+    let tmp = TempDir::new().unwrap();
+    let data_dir = tmp.path().to_str().unwrap().to_string();
+
+    let keyring = Arc::new(Keyring::load(&data_dir, None).await.unwrap());
+    let storage = FilesystemStorage::new(&data_dir, false, 10 * 1024 * 1024, 0, keyring)
+        .await
+        .unwrap();
+
+    // An operator created a bucket and enabled public_list (e.g. via the console).
+    maxio::storage::provision_default_buckets(&storage, "shared", REGION).await;
+    storage
+        .set_bucket_public("shared", true, true)
+        .await
+        .unwrap();
+
+    // Re-provisioning it as a public bucket must force public_read on while
+    // PRESERVING the operator-enabled public_list — not silently revert it.
+    maxio::storage::provision_public_buckets(&storage, "shared", REGION).await;
+    let (read, list) = storage.get_bucket_public("shared").await.unwrap();
+    assert!(read, "public_read forced on");
+    assert!(
+        list,
+        "operator-enabled public_list must be preserved across provisioning"
+    );
+}
+
+#[tokio::test]
+async fn test_public_buckets_skip_invalid_and_empty() {
+    let tmp = TempDir::new().unwrap();
+    let data_dir = tmp.path().to_str().unwrap().to_string();
+
+    let keyring = Arc::new(Keyring::load(&data_dir, None).await.unwrap());
+    let storage = FilesystemStorage::new(&data_dir, false, 10 * 1024 * 1024, 0, keyring)
+        .await
+        .unwrap();
+
+    // Empty input is a no-op; invalid names and blank entries are skipped
+    // without panicking, and the one valid name in the list is still applied.
+    maxio::storage::provision_public_buckets(&storage, "", REGION).await;
+    maxio::storage::provision_public_buckets(&storage, "INVALID, , good-media", REGION).await;
+
+    // The invalid name was never created (head_bucket rejects the bad name too).
+    assert!(storage.head_bucket("INVALID").await.is_err());
+    // The valid name was created and flagged public-read.
+    assert!(storage.head_bucket("good-media").await.unwrap());
+    let (read, list) = storage.get_bucket_public("good-media").await.unwrap();
+    assert!(read);
+    assert!(!list);
 }
 
 #[tokio::test]
@@ -2977,6 +3075,7 @@ async fn start_server_ec() -> (String, TempDir) {
         chunk_size: 1024,
         parity_shards: 0,
         default_buckets: String::new(),
+        public_buckets: String::new(),
         max_console_body_bytes: 1024 * 1024,
     };
 
@@ -3434,6 +3533,7 @@ async fn start_server_parity(parity_shards: u32) -> (String, TempDir) {
         chunk_size: 100,
         parity_shards,
         default_buckets: String::new(),
+        public_buckets: String::new(),
         max_console_body_bytes: 1024 * 1024,
     };
 
@@ -5212,6 +5312,15 @@ async fn test_public_bucket_rejects_mutating_query() {
         .await
         .unwrap();
     assert_eq!(resp.status(), 403);
+
+    // Anonymous GET ?uploadId routes to multipart list_parts — a distinct
+    // surface from object read — so it stays blocked even on a public_read bucket.
+    let resp = client()
+        .get(&format!("{}/pub-mut/some-key?uploadId=deadbeef", base_url))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 403);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -6113,6 +6222,7 @@ async fn start_server_ec_parity(chunk_size: u64, parity_shards: u32) -> (String,
         chunk_size,
         parity_shards,
         default_buckets: String::new(),
+        public_buckets: String::new(),
         max_console_body_bytes: 1024 * 1024,
     };
 

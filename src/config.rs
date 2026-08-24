@@ -25,6 +25,10 @@ fn default_default_buckets() -> Option<String> {
     first_env_value(&["MINIO_DEFAULT_BUCKETS"])
 }
 
+fn default_public_buckets() -> Option<String> {
+    first_env_value(&["MINIO_PUBLIC_BUCKETS"])
+}
+
 #[derive(Args, Debug, Clone)]
 pub struct Config {
     /// Port to listen on
@@ -80,6 +84,13 @@ pub struct Config {
     /// (MAXIO_DEFAULT_BUCKETS, MINIO_DEFAULT_BUCKETS)
     #[arg(long, env = "MAXIO_DEFAULT_BUCKETS", default_value_t = default_default_buckets().unwrap_or_default())]
     pub default_buckets: String,
+
+    /// Comma-separated list of bucket names to expose as anonymous public-read.
+    /// Each is created on first boot if missing, then flagged public-read (but
+    /// not public-list) — the equivalent of MinIO's `mc anonymous set download`.
+    /// (MAXIO_PUBLIC_BUCKETS, MINIO_PUBLIC_BUCKETS)
+    #[arg(long, env = "MAXIO_PUBLIC_BUCKETS", default_value_t = default_public_buckets().unwrap_or_default())]
+    pub public_buckets: String,
 
     /// Max request body size for console JSON/form API routes, in bytes. Object uploads are streaming and not covered by this limit.
     #[arg(long, env = "MAXIO_MAX_CONSOLE_BODY_BYTES", default_value = "1048576")]

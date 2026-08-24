@@ -145,8 +145,10 @@ fn redact_header_value(name: &str) -> &'static str {
 ///   - Path must be `/{bucket}` (list) or `/{bucket}/{key}` (object).
 ///   - For bucket-level path: `public_list` must be true.
 ///   - For object path: `public_read` must be true.
-///   - Query must not contain mutating sub-resources (`delete`, `uploads`, `tagging`,
-///     `versioning`, `cors`, `encryption`, `policy`, `acl`).
+///   - Query must not contain mutating or non-object-read sub-resources
+///     (`delete`, `uploads`, `uploadId`, `partNumber`, `tagging`, `versioning`,
+///     `cors`, `encryption`, `policy`, `acl`). `uploadId`/`partNumber` route to
+///     multipart `list_parts`, which is a distinct surface from object read.
 async fn is_public_bypass_allowed(state: &AppState, method: &str, path: &str, query: &str) -> bool {
     match method {
         "GET" | "HEAD" | "OPTIONS" => {}
@@ -157,6 +159,8 @@ async fn is_public_bypass_allowed(state: &AppState, method: &str, path: &str, qu
     for forbidden in [
         "delete",
         "uploads",
+        "uploadId",
+        "partNumber",
         "tagging",
         "versioning",
         "cors",

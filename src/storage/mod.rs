@@ -114,6 +114,11 @@ pub struct ObjectMeta {
     pub checksum_value: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tags: Option<HashMap<String, String>>,
+    /// S3 user metadata (`x-amz-meta-*`), keys stored lowercased without the
+    /// prefix. Immutable after write: only a copy with `REPLACE` changes it,
+    /// and that writes a fresh object, so it stays bound into the sidecar MAC.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_metadata: Option<HashMap<String, String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub part_sizes: Option<Vec<u64>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -127,6 +132,8 @@ pub struct MultipartUploadMeta {
     pub key: String,
     pub content_type: String,
     pub initiated: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_metadata: Option<HashMap<String, String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub checksum_algorithm: Option<ChecksumAlgorithm>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

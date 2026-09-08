@@ -450,6 +450,10 @@ export type UploadObjectData = {
 
 export type UploadObjectErrors = {
     /**
+     * Invalid user metadata (x-amz-meta-*)
+     */
+    400: ErrorResponse;
+    /**
      * Bucket not found
      */
     404: ErrorResponse;

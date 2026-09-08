@@ -192,6 +192,60 @@ pub(crate) fn add_sse_headers(
     builder
 }
 
+/// S3 caps the whole set of user-defined metadata at 2 KB (names + values).
+const USER_METADATA_MAX_BYTES: usize = 2048;
+
+/// Collect `x-amz-meta-*` request headers into the map persisted in the object
+/// sidecar. Names are stored lowercased and without the prefix.
+pub(crate) fn extract_user_metadata(
+    headers: &HeaderMap,
+) -> Result<Option<HashMap<String, String>>, S3Error> {
+    let mut map = HashMap::new();
+    let mut total = 0;
+    for (name, value) in headers.iter() {
+        let Some(suffix) = name.as_str().strip_prefix("x-amz-meta-") else {
+            continue;
+        };
+        if suffix.is_empty() {
+            return Err(S3Error::invalid_argument(
+                "metadata header name must not be empty",
+            ));
+        }
+        // `to_str` accepts only visible ASCII — exactly what can be written back.
+        let value = value.to_str().map_err(|_| {
+            S3Error::invalid_argument(&format!(
+                "metadata value for x-amz-meta-{} is not valid US-ASCII",
+                suffix
+            ))
+        })?;
+        total += suffix.len() + value.len();
+        if total > USER_METADATA_MAX_BYTES {
+            return Err(S3Error::metadata_too_large(USER_METADATA_MAX_BYTES));
+        }
+        map.insert(suffix.to_ascii_lowercase(), value.to_string());
+    }
+    Ok(if map.is_empty() { None } else { Some(map) })
+}
+
+/// Emit stored user metadata as `x-amz-meta-*` response headers. Entries `http`
+/// refuses are skipped — the sidecar is on disk and can hold anything.
+pub(crate) fn add_user_meta_headers(
+    mut builder: http::response::Builder,
+    meta: &crate::storage::ObjectMeta,
+) -> http::response::Builder {
+    if let Some(map) = &meta.user_metadata {
+        for (k, v) in map {
+            if let (Ok(name), Ok(value)) = (
+                http::HeaderName::try_from(format!("x-amz-meta-{}", k)),
+                http::HeaderValue::from_str(v),
+            ) {
+                builder = builder.header(name, value);
+            }
+        }
+    }
+    builder
+}
+
 /// Extract checksum algorithm and optional expected value from request headers.
 pub(crate) fn extract_checksum(headers: &HeaderMap) -> Option<(ChecksumAlgorithm, Option<String>)> {
     let pairs = [
@@ -225,6 +279,19 @@ fn add_checksum_header(
     } else {
         builder
     }
+}
+
+/// Attach the response headers derived from stored object metadata.
+fn add_object_meta_headers(
+    builder: http::response::Builder,
+    meta: &crate::storage::ObjectMeta,
+) -> http::response::Builder {
+    let mut builder = add_user_meta_headers(builder, meta);
+    if let Some(vid) = &meta.version_id {
+        builder = builder.header("x-amz-version-id", vid.as_str());
+    }
+    builder = add_checksum_header(builder, meta);
+    add_sse_headers(builder, &meta.encryption)
 }
 
 pub async fn put_object(
@@ -294,6 +361,7 @@ pub async fn put_object(
     }
 
     let checksum = extract_checksum(&headers);
+    let user_metadata = extract_user_metadata(&headers)?;
 
     // Resolve encryption: explicit request headers win over bucket default.
     let mut encryption = extract_sse_request(&headers)?;
@@ -315,7 +383,15 @@ pub async fn put_object(
 
     let result = state
         .storage
-        .put_object(&bucket, &key, content_type, reader, checksum, encryption)
+        .put_object(
+            &bucket,
+            &key,
+            content_type,
+            reader,
+            checksum,
+            encryption,
+            user_metadata,
+        )
         .await
         .map_err(|e| match e {
             StorageError::InvalidKey(msg) => S3Error::invalid_argument(&msg),
@@ -517,13 +593,17 @@ async fn copy_object(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("COPY");
 
-    let content_type = match directive {
-        "COPY" => src_meta.content_type.clone(),
-        "REPLACE" => headers
-            .get("content-type")
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("application/octet-stream")
-            .to_string(),
+    let (content_type, user_metadata) = match directive {
+        "COPY" => (src_meta.content_type, src_meta.user_metadata),
+        // REPLACE takes the request's metadata wholesale — no source fallback.
+        "REPLACE" => (
+            headers
+                .get("content-type")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("application/octet-stream")
+                .to_string(),
+            extract_user_metadata(&headers)?,
+        ),
         _ => {
             return Err(S3Error::invalid_argument(
                 "invalid x-amz-metadata-directive",
@@ -545,7 +625,15 @@ async fn copy_object(
     // Write destination
     let result = state
         .storage
-        .put_object(&bucket, &key, &content_type, reader, checksum, encryption)
+        .put_object(
+            &bucket,
+            &key,
+            &content_type,
+            reader,
+            checksum,
+            encryption,
+            user_metadata,
+        )
         .await
         .map_err(|e| match e {
             StorageError::InvalidKey(msg) => S3Error::invalid_argument(&msg),
@@ -794,7 +882,7 @@ pub async fn get_object(
 
         let stream = ReaderStream::with_capacity(reader, 256 * 1024);
         let body = Body::from_stream(stream);
-        return Ok(Response::builder()
+        let builder = Response::builder()
             .status(StatusCode::PARTIAL_CONTENT)
             .header("Content-Type", &meta.content_type)
             .header("Content-Length", length.to_string())
@@ -804,9 +892,9 @@ pub async fn get_object(
             )
             .header("ETag", &meta.etag)
             .header("Last-Modified", to_http_date(&meta.last_modified))
-            .header("x-amz-mp-parts-count", total_parts.to_string())
-            .body(body)
-            .unwrap());
+            .header("x-amz-mp-parts-count", total_parts.to_string());
+        let builder = add_user_meta_headers(builder, &meta);
+        return Ok(builder.body(body).unwrap());
     }
 
     let range_header = headers.get("range").and_then(|v| v.to_str().ok());
@@ -846,7 +934,7 @@ pub async fn get_object(
                 let stream = ReaderStream::with_capacity(reader, 256 * 1024);
                 let body = Body::from_stream(stream);
 
-                return Ok(Response::builder()
+                let builder = Response::builder()
                     .status(StatusCode::PARTIAL_CONTENT)
                     .header("Content-Type", &meta.content_type)
                     .header("Content-Length", length.to_string())
@@ -856,9 +944,9 @@ pub async fn get_object(
                     )
                     .header("Accept-Ranges", "bytes")
                     .header("ETag", &meta.etag)
-                    .header("Last-Modified", to_http_date(&meta.last_modified))
-                    .body(body)
-                    .unwrap());
+                    .header("Last-Modified", to_http_date(&meta.last_modified));
+                let builder = add_user_meta_headers(builder, &meta);
+                return Ok(builder.body(body).unwrap());
             }
             Ok(None) => {
                 // Unparseable or multi-range — fall through to full 200
@@ -908,18 +996,14 @@ pub async fn get_object(
     let stream = ReaderStream::with_capacity(reader, 256 * 1024);
     let body = Body::from_stream(stream);
 
-    let mut builder = Response::builder()
+    let builder = Response::builder()
         .status(StatusCode::OK)
         .header("Content-Type", &meta.content_type)
         .header("Content-Length", meta.size.to_string())
         .header("Accept-Ranges", "bytes")
         .header("ETag", &meta.etag)
         .header("Last-Modified", to_http_date(&meta.last_modified));
-    if let Some(vid) = &meta.version_id {
-        builder = builder.header("x-amz-version-id", vid.as_str());
-    }
-    builder = add_checksum_header(builder, &meta);
-    builder = add_sse_headers(builder, &meta.encryption);
+    let builder = add_object_meta_headers(builder, &meta);
     Ok(builder.body(body).unwrap())
 }
 
@@ -988,24 +1072,21 @@ pub async fn head_object(
             .header("ETag", &meta.etag)
             .header("Last-Modified", to_http_date(&meta.last_modified))
             .header("x-amz-mp-parts-count", total_parts.to_string());
+        builder = add_user_meta_headers(builder, &meta);
         if let Some(vid) = &meta.version_id {
             builder = builder.header("x-amz-version-id", vid.as_str());
         }
         return Ok(builder.body(Body::empty()).unwrap());
     }
 
-    let mut builder = Response::builder()
+    let builder = Response::builder()
         .status(StatusCode::OK)
         .header("Content-Type", &meta.content_type)
         .header("Content-Length", meta.size.to_string())
         .header("ETag", &meta.etag)
         .header("Last-Modified", to_http_date(&meta.last_modified))
         .header("Accept-Ranges", "bytes");
-    if let Some(vid) = &meta.version_id {
-        builder = builder.header("x-amz-version-id", vid.as_str());
-    }
-    builder = add_checksum_header(builder, &meta);
-    builder = add_sse_headers(builder, &meta.encryption);
+    let builder = add_object_meta_headers(builder, &meta);
     Ok(builder.body(Body::empty()).unwrap())
 }
 
@@ -1200,6 +1281,7 @@ mod tests {
             checksum_algorithm: None,
             checksum_value: None,
             tags: None,
+            user_metadata: None,
             part_sizes: None,
             encryption: None,
         }

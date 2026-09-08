@@ -694,6 +694,16 @@
               }
             }
           },
+          "400": {
+            "description": "Invalid user metadata (x-amz-meta-*)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
           "404": {
             "description": "Bucket not found",
             "content": {

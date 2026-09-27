@@ -20,14 +20,24 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@1.97.1
+        with:
+          components: clippy, rustfmt
 
       - name: Install bun
         uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.2
+
+      - name: Install just
+        uses: extractions/setup-just@v3
 
       - name: Install frontend deps
         run: bun install --frozen-lockfile
         working-directory: ui
+
+      - name: Version check
+        run: just version-check
 
       - name: fmt
         run: cargo fmt --all -- --check
@@ -35,6 +45,17 @@ jobs:
       - name: clippy
         run: cargo clippy --all-targets --all-features -- -D warnings
 
-      - name: Build frontend
+      - name: Frontend build
         run: bun run build
         working-directory: ui
+
+      - name: Frontend lint
+        run: bun run lint
+        working-directory: ui
+
+      - name: Frontend tests
+        run: bun run test
+        working-directory: ui
+
+      - name: API client up to date
+        run: just api-check

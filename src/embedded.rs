@@ -3,13 +3,13 @@ use axum::response::{IntoResponse, Response};
 use rust_embed::Embed;
 
 #[derive(Embed)]
-#[folder = "ui/build"]
+#[folder = "ui/dist"]
 struct UiAssets;
 
 pub async fn ui_handler(uri: Uri) -> Response {
     let path = uri.path().strip_prefix("/ui").unwrap_or(uri.path());
     let path = path.trim_start_matches('/');
-    let path = if path.is_empty() { "200.html" } else { path };
+    let path = if path.is_empty() { "index.html" } else { path };
     let requested_file = UiAssets::get(path);
     let missing_asset = requested_file.is_none()
         && path
@@ -19,19 +19,14 @@ pub async fn ui_handler(uri: Uri) -> Response {
 
     match requested_file.map(|file| (file, path)).or_else(|| {
         (!missing_asset)
-            .then(|| UiAssets::get("200.html").map(|file| (file, "200.html")))
+            .then(|| UiAssets::get("index.html").map(|file| (file, "index.html")))
             .flatten()
     }) {
         Some((file, served_path)) => {
             let mime = mime_guess::from_path(served_path).first_or_octet_stream();
             let hash = file.metadata.sha256_hash();
             let etag = hex::encode(&hash[..8]);
-            let is_shell = served_path == "200.html" || served_path.ends_with(".html");
-            let cache_control = if is_shell {
-                "no-store, must-revalidate"
-            } else {
-                "public, max-age=31536000, immutable"
-            };
+            let cache_control = cache_control(served_path);
 
             (
                 StatusCode::OK,
@@ -50,5 +45,34 @@ pub async fn ui_handler(uri: Uri) -> Response {
             "UI not built. Run: cd ui && bun run build",
         )
             .into_response(),
+    }
+}
+
+/// Vite puts content-hashed files in `assets/`; everything else keeps its name between builds.
+fn cache_control(path: &str) -> &'static str {
+    if path.ends_with(".html") {
+        "no-store, must-revalidate"
+    } else if path.starts_with("assets/") {
+        "public, max-age=31536000, immutable"
+    } else {
+        "no-cache"
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::cache_control;
+
+    #[test]
+    fn only_hashed_assets_are_cached_forever() {
+        assert_eq!(
+            cache_control("assets/index-Buc3FXVi.js"),
+            "public, max-age=31536000, immutable"
+        );
+        assert_eq!(cache_control("index.html"), "no-store, must-revalidate");
+        // Icons and the manifest keep their names across builds: revalidate them.
+        for path in ["manifest.webmanifest", "icon-512.png", "logo.svg"] {
+            assert_eq!(cache_control(path), "no-cache", "{path}");
+        }
     }
 }

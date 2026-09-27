@@ -1,19 +1,18 @@
-FROM rust:1-bookworm AS builder
+# syntax=docker/dockerfile:1.7
+FROM oven/bun:1.4.2 AS web
+WORKDIR /app/ui
+COPY ui/package.json ui/bun.lock ./
+RUN bun install --frozen-lockfile
+COPY ui/ ./
+RUN bun run build
 
-RUN curl -fsSL https://bun.sh/install | bash
-ENV PATH="/root/.bun/bin:${PATH}"
-
+FROM rust:1.97.1-bookworm AS builder
 WORKDIR /app
-
-COPY ui/package.json ui/bun.lock ./ui/
-RUN cd ui && bun install --frozen-lockfile
-
-COPY Cargo.toml Cargo.lock build.rs ./
+COPY Cargo.toml Cargo.lock build.rs rust-toolchain.toml ./
 COPY src ./src
 COPY tests ./tests
-COPY ui ./ui
-
-RUN cd ui && bun run build
+# Prebuilt UI: build.rs sees ui/dist/index.html and skips the bun build.
+COPY --from=web /app/ui/dist ./ui/dist
 RUN cargo build --release --locked
 
 FROM debian:bookworm-slim AS runtime

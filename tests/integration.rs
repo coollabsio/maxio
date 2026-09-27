@@ -6952,7 +6952,10 @@ async fn test_null_version_preserved_on_overwrite() {
 
     // Current object is the new content.
     let get = s3_request("GET", &format!("{}/nullver/doc.txt", base_url), vec![]).await;
-    assert_eq!(get.bytes().await.unwrap().as_ref(), b"new versioned content");
+    assert_eq!(
+        get.bytes().await.unwrap().as_ref(),
+        b"new versioned content"
+    );
 
     // The pre-versioning object must still be retrievable as version "null".
     let get_null = s3_request(
@@ -6962,7 +6965,10 @@ async fn test_null_version_preserved_on_overwrite() {
     )
     .await;
     assert_eq!(get_null.status(), 200, "null version must be preserved");
-    assert_eq!(get_null.bytes().await.unwrap().as_ref(), original.as_slice());
+    assert_eq!(
+        get_null.bytes().await.unwrap().as_ref(),
+        original.as_slice()
+    );
 }
 
 /// Deleting the newest version must fall back to the archived null version,
@@ -7003,11 +7009,19 @@ async fn test_null_version_restored_after_newest_version_deleted() {
         vec![],
     )
     .await;
-    assert!(del.status().is_success(), "delete of v2 failed: {}", del.status());
+    assert!(
+        del.status().is_success(),
+        "delete of v2 failed: {}",
+        del.status()
+    );
 
     // The null version must be promoted back to current.
     let get = s3_request("GET", &format!("{}/nullrestore/doc.txt", base_url), vec![]).await;
-    assert_eq!(get.status(), 200, "null version must be restored as current");
+    assert_eq!(
+        get.status(),
+        200,
+        "null version must be restored as current"
+    );
     assert_eq!(get.bytes().await.unwrap().as_ref(), original.as_slice());
 }
 
@@ -7044,8 +7058,15 @@ async fn test_null_version_preserved_on_delete_marker() {
         vec![],
     )
     .await;
-    assert_eq!(get_null.status(), 200, "delete marker must not destroy the null version");
-    assert_eq!(get_null.bytes().await.unwrap().as_ref(), original.as_slice());
+    assert_eq!(
+        get_null.status(),
+        200,
+        "delete marker must not destroy the null version"
+    );
+    assert_eq!(
+        get_null.bytes().await.unwrap().as_ref(),
+        original.as_slice()
+    );
 }
 
 /// CompleteMultipartUpload with parts out of ascending order must be rejected
@@ -7309,7 +7330,10 @@ async fn test_housekeeping_restores_stranded_backup() {
     // Age the backup past the 1-hour recovery gate.
     let old = std::time::SystemTime::now() - std::time::Duration::from_secs(2 * 3600);
     let times = std::fs::FileTimes::new().set_modified(old);
-    std::fs::File::open(&backup).unwrap().set_times(times).unwrap();
+    std::fs::File::open(&backup)
+        .unwrap()
+        .set_times(times)
+        .unwrap();
 
     storage.housekeeping_sweep(chrono::Duration::days(7)).await;
 
@@ -7347,10 +7371,7 @@ async fn test_list_objects_empty_delimiter_means_no_delimiter() {
 
     let resp = s3_request(
         "GET",
-        &format!(
-            "{}/listbucket/?delimiter=&list-type=2&prefix=",
-            base_url
-        ),
+        &format!("{}/listbucket/?delimiter=&list-type=2&prefix=", base_url),
         vec![],
     )
     .await;
@@ -7387,4 +7408,23 @@ async fn test_delete_bucket_ignores_crash_leftover_temps() {
     );
     let head = s3_request("HEAD", &format!("{}/crashbucket", base_url), vec![]).await;
     assert_eq!(head.status(), 404);
+}
+
+#[tokio::test]
+async fn test_ui_without_trailing_slash_redirects_to_ui_root() {
+    let (base_url, _tmp) = start_server().await;
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap();
+
+    for (path, location) in [("/ui", "/ui/"), ("/ui?next=x", "/ui/?next=x")] {
+        let resp = client
+            .get(format!("{}{}", base_url, path))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 308, "{path}");
+        assert_eq!(resp.headers()["location"], location, "{path}");
+    }
 }

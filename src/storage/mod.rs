@@ -292,32 +292,41 @@ pub struct UploadEncryptionSpec {
 
 /// Returns `true` if `name` is a valid S3 bucket name.
 pub fn is_valid_bucket_name(name: &str) -> bool {
+    bucket_name_error(name).is_none()
+}
+
+/// Explains why `name` is not a valid S3 bucket name, or `None` when it is valid.
+pub fn bucket_name_error(name: &str) -> Option<&'static str> {
     if name.len() < 3 || name.len() > 63 {
-        return false;
+        return Some("Bucket name must be 3-63 characters long.");
     }
     if !name
         .chars()
         .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '.')
     {
-        return false;
+        return Some(
+            "Bucket name may only contain lowercase letters, numbers, hyphens (-), and dots (.).",
+        );
     }
 
     let first = name.chars().next().unwrap();
     let last = name.chars().last().unwrap();
     if !first.is_ascii_alphanumeric() || !last.is_ascii_alphanumeric() {
-        return false;
+        return Some("Bucket name must start and end with a letter or number.");
     }
 
     if name.contains("..") || name.contains(".-") || name.contains("-.") {
-        return false;
+        return Some("Bucket name must not contain two dots in a row or a dot next to a hyphen.");
     }
 
     let parts: Vec<&str> = name.split('.').collect();
     if parts.len() == 4 && parts.iter().all(|p| p.parse::<u8>().is_ok()) {
-        return false;
+        return Some(
+            "Bucket name must not be formatted as an IP address (for example 192.168.5.4).",
+        );
     }
 
-    true
+    None
 }
 
 /// Create each bucket in `default_buckets` (comma-separated) if it does not
@@ -413,5 +422,22 @@ mod validation_tests {
     #[test]
     fn accepts_s3_style_bucket_name() {
         assert!(validate_bucket_name("prod-logs.2026").is_ok());
+    }
+
+    #[test]
+    fn bucket_name_error_explains_each_rule() {
+        use super::bucket_name_error;
+        assert_eq!(bucket_name_error("prod-logs.2026"), None);
+        for (name, expected) in [
+            ("ab", "must be 3-63 characters long"),
+            ("My-Bucket", "may only contain lowercase letters"),
+            ("-bucket", "must start and end with a letter or number"),
+            ("evil..bucket", "must not contain two dots in a row"),
+            ("a.-b", "or a dot next to a hyphen"),
+            ("192.168.0.1", "must not be formatted as an IP address"),
+        ] {
+            let reason = bucket_name_error(name).unwrap_or_default();
+            assert!(reason.contains(expected), "{name}: got {reason:?}");
+        }
     }
 }

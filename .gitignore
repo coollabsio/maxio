@@ -3,6 +3,4 @@
 /ui/dist
 /ui/node_modules
 .DS_Store
-
-/ui/build
-/ui/.svelte-kit
+.ai/todo.md

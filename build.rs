@@ -8,21 +8,21 @@ fn main() {
     println!("cargo:rerun-if-env-changed=SKIP_FRONTEND");
     println!("cargo:rerun-if-changed=ui/package.json");
     println!("cargo:rerun-if-changed=ui/bun.lock");
-    println!("cargo:rerun-if-changed=ui/svelte.config.js");
+    println!("cargo:rerun-if-changed=ui/index.html");
     println!("cargo:rerun-if-changed=ui/vite.config.ts");
     println!("cargo:rerun-if-changed=ui/src");
-    println!("cargo:rerun-if-changed=ui/static");
-    println!("cargo:rerun-if-changed=ui/build");
+    println!("cargo:rerun-if-changed=ui/public");
+    println!("cargo:rerun-if-changed=ui/dist");
 
     let ui_dir = Path::new("ui");
-    let build_dir = ui_dir.join("build");
+    let build_dir = ui_dir.join("dist");
 
     if std::env::var("SKIP_FRONTEND").ok().as_deref() == Some("1") {
         ensure_minimal_frontend(&build_dir);
         return;
     }
 
-    let existing_artifact = build_dir.join("200.html");
+    let existing_artifact = build_dir.join("index.html");
     if existing_artifact.exists() && !frontend_inputs_newer_than(&existing_artifact) {
         return;
     }
@@ -62,10 +62,10 @@ fn frontend_inputs_newer_than(artifact: &Path) -> bool {
     let roots = [
         PathBuf::from("ui/package.json"),
         PathBuf::from("ui/bun.lock"),
-        PathBuf::from("ui/svelte.config.js"),
+        PathBuf::from("ui/index.html"),
         PathBuf::from("ui/vite.config.ts"),
         PathBuf::from("ui/src"),
-        PathBuf::from("ui/static"),
+        PathBuf::from("ui/public"),
     ];
 
     roots.iter().any(|path| newest_mtime(path) > artifact_mtime)
@@ -93,13 +93,13 @@ fn mtime(path: &Path) -> SystemTime {
 }
 
 fn ensure_minimal_frontend(build_dir: &Path) {
-    fs::create_dir_all(build_dir).expect("create ui/build for SKIP_FRONTEND");
-    let fallback = build_dir.join("200.html");
+    fs::create_dir_all(build_dir).expect("create ui/dist for SKIP_FRONTEND");
+    let fallback = build_dir.join("index.html");
     if !fallback.exists() {
         fs::write(
             &fallback,
             "<!doctype html><title>MaxIO</title><body>UI build skipped</body>",
         )
-        .expect("write minimal ui/build/200.html");
+        .expect("write minimal ui/dist/index.html");
     }
 }

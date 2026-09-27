@@ -29,17 +29,17 @@ The release binary is fully self-contained — the frontend UI is embedded at co
 # 1. Install frontend dependencies
 cd ui && bun install
 
-# 2. Build frontend (outputs to ui/build/; cargo build also does this automatically)
+# 2. Build frontend (outputs to ui/dist/; cargo build also does this automatically)
 bun run build && cd ..
 
 # 3. Build optimized binary
 cargo build --release
 
 # Result: single binary at ./target/release/maxio
-# Copy it anywhere — no ui/build/ or other files needed at runtime
+# Copy it anywhere — no ui/dist/ or other files needed at runtime
 ```
 
-The binary serves the web console at `/ui/` with proper MIME types, ETags, and cache headers (immutable for hashed assets, no-store for `200.html` / HTML shell).
+The binary serves the web console at `/ui/` (`/ui` redirects there with 308, also in the Vite dev server) with proper MIME types, ETags, and cache headers (immutable for hashed assets, no-store for `index.html` / HTML shell).
 
 Defaults: port 9000, access/secret `maxioadmin`/`maxioadmin`, region `us-east-1`
 
@@ -47,11 +47,13 @@ Defaults: port 9000, access/secret `maxioadmin`/`maxioadmin`, region `us-east-1`
 
 **Test-Driven Development (TDD)**: Before implementing any new function or feature, write a failing test first. Then implement until the test passes.
 
+Tasks run through [`just`](https://github.com/casey/just) (see `justfile`). Toolchains are pinned: Rust in `rust-toolchain.toml`, bun 1.4.2 in CI.
+
 **After every code change**, re-run the full test suite to catch regressions:
 
 ```bash
-# 1. Unit + integration tests (always run first, no server needed)
-cargo test
+# 1. Full gate: fmt, clippy, cargo test, UI build/lint/tests, API client check
+just check
 
 # 2. AWS CLI integration tests (start server, run tests, stop server)
 cargo build && RUST_LOG=info ./target/debug/maxio --data-dir /tmp/maxio-test --port 9876 &
@@ -62,12 +64,18 @@ kill %1 && rm -rf /tmp/maxio-test
 **Hot-reload dev server** (for manual testing):
 
 ```bash
-bun run dev
+just dev   # or: bun run dev
 ```
 
 This runs both processes concurrently (Ctrl+C kills both):
 - `cargo watch` — rebuilds and restarts the Rust server on backend changes
-- Vite dev server — serves the UI with HMR at `http://127.0.0.1:5173/ui/` and proxies `/api` to the Rust server
+- Vite dev server — serves the UI with HMR at `http://127.0.0.1:5190/ui/` (override with `MAXIO_DEV_WEB_PORT`) and proxies `/api` to the Rust server
+
+**Tailnet access**: Vite binds to `127.0.0.1` and accepts `*.ts.net` hosts. Expose it to the tailnet (HTTPS, tailnet only) once with `tailscale serve --bg --https=5190 http://127.0.0.1:5190`, then open `https://<machine>.<tailnet>.ts.net:5190/ui/`.
+
+**Console API changes**: the UI client is generated from the Rust handlers. After you change a handler in `src/api/console.rs` (add `#[utoipa::path]` and register it in `src/openapi.rs`), run `just api` and commit `ui/src/api/generated/`. `just api-check` (in CI) fails when the client is stale.
+
+**UI e2e**: `just e2e` starts a fresh server on port 9876 and runs Playwright (`ui/e2e/`). Run `cd ui && bunx playwright install chromium` once.
 
 ## Architecture
 
@@ -79,6 +87,7 @@ This runs both processes concurrently (Ctrl+C kills both):
 - `src/error.rs` — S3Error with XML error response rendering
 - `src/auth/` — AWS Signature V4 verification + Axum middleware
 - `src/api/` — S3 API handlers (bucket.rs, object.rs, multipart.rs, list.rs, router.rs, console.rs)
+- `src/openapi.rs` — utoipa OpenAPI document for the console API (`maxio openapi --output <file>`)
 - `src/storage/` — Filesystem storage (buckets as dirs, objects as files, JSON sidecar metadata)
 - `src/xml/` — S3 XML response types (serde + quick-xml)
 
@@ -88,8 +97,8 @@ This runs both processes concurrently (Ctrl+C kills both):
 - **Storage layout**: `{data_dir}/buckets/{bucket-name}/{key-path}` for data, `{key-path}.meta.json` for metadata, `.bucket.json` for bucket metadata
 - **Path-style only**: `/{bucket}/{key}` routing. No virtual-hosted-style yet
 - **UNSIGNED-PAYLOAD accepted**: Skips body hashing for PutObject (AWS CLI default)
-- **Embedded UI assets**: Frontend is compiled into the binary via `rust-embed`. In debug builds, assets are read from the SvelteKit static build (`ui/build/`) when embedded; dev uses Vite/SvelteKit HMR. In release builds, assets are baked in — single binary, no external files needed
-- **Web console**: SPA at `/ui/`, API at `/api/`. Cookie-based auth (HMAC tokens, not SigV4). Presigned URL generation with configurable expiry (1h/6h/24h/7d picker in UI)
+- **Embedded UI assets**: Frontend is compiled into the binary via `rust-embed`. `build.rs` runs `bun run build` into `ui/dist/` (skip with `SKIP_FRONTEND=1`); `index.html` is the SPA fallback. Dev uses Vite HMR. In release builds, assets are baked in — single binary, no external files needed
+- **Web console**: React SPA at `/ui/`, API at `/api/` (OpenAPI via utoipa, typed client generated with hey-api). Cookie-based auth (HMAC tokens, not SigV4). Presigned URL generation with configurable expiry (1h/6h/24h/7d picker in UI)
 
 ### Data Layout
 
@@ -162,6 +171,15 @@ This runs both processes concurrently (Ctrl+C kills both):
 | `/api/buckets/{bucket}/upload/{key}` | PUT | cookie | Upload object |
 | `/api/buckets/{bucket}/download/{key}` | GET | cookie | Download object |
 | `/api/buckets/{bucket}/presign/{key}` | GET | cookie | Generate presigned URL (`?expires=SECONDS`, default 3600, max 604800) |
+| `/api/buckets/{bucket}/folders` | POST | cookie | Create folder marker (`{ name }`) |
+| `/api/buckets/{bucket}/versioning` | GET/PUT | cookie | Bucket versioning (`{ enabled }`) |
+| `/api/buckets/{bucket}/encryption` | GET/PUT | cookie | Bucket default SSE-S3 (`{ enabled }`) |
+| `/api/buckets/{bucket}/public` | GET/PUT | cookie | Anonymous read/list (`{ read, list }`) |
+| `/api/buckets/{bucket}/versions` | GET | cookie | List versions of one key (`?key=`) |
+| `/api/buckets/{bucket}/versions/{versionId}/objects/{key}` | DELETE | cookie | Delete a version |
+| `/api/buckets/{bucket}/versions/{versionId}/download/{key}` | GET | cookie | Download a version |
+
+The full contract is `ui/src/api/generated/openapi.json` (generated — do not edit).
 
 ### Server-Side Encryption (SSE)
 
@@ -189,7 +207,7 @@ The `.maxio-keys.json` file is the single source of truth for SSE-S3 decryption.
 
 ### Frontend Error Logging
 
-All `fetch` catch blocks in UI components log errors via `console.error` with context (e.g. `'fetchBuckets failed:'`, `'shareObject failed:'`). Check browser DevTools console for debugging.
+API calls go through the generated client configured in `ui/src/api/client.ts`. Non-2xx responses become an `ApiError` (`status`, `message` from `{ "error": ... }`); a 401 outside `/api/auth/` sends the user to `/ui/login`. Failed mutations show a toast. Check the browser DevTools console and network tab for debugging.
 
 ### Testing with MinIO Client (mc)
 
@@ -240,6 +258,12 @@ aws --endpoint-url http://localhost:9000 s3 rb s3://test-bucket
 # Unit + integration tests (no server needed)
 cargo test
 
+# UI unit tests (bun test + happy-dom + Testing Library) and lint (oxlint)
+cd ui && bun run test && bun run lint
+
+# UI e2e (Playwright, starts its own server)
+just e2e
+
 # AWS CLI integration tests (requires running server)
 ./tests/aws_cli_test.sh
 ```
@@ -278,14 +302,15 @@ bun run bench:quick  # quick smoke test
 
 The web console (`ui/`) follows the Coolify design system. The full specification is in [`ui/DESIGN_SYSTEM.md`](ui/DESIGN_SYSTEM.md). Key points:
 
-- **Stack**: SvelteKit static SPA, Svelte 5, Vite, Tailwind CSS v4, shadcn-svelte components, TanStack Query
-- **Theme**: Class-based dark mode (`.dark` on `<html>`), with light/dark CSS variable swap in `ui/src/app.css`
+- **Stack**: React 19 SPA (React Compiler), Vite 8, TypeScript 6, React Router 8, TanStack Query 5, Tailwind CSS v4, shadcn (`base-nova`) on `@base-ui/react`, `lucide-react`, `sonner`. Same stack as Orbit
+- **Theme**: Class-based dark mode (`.dark` on `<html>`), with light/dark CSS variable swap in `ui/src/index.css`
 - **Accent colors**: Coollabs purple `#6b16ed` (light) / warning yellow `#fcd452` (dark). Brand purple (`--color-brand`) is always `#6b16ed` regardless of theme
 - **Font**: Geist Sans + Geist Mono via `@fontsource/geist-sans` / `@fontsource/geist-mono` (Inter fallback)
-- **Inputs**: Inset box-shadow system (4px colored left bar on focus), no standard borders — see `.input-cool` in `app.css`
+- **Inputs**: Inset box-shadow system (4px colored left bar on focus), no standard borders — see `.input-cool` in `index.css`
 - **Buttons**: `border-2`, `h-8`, `rounded-sm`. Variants: `default`, `highlighted`, `destructive`, `outline`, `secondary`, `ghost`, `link`, `brand`
 - **Border radius**: `0.125rem` (2px) everywhere — set via `--radius` in `@theme inline`
-- **Sidebar**: Collapsible 224px → 56px icon-only, uses `--cool-sidebar-*` CSS variables
+- **Sidebar**: Collapsible 256px → 64px icon-only, uses `--cool-sidebar-*` CSS variables
+- **Icons / web app**: `ui/public/logo.svg` is the single source. `cd ui && bun run icons` regenerates the favicon, Apple touch icon, and PWA icons (incl. maskable) in `ui/public/`; `manifest.webmanifest` makes the console installable (start URL `/ui/`)
 
 ## Roadmap
 

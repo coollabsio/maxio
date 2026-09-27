@@ -34,13 +34,21 @@ pub fn build_router(state: AppState) -> Router {
         .nest("/api", console_router(state.clone()))
         .route("/healthz", get(healthz))
         .route("/readyz", get(readyz))
-        .route("/ui", get(ui_handler))
+        .route("/ui", get(redirect_to_ui_root))
         .route("/ui/", get(ui_handler))
         .route("/ui/{*path}", get(ui_handler))
         .merge(s3_routes)
         .layer(axum::middleware::from_fn(security_headers_middleware))
         .layer(axum::middleware::from_fn(request_id_middleware))
         .with_state(state)
+}
+
+/// `/ui` -> `/ui/` (keeps the query), so the console has one canonical base URL.
+async fn redirect_to_ui_root(uri: axum::http::Uri) -> axum::response::Redirect {
+    match uri.query() {
+        Some(query) => axum::response::Redirect::permanent(&format!("/ui/?{query}")),
+        None => axum::response::Redirect::permanent("/ui/"),
+    }
 }
 
 async fn healthz() -> StatusCode {

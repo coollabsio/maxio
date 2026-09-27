@@ -7,7 +7,8 @@ cd "$ROOT"
 PORT="${PORT:-9000}"
 HOST="${HOST:-127.0.0.1}"
 DATA_DIR="${DATA_DIR:-./data}"
-UI_URL="http://127.0.0.1:5173/ui/"
+WEB_PORT="${MAXIO_DEV_WEB_PORT:-5190}"
+UI_URL="http://127.0.0.1:$WEB_PORT/ui/"
 
 command -v bun >/dev/null 2>&1 || {
   echo "bun is required for frontend dev." >&2
@@ -40,11 +41,17 @@ trap cleanup EXIT INT TERM
 
 echo "MaxIO dev mode"
 echo "Open: $UI_URL"
+if command -v tailscale >/dev/null 2>&1; then
+  ts_host="$(tailscale status --json 2>/dev/null | sed -n 's/.*"DNSName": "\([^"]*\)\.".*/\1/p' | head -n1)"
+  if [[ -n "$ts_host" ]]; then
+    echo "Tailnet: https://$ts_host:$WEB_PORT/ui/ (needs: tailscale serve --bg --https=$WEB_PORT http://127.0.0.1:$WEB_PORT)"
+  fi
+fi
 echo
 
 (
   cd "$ROOT/ui"
-  exec bun run dev
+  exec env MAXIO_DEV_WEB_PORT="$WEB_PORT" PORT="$PORT" bun run dev
 ) &
 frontend_pid=$!
 

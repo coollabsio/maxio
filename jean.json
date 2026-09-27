@@ -6,7 +6,7 @@
   },
   "ports": [
     {
-      "port": 5173,
+      "port": 5190,
       "label": "Frontend"
     }
   ]

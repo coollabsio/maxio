@@ -42,8 +42,9 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@1.97.1
         with:
+          components: clippy, rustfmt
           targets: ${{ matrix.target }}
 
       - name: Install cross-compilation tools (ARM64)
@@ -54,6 +55,8 @@ jobs:
 
       - name: Install bun
         uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.2
 
       - name: Install frontend deps
         run: bun install --frozen-lockfile

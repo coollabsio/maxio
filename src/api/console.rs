@@ -12,7 +12,9 @@ use axum::{
 };
 use futures::TryStreamExt;
 use hmac::{Hmac, Mac};
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use utoipa::{IntoParams, ToSchema};
 
 use crate::auth::signature_v4;
 use crate::server::AppState;
@@ -146,6 +148,40 @@ fn make_cookie(value: &str, max_age: i64, secure: bool) -> String {
     )
 }
 
+#[derive(Serialize, ToSchema)]
+pub struct OkResponse {
+    ok: bool,
+}
+
+#[derive(Serialize, ToSchema)]
+pub struct ErrorResponse {
+    error: String,
+}
+
+/// Raw object bytes (upload body and download response).
+#[derive(ToSchema)]
+#[schema(value_type = String, format = Binary)]
+#[allow(dead_code)]
+pub struct BinaryBody(Vec<u8>);
+
+fn ok() -> Response {
+    (StatusCode::OK, Json(OkResponse { ok: true })).into_response()
+}
+
+fn error(status: StatusCode, message: impl Into<String>) -> Response {
+    (
+        status,
+        Json(ErrorResponse {
+            error: message.into(),
+        }),
+    )
+        .into_response()
+}
+
+fn internal(e: impl std::fmt::Display) -> Response {
+    error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+}
+
 async fn console_auth_middleware(
     State(state): State<AppState>,
     request: Request,
@@ -156,22 +192,31 @@ async fn console_auth_middleware(
         .unwrap_or(false);
 
     if !authenticated {
-        return (
-            StatusCode::UNAUTHORIZED,
-            Json(serde_json::json!({"error": "Not authenticated"})),
-        )
-            .into_response();
+        return error(StatusCode::UNAUTHORIZED, "Not authenticated");
     }
     next.run(request).await
 }
 
-#[derive(serde::Deserialize)]
+#[derive(Deserialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct LoginRequest {
     access_key: String,
     secret_key: String,
 }
 
+#[utoipa::path(
+    post,
+    path = "/api/auth/login",
+    operation_id = "login",
+    tag = "auth",
+    security(()),
+    request_body = LoginRequest,
+    responses(
+        (status = 200, body = OkResponse),
+        (status = 401, description = "Invalid credentials", body = ErrorResponse),
+        (status = 429, description = "Too many login attempts", body = ErrorResponse),
+    )
+)]
 pub async fn login(
     State(state): State<AppState>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
@@ -182,9 +227,11 @@ pub async fn login(
 
     if let Some(retry_after) = state.login_rate_limiter.check_and_increment(&ip) {
         return (
-            StatusCode::TOO_MANY_REQUESTS,
             [(axum::http::header::RETRY_AFTER, retry_after.to_string())],
-            Json(serde_json::json!({"error": "Too many login attempts. Try again later."})),
+            error(
+                StatusCode::TOO_MANY_REQUESTS,
+                "Too many login attempts. Try again later.",
+            ),
         )
             .into_response();
     }
@@ -199,11 +246,7 @@ pub async fn login(
         state.config.secret_key.as_bytes(),
     );
     if !key_match || !secret_match {
-        return (
-            StatusCode::UNAUTHORIZED,
-            Json(serde_json::json!({"error": "Invalid credentials"})),
-        )
-            .into_response();
+        return error(StatusCode::UNAUTHORIZED, "Invalid credentials");
     }
 
     let now = chrono::Utc::now().timestamp();
@@ -216,31 +259,40 @@ pub async fn login(
 
     let mut resp_headers = HeaderMap::new();
     resp_headers.insert("Set-Cookie", cookie.parse().unwrap());
-
-    (
-        StatusCode::OK,
-        resp_headers,
-        Json(serde_json::json!({"ok": true})),
-    )
-        .into_response()
+    (resp_headers, ok()).into_response()
 }
 
-pub async fn check(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
+#[utoipa::path(
+    get,
+    path = "/api/auth/check",
+    operation_id = "checkAuth",
+    tag = "auth",
+    security(()),
+    responses(
+        (status = 200, body = OkResponse),
+        (status = 401, description = "Not authenticated", body = ErrorResponse),
+    )
+)]
+pub async fn check(State(state): State<AppState>, headers: HeaderMap) -> Response {
     let authenticated = extract_cookie(&headers)
         .map(|token| verify_token(&token, &state.config.access_key, &state.config.secret_key))
         .unwrap_or(false);
 
     if authenticated {
-        (StatusCode::OK, Json(serde_json::json!({"ok": true})))
+        ok()
     } else {
-        (
-            StatusCode::UNAUTHORIZED,
-            Json(serde_json::json!({"error": "Not authenticated"})),
-        )
+        error(StatusCode::UNAUTHORIZED, "Not authenticated")
     }
 }
 
-pub async fn logout(State(state): State<AppState>) -> impl IntoResponse {
+#[utoipa::path(
+    post,
+    path = "/api/auth/logout",
+    operation_id = "logout",
+    tag = "auth",
+    responses((status = 200, body = OkResponse))
+)]
+pub async fn logout(State(state): State<AppState>) -> Response {
     let cookie = make_cookie(
         "",
         0,
@@ -248,11 +300,7 @@ pub async fn logout(State(state): State<AppState>) -> impl IntoResponse {
     );
     let mut resp_headers = HeaderMap::new();
     resp_headers.insert("Set-Cookie", cookie.parse().unwrap());
-    (
-        StatusCode::OK,
-        resp_headers,
-        Json(serde_json::json!({"ok": true})),
-    )
+    (resp_headers, ok()).into_response()
 }
 
 async fn console_csrf_middleware(
@@ -281,11 +329,7 @@ async fn console_csrf_middleware(
         if let Some(origin) = origin {
             if !same_origin_host(origin, host) && !dev_loopback_origin_allowed(&state, origin, host)
             {
-                return (
-                    StatusCode::FORBIDDEN,
-                    Json(serde_json::json!({"error": "CSRF origin check failed"})),
-                )
-                    .into_response();
+                return error(StatusCode::FORBIDDEN, "CSRF origin check failed");
             }
         }
     }
@@ -334,45 +378,71 @@ fn apply_security_headers(headers: &mut HeaderMap) {
     headers.insert("x-frame-options", "DENY".parse().unwrap());
 }
 
-pub async fn list_buckets(State(state): State<AppState>) -> impl IntoResponse {
+#[derive(Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct BucketSummary {
+    name: String,
+    created_at: String,
+    versioning: bool,
+    encryption: bool,
+}
+
+#[derive(Serialize, ToSchema)]
+pub struct BucketListResponse {
+    buckets: Vec<BucketSummary>,
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/buckets",
+    operation_id = "listBuckets",
+    tag = "buckets",
+    responses(
+        (status = 200, body = BucketListResponse),
+        (status = 500, body = ErrorResponse),
+    )
+)]
+pub async fn list_buckets(State(state): State<AppState>) -> Response {
     match state.storage.list_buckets().await {
         Ok(buckets) => {
-            let list: Vec<serde_json::Value> = buckets
+            let buckets = buckets
                 .into_iter()
-                .map(|b| {
-                    serde_json::json!({
-                        "name": b.name,
-                        "createdAt": b.created_at,
-                        "versioning": b.versioning,
-                        "encryption": b.encryption_config.is_some(),
-                    })
+                .map(|b| BucketSummary {
+                    name: b.name,
+                    created_at: b.created_at,
+                    versioning: b.versioning,
+                    encryption: b.encryption_config.is_some(),
                 })
                 .collect();
-            (StatusCode::OK, Json(serde_json::json!({ "buckets": list }))).into_response()
+            (StatusCode::OK, Json(BucketListResponse { buckets })).into_response()
         }
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({ "error": e.to_string() })),
-        )
-            .into_response(),
+        Err(e) => internal(e),
     }
 }
 
-#[derive(serde::Deserialize)]
+#[derive(Deserialize, ToSchema)]
 pub struct CreateBucketRequest {
     name: String,
 }
 
+#[utoipa::path(
+    post,
+    path = "/api/buckets",
+    operation_id = "createBucket",
+    tag = "buckets",
+    request_body = CreateBucketRequest,
+    responses(
+        (status = 200, body = OkResponse),
+        (status = 400, description = "Invalid bucket name", body = ErrorResponse),
+        (status = 409, description = "Bucket already exists", body = ErrorResponse),
+    )
+)]
 pub async fn create_bucket(
     State(state): State<AppState>,
     Json(body): Json<CreateBucketRequest>,
-) -> impl IntoResponse {
-    if crate::storage::validate_bucket_name(&body.name).is_err() {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({"error": "Invalid bucket name"})),
-        )
-            .into_response();
+) -> Response {
+    if let Some(reason) = crate::storage::bucket_name_error(&body.name) {
+        return error(StatusCode::BAD_REQUEST, reason);
     }
     let now = chrono::Utc::now()
         .format("%Y-%m-%dT%H:%M:%S%.3fZ")
@@ -389,71 +459,91 @@ pub async fn create_bucket(
     };
 
     match state.storage.create_bucket(&meta).await {
-        Ok(true) => (StatusCode::OK, Json(serde_json::json!({"ok": true}))).into_response(),
-        Ok(false) => (
-            StatusCode::CONFLICT,
-            Json(serde_json::json!({"error": "Bucket already exists"})),
-        )
-            .into_response(),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": e.to_string()})),
-        )
-            .into_response(),
+        Ok(true) => ok(),
+        Ok(false) => error(StatusCode::CONFLICT, "Bucket already exists"),
+        Err(e) => internal(e),
     }
 }
 
+#[utoipa::path(
+    delete,
+    path = "/api/buckets/{bucket}",
+    operation_id = "deleteBucket",
+    tag = "buckets",
+    params(("bucket" = String, Path)),
+    responses(
+        (status = 200, body = OkResponse),
+        (status = 404, description = "Bucket not found", body = ErrorResponse),
+        (status = 409, description = "Bucket is not empty", body = ErrorResponse),
+    )
+)]
 pub async fn delete_bucket_api(
     State(state): State<AppState>,
     Path(bucket): Path<String>,
-) -> impl IntoResponse {
+) -> Response {
     match state.storage.delete_bucket(&bucket).await {
-        Ok(true) => (StatusCode::OK, Json(serde_json::json!({"ok": true}))).into_response(),
-        Ok(false) => (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({"error": "Bucket not found"})),
-        )
-            .into_response(),
-        Err(crate::storage::StorageError::BucketNotEmpty) => (
-            StatusCode::CONFLICT,
-            Json(serde_json::json!({"error": "Bucket is not empty"})),
-        )
-            .into_response(),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": e.to_string()})),
-        )
-            .into_response(),
+        Ok(true) => ok(),
+        Ok(false) => error(StatusCode::NOT_FOUND, "Bucket not found"),
+        Err(crate::storage::StorageError::BucketNotEmpty) => {
+            error(StatusCode::CONFLICT, "Bucket is not empty")
+        }
+        Err(e) => internal(e),
     }
 }
 
-#[derive(serde::Deserialize)]
+/// Returns an error response unless the bucket exists.
+async fn require_bucket(state: &AppState, bucket: &str) -> Result<(), Response> {
+    match state.storage.head_bucket(bucket).await {
+        Ok(true) => Ok(()),
+        Ok(false) => Err(error(StatusCode::NOT_FOUND, "Bucket not found")),
+        Err(e) => Err(internal(e)),
+    }
+}
+
+#[derive(Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
 pub struct ListObjectsParams {
     prefix: Option<String>,
+    /// Defaults to `/`.
     delimiter: Option<String>,
 }
 
+#[derive(Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ObjectSummary {
+    key: String,
+    size: u64,
+    last_modified: String,
+    etag: String,
+}
+
+#[derive(Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ObjectListResponse {
+    files: Vec<ObjectSummary>,
+    prefixes: Vec<String>,
+    /// Prefixes that only contain a folder marker.
+    empty_prefixes: Vec<String>,
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/buckets/{bucket}/objects",
+    operation_id = "listObjects",
+    tag = "objects",
+    params(("bucket" = String, Path), ListObjectsParams),
+    responses(
+        (status = 200, body = ObjectListResponse),
+        (status = 404, description = "Bucket not found", body = ErrorResponse),
+    )
+)]
 pub async fn list_objects(
     State(state): State<AppState>,
     Path(bucket): Path<String>,
     Query(params): Query<ListObjectsParams>,
-) -> impl IntoResponse {
-    match state.storage.head_bucket(&bucket).await {
-        Ok(true) => {}
-        Ok(false) => {
-            return (
-                StatusCode::NOT_FOUND,
-                Json(serde_json::json!({"error": "Bucket not found"})),
-            )
-                .into_response();
-        }
-        Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": e.to_string()})),
-            )
-                .into_response();
-        }
+) -> Response {
+    if let Err(resp) = require_bucket(&state, &bucket).await {
+        return resp;
     }
 
     let prefix = params.prefix.unwrap_or_default();
@@ -461,13 +551,7 @@ pub async fn list_objects(
 
     let all_objects = match state.storage.list_objects(&bucket, &prefix).await {
         Ok(objects) => objects,
-        Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": e.to_string()})),
-            )
-                .into_response();
-        }
+        Err(e) => return internal(e),
     };
 
     let mut files = Vec::new();
@@ -479,61 +563,67 @@ pub async fn list_objects(
             let common = format!("{}{}", prefix, &suffix[..pos + delimiter.len()]);
             prefix_set.insert(common);
         } else if !obj.key.ends_with('/') {
-            files.push(serde_json::json!({
-                "key": obj.key,
-                "size": obj.size,
-                "lastModified": obj.last_modified,
-                "etag": obj.etag,
-            }));
+            files.push(ObjectSummary {
+                key: obj.key.clone(),
+                size: obj.size,
+                last_modified: obj.last_modified.clone(),
+                etag: obj.etag.clone(),
+            });
         }
     }
 
     // Determine which prefixes are empty (only contain a folder marker, no real objects)
-    let mut empty_prefixes: Vec<&String> = Vec::new();
-    for p in &prefix_set {
-        let has_children = all_objects
-            .iter()
-            .any(|obj| obj.key.starts_with(p.as_str()) && obj.key != *p);
-        if !has_children {
-            empty_prefixes.push(p);
-        }
-    }
-
-    let prefixes: Vec<&String> = prefix_set.iter().collect();
+    let empty_prefixes = prefix_set
+        .iter()
+        .filter(|p| {
+            !all_objects
+                .iter()
+                .any(|obj| obj.key.starts_with(p.as_str()) && obj.key != **p)
+        })
+        .cloned()
+        .collect();
 
     (
         StatusCode::OK,
-        Json(serde_json::json!({
-            "files": files,
-            "prefixes": prefixes,
-            "emptyPrefixes": empty_prefixes,
-        })),
+        Json(ObjectListResponse {
+            files,
+            prefixes: prefix_set.into_iter().collect(),
+            empty_prefixes,
+        }),
     )
         .into_response()
 }
 
+#[derive(Serialize, ToSchema)]
+pub struct UploadResponse {
+    ok: bool,
+    etag: String,
+    size: u64,
+}
+
+#[utoipa::path(
+    put,
+    path = "/api/buckets/{bucket}/upload/{key}",
+    operation_id = "uploadObject",
+    tag = "objects",
+    params(
+        ("bucket" = String, Path),
+        ("key" = String, Path, description = "Object key; may contain `/`"),
+    ),
+    request_body(content = BinaryBody, content_type = "application/octet-stream"),
+    responses(
+        (status = 200, body = UploadResponse),
+        (status = 404, description = "Bucket not found", body = ErrorResponse),
+    )
+)]
 pub async fn upload_object(
     State(state): State<AppState>,
     Path((bucket, key)): Path<(String, String)>,
     headers: HeaderMap,
     body: axum::body::Body,
-) -> impl IntoResponse {
-    match state.storage.head_bucket(&bucket).await {
-        Ok(true) => {}
-        Ok(false) => {
-            return (
-                StatusCode::NOT_FOUND,
-                Json(serde_json::json!({"error": "Bucket not found"})),
-            )
-                .into_response();
-        }
-        Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": e.to_string()})),
-            )
-                .into_response();
-        }
+) -> Response {
+    if let Err(resp) = require_bucket(&state, &bucket).await {
+        return resp;
     }
 
     let content_type = headers
@@ -546,18 +636,9 @@ pub async fn upload_object(
         stream.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e)),
     );
 
-    let encryption = match state.storage.get_bucket_encryption(&bucket).await {
-        Ok(Some(cfg)) => Some(crate::api::object::encryption_from_bucket_default(&cfg)),
-        Ok(None) => None,
-        Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({
-                    "error": format!("failed to read bucket encryption: {}", e)
-                })),
-            )
-                .into_response();
-        }
+    let encryption = match bucket_default_encryption(&state, &bucket).await {
+        Ok(encryption) => encryption,
+        Err(resp) => return resp,
     };
 
     match state
@@ -574,62 +655,62 @@ pub async fn upload_object(
     {
         Ok(result) => (
             StatusCode::OK,
-            Json(serde_json::json!({
-                "ok": true,
-                "etag": result.etag,
-                "size": result.size,
-            })),
+            Json(UploadResponse {
+                ok: true,
+                etag: result.etag,
+                size: result.size,
+            }),
         )
             .into_response(),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": e.to_string()})),
-        )
-            .into_response(),
+        Err(e) => internal(e),
     }
 }
 
+async fn bucket_default_encryption(
+    state: &AppState,
+    bucket: &str,
+) -> Result<Option<crate::storage::EncryptionRequest>, Response> {
+    match state.storage.get_bucket_encryption(bucket).await {
+        Ok(Some(cfg)) => Ok(Some(crate::api::object::encryption_from_bucket_default(
+            &cfg,
+        ))),
+        Ok(None) => Ok(None),
+        Err(e) => Err(internal(format!("failed to read bucket encryption: {}", e))),
+    }
+}
+
+#[utoipa::path(
+    delete,
+    path = "/api/buckets/{bucket}/objects/{key}",
+    operation_id = "deleteObject",
+    tag = "objects",
+    params(
+        ("bucket" = String, Path),
+        ("key" = String, Path, description = "Object key; may contain `/`"),
+    ),
+    responses(
+        (status = 200, body = OkResponse),
+        (status = 404, description = "Bucket not found", body = ErrorResponse),
+    )
+)]
 pub async fn delete_object_api(
     State(state): State<AppState>,
     Path((bucket, key)): Path<(String, String)>,
-) -> impl IntoResponse {
-    match state.storage.head_bucket(&bucket).await {
-        Ok(true) => {}
-        Ok(false) => {
-            return (
-                StatusCode::NOT_FOUND,
-                Json(serde_json::json!({"error": "Bucket not found"})),
-            )
-                .into_response();
-        }
-        Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": e.to_string()})),
-            )
-                .into_response();
-        }
+) -> Response {
+    if let Err(resp) = require_bucket(&state, &bucket).await {
+        return resp;
     }
 
     match state.storage.delete_object(&bucket, &key).await {
         Ok(_) => {
-            if let Err(e) =
-                preserve_empty_parent_folder_after_object_delete(&state.storage, &bucket, &key)
-                    .await
+            match preserve_empty_parent_folder_after_object_delete(&state.storage, &bucket, &key)
+                .await
             {
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(serde_json::json!({"error": e})),
-                )
-                    .into_response();
+                Ok(()) => ok(),
+                Err(e) => internal(e),
             }
-            (StatusCode::OK, Json(serde_json::json!({"ok": true}))).into_response()
         }
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": e.to_string()})),
-        )
-            .into_response(),
+        Err(e) => internal(e),
     }
 }
 
@@ -677,22 +758,36 @@ async fn preserve_empty_parent_folder_after_object_delete(
         .map_err(|e| e.to_string())
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/buckets/{bucket}/download/{key}",
+    operation_id = "downloadObject",
+    tag = "objects",
+    params(
+        ("bucket" = String, Path),
+        ("key" = String, Path, description = "Object key; may contain `/`"),
+    ),
+    responses(
+        (status = 200, body = BinaryBody, content_type = "application/octet-stream"),
+        (status = 404, description = "Object not found", body = ErrorResponse),
+    )
+)]
 pub async fn download_object(
     State(state): State<AppState>,
     Path((bucket, key)): Path<(String, String)>,
 ) -> Response {
-    let (reader, meta) = match state.storage.get_object(&bucket, &key, None).await {
-        Ok(r) => r,
-        Err(_) => {
-            return (
-                StatusCode::NOT_FOUND,
-                Json(serde_json::json!({"error": "Object not found"})),
-            )
-                .into_response();
-        }
-    };
+    match state.storage.get_object(&bucket, &key, None).await {
+        Ok((reader, meta)) => attachment_response(&key, reader, &meta),
+        Err(_) => error(StatusCode::NOT_FOUND, "Object not found"),
+    }
+}
 
-    let filename = key.rsplit('/').next().unwrap_or(&key);
+fn attachment_response(
+    key: &str,
+    reader: crate::storage::ByteStream,
+    meta: &crate::storage::ObjectMeta,
+) -> Response {
+    let filename = key.rsplit('/').next().unwrap_or(key);
     let safe_filename = sanitize_filename(filename);
     let stream = tokio_util::io::ReaderStream::with_capacity(reader, 256 * 1024);
     let body = axum::body::Body::from_stream(stream);
@@ -718,27 +813,44 @@ fn sanitize_filename(name: &str) -> String {
         .collect()
 }
 
-#[derive(serde::Deserialize)]
+#[derive(Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
 pub struct PresignParams {
+    /// Expiry in seconds. Defaults to 3600, max 604800.
     expires: Option<u64>,
 }
 
+#[derive(Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct PresignResponse {
+    url: String,
+    expires_in: u64,
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/buckets/{bucket}/presign/{key}",
+    operation_id = "presignObject",
+    tag = "objects",
+    params(
+        ("bucket" = String, Path),
+        ("key" = String, Path, description = "Object key; may contain `/`"),
+        PresignParams,
+    ),
+    responses(
+        (status = 200, body = PresignResponse),
+        (status = 404, description = "Object not found", body = ErrorResponse),
+    )
+)]
 pub async fn presign_object(
     State(state): State<AppState>,
     Path((bucket, key)): Path<(String, String)>,
     Query(params): Query<PresignParams>,
     headers: HeaderMap,
-) -> impl IntoResponse {
+) -> Response {
     // Verify object exists
-    match state.storage.head_object(&bucket, &key).await {
-        Ok(_) => {}
-        Err(_) => {
-            return (
-                StatusCode::NOT_FOUND,
-                Json(serde_json::json!({"error": "Object not found"})),
-            )
-                .into_response();
-        }
+    if state.storage.head_object(&bucket, &key).await.is_err() {
+        return error(StatusCode::NOT_FOUND, "Object not found");
     }
 
     let expires_secs = params.expires.unwrap_or(3600).min(604800);
@@ -822,53 +934,52 @@ pub async fn presign_object(
         "http"
     };
 
-    let presigned_url = format!(
+    let url = format!(
         "{}://{}{}?{}&X-Amz-Signature={}",
         scheme, host, path, canonical_qs, signature
     );
 
     (
         StatusCode::OK,
-        Json(serde_json::json!({
-            "url": presigned_url,
-            "expiresIn": expires_secs,
-        })),
+        Json(PresignResponse {
+            url,
+            expires_in: expires_secs,
+        }),
     )
         .into_response()
 }
 
-#[derive(serde::Deserialize)]
+#[derive(Deserialize, ToSchema)]
 pub struct CreateFolderRequest {
     name: String,
 }
 
+#[utoipa::path(
+    post,
+    path = "/api/buckets/{bucket}/folders",
+    operation_id = "createFolder",
+    tag = "objects",
+    params(("bucket" = String, Path)),
+    request_body = CreateFolderRequest,
+    responses(
+        (status = 200, body = OkResponse),
+        (status = 400, description = "Folder name is required", body = ErrorResponse),
+    )
+)]
 pub async fn create_folder(
     State(state): State<AppState>,
     Path(bucket): Path<String>,
     Json(body): Json<CreateFolderRequest>,
-) -> impl IntoResponse {
+) -> Response {
     let name = body.name.trim().trim_matches('/');
     if name.is_empty() {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({"error": "Folder name is required"})),
-        )
-            .into_response();
+        return error(StatusCode::BAD_REQUEST, "Folder name is required");
     }
 
     let key = format!("{}/", name);
-    let encryption = match state.storage.get_bucket_encryption(&bucket).await {
-        Ok(Some(cfg)) => Some(crate::api::object::encryption_from_bucket_default(&cfg)),
-        Ok(None) => None,
-        Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({
-                    "error": format!("failed to read bucket encryption: {}", e)
-                })),
-            )
-                .into_response();
-        }
+    let encryption = match bucket_default_encryption(&state, &bucket).await {
+        Ok(encryption) => encryption,
+        Err(resp) => return resp,
     };
     match state
         .storage
@@ -882,92 +993,99 @@ pub async fn create_folder(
         )
         .await
     {
-        Ok(_) => (StatusCode::OK, Json(serde_json::json!({"ok": true}))).into_response(),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": e.to_string()})),
-        )
-            .into_response(),
+        Ok(_) => ok(),
+        Err(e) => internal(e),
     }
 }
 
-pub async fn get_versioning(
-    State(state): State<AppState>,
-    Path(bucket): Path<String>,
-) -> impl IntoResponse {
-    match state.storage.is_versioned(&bucket).await {
-        Ok(enabled) => (
-            StatusCode::OK,
-            Json(serde_json::json!({"enabled": enabled})),
-        )
-            .into_response(),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": e.to_string()})),
-        )
-            .into_response(),
-    }
-}
-
-#[derive(serde::Deserialize)]
-pub struct SetVersioningRequest {
+#[derive(Serialize, ToSchema)]
+pub struct EnabledResponse {
     enabled: bool,
 }
 
+#[derive(Deserialize, ToSchema)]
+pub struct SetEnabledRequest {
+    enabled: bool,
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/buckets/{bucket}/versioning",
+    operation_id = "getVersioning",
+    tag = "settings",
+    params(("bucket" = String, Path)),
+    responses((status = 200, body = EnabledResponse))
+)]
+pub async fn get_versioning(State(state): State<AppState>, Path(bucket): Path<String>) -> Response {
+    match state.storage.is_versioned(&bucket).await {
+        Ok(enabled) => (StatusCode::OK, Json(EnabledResponse { enabled })).into_response(),
+        Err(e) => internal(e),
+    }
+}
+
+#[utoipa::path(
+    put,
+    path = "/api/buckets/{bucket}/versioning",
+    operation_id = "setVersioning",
+    tag = "settings",
+    params(("bucket" = String, Path)),
+    request_body = SetEnabledRequest,
+    responses((status = 200, body = OkResponse))
+)]
 pub async fn set_versioning(
     State(state): State<AppState>,
     Path(bucket): Path<String>,
-    Json(body): Json<SetVersioningRequest>,
-) -> impl IntoResponse {
+    Json(body): Json<SetEnabledRequest>,
+) -> Response {
     match state.storage.set_versioning(&bucket, body.enabled).await {
-        Ok(()) => (StatusCode::OK, Json(serde_json::json!({"ok": true}))).into_response(),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": e.to_string()})),
-        )
-            .into_response(),
+        Ok(()) => ok(),
+        Err(e) => internal(e),
     }
 }
 
-pub async fn get_encryption(
-    State(state): State<AppState>,
-    Path(bucket): Path<String>,
-) -> impl IntoResponse {
-    match state.storage.get_bucket_encryption(&bucket).await {
-        Ok(Some(cfg)) => (
-            StatusCode::OK,
-            Json(serde_json::json!({
-                "enabled": true,
-                "algorithm": cfg.sse_algorithm,
-            })),
-        )
-            .into_response(),
-        Ok(None) => (
-            StatusCode::OK,
-            Json(serde_json::json!({
-                "enabled": false,
-                "algorithm": null,
-            })),
-        )
-            .into_response(),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": e.to_string()})),
-        )
-            .into_response(),
-    }
-}
-
-#[derive(serde::Deserialize)]
-pub struct SetEncryptionRequest {
+#[derive(Serialize, ToSchema)]
+pub struct EncryptionResponse {
     enabled: bool,
+    #[schema(required = true)]
+    algorithm: Option<String>,
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/buckets/{bucket}/encryption",
+    operation_id = "getEncryption",
+    tag = "settings",
+    params(("bucket" = String, Path)),
+    responses((status = 200, body = EncryptionResponse))
+)]
+pub async fn get_encryption(State(state): State<AppState>, Path(bucket): Path<String>) -> Response {
+    match state.storage.get_bucket_encryption(&bucket).await {
+        Ok(cfg) => (
+            StatusCode::OK,
+            Json(EncryptionResponse {
+                enabled: cfg.is_some(),
+                algorithm: cfg.map(|cfg| cfg.sse_algorithm),
+            }),
+        )
+            .into_response(),
+        Err(e) => internal(e),
+    }
+}
+
+#[utoipa::path(
+    put,
+    path = "/api/buckets/{bucket}/encryption",
+    operation_id = "setEncryption",
+    tag = "settings",
+    params(("bucket" = String, Path)),
+    request_body = SetEnabledRequest,
+    responses((status = 200, body = OkResponse))
+)]
 pub async fn set_encryption(
     State(state): State<AppState>,
     Path(bucket): Path<String>,
-    Json(body): Json<SetEncryptionRequest>,
-) -> impl IntoResponse {
+    Json(body): Json<SetEnabledRequest>,
+) -> Response {
     let result = if body.enabled {
         let cfg = crate::storage::BucketEncryptionConfig {
             sse_algorithm: "AES256".to_string(),
@@ -977,158 +1095,169 @@ pub async fn set_encryption(
         state.storage.delete_bucket_encryption(&bucket).await
     };
     match result {
-        Ok(()) => (StatusCode::OK, Json(serde_json::json!({"ok": true}))).into_response(),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": e.to_string()})),
-        )
-            .into_response(),
+        Ok(()) => ok(),
+        Err(e) => internal(e),
     }
 }
 
-pub async fn get_public(
-    State(state): State<AppState>,
-    Path(bucket): Path<String>,
-) -> impl IntoResponse {
-    match state.storage.get_bucket_public(&bucket).await {
-        Ok((read, list)) => (
-            StatusCode::OK,
-            Json(serde_json::json!({"read": read, "list": list})),
-        )
-            .into_response(),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": e.to_string()})),
-        )
-            .into_response(),
-    }
-}
-
-#[derive(serde::Deserialize)]
-pub struct SetPublicRequest {
+#[derive(Serialize, Deserialize, ToSchema)]
+pub struct PublicAccess {
     read: bool,
     list: bool,
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/buckets/{bucket}/public",
+    operation_id = "getPublicAccess",
+    tag = "settings",
+    params(("bucket" = String, Path)),
+    responses((status = 200, body = PublicAccess))
+)]
+pub async fn get_public(State(state): State<AppState>, Path(bucket): Path<String>) -> Response {
+    match state.storage.get_bucket_public(&bucket).await {
+        Ok((read, list)) => (StatusCode::OK, Json(PublicAccess { read, list })).into_response(),
+        Err(e) => internal(e),
+    }
+}
+
+#[utoipa::path(
+    put,
+    path = "/api/buckets/{bucket}/public",
+    operation_id = "setPublicAccess",
+    tag = "settings",
+    params(("bucket" = String, Path)),
+    request_body = PublicAccess,
+    responses((status = 200, body = OkResponse))
+)]
 pub async fn set_public(
     State(state): State<AppState>,
     Path(bucket): Path<String>,
-    Json(body): Json<SetPublicRequest>,
-) -> impl IntoResponse {
+    Json(body): Json<PublicAccess>,
+) -> Response {
     match state
         .storage
         .set_bucket_public(&bucket, body.read, body.list)
         .await
     {
-        Ok(()) => (StatusCode::OK, Json(serde_json::json!({"ok": true}))).into_response(),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": e.to_string()})),
-        )
-            .into_response(),
+        Ok(()) => ok(),
+        Err(e) => internal(e),
     }
 }
 
-#[derive(serde::Deserialize)]
+#[derive(Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
 pub struct ListVersionsParams {
     key: String,
 }
 
+#[derive(Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ObjectVersion {
+    #[schema(required = true)]
+    version_id: Option<String>,
+    last_modified: String,
+    size: u64,
+    etag: String,
+    is_delete_marker: bool,
+}
+
+#[derive(Serialize, ToSchema)]
+pub struct VersionListResponse {
+    versions: Vec<ObjectVersion>,
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/buckets/{bucket}/versions",
+    operation_id = "listVersions",
+    tag = "versions",
+    params(("bucket" = String, Path), ListVersionsParams),
+    responses((status = 200, body = VersionListResponse))
+)]
 pub async fn list_versions(
     State(state): State<AppState>,
     Path(bucket): Path<String>,
     Query(params): Query<ListVersionsParams>,
-) -> impl IntoResponse {
+) -> Response {
     let all = match state
         .storage
         .list_object_versions(&bucket, &params.key)
         .await
     {
         Ok(v) => v,
-        Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": e.to_string()})),
-            )
-                .into_response();
-        }
+        Err(e) => return internal(e),
     };
 
     // Filter to only versions matching this exact key
-    let versions: Vec<serde_json::Value> = all
+    let versions = all
         .into_iter()
         .filter(|v| v.key == params.key)
-        .map(|v| {
-            serde_json::json!({
-                "versionId": v.version_id,
-                "lastModified": v.last_modified,
-                "size": v.size,
-                "etag": v.etag,
-                "isDeleteMarker": v.is_delete_marker,
-            })
+        .map(|v| ObjectVersion {
+            version_id: v.version_id,
+            last_modified: v.last_modified,
+            size: v.size,
+            etag: v.etag,
+            is_delete_marker: v.is_delete_marker,
         })
         .collect();
 
-    (
-        StatusCode::OK,
-        Json(serde_json::json!({"versions": versions})),
-    )
-        .into_response()
+    (StatusCode::OK, Json(VersionListResponse { versions })).into_response()
 }
 
+#[utoipa::path(
+    delete,
+    path = "/api/buckets/{bucket}/versions/{versionId}/objects/{key}",
+    operation_id = "deleteVersion",
+    tag = "versions",
+    params(
+        ("bucket" = String, Path),
+        ("versionId" = String, Path),
+        ("key" = String, Path, description = "Object key; may contain `/`"),
+    ),
+    responses((status = 200, body = OkResponse))
+)]
 pub async fn delete_version(
     State(state): State<AppState>,
     Path((bucket, version_id, key)): Path<(String, String, String)>,
-) -> impl IntoResponse {
+) -> Response {
     match state
         .storage
         .delete_object_version(&bucket, &key, &version_id)
         .await
     {
-        Ok(_) => (StatusCode::OK, Json(serde_json::json!({"ok": true}))).into_response(),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": e.to_string()})),
-        )
-            .into_response(),
+        Ok(_) => ok(),
+        Err(e) => internal(e),
     }
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/buckets/{bucket}/versions/{versionId}/download/{key}",
+    operation_id = "downloadVersion",
+    tag = "versions",
+    params(
+        ("bucket" = String, Path),
+        ("versionId" = String, Path),
+        ("key" = String, Path, description = "Object key; may contain `/`"),
+    ),
+    responses(
+        (status = 200, body = BinaryBody, content_type = "application/octet-stream"),
+        (status = 404, description = "Version not found", body = ErrorResponse),
+    )
+)]
 pub async fn download_version(
     State(state): State<AppState>,
     Path((bucket, version_id, key)): Path<(String, String, String)>,
 ) -> Response {
-    let (reader, meta) = match state
+    match state
         .storage
         .get_object_version(&bucket, &key, &version_id, None)
         .await
     {
-        Ok(r) => r,
-        Err(_) => {
-            return (
-                StatusCode::NOT_FOUND,
-                Json(serde_json::json!({"error": "Version not found"})),
-            )
-                .into_response();
-        }
-    };
-
-    let filename = key.rsplit('/').next().unwrap_or(&key);
-    let safe_filename = sanitize_filename(filename);
-    let stream = tokio_util::io::ReaderStream::with_capacity(reader, 256 * 1024);
-    let body = axum::body::Body::from_stream(stream);
-
-    Response::builder()
-        .status(StatusCode::OK)
-        .header("Content-Type", &meta.content_type)
-        .header("Content-Length", meta.size.to_string())
-        .header(
-            "Content-Disposition",
-            format!("attachment; filename=\"{}\"", safe_filename),
-        )
-        .body(body)
-        .unwrap()
-        .into_response()
+        Ok((reader, meta)) => attachment_response(&key, reader, &meta),
+        Err(_) => error(StatusCode::NOT_FOUND, "Version not found"),
+    }
 }
 
 pub fn console_router(state: AppState) -> Router<AppState> {

@@ -781,7 +781,8 @@ impl FilesystemStorage {
                 // Archive a pre-versioning ("null") current object instead of
                 // destroying it.
                 self.archive_null_version_if_needed(bucket, key).await?;
-                self.write_version(bucket, key, &meta, &tmp_obj_path).await?;
+                self.write_version(bucket, key, &meta, &tmp_obj_path)
+                    .await?;
             }
             publish_temp_payload_and_meta(
                 &tmp_obj_path,
@@ -3500,7 +3501,8 @@ impl FilesystemStorage {
     }
 
     pub async fn delete_bucket_cors(&self, bucket: &str) -> Result<(), StorageError> {
-        self.update_bucket_meta(bucket, |m| m.cors_rules = None).await
+        self.update_bucket_meta(bucket, |m| m.cors_rules = None)
+            .await
     }
 
     // --- Bucket default encryption ---
@@ -4004,8 +4006,14 @@ impl FilesystemStorage {
                 let tmp_data = temp_sibling_path(&obj_path);
                 let mut tmp_data_guard = TempPathGuard::file(tmp_data.clone());
                 fs::copy(&ver_data, &tmp_data).await?;
-                publish_temp_payload_and_meta(&tmp_data, &obj_path, false, &tmp_meta, &obj_meta_path)
-                    .await?;
+                publish_temp_payload_and_meta(
+                    &tmp_data,
+                    &obj_path,
+                    false,
+                    &tmp_meta,
+                    &obj_meta_path,
+                )
+                .await?;
                 tmp_data_guard.disarm();
                 tmp_meta_guard.disarm();
                 remove_dir_all_if_exists(&self.ec_dir(bucket, key)).await?;

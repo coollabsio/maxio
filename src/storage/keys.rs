@@ -522,7 +522,11 @@ mod tests {
             .map(|e| e.file_name().to_string_lossy().into_owned())
             .filter(|n| n.contains(".tmp"))
             .collect();
-        assert!(leftovers.is_empty(), "temp files left behind: {:?}", leftovers);
+        assert!(
+            leftovers.is_empty(),
+            "temp files left behind: {:?}",
+            leftovers
+        );
     }
 
     /// chmod-000 variant of the above. Skips the core assertion when running
@@ -575,7 +579,10 @@ mod tests {
         let marker = format!("{}/marker", file_path);
         std::fs::write(&marker, b"do-not-destroy").unwrap();
 
-        let err = rotate(&dir).await.err().expect("read error must abort rotate");
+        let err = rotate(&dir)
+            .await
+            .err()
+            .expect("read error must abort rotate");
         assert!(
             err.to_string().contains("Failed to read keyring file"),
             "expected read-failure error, got: {}",
@@ -590,7 +597,11 @@ mod tests {
             .map(|e| e.file_name().to_string_lossy().into_owned())
             .filter(|n| n.contains(".tmp"))
             .collect();
-        assert!(leftovers.is_empty(), "temp files left behind: {:?}", leftovers);
+        assert!(
+            leftovers.is_empty(),
+            "temp files left behind: {:?}",
+            leftovers
+        );
     }
 
     /// chmod-000 variant for rotate (skips when privileged).
@@ -609,7 +620,10 @@ mod tests {
         let privileged = std::fs::read(&file_path).is_ok();
 
         if !privileged {
-            let err = rotate(&dir).await.err().expect("unreadable keyring must abort rotate");
+            let err = rotate(&dir)
+                .await
+                .err()
+                .expect("unreadable keyring must abort rotate");
             assert!(
                 err.to_string().contains("Failed to read keyring file"),
                 "expected read-failure error, got: {}",
@@ -640,7 +654,10 @@ mod tests {
 
         let result = rotate(&dir).await.unwrap();
         assert_ne!(result.new_active_id, bootstrap_id);
-        assert_eq!(result.previous_active_id.as_deref(), Some(bootstrap_id.as_str()));
+        assert_eq!(
+            result.previous_active_id.as_deref(),
+            Some(bootstrap_id.as_str())
+        );
         assert_eq!(result.total_keys, 2);
 
         // Backup matches the pre-rotate content exactly.

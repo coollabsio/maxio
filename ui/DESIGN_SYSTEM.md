@@ -1,6 +1,8 @@
 # Coolify Design System
 
 > **Purpose**: AI/LLM-consumable reference for replicating Coolify's visual design in new applications. Contains design tokens, component styles, and interactive states — with both Tailwind CSS classes and plain CSS equivalents.
+>
+> **In MaxIO**: tokens and the `.input-cool` class live in `ui/src/index.css` (Tailwind v4, CSS-first). The React primitives in `ui/src/components/ui/*.tsx` (shadcn `base-nova` style on `@base-ui/react`, variants via `class-variance-authority`) implement the component styles below.
 
 ---
 

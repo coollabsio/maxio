@@ -20,6 +20,7 @@ mod auth;
 mod config;
 mod embedded;
 mod error;
+mod openapi;
 mod server;
 mod storage;
 mod xml;
@@ -69,6 +70,13 @@ enum Commands {
     /// Manage the SSE-S3 master-key keyring
     #[command(subcommand)]
     Keyring(KeyringCmd),
+
+    /// Write the web console OpenAPI document (used to generate the UI API client)
+    Openapi {
+        /// Output file; prints to stdout when omitted
+        #[arg(long)]
+        output: Option<std::path::PathBuf>,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -111,6 +119,19 @@ async fn main() -> anyhow::Result<()> {
         }
         Some(Commands::Keyring(KeyringCmd::List { ref data_dir })) => {
             return run_keyring_list(data_dir).await;
+        }
+        Some(Commands::Openapi { ref output }) => {
+            let json = openapi::openapi_json();
+            match output {
+                Some(path) => {
+                    if let Some(parent) = path.parent() {
+                        std::fs::create_dir_all(parent)?;
+                    }
+                    std::fs::write(path, json)?;
+                }
+                None => print!("{json}"),
+            }
+            return Ok(());
         }
     }
 

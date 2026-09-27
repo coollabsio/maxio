@@ -1,1 +1,1 @@
-export { toast } from 'svelte-sonner'
+export { toast } from 'sonner'

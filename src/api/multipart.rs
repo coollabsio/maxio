@@ -160,6 +160,9 @@ pub async fn complete_multipart_upload(
     let mut builder = Response::builder()
         .status(StatusCode::OK)
         .header("content-type", "application/xml");
+    if let Some(vid) = &result.version_id {
+        builder = builder.header("x-amz-version-id", vid.as_str());
+    }
     if let (Some(algo), Some(val)) = (&result.checksum_algorithm, &result.checksum_value) {
         builder = builder.header(algo.header_name(), val.as_str());
     }

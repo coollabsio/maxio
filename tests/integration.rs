@@ -643,6 +643,16 @@ fn extract_xml_tag(body: &str, tag: &str) -> Option<String> {
     Some(body[from..to].to_string())
 }
 
+async fn enable_bucket_versioning(base_url: &str, bucket: &str) -> reqwest::Response {
+    let xml = br#"<VersioningConfiguration><Status>Enabled</Status></VersioningConfiguration>"#;
+    s3_request(
+        "PUT",
+        &format!("{}/{}?versioning=", base_url, bucket),
+        xml.to_vec(),
+    )
+    .await
+}
+
 // ---- Tests ----
 
 #[tokio::test]
@@ -1631,6 +1641,126 @@ async fn test_multipart_complete() {
     let mut expected = p1;
     expected.extend_from_slice(&p2);
     assert_eq!(body.as_ref(), expected.as_slice());
+}
+
+#[tokio::test]
+async fn test_multipart_complete_in_versioned_bucket_preserves_prior_versions() {
+    let (base_url, _tmp) = start_server().await;
+    assert_eq!(
+        s3_request("PUT", &format!("{}/mybucket", base_url), vec![])
+            .await
+            .status(),
+        200
+    );
+    assert_eq!(
+        enable_bucket_versioning(&base_url, "mybucket")
+            .await
+            .status(),
+        200
+    );
+
+    let create_v1 = s3_request(
+        "POST",
+        &format!("{}/mybucket/large.bin?uploads=", base_url),
+        vec![],
+    )
+    .await;
+    let upload_id_v1 = extract_xml_tag(&create_v1.text().await.unwrap(), "UploadId").unwrap();
+    let part_v1 = vec![b'a'; 5 * 1024 * 1024];
+    let upload_part_v1 = s3_request(
+        "PUT",
+        &format!(
+            "{}/mybucket/large.bin?partNumber=1&uploadId={}",
+            base_url, upload_id_v1
+        ),
+        part_v1.clone(),
+    )
+    .await;
+    let etag_v1 = upload_part_v1
+        .headers()
+        .get("etag")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+    let complete_v1 = s3_request(
+        "POST",
+        &format!("{}/mybucket/large.bin?uploadId={}", base_url, upload_id_v1),
+        format!(
+            "<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>{}</ETag></Part></CompleteMultipartUpload>",
+            etag_v1
+        )
+        .into_bytes(),
+    )
+    .await;
+    assert_eq!(complete_v1.status(), 200);
+    let version_id_v1 = complete_v1
+        .headers()
+        .get("x-amz-version-id")
+        .expect("multipart completion should return version id")
+        .to_str()
+        .unwrap()
+        .to_string();
+
+    let create_v2 = s3_request(
+        "POST",
+        &format!("{}/mybucket/large.bin?uploads=", base_url),
+        vec![],
+    )
+    .await;
+    let upload_id_v2 = extract_xml_tag(&create_v2.text().await.unwrap(), "UploadId").unwrap();
+    let part_v2 = vec![b'b'; 5 * 1024 * 1024];
+    let upload_part_v2 = s3_request(
+        "PUT",
+        &format!(
+            "{}/mybucket/large.bin?partNumber=1&uploadId={}",
+            base_url, upload_id_v2
+        ),
+        part_v2.clone(),
+    )
+    .await;
+    let etag_v2 = upload_part_v2
+        .headers()
+        .get("etag")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+    let complete_v2 = s3_request(
+        "POST",
+        &format!("{}/mybucket/large.bin?uploadId={}", base_url, upload_id_v2),
+        format!(
+            "<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>{}</ETag></Part></CompleteMultipartUpload>",
+            etag_v2
+        )
+        .into_bytes(),
+    )
+    .await;
+    assert_eq!(complete_v2.status(), 200);
+    let version_id_v2 = complete_v2
+        .headers()
+        .get("x-amz-version-id")
+        .expect("multipart overwrite should return version id")
+        .to_str()
+        .unwrap()
+        .to_string();
+    assert_ne!(version_id_v1, version_id_v2);
+
+    let current = s3_request("GET", &format!("{}/mybucket/large.bin", base_url), vec![]).await;
+    assert_eq!(current.status(), 200);
+    assert_eq!(current.bytes().await.unwrap().as_ref(), part_v2.as_slice());
+
+    let prior = s3_request(
+        "GET",
+        &format!(
+            "{}/mybucket/large.bin?versionId={}",
+            base_url, version_id_v1
+        ),
+        vec![],
+    )
+    .await;
+    assert_eq!(prior.status(), 200);
+    assert_eq!(prior.bytes().await.unwrap().as_ref(), part_v1.as_slice());
 }
 
 #[tokio::test]
@@ -3029,6 +3159,126 @@ async fn test_ec_put_and_get_object() {
     let body = resp.bytes().await.unwrap();
     assert_eq!(body.len(), 3 * 1024);
     assert_eq!(&body[..], &data[..]);
+}
+
+#[tokio::test]
+async fn test_ec_multipart_complete_in_versioned_bucket_preserves_prior_versions() {
+    let (base_url, _tmp) = start_server_ec().await;
+    assert_eq!(
+        s3_request("PUT", &format!("{}/mybucket", base_url), vec![])
+            .await
+            .status(),
+        200
+    );
+    assert_eq!(
+        enable_bucket_versioning(&base_url, "mybucket")
+            .await
+            .status(),
+        200
+    );
+
+    let create_v1 = s3_request(
+        "POST",
+        &format!("{}/mybucket/chunked.bin?uploads=", base_url),
+        vec![],
+    )
+    .await;
+    let upload_id_v1 = extract_xml_tag(&create_v1.text().await.unwrap(), "UploadId").unwrap();
+    let part_v1 = vec![b'a'; 2048];
+    let upload_part_v1 = s3_request(
+        "PUT",
+        &format!(
+            "{}/mybucket/chunked.bin?partNumber=1&uploadId={}",
+            base_url, upload_id_v1
+        ),
+        part_v1.clone(),
+    )
+    .await;
+    let etag_v1 = upload_part_v1
+        .headers()
+        .get("etag")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+    let complete_v1 = s3_request(
+        "POST",
+        &format!("{}/mybucket/chunked.bin?uploadId={}", base_url, upload_id_v1),
+        format!(
+            "<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>{}</ETag></Part></CompleteMultipartUpload>",
+            etag_v1
+        )
+        .into_bytes(),
+    )
+    .await;
+    assert_eq!(complete_v1.status(), 200);
+    let version_id_v1 = complete_v1
+        .headers()
+        .get("x-amz-version-id")
+        .expect("erasure-coded multipart completion should return version id")
+        .to_str()
+        .unwrap()
+        .to_string();
+
+    let create_v2 = s3_request(
+        "POST",
+        &format!("{}/mybucket/chunked.bin?uploads=", base_url),
+        vec![],
+    )
+    .await;
+    let upload_id_v2 = extract_xml_tag(&create_v2.text().await.unwrap(), "UploadId").unwrap();
+    let part_v2 = vec![b'b'; 3072];
+    let upload_part_v2 = s3_request(
+        "PUT",
+        &format!(
+            "{}/mybucket/chunked.bin?partNumber=1&uploadId={}",
+            base_url, upload_id_v2
+        ),
+        part_v2.clone(),
+    )
+    .await;
+    let etag_v2 = upload_part_v2
+        .headers()
+        .get("etag")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+    let complete_v2 = s3_request(
+        "POST",
+        &format!("{}/mybucket/chunked.bin?uploadId={}", base_url, upload_id_v2),
+        format!(
+            "<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>{}</ETag></Part></CompleteMultipartUpload>",
+            etag_v2
+        )
+        .into_bytes(),
+    )
+    .await;
+    assert_eq!(complete_v2.status(), 200);
+    let version_id_v2 = complete_v2
+        .headers()
+        .get("x-amz-version-id")
+        .expect("erasure-coded multipart overwrite should return version id")
+        .to_str()
+        .unwrap()
+        .to_string();
+    assert_ne!(version_id_v1, version_id_v2);
+
+    let current = s3_request("GET", &format!("{}/mybucket/chunked.bin", base_url), vec![]).await;
+    assert_eq!(current.status(), 200);
+    assert_eq!(current.bytes().await.unwrap().as_ref(), part_v2.as_slice());
+
+    let prior = s3_request(
+        "GET",
+        &format!(
+            "{}/mybucket/chunked.bin?versionId={}",
+            base_url, version_id_v1
+        ),
+        vec![],
+    )
+    .await;
+    assert_eq!(prior.status(), 200);
+    assert_eq!(prior.bytes().await.unwrap().as_ref(), part_v1.as_slice());
 }
 
 #[tokio::test]

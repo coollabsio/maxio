@@ -1,5 +1,5 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { Check, Download, File as FileIcon, Folder, FolderPlus, History, Share2, Trash2, Upload } from 'lucide-react'
+import { Check, Download, Eye, File as FileIcon, Folder, FolderPlus, History, Share2, Trash2, Upload } from 'lucide-react'
 import { Fragment, useEffect, useRef, useState, type MouseEvent } from 'react'
 import { Navigate, useNavigate, useParams, useSearchParams } from 'react-router'
 import { ApiError } from '@/api/client'
@@ -14,8 +14,10 @@ import { getVersioning } from '@/features/settings/api'
 import { VersionHistory } from '@/features/versions/VersionHistory'
 import { formatDate, formatSize } from '@/lib/format'
 import { bucketPath, displayName, downloadUrl, normalizePrefix } from '@/lib/paths'
+import { isPreviewable } from '@/lib/preview'
 import { toast } from '@/lib/toast'
 import { createFolder, deleteObject, listObjects, presignObject, uploadObject } from './api'
+import { FilePreview } from './FilePreview'
 
 const expiryOptions = [
   { label: '1 hour', seconds: 3600 },
@@ -43,6 +45,7 @@ function ObjectBrowser({ bucket }: { bucket: string }) {
   const [showCreateFolder, setShowCreateFolder] = useState(false)
   const [newFolderName, setNewFolderName] = useState('')
   const [versionKey, setVersionKey] = useState<string | null>(null)
+  const [previewFile, setPreviewFile] = useState<{ key: string; contentType: string; size: number } | null>(null)
   const [pendingDelete, setPendingDelete] = useState<{ key: string; kind: 'object' | 'folder' } | null>(null)
 
   const objectsQuery = useQuery({
@@ -229,6 +232,7 @@ function ObjectBrowser({ bucket }: { bucket: string }) {
             <TableHeader>
               <TableRow>
                 <TableHead>Name</TableHead>
+                <TableHead className="w-48">Type</TableHead>
                 <TableHead className="w-28 text-right">Size</TableHead>
                 <TableHead className="w-48">Modified</TableHead>
                 <TableHead className="w-24"></TableHead>
@@ -243,6 +247,7 @@ function ObjectBrowser({ bucket }: { bucket: string }) {
                       <span className="font-medium">{displayName(folder)}/</span>
                     </span>
                   </TableCell>
+                  <TableCell className="text-muted-foreground">&mdash;</TableCell>
                   <TableCell className="text-right text-muted-foreground">&mdash;</TableCell>
                   <TableCell className="text-muted-foreground">&mdash;</TableCell>
                   <TableCell>
@@ -272,6 +277,7 @@ function ObjectBrowser({ bucket }: { bucket: string }) {
                         <span className="font-medium">{displayName(file.key)}</span>
                       </span>
                     </TableCell>
+                    <TableCell className="truncate text-muted-foreground">{file.contentType || '\u2014'}</TableCell>
                     <TableCell className="text-right text-muted-foreground">{formatSize(file.size)}</TableCell>
                     <TableCell className="text-muted-foreground">{formatDate(file.lastModified)}</TableCell>
                     <TableCell className="w-24">
@@ -288,6 +294,20 @@ function ObjectBrowser({ bucket }: { bucket: string }) {
                             aria-label="Version history"
                           >
                             <History className="size-4" />
+                          </button>
+                        ) : null}
+                        {isPreviewable(file.contentType) ? (
+                          <button
+                            type="button"
+                            className="text-muted-foreground hover:text-foreground transition-colors"
+                            onClick={(event) => {
+                              event.stopPropagation()
+                              setPreviewFile({ key: file.key, contentType: file.contentType, size: file.size })
+                            }}
+                            title="Preview"
+                            aria-label="Preview"
+                          >
+                            <Eye className="size-4" />
                           </button>
                         ) : null}
                         <button
@@ -329,7 +349,7 @@ function ObjectBrowser({ bucket }: { bucket: string }) {
                   </TableRow>
                   {versionKey === file.key ? (
                     <TableRow>
-                      <TableCell colSpan={4} className="p-0">
+                      <TableCell colSpan={5} className="p-0">
                         <div className="p-2">
                           <VersionHistory
                             bucket={bucket}
@@ -413,6 +433,16 @@ function ObjectBrowser({ bucket }: { bucket: string }) {
             </button>
           ))}
         </div>
+      ) : null}
+
+      {previewFile ? (
+        <FilePreview
+          bucket={bucket}
+          objectKey={previewFile.key}
+          contentType={previewFile.contentType}
+          size={previewFile.size}
+          onClose={() => setPreviewFile(null)}
+        />
       ) : null}
 
       {pendingDelete ? (

@@ -56,6 +56,10 @@ export type ObjectListResponse = {
 };
 
 export type ObjectSummary = {
+    /**
+     * Stored `Content-Type` of the object (what download/preview will serve).
+     */
+    contentType: string;
     etag: string;
     key: string;
     lastModified: string;

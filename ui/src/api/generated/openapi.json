@@ -1074,9 +1074,14 @@
           "key",
           "size",
           "lastModified",
-          "etag"
+          "etag",
+          "contentType"
         ],
         "properties": {
+          "contentType": {
+            "type": "string",
+            "description": "Stored `Content-Type` of the object (what download/preview will serve)."
+          },
           "etag": {
             "type": "string"
           },

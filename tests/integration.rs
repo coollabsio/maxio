@@ -7428,3 +7428,34 @@ async fn test_ui_without_trailing_slash_redirects_to_ui_root() {
         assert_eq!(resp.headers()["location"], location, "{path}");
     }
 }
+
+/// The console listing must expose each object's stored content type so the
+/// UI can decide whether (and how) to preview it.
+#[tokio::test]
+async fn test_console_list_objects_returns_content_type() {
+    let (base_url, _tmp) = start_server().await;
+    s3_request("PUT", &format!("{}/ctype-list", base_url), vec![]).await;
+    let put = s3_request_with_headers(
+        "PUT",
+        &format!("{}/ctype-list/notes.md", base_url),
+        b"# hello".to_vec(),
+        vec![("Content-Type", "text/markdown")],
+    )
+    .await;
+    assert_eq!(put.status(), 200);
+
+    let session = console_login(&base_url).await;
+    let resp = client()
+        .get(&format!("{}/api/buckets/ctype-list/objects", base_url))
+        .header("Cookie", format!("maxio_session={}", session))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let json: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(json["files"][0]["key"], "notes.md");
+    assert_eq!(
+        json["files"][0]["contentType"], "text/markdown",
+        "listing must carry the stored content type: {json}"
+    );
+}

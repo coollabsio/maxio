@@ -7428,3 +7428,303 @@ async fn test_ui_without_trailing_slash_redirects_to_ui_root() {
         assert_eq!(resp.headers()["location"], location, "{path}");
     }
 }
+
+// ── User metadata (x-amz-meta-*) ─────────────────────────────────────────────
+
+/// Read every `x-amz-meta-*` header off a response, prefix stripped.
+fn user_meta(resp: &reqwest::Response) -> std::collections::BTreeMap<String, String> {
+    resp.headers()
+        .iter()
+        .filter_map(|(k, v)| {
+            k.as_str()
+                .strip_prefix("x-amz-meta-")
+                .map(|name| (name.to_string(), v.to_str().unwrap().to_string()))
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn test_user_metadata_roundtrip() {
+    let (base_url, _tmp) = start_server().await;
+    s3_request("PUT", &format!("{}/umeta", base_url), vec![]).await;
+
+    let put = s3_request_with_headers(
+        "PUT",
+        &format!("{}/umeta/a.txt", base_url),
+        b"hello world".to_vec(),
+        vec![
+            // Mixed case on the way in: S3 stores metadata names lowercased.
+            ("x-amz-meta-Alembic-Revision", "e8b2f47c1a90"),
+            ("x-amz-meta-owner", "nexctf"),
+        ],
+    )
+    .await;
+    assert_eq!(put.status(), 200);
+
+    let expected: std::collections::BTreeMap<String, String> = [
+        ("alembic-revision".to_string(), "e8b2f47c1a90".to_string()),
+        ("owner".to_string(), "nexctf".to_string()),
+    ]
+    .into_iter()
+    .collect();
+
+    let head = s3_request("HEAD", &format!("{}/umeta/a.txt", base_url), vec![]).await;
+    assert_eq!(user_meta(&head), expected, "HEAD must return user metadata");
+
+    let get = s3_request("GET", &format!("{}/umeta/a.txt", base_url), vec![]).await;
+    assert_eq!(user_meta(&get), expected, "GET must return user metadata");
+
+    let ranged = s3_request_with_headers(
+        "GET",
+        &format!("{}/umeta/a.txt", base_url),
+        vec![],
+        vec![("Range", "bytes=0-3")],
+    )
+    .await;
+    assert_eq!(ranged.status(), 206);
+    assert_eq!(user_meta(&ranged), expected, "range GET must return it too");
+}
+
+#[tokio::test]
+async fn test_user_metadata_absent_emits_no_headers() {
+    let (base_url, _tmp) = start_server().await;
+    s3_request("PUT", &format!("{}/umeta-none", base_url), vec![]).await;
+    s3_request(
+        "PUT",
+        &format!("{}/umeta-none/a.txt", base_url),
+        b"x".to_vec(),
+    )
+    .await;
+
+    let head = s3_request("HEAD", &format!("{}/umeta-none/a.txt", base_url), vec![]).await;
+    assert!(user_meta(&head).is_empty());
+}
+
+#[tokio::test]
+async fn test_user_metadata_copy_directive() {
+    let (base_url, _tmp) = start_server().await;
+    s3_request("PUT", &format!("{}/umeta-cp", base_url), vec![]).await;
+    s3_request_with_headers(
+        "PUT",
+        &format!("{}/umeta-cp/src.txt", base_url),
+        b"payload".to_vec(),
+        vec![("x-amz-meta-rev", "abc123")],
+    )
+    .await;
+
+    // Default directive is COPY: metadata carries forward.
+    let copied = s3_request_with_headers(
+        "PUT",
+        &format!("{}/umeta-cp/copy.txt", base_url),
+        vec![],
+        vec![("x-amz-copy-source", "/umeta-cp/src.txt")],
+    )
+    .await;
+    assert_eq!(copied.status(), 200);
+    let head = s3_request("HEAD", &format!("{}/umeta-cp/copy.txt", base_url), vec![]).await;
+    assert_eq!(
+        user_meta(&head).get("rev").map(String::as_str),
+        Some("abc123")
+    );
+
+    // REPLACE takes the request's metadata wholesale.
+    let replaced = s3_request_with_headers(
+        "PUT",
+        &format!("{}/umeta-cp/repl.txt", base_url),
+        vec![],
+        vec![
+            ("x-amz-copy-source", "/umeta-cp/src.txt"),
+            ("x-amz-metadata-directive", "REPLACE"),
+            ("x-amz-meta-fresh", "yes"),
+        ],
+    )
+    .await;
+    assert_eq!(replaced.status(), 200);
+    let head = s3_request("HEAD", &format!("{}/umeta-cp/repl.txt", base_url), vec![]).await;
+    assert_eq!(
+        user_meta(&head).get("fresh").map(String::as_str),
+        Some("yes")
+    );
+    assert!(
+        !user_meta(&head).contains_key("rev"),
+        "REPLACE must not inherit source metadata"
+    );
+
+    // REPLACE with no metadata headers empties it rather than falling back.
+    let cleared = s3_request_with_headers(
+        "PUT",
+        &format!("{}/umeta-cp/clear.txt", base_url),
+        vec![],
+        vec![
+            ("x-amz-copy-source", "/umeta-cp/src.txt"),
+            ("x-amz-metadata-directive", "REPLACE"),
+        ],
+    )
+    .await;
+    assert_eq!(cleared.status(), 200);
+    let head = s3_request("HEAD", &format!("{}/umeta-cp/clear.txt", base_url), vec![]).await;
+    assert!(user_meta(&head).is_empty());
+}
+
+#[tokio::test]
+async fn test_user_metadata_too_large_rejected() {
+    let (base_url, _tmp) = start_server().await;
+    s3_request("PUT", &format!("{}/umeta-big", base_url), vec![]).await;
+
+    let big = "x".repeat(3000);
+    let resp = s3_request_with_headers(
+        "PUT",
+        &format!("{}/umeta-big/a.txt", base_url),
+        b"x".to_vec(),
+        vec![("x-amz-meta-big", big.as_str())],
+    )
+    .await;
+    assert_eq!(resp.status(), 400);
+    assert!(resp.text().await.unwrap().contains("MetadataTooLarge"));
+
+    // Nothing was written.
+    let head = s3_request("HEAD", &format!("{}/umeta-big/a.txt", base_url), vec![]).await;
+    assert_eq!(head.status(), 404);
+}
+
+#[tokio::test]
+async fn test_user_metadata_multipart() {
+    let (base_url, _tmp) = start_server().await;
+    s3_request("PUT", &format!("{}/umeta-mp", base_url), vec![]).await;
+
+    let init = s3_request_with_headers(
+        "POST",
+        &format!("{}/umeta-mp/big.bin?uploads", base_url),
+        vec![],
+        vec![("x-amz-meta-rev", "mp-revision")],
+    )
+    .await;
+    assert_eq!(init.status(), 200);
+    let upload_id =
+        extract_xml_tag(&init.text().await.unwrap(), "UploadId").expect("UploadId in response");
+
+    let part = vec![b'a'; 5 * 1024 * 1024];
+    let put_part = s3_request(
+        "PUT",
+        &format!(
+            "{}/umeta-mp/big.bin?partNumber=1&uploadId={}",
+            base_url, upload_id
+        ),
+        part,
+    )
+    .await;
+    assert_eq!(put_part.status(), 200);
+    let etag = put_part
+        .headers()
+        .get("etag")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+
+    let complete = s3_request(
+        "POST",
+        &format!("{}/umeta-mp/big.bin?uploadId={}", base_url, upload_id),
+        format!(
+            "<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>{}</ETag></Part></CompleteMultipartUpload>",
+            etag
+        )
+        .into_bytes(),
+    )
+    .await;
+    assert_eq!(complete.status(), 200);
+
+    let head = s3_request("HEAD", &format!("{}/umeta-mp/big.bin", base_url), vec![]).await;
+    assert_eq!(
+        user_meta(&head).get("rev").map(String::as_str),
+        Some("mp-revision"),
+        "metadata set at CreateMultipartUpload must survive completion"
+    );
+}
+
+#[tokio::test]
+async fn test_user_metadata_bound_into_sidecar_mac() {
+    let (base_url, tmp) = start_server().await;
+    s3_request("PUT", &format!("{}/umeta-sse", base_url), vec![]).await;
+    s3_request_with_headers(
+        "PUT",
+        &format!("{}/umeta-sse/a.txt", base_url),
+        b"secret".to_vec(),
+        vec![
+            ("x-amz-server-side-encryption", "AES256"),
+            ("x-amz-meta-rev", "abc123"),
+        ],
+    )
+    .await;
+
+    let head = s3_request("HEAD", &format!("{}/umeta-sse/a.txt", base_url), vec![]).await;
+    assert_eq!(
+        user_meta(&head).get("rev").map(String::as_str),
+        Some("abc123")
+    );
+
+    // User metadata is immutable after write, so it stays inside the MAC —
+    // unlike tags, which mac_input deliberately strips.
+    let meta_path = tmp.path().join("buckets/umeta-sse/a.txt.meta.json");
+    let mut meta: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&meta_path).unwrap()).unwrap();
+    meta["user_metadata"]["rev"] = serde_json::json!("TAMPERED");
+    std::fs::write(&meta_path, serde_json::to_vec(&meta).unwrap()).unwrap();
+
+    let get = s3_request("GET", &format!("{}/umeta-sse/a.txt", base_url), vec![]).await;
+    assert_eq!(get.status(), 400, "tampered user metadata must be rejected");
+}
+
+#[tokio::test]
+async fn test_user_metadata_erasure_coded() {
+    let (base_url, _tmp) = start_server_ec().await;
+    s3_request("PUT", &format!("{}/umeta-ec", base_url), vec![]).await;
+    s3_request_with_headers(
+        "PUT",
+        &format!("{}/umeta-ec/a.bin", base_url),
+        vec![b'z'; 300 * 1024],
+        vec![("x-amz-meta-rev", "ec-revision")],
+    )
+    .await;
+
+    let head = s3_request("HEAD", &format!("{}/umeta-ec/a.bin", base_url), vec![]).await;
+    assert_eq!(
+        user_meta(&head).get("rev").map(String::as_str),
+        Some("ec-revision")
+    );
+}
+
+#[tokio::test]
+async fn test_user_metadata_unservable_sidecar_value_is_skipped() {
+    let (base_url, tmp) = start_server().await;
+    s3_request("PUT", &format!("{}/umeta-bad", base_url), vec![]).await;
+    s3_request_with_headers(
+        "PUT",
+        &format!("{}/umeta-bad/a.txt", base_url),
+        b"payload".to_vec(),
+        vec![("x-amz-meta-good", "fine")],
+    )
+    .await;
+
+    // The sidecar is a plain file — a restored backup or a hand-edit can put a
+    // name or value in it that `http` refuses. Emitting it would defer the
+    // conversion error to the `.body().unwrap()` and panic on every read.
+    let meta_path = tmp.path().join("buckets/umeta-bad/a.txt.meta.json");
+    let mut meta: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&meta_path).unwrap()).unwrap();
+    meta["user_metadata"]["bad value"] = serde_json::json!("ok");
+    meta["user_metadata"]["ctl"] = serde_json::json!("has\u{0001}control");
+    std::fs::write(&meta_path, serde_json::to_vec(&meta).unwrap()).unwrap();
+
+    let head = s3_request("HEAD", &format!("{}/umeta-bad/a.txt", base_url), vec![]).await;
+    assert_eq!(head.status(), 200, "object must stay readable");
+    assert_eq!(
+        user_meta(&head).get("good").map(String::as_str),
+        Some("fine"),
+        "servable entries still come back"
+    );
+
+    let get = s3_request("GET", &format!("{}/umeta-bad/a.txt", base_url), vec![]).await;
+    assert_eq!(get.status(), 200);
+    assert_eq!(get.bytes().await.unwrap().as_ref(), b"payload");
+}

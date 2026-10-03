@@ -95,6 +95,7 @@ This runs both processes concurrently (Ctrl+C kills both):
 
 - **Pure filesystem storage**: No database. Buckets are directories, objects are files at their key path, metadata in `.meta.json` sidecars. Backup-friendly — just copy the data dir
 - **Storage layout**: `{data_dir}/buckets/{bucket-name}/{key-path}` for data, `{key-path}.meta.json` for metadata, `.bucket.json` for bucket metadata
+- **User metadata**: `x-amz-meta-*` is persisted in the object's `.meta.json` sidecar (names lowercased, prefix stripped) and returned on GET/HEAD.
 - **Path-style only**: `/{bucket}/{key}` routing. No virtual-hosted-style yet
 - **UNSIGNED-PAYLOAD accepted**: Skips body hashing for PutObject (AWS CLI default)
 - **Embedded UI assets**: Frontend is compiled into the binary via `rust-embed`. `build.rs` runs `bun run build` into `ui/dist/` (skip with `SKIP_FRONTEND=1`); `index.html` is the SPA fallback. Dev uses Vite HMR. In release builds, assets are baked in — single binary, no external files needed

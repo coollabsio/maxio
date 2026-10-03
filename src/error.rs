@@ -35,6 +35,7 @@ pub enum S3ErrorCode {
     SignatureDoesNotMatch,
     InvalidEncryptionAlgorithm,
     ServerSideEncryptionConfigurationNotFound,
+    MetadataTooLarge,
 }
 
 impl S3ErrorCode {
@@ -66,6 +67,7 @@ impl S3ErrorCode {
             Self::ServerSideEncryptionConfigurationNotFound => {
                 "ServerSideEncryptionConfigurationNotFoundError"
             }
+            Self::MetadataTooLarge => "MetadataTooLarge",
         }
     }
 
@@ -156,6 +158,17 @@ impl S3Error {
         Self {
             code: S3ErrorCode::InvalidArgument,
             message: msg.to_string(),
+            resource: None,
+        }
+    }
+
+    pub fn metadata_too_large(limit: usize) -> Self {
+        Self {
+            code: S3ErrorCode::MetadataTooLarge,
+            message: format!(
+                "Your metadata headers exceed the maximum allowed metadata size of {} bytes.",
+                limit
+            ),
             resource: None,
         }
     }

@@ -14,7 +14,7 @@ use crate::xml::{response::to_xml, types::*};
 
 use super::object::{
     body_to_reader, encryption_from_bucket_default, extract_checksum, extract_customer_key,
-    extract_sse_request, spec_from_request,
+    extract_sse_request, extract_user_metadata, spec_from_request,
 };
 
 const COMPLETE_BODY_MAX: usize = 1024 * 1024;
@@ -43,6 +43,7 @@ pub async fn create_multipart_upload(
         }
     }
     let encryption_spec = encryption.as_ref().map(spec_from_request);
+    let user_metadata = extract_user_metadata(&headers)?;
     let applied_mode = encryption.as_ref().map(|e| e.mode.clone());
 
     let upload = state
@@ -53,6 +54,7 @@ pub async fn create_multipart_upload(
             content_type,
             checksum_algorithm,
             encryption_spec,
+            user_metadata,
         )
         .await
         .map_err(map_storage_err)?;

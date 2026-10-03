@@ -613,6 +613,7 @@ pub struct UploadResponse {
     request_body(content = BinaryBody, content_type = "application/octet-stream"),
     responses(
         (status = 200, body = UploadResponse),
+        (status = 400, description = "Invalid user metadata (x-amz-meta-*)", body = ErrorResponse),
         (status = 404, description = "Bucket not found", body = ErrorResponse),
     )
 )]
@@ -630,6 +631,13 @@ pub async fn upload_object(
         .get("content-type")
         .and_then(|v| v.to_str().ok())
         .unwrap_or("application/octet-stream");
+
+    // This handler already reads S3-style request headers, so honour
+    // `x-amz-meta-*` here too rather than accepting and discarding it.
+    let user_metadata = match crate::api::object::extract_user_metadata(&headers) {
+        Ok(m) => m,
+        Err(e) => return error(StatusCode::BAD_REQUEST, e.message),
+    };
 
     let stream = body.into_data_stream();
     let reader = tokio_util::io::StreamReader::new(
@@ -650,6 +658,7 @@ pub async fn upload_object(
             Box::pin(reader),
             None,
             encryption,
+            user_metadata,
         )
         .await
     {
@@ -750,6 +759,7 @@ async fn preserve_empty_parent_folder_after_object_delete(
             &parent_prefix,
             "application/x-directory",
             Box::pin(tokio::io::empty()),
+            None,
             None,
             None,
         )
@@ -990,6 +1000,7 @@ pub async fn create_folder(
             Box::pin(tokio::io::empty()),
             None,
             encryption,
+            None,
         )
         .await
     {
@@ -1377,6 +1388,7 @@ mod tests {
                 bytes(b"hello"),
                 None,
                 None,
+                None,
             )
             .await
             .unwrap();
@@ -1407,6 +1419,7 @@ mod tests {
                 "folder/",
                 "application/x-directory",
                 Box::pin(tokio::io::empty()),
+                None,
                 None,
                 None,
             )

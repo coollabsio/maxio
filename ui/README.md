@@ -22,7 +22,7 @@ bun run api:generate  # regenerate src/api/generated from src/api/generated/open
 ```
 
 For e2e, install the browser once with `bunx playwright install chromium` and start a server, e.g.
-`cargo run -- --data-dir /tmp/maxio-e2e --port 9876`.
+`cargo run -- --data-dir /tmp/maxio-e2e --port 9876 --allow-insecure-dev`.
 
 ## Layout
 

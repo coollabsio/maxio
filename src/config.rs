@@ -56,11 +56,15 @@ pub struct Config {
     #[arg(long, env = "MAXIO_MASTER_KEY")]
     pub master_key: Option<String>,
 
-    /// Allow insecure development defaults (default credentials, HTTP cookies).
+    /// Allow the built-in maxioadmin credentials and omit Secure on console cookies for every host.
+    /// For local development only. A production server should set its own access key and secret key.
     #[arg(long, env = "MAXIO_ALLOW_INSECURE_DEV", default_value = "false")]
     pub allow_insecure_dev: bool,
 
-    /// Force Secure on console session cookies. Keep enabled for public consoles.
+    /// Mark console session cookies Secure.
+    /// On by default. HTTPS requests (`X-Forwarded-Proto: https`) and any non-loopback host
+    /// get a Secure cookie. Plain HTTP to localhost omits it so a browser will store the session.
+    /// Set to false only to allow a non-Secure cookie on a non-loopback HTTP host.
     #[arg(long, env = "MAXIO_SECURE_COOKIES", default_value = "true")]
     pub secure_cookies: bool,
 

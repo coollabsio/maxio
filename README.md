@@ -19,20 +19,36 @@ See [COMPATIBILITY.md](COMPATIBILITY.md) for the full list of supported S3 and M
 
 ## Quick Start
 
+The web console is at `http://localhost:9000/ui/`.
+
+Sign-in sticks on plain `http://localhost`, `http://127.0.0.1`, and `http://[::1]`. The session cookie is marked `Secure` when the request is HTTPS (`X-Forwarded-Proto: https`) or the host is anything else, so a public HTTP listener does not store a console session. A TLS proxy must forward `X-Forwarded-Proto: https`. To allow the console over plain HTTP on a non-loopback host, set `MAXIO_SECURE_COOKIES=false` (anyone on that network can read the session).
+
+The server refuses to start with the built-in `maxioadmin` / `maxioadmin` keys. Set your own keys, as below. `--allow-insecure-dev` keeps those defaults and also omits `Secure` on every host; use it only on a machine you trust.
+
+### Docker
+
 ```bash
-docker run -d -p 9000:9000 -v $(pwd)/data:/data \
+docker run -d --name maxio -p 9000:9000 -v "$(pwd)/data:/data" \
   -e MAXIO_ACCESS_KEY=myadmin -e MAXIO_SECRET_KEY=mysecret \
   ghcr.io/coollabsio/maxio
 ```
 
-Open `http://localhost:9000/ui/`. Images are on [GHCR](https://ghcr.io/coollabsio/maxio) and Docker Hub (`coollabsio/maxio`).
+Open `http://localhost:9000/ui/` and sign in with `myadmin` / `mysecret`. Images are on [GHCR](https://ghcr.io/coollabsio/maxio) and Docker Hub (`coollabsio/maxio`).
 
-Build from source:
+### Build from source
+
+Install [Rust](https://rustup.rs) (the version in `rust-toolchain.toml`) and [bun](https://bun.sh) **1.4.2**. `cargo build` runs bun to compile the web console and embed it in the binary.
 
 ```bash
+curl -fsSL https://bun.sh/install | bash -s "bun-v1.4.2"
+export PATH="$HOME/.bun/bin:$PATH"
+
 cargo build --release
-./target/release/maxio --data-dir ./data --port 9000
+./target/release/maxio --data-dir ./data --port 9000 \
+  --access-key myadmin --secret-key mysecret
 ```
+
+Open `http://localhost:9000/ui/` and sign in with `myadmin` / `mysecret`.
 
 ## Configuration
 
@@ -45,8 +61,8 @@ cargo build --release
 | `MAXIO_SECRET_KEY` | `maxioadmin` | Secret key (aliases: `MINIO_ROOT_PASSWORD`, `MINIO_SECRET_KEY`) |
 | `MAXIO_REGION` | `us-east-1` | S3 region (aliases: `MINIO_REGION_NAME`, `MINIO_REGION`) |
 | `MAXIO_DEFAULT_BUCKETS` | _(none)_ | Comma-separated buckets to create at startup (alias: `MINIO_DEFAULT_BUCKETS`) |
-| `MAXIO_ALLOW_INSECURE_DEV` | `false` | Allow default credentials and HTTP console cookies |
-| `MAXIO_SECURE_COOKIES` | `true` | Force `Secure` on console session cookies |
+| `MAXIO_ALLOW_INSECURE_DEV` | `false` | Keep the built-in `maxioadmin` keys and omit `Secure` on console cookies for every host. Local only |
+| `MAXIO_SECURE_COOKIES` | `true` | `Secure` cookies on HTTPS and on non-loopback hosts. Plain `http://localhost` still stores a session. Set `false` to allow that on any host |
 | `MAXIO_ERASURE_CODING` | `false` | Enable erasure coding |
 | `MAXIO_CHUNK_SIZE` | `10485760` | Erasure coding chunk size in bytes |
 | `MAXIO_PARITY_SHARDS` | `0` | Parity shards per object |
@@ -58,7 +74,7 @@ Each variable also has a CLI flag (for example `--port`). Run `maxio --help` for
 ## Usage
 
 ```bash
-mc alias set maxio http://localhost:9000 maxioadmin maxioadmin
+mc alias set maxio http://localhost:9000 myadmin mysecret
 mc mb maxio/my-bucket
 mc cp file.txt maxio/my-bucket/
 ```

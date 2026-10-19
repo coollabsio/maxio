@@ -254,7 +254,7 @@ pub async fn login(
     let cookie = make_cookie(
         &token,
         TOKEN_MAX_AGE_SECS,
-        state.config.secure_cookies && !state.config.allow_insecure_dev,
+        console_cookie_secure(&state.config, &headers),
     );
 
     let mut resp_headers = HeaderMap::new();
@@ -292,12 +292,8 @@ pub async fn check(State(state): State<AppState>, headers: HeaderMap) -> Respons
     tag = "auth",
     responses((status = 200, body = OkResponse))
 )]
-pub async fn logout(State(state): State<AppState>) -> Response {
-    let cookie = make_cookie(
-        "",
-        0,
-        state.config.secure_cookies && !state.config.allow_insecure_dev,
-    );
+pub async fn logout(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    let cookie = make_cookie("", 0, console_cookie_secure(&state.config, &headers));
     let mut resp_headers = HeaderMap::new();
     resp_headers.insert("Set-Cookie", cookie.parse().unwrap());
     (resp_headers, ok()).into_response()
@@ -356,6 +352,37 @@ fn origin_host(origin_or_referer: &str) -> Option<&str> {
         .strip_prefix("https://")
         .or_else(|| origin_or_referer.strip_prefix("http://"))
         .and_then(|rest| rest.split('/').next())
+}
+
+/// Whether the console session cookie should carry `Secure`.
+///
+/// `Secure` is required when the browser is on HTTPS (`X-Forwarded-Proto: https`)
+/// and for any non-loopback host. Plain HTTP to `localhost` / `127.0.0.1` / `::1`
+/// omits it: browsers drop `Secure` cookies on `http://` pages, so the flag would
+/// only break the documented local login. It does not make a public HTTP console
+/// store a session — that still needs TLS or `MAXIO_SECURE_COOKIES=false`.
+/// `--allow-insecure-dev` also omits `Secure` on every host.
+fn console_cookie_secure(config: &crate::config::Config, headers: &HeaderMap) -> bool {
+    if !config.secure_cookies || config.allow_insecure_dev {
+        return false;
+    }
+    if forwarded_proto_is_https(headers) {
+        return true;
+    }
+    let host = headers
+        .get("host")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("");
+    !is_loopback_host(host)
+}
+
+/// First entry of `X-Forwarded-Proto` (proxies may send `https,http`).
+fn forwarded_proto_is_https(headers: &HeaderMap) -> bool {
+    headers
+        .get("x-forwarded-proto")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(',').next())
+        .is_some_and(|value| value.trim().eq_ignore_ascii_case("https"))
 }
 
 fn is_loopback_host(host_with_optional_port: &str) -> bool {
@@ -2056,5 +2083,77 @@ mod tests {
 
         let objects = storage.list_objects("bucket", "folder/").await.unwrap();
         assert!(objects.is_empty());
+    }
+
+    fn cookie_config(secure_cookies: bool, allow_insecure_dev: bool) -> crate::config::Config {
+        crate::config::Config {
+            port: 9000,
+            address: "0.0.0.0".into(),
+            data_dir: "./data".into(),
+            access_key: "myadmin".into(),
+            secret_key: "mysecret".into(),
+            region: "us-east-1".into(),
+            master_key: None,
+            allow_insecure_dev,
+            secure_cookies,
+            erasure_coding: false,
+            chunk_size: 10 * 1024 * 1024,
+            parity_shards: 0,
+            default_buckets: String::new(),
+            max_console_body_bytes: 1024 * 1024,
+        }
+    }
+
+    fn header_map(pairs: &[(&str, &str)]) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        for (name, value) in pairs {
+            headers.insert(
+                axum::http::HeaderName::try_from(*name).unwrap(),
+                value.parse().unwrap(),
+            );
+        }
+        headers
+    }
+
+    #[test]
+    fn loopback_http_console_cookie_is_not_secure() {
+        let config = cookie_config(true, false);
+        for host in ["localhost:9000", "127.0.0.1:9000", "[::1]:9000"] {
+            let headers = header_map(&[("host", host)]);
+            assert!(
+                !console_cookie_secure(&config, &headers),
+                "{host} should omit Secure"
+            );
+        }
+    }
+
+    #[test]
+    fn https_and_non_loopback_console_cookies_are_secure() {
+        let config = cookie_config(true, false);
+        assert!(console_cookie_secure(
+            &config,
+            &header_map(&[("host", "storage.example.com")])
+        ));
+        assert!(console_cookie_secure(
+            &config,
+            &header_map(&[("host", "localhost:9000"), ("x-forwarded-proto", "https")])
+        ));
+        assert!(console_cookie_secure(
+            &config,
+            &header_map(&[
+                ("host", "storage.example.com"),
+                ("x-forwarded-proto", "https,http")
+            ])
+        ));
+        assert!(console_cookie_secure(&config, &header_map(&[])));
+    }
+
+    #[test]
+    fn insecure_dev_and_secure_cookies_false_omit_secure_everywhere() {
+        let insecure = cookie_config(true, true);
+        let opted_out = cookie_config(false, false);
+        let public_host = header_map(&[("host", "storage.example.com")]);
+        assert!(!console_cookie_secure(&insecure, &public_host));
+        assert!(!console_cookie_secure(&opted_out, &public_host));
     }
 }

@@ -1,6 +1,8 @@
 pub mod bucket;
+pub mod chunked;
 pub mod console;
 pub mod cors;
+pub mod lifecycle;
 pub mod list;
 pub mod multipart;
 pub mod object;

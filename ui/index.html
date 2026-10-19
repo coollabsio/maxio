@@ -7,8 +7,8 @@
     <link rel="icon" type="image/png" sizes="32x32" href="/favicon-32.png" />
     <link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png" />
     <link rel="manifest" href="/manifest.webmanifest" />
-    <meta name="theme-color" media="(prefers-color-scheme: light)" content="#f9fafb" />
-    <meta name="theme-color" media="(prefers-color-scheme: dark)" content="#101010" />
+    <meta name="theme-color" media="(prefers-color-scheme: light)" content="#fbfbfb" />
+    <meta name="theme-color" media="(prefers-color-scheme: dark)" content="#0d0d0d" />
     <meta name="application-name" content="MaxIO" />
     <meta name="mobile-web-app-capable" content="yes" />
     <meta name="apple-mobile-web-app-capable" content="yes" />
@@ -21,6 +21,8 @@
         const prefersDark = window.matchMedia('(prefers-color-scheme: dark)').matches
         const shouldUseDark = saved === 'dark' || ((saved === null || saved === 'system') && prefersDark)
         document.documentElement.classList.toggle('dark', shouldUseDark)
+        document.documentElement.dataset.navStyle = localStorage.getItem('navStyle') === 'floating' ? 'floating' : 'default'
+        document.documentElement.dataset.navItems = localStorage.getItem('navItems') === 'flat' ? 'flat' : '3d'
       } catch (_) {
         document.documentElement.classList.toggle(
           'dark',

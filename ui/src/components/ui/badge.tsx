@@ -37,7 +37,7 @@ function Badge({ className, variant = 'success', label, ...props }: BadgeProps) 
   return (
     <span className="inline-flex items-center gap-2">
       {dot}
-      <span className={cn('text-xs font-bold', textColors[variant])}>{label}</span>
+      <span className={cn('text-xs font-medium', textColors[variant])}>{label}</span>
     </span>
   )
 }

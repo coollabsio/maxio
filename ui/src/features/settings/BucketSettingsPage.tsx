@@ -5,9 +5,13 @@ import { ApiError } from '@/api/client'
 import { bucketKeys, settingsKeys } from '@/api/queryKeys'
 import { Callout } from '@/components/ui/callout'
 import { ConfirmDialog } from '@/components/ui/confirm-dialog'
+import { PageHeader } from '@/components/ui/page-header'
 import { Switch } from '@/components/ui/switch'
+import { LifecycleCard } from '@/features/lifecycle/LifecycleCard'
 import { toast } from '@/lib/toast'
 import { getEncryption, getPublicAccess, getVersioning, setEncryption, setPublicAccess, setVersioning } from './api'
+import { BucketPolicyCard } from './BucketPolicyCard'
+import { BucketTagsCard } from './BucketTagsCard'
 
 interface PendingConfirmation {
   title: string
@@ -29,10 +33,10 @@ interface SettingRowProps {
 
 function SettingRow({ title, description, loading, checked, disabled, label, onToggle }: SettingRowProps) {
   return (
-    <div className="flex items-center justify-between">
+    <div className="flex items-center justify-between gap-6 px-4 py-3.5">
       <div className="flex flex-col gap-0.5">
-        <span className="text-sm font-medium">{title}</span>
-        <span className="text-sm text-muted-foreground">{loading ? 'Loading...' : description}</span>
+        <span className="text-[13px] font-medium text-black dark:text-fg">{title}</span>
+        <span className="text-[13px] text-neutral-500 dark:text-fg-faint">{loading ? 'Loading...' : description}</span>
       </div>
       {!loading ? (
         <Switch checked={checked} onCheckedChange={onToggle} disabled={disabled} aria-label={label} />
@@ -82,6 +86,8 @@ function BucketSettings({ bucket }: { bucket: string }) {
     mutationFn: (next: { read: boolean; list: boolean }) => setPublicAccess(bucket, next.read, next.list),
     onSuccess: (_data, next) => {
       void queryClient.invalidateQueries({ queryKey: settingsKeys.publicAccess(bucket) })
+      void queryClient.invalidateQueries({ queryKey: settingsKeys.policy(bucket) })
+      void queryClient.invalidateQueries({ queryKey: bucketKeys.list() })
       toast.success(
         next.read !== publicRead
           ? next.read
@@ -183,7 +189,9 @@ function BucketSettings({ bucket }: { bucket: string }) {
 
   return (
     <>
-      <div className="flex flex-col gap-6 max-w-2xl">
+      <div className="flex max-w-3xl flex-col gap-6">
+        <PageHeader title="Settings" description={`Configuration of bucket ${bucket}`} />
+
         {versioningQuery.isError || encryptionQuery.isError || publicQuery.isError ? (
           <Callout type="danger">Failed to load bucket settings</Callout>
         ) : null}
@@ -195,65 +203,73 @@ function BucketSettings({ bucket }: { bucket: string }) {
           </Callout>
         ) : null}
 
-        <div className="flex flex-col gap-4">
-          <h3 className="text-sm font-medium text-muted-foreground uppercase tracking-wide">General</h3>
+        <section className="settings-section">
+          <div className="settings-section-header">
+            <h2>General</h2>
+            <p>Versioning, encryption at rest, and anonymous access.</p>
+          </div>
+          <div className="settings-section-body divide-y divide-neutral-200 dark:divide-white/[0.06]">
+            <SettingRow
+              title="Versioning"
+              loading={versioningQuery.isPending}
+              description={
+                versioningEnabled
+                  ? 'Every upload creates a new version. Deleted files become delete markers.'
+                  : 'Uploading a file overwrites the previous version.'
+              }
+              checked={versioningEnabled}
+              disabled={versioningMutation.isPending}
+              label="Toggle versioning"
+              onToggle={toggleVersioning}
+            />
 
-          <SettingRow
-            title="Versioning"
-            loading={versioningQuery.isPending}
-            description={
-              versioningEnabled
-                ? 'Every upload creates a new version. Deleted files become delete markers.'
-                : 'Uploading a file overwrites the previous version.'
-            }
-            checked={versioningEnabled}
-            disabled={versioningMutation.isPending}
-            label="Toggle versioning"
-            onToggle={toggleVersioning}
-          />
+            <SettingRow
+              title="Default encryption (SSE-S3)"
+              loading={encryptionQuery.isPending}
+              description={
+                encryptionEnabled
+                  ? 'New uploads are encrypted at rest with SSE-S3 (AES-256).'
+                  : 'New uploads are stored unencrypted unless the client sends SSE headers.'
+              }
+              checked={encryptionEnabled}
+              disabled={encryptionMutation.isPending}
+              label="Toggle default encryption"
+              onToggle={toggleEncryption}
+            />
 
-          <SettingRow
-            title="Default encryption (SSE-S3)"
-            loading={encryptionQuery.isPending}
-            description={
-              encryptionEnabled
-                ? 'New uploads are encrypted at rest with SSE-S3 (AES-256).'
-                : 'New uploads are stored unencrypted unless the client sends SSE headers.'
-            }
-            checked={encryptionEnabled}
-            disabled={encryptionMutation.isPending}
-            label="Toggle default encryption"
-            onToggle={toggleEncryption}
-          />
+            <SettingRow
+              title="Public read"
+              loading={publicQuery.isPending}
+              description={
+                publicRead
+                  ? 'Anyone with an object URL can download it without credentials.'
+                  : 'Object downloads require a signed request.'
+              }
+              checked={publicRead}
+              disabled={publicMutation.isPending}
+              label="Toggle public read"
+              onToggle={togglePublicRead}
+            />
 
-          <SettingRow
-            title="Public read"
-            loading={publicQuery.isPending}
-            description={
-              publicRead
-                ? 'Anyone with an object URL can download it without credentials.'
-                : 'Object downloads require a signed request.'
-            }
-            checked={publicRead}
-            disabled={publicMutation.isPending}
-            label="Toggle public read"
-            onToggle={togglePublicRead}
-          />
+            <SettingRow
+              title="Public listing"
+              loading={publicQuery.isPending}
+              description={
+                publicList
+                  ? 'Anyone can list every object key in this bucket without credentials.'
+                  : 'Listing the bucket requires a signed request.'
+              }
+              checked={publicList}
+              disabled={publicMutation.isPending}
+              label="Toggle public listing"
+              onToggle={togglePublicList}
+            />
+          </div>
+        </section>
 
-          <SettingRow
-            title="Public listing"
-            loading={publicQuery.isPending}
-            description={
-              publicList
-                ? 'Anyone can list every object key in this bucket without credentials.'
-                : 'Listing the bucket requires a signed request.'
-            }
-            checked={publicList}
-            disabled={publicMutation.isPending}
-            label="Toggle public listing"
-            onToggle={togglePublicList}
-          />
-        </div>
+        <BucketPolicyCard bucket={bucket} />
+        <BucketTagsCard bucket={bucket} />
+        <LifecycleCard bucket={bucket} versioningEnabled={versioningEnabled} />
       </div>
 
       {pendingConfirmation ? (

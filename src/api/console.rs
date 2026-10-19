@@ -385,6 +385,12 @@ pub struct BucketSummary {
     created_at: String,
     versioning: bool,
     encryption: bool,
+    /// Anonymous GetObject allowed (bucket policy).
+    public_read: bool,
+    /// Anonymous ListBucket allowed (bucket policy).
+    public_list: bool,
+    /// Number of bucket tags.
+    tag_count: u32,
 }
 
 #[derive(Serialize, ToSchema)]
@@ -412,6 +418,9 @@ pub async fn list_buckets(State(state): State<AppState>) -> Response {
                     created_at: b.created_at,
                     versioning: b.versioning,
                     encryption: b.encryption_config.is_some(),
+                    public_read: b.public_read,
+                    public_list: b.public_list,
+                    tag_count: b.tags.as_ref().map_or(0, |t| t.len() as u32),
                 })
                 .collect();
             (StatusCode::OK, Json(BucketListResponse { buckets })).into_response()
@@ -456,6 +465,9 @@ pub async fn create_bucket(
         encryption_config: None,
         public_read: false,
         public_list: false,
+        versioning_suspended: false,
+        tags: None,
+        lifecycle: None,
     };
 
     match state.storage.create_bucket(&meta).await {
@@ -515,6 +527,7 @@ pub struct ObjectSummary {
     size: u64,
     last_modified: String,
     etag: String,
+    content_type: String,
 }
 
 #[derive(Serialize, ToSchema)]
@@ -568,6 +581,7 @@ pub async fn list_objects(
                 size: obj.size,
                 last_modified: obj.last_modified.clone(),
                 etag: obj.etag.clone(),
+                content_type: obj.content_type.clone(),
             });
         }
     }
@@ -1227,6 +1241,7 @@ pub async fn delete_version(
         .await
     {
         Ok(_) => ok(),
+        Err(crate::storage::StorageError::InvalidKey(msg)) => error(StatusCode::BAD_REQUEST, msg),
         Err(e) => internal(e),
     }
 }
@@ -1257,6 +1272,606 @@ pub async fn download_version(
     {
         Ok((reader, meta)) => attachment_response(&key, reader, &meta),
         Err(_) => error(StatusCode::NOT_FOUND, "Version not found"),
+    }
+}
+
+// --- Object details, tags, bucket tags, policy view, version restore ---------
+
+#[derive(Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
+#[serde(rename_all = "camelCase")]
+pub struct VersionParams {
+    /// Target a specific version instead of the current object.
+    version_id: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, ToSchema)]
+pub struct TagEntry {
+    key: String,
+    value: String,
+}
+
+/// A tag set (`GET` response and `PUT` body). An empty list clears the tags.
+#[derive(Serialize, Deserialize, ToSchema)]
+pub struct TagSetBody {
+    tags: Vec<TagEntry>,
+}
+
+#[derive(Serialize, ToSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum StorageFormat {
+    /// Single file on disk.
+    Plain,
+    /// Split into checksummed chunks.
+    Chunked,
+    /// Chunked with erasure-coding parity shards.
+    Erasure,
+}
+
+#[derive(Serialize, ToSchema)]
+pub struct ObjectChecksum {
+    /// `CRC32`, `CRC32C`, `CRC64NVME`, `SHA1` or `SHA256`.
+    algorithm: String,
+    #[schema(required = true)]
+    value: Option<String>,
+}
+
+#[derive(Serialize, ToSchema)]
+pub enum EncryptionModeName {
+    #[serde(rename = "SSE-S3")]
+    SseS3,
+    #[serde(rename = "SSE-C")]
+    SseC,
+}
+
+/// Server-side encryption summary. Key material is never exposed.
+#[derive(Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ObjectEncryption {
+    mode: EncryptionModeName,
+    /// Master key id that wraps the object key (SSE-S3 only).
+    #[schema(required = true)]
+    key_id: Option<String>,
+}
+
+#[derive(Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ObjectInfo {
+    key: String,
+    size: u64,
+    etag: String,
+    content_type: String,
+    last_modified: String,
+    #[schema(required = true)]
+    version_id: Option<String>,
+    is_delete_marker: bool,
+    storage_format: StorageFormat,
+    /// Number of parts for multipart uploads.
+    #[schema(required = true)]
+    part_count: Option<u32>,
+    #[schema(required = true)]
+    checksum: Option<ObjectChecksum>,
+    #[schema(required = true)]
+    encryption: Option<ObjectEncryption>,
+    /// User-defined `x-amz-meta-*` metadata (names without the prefix).
+    user_metadata: std::collections::BTreeMap<String, String>,
+    #[schema(required = true)]
+    cache_control: Option<String>,
+    #[schema(required = true)]
+    content_disposition: Option<String>,
+    #[schema(required = true)]
+    content_encoding: Option<String>,
+    #[schema(required = true)]
+    content_language: Option<String>,
+    #[schema(required = true)]
+    expires: Option<String>,
+    tags: Vec<TagEntry>,
+}
+
+fn sorted_tags<I: IntoIterator<Item = (String, String)>>(tags: I) -> Vec<TagEntry> {
+    let mut out: Vec<TagEntry> = tags
+        .into_iter()
+        .map(|(key, value)| TagEntry { key, value })
+        .collect();
+    out.sort_by(|a, b| a.key.cmp(&b.key));
+    out
+}
+
+fn object_info(meta: crate::storage::ObjectMeta) -> ObjectInfo {
+    use crate::storage::EncryptionMode;
+    let storage_format = match meta.storage_format.as_deref() {
+        None => StorageFormat::Plain,
+        Some("chunked-v2") => StorageFormat::Erasure,
+        Some(_) => StorageFormat::Chunked,
+    };
+    let checksum = meta.checksum_algorithm.map(|algo| ObjectChecksum {
+        algorithm: format!("{:?}", algo),
+        value: meta.checksum_value.clone(),
+    });
+    let encryption = meta.encryption.as_ref().map(|enc| match enc.mode {
+        EncryptionMode::SseS3 => ObjectEncryption {
+            mode: EncryptionModeName::SseS3,
+            key_id: enc.key_id.clone(),
+        },
+        EncryptionMode::SseC => ObjectEncryption {
+            mode: EncryptionModeName::SseC,
+            key_id: None,
+        },
+    });
+    ObjectInfo {
+        part_count: meta.part_sizes.as_ref().map(|p| p.len() as u32),
+        storage_format,
+        checksum,
+        encryption,
+        user_metadata: meta.metadata.user_metadata.unwrap_or_default(),
+        tags: sorted_tags(meta.tags.unwrap_or_default()),
+        key: meta.key,
+        size: meta.size,
+        etag: meta.etag,
+        content_type: meta.content_type,
+        last_modified: meta.last_modified,
+        version_id: meta.version_id,
+        is_delete_marker: meta.is_delete_marker,
+        cache_control: meta.metadata.cache_control,
+        content_disposition: meta.metadata.content_disposition,
+        content_encoding: meta.metadata.content_encoding,
+        content_language: meta.metadata.content_language,
+        expires: meta.metadata.expires,
+    }
+}
+
+fn object_storage_error(e: crate::storage::StorageError) -> Response {
+    use crate::storage::StorageError;
+    match e {
+        StorageError::NotFound(_) => error(StatusCode::NOT_FOUND, "Object not found"),
+        StorageError::VersionNotFound(_) => error(StatusCode::NOT_FOUND, "Version not found"),
+        StorageError::InvalidKey(msg) => error(StatusCode::BAD_REQUEST, msg),
+        e => internal(e),
+    }
+}
+
+/// Metadata of the current object, or of `version_id`. The live sidecar wins
+/// when it is that version (it carries the freshest tags).
+async fn resolve_object_meta(
+    state: &AppState,
+    bucket: &str,
+    key: &str,
+    version_id: Option<&str>,
+) -> Result<crate::storage::ObjectMeta, Response> {
+    require_bucket(state, bucket).await?;
+    let current = match state.storage.head_object(bucket, key).await {
+        Ok(meta) => Some(meta),
+        Err(crate::storage::StorageError::NotFound(_)) => None,
+        Err(e) => return Err(object_storage_error(e)),
+    };
+    match version_id {
+        None => current
+            .filter(|m| !m.is_delete_marker)
+            .ok_or_else(|| error(StatusCode::NOT_FOUND, "Object not found")),
+        Some(vid) => {
+            if let Some(cur) = current.filter(|m| m.version_id.as_deref().unwrap_or("null") == vid)
+            {
+                return Ok(cur);
+            }
+            state
+                .storage
+                .version_meta(bucket, key, vid)
+                .await
+                .map_err(object_storage_error)
+        }
+    }
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/buckets/{bucket}/object-info/{key}",
+    operation_id = "getObjectInfo",
+    tag = "objects",
+    params(
+        ("bucket" = String, Path),
+        ("key" = String, Path, description = "Object key; may contain `/`"),
+        VersionParams,
+    ),
+    responses(
+        (status = 200, body = ObjectInfo),
+        (status = 400, description = "Invalid version id", body = ErrorResponse),
+        (status = 404, description = "Object or version not found", body = ErrorResponse),
+    )
+)]
+pub async fn get_object_info(
+    State(state): State<AppState>,
+    Path((bucket, key)): Path<(String, String)>,
+    Query(params): Query<VersionParams>,
+) -> Response {
+    match resolve_object_meta(&state, &bucket, &key, params.version_id.as_deref()).await {
+        Ok(meta) => (StatusCode::OK, Json(object_info(meta))).into_response(),
+        Err(resp) => resp,
+    }
+}
+
+/// Validate a console tag set with the S3 tagging limits.
+fn validate_tag_set(
+    tags: Vec<TagEntry>,
+    max: usize,
+    reject_aws_prefix: bool,
+) -> Result<Vec<(String, String)>, String> {
+    crate::storage::validate_tags(
+        tags.iter().map(|t| (t.key.as_str(), t.value.as_str())),
+        max,
+        reject_aws_prefix,
+    )
+    .map_err(|e| e.message)?;
+    Ok(tags.into_iter().map(|t| (t.key, t.value)).collect())
+}
+
+const OBJECT_TAGS_MAX: usize = 10;
+const BUCKET_TAGS_MAX: usize = 50;
+
+#[utoipa::path(
+    get,
+    path = "/api/buckets/{bucket}/object-tags/{key}",
+    operation_id = "getObjectTags",
+    tag = "objects",
+    params(
+        ("bucket" = String, Path),
+        ("key" = String, Path, description = "Object key; may contain `/`"),
+        VersionParams,
+    ),
+    responses(
+        (status = 200, body = TagSetBody),
+        (status = 400, description = "Invalid version id or delete marker", body = ErrorResponse),
+        (status = 404, description = "Object or version not found", body = ErrorResponse),
+    )
+)]
+pub async fn get_object_tags(
+    State(state): State<AppState>,
+    Path((bucket, key)): Path<(String, String)>,
+    Query(params): Query<VersionParams>,
+) -> Response {
+    match resolve_object_meta(&state, &bucket, &key, params.version_id.as_deref()).await {
+        Ok(meta) if meta.is_delete_marker => {
+            error(StatusCode::BAD_REQUEST, "Delete markers have no tags")
+        }
+        Ok(meta) => (
+            StatusCode::OK,
+            Json(TagSetBody {
+                tags: sorted_tags(meta.tags.unwrap_or_default()),
+            }),
+        )
+            .into_response(),
+        Err(resp) => resp,
+    }
+}
+
+#[utoipa::path(
+    put,
+    path = "/api/buckets/{bucket}/object-tags/{key}",
+    operation_id = "setObjectTags",
+    tag = "objects",
+    params(
+        ("bucket" = String, Path),
+        ("key" = String, Path, description = "Object key; may contain `/`"),
+        VersionParams,
+    ),
+    request_body = TagSetBody,
+    responses(
+        (status = 200, body = OkResponse),
+        (status = 400, description = "Invalid tags or version id", body = ErrorResponse),
+        (status = 404, description = "Object or version not found", body = ErrorResponse),
+    )
+)]
+pub async fn set_object_tags(
+    State(state): State<AppState>,
+    Path((bucket, key)): Path<(String, String)>,
+    Query(params): Query<VersionParams>,
+    Json(body): Json<TagSetBody>,
+) -> Response {
+    let tags: HashMap<String, String> = match validate_tag_set(body.tags, OBJECT_TAGS_MAX, false) {
+        Ok(tags) => tags.into_iter().collect(),
+        Err(msg) => return error(StatusCode::BAD_REQUEST, msg),
+    };
+    let meta = match resolve_object_meta(&state, &bucket, &key, params.version_id.as_deref()).await
+    {
+        Ok(meta) if meta.is_delete_marker => {
+            return error(StatusCode::BAD_REQUEST, "Delete markers have no tags");
+        }
+        Ok(meta) => meta,
+        Err(resp) => return resp,
+    };
+    // Versioned objects keep the version sidecar in sync with the live one.
+    let result = match params.version_id.or(meta.version_id) {
+        Some(vid) => {
+            state
+                .storage
+                .put_object_version_tagging(&bucket, &key, &vid, tags)
+                .await
+        }
+        None => state.storage.put_object_tagging(&bucket, &key, tags).await,
+    };
+    match result {
+        Ok(()) => ok(),
+        Err(e) => object_storage_error(e),
+    }
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/buckets/{bucket}/tags",
+    operation_id = "getBucketTags",
+    tag = "settings",
+    params(("bucket" = String, Path)),
+    responses(
+        (status = 200, body = TagSetBody),
+        (status = 404, description = "Bucket not found", body = ErrorResponse),
+    )
+)]
+pub async fn get_bucket_tags(
+    State(state): State<AppState>,
+    Path(bucket): Path<String>,
+) -> Response {
+    if let Err(resp) = require_bucket(&state, &bucket).await {
+        return resp;
+    }
+    match state.storage.get_bucket_meta(&bucket).await {
+        Ok(meta) => (
+            StatusCode::OK,
+            Json(TagSetBody {
+                tags: sorted_tags(meta.tags.unwrap_or_default()),
+            }),
+        )
+            .into_response(),
+        Err(crate::storage::StorageError::NotFound(_)) => {
+            error(StatusCode::NOT_FOUND, "Bucket not found")
+        }
+        Err(e) => internal(e),
+    }
+}
+
+#[utoipa::path(
+    put,
+    path = "/api/buckets/{bucket}/tags",
+    operation_id = "setBucketTags",
+    tag = "settings",
+    params(("bucket" = String, Path)),
+    request_body = TagSetBody,
+    responses(
+        (status = 200, body = OkResponse),
+        (status = 400, description = "Invalid tags", body = ErrorResponse),
+        (status = 404, description = "Bucket not found", body = ErrorResponse),
+    )
+)]
+pub async fn set_bucket_tags(
+    State(state): State<AppState>,
+    Path(bucket): Path<String>,
+    Json(body): Json<TagSetBody>,
+) -> Response {
+    let tags: std::collections::BTreeMap<String, String> =
+        match validate_tag_set(body.tags, BUCKET_TAGS_MAX, true) {
+            Ok(tags) => tags.into_iter().collect(),
+            Err(msg) => return error(StatusCode::BAD_REQUEST, msg),
+        };
+    if let Err(resp) = require_bucket(&state, &bucket).await {
+        return resp;
+    }
+    match state
+        .storage
+        .set_bucket_tags(&bucket, (!tags.is_empty()).then_some(tags))
+        .await
+    {
+        Ok(()) => ok(),
+        Err(e) => internal(e),
+    }
+}
+
+#[derive(Serialize, ToSchema)]
+pub struct BucketPolicyResponse {
+    /// The bucket policy JSON exactly as S3 `GET ?policy` returns it; `null`
+    /// when the bucket has no anonymous access.
+    #[schema(required = true)]
+    policy: Option<String>,
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/buckets/{bucket}/policy",
+    operation_id = "getBucketPolicy",
+    tag = "settings",
+    params(("bucket" = String, Path)),
+    responses(
+        (status = 200, body = BucketPolicyResponse),
+        (status = 404, description = "Bucket not found", body = ErrorResponse),
+    )
+)]
+pub async fn get_bucket_policy_view(
+    State(state): State<AppState>,
+    Path(bucket): Path<String>,
+) -> Response {
+    if let Err(resp) = require_bucket(&state, &bucket).await {
+        return resp;
+    }
+    let policy = match crate::api::bucket::get_bucket_policy(state.clone(), bucket).await {
+        Ok(resp) => match axum::body::to_bytes(resp.into_body(), usize::MAX).await {
+            Ok(bytes) => Some(String::from_utf8_lossy(&bytes).into_owned()),
+            Err(e) => return internal(e),
+        },
+        Err(e) if matches!(e.code, crate::error::S3ErrorCode::NoSuchBucketPolicy) => None,
+        Err(e) if matches!(e.code, crate::error::S3ErrorCode::NoSuchBucket) => {
+            return error(StatusCode::NOT_FOUND, "Bucket not found");
+        }
+        Err(e) => return internal(e.message),
+    };
+    (StatusCode::OK, Json(BucketPolicyResponse { policy })).into_response()
+}
+
+#[derive(Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct RestoreVersionResponse {
+    /// Version id of the new current version (`null` when versioning is off).
+    #[schema(required = true)]
+    version_id: Option<String>,
+}
+
+#[utoipa::path(
+    post,
+    path = "/api/buckets/{bucket}/versions/{versionId}/restore/{key}",
+    operation_id = "restoreVersion",
+    tag = "versions",
+    params(
+        ("bucket" = String, Path),
+        ("versionId" = String, Path),
+        ("key" = String, Path, description = "Object key; may contain `/`"),
+    ),
+    responses(
+        (status = 200, body = RestoreVersionResponse),
+        (status = 400, description = "Invalid version id, delete marker or SSE-C object", body = ErrorResponse),
+        (status = 404, description = "Version not found", body = ErrorResponse),
+    )
+)]
+pub async fn restore_version(
+    State(state): State<AppState>,
+    Path((bucket, version_id, key)): Path<(String, String, String)>,
+) -> Response {
+    // Copy the version (content, content type, metadata, tags) on top of the
+    // key, like CopyObject with a source versionId.
+    let src_meta = match resolve_object_meta(&state, &bucket, &key, Some(&version_id)).await {
+        Ok(meta) => meta,
+        Err(resp) => return resp,
+    };
+    if src_meta.is_delete_marker {
+        return error(StatusCode::BAD_REQUEST, "Delete markers cannot be restored");
+    }
+    let src_encryption = src_meta.encryption.as_ref().map(|e| e.mode.clone());
+    if src_encryption == Some(crate::storage::EncryptionMode::SseC) {
+        return error(
+            StatusCode::BAD_REQUEST,
+            "SSE-C objects need the customer key",
+        );
+    }
+
+    let reader = match state
+        .storage
+        .get_object_version(&bucket, &key, &version_id, None)
+        .await
+    {
+        Ok((reader, _)) => reader,
+        Err(e) => return object_storage_error(e),
+    };
+
+    let encryption = if src_encryption == Some(crate::storage::EncryptionMode::SseS3) {
+        Some(crate::storage::EncryptionRequest::sse_s3())
+    } else {
+        match bucket_default_encryption(&state, &bucket).await {
+            Ok(encryption) => encryption,
+            Err(resp) => return resp,
+        }
+    };
+    let opts = crate::storage::PutOptions {
+        metadata: src_meta.metadata.clone(),
+        tags: src_meta.tags.clone(),
+        precondition: None,
+    };
+    let checksum = src_meta.checksum_algorithm.map(|algo| (algo, None));
+    match state
+        .storage
+        .put_object_with(
+            &bucket,
+            &key,
+            &src_meta.content_type,
+            reader,
+            checksum,
+            encryption,
+            &opts,
+        )
+        .await
+    {
+        Ok(result) => (
+            StatusCode::OK,
+            Json(RestoreVersionResponse {
+                version_id: result.version_id,
+            }),
+        )
+            .into_response(),
+        Err(e) => internal(e),
+    }
+}
+
+/// A bucket lifecycle configuration (`GET` response and `PUT` body). An
+/// empty list removes the configuration.
+#[derive(Serialize, Deserialize, ToSchema)]
+pub struct LifecycleConfigBody {
+    rules: Vec<crate::storage::lifecycle::LifecycleRule>,
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/buckets/{bucket}/lifecycle",
+    operation_id = "getBucketLifecycle",
+    tag = "settings",
+    params(("bucket" = String, Path)),
+    responses(
+        (status = 200, body = LifecycleConfigBody),
+        (status = 404, description = "Bucket not found", body = ErrorResponse),
+    )
+)]
+pub async fn get_bucket_lifecycle_api(
+    State(state): State<AppState>,
+    Path(bucket): Path<String>,
+) -> Response {
+    if let Err(resp) = require_bucket(&state, &bucket).await {
+        return resp;
+    }
+    match state.storage.get_bucket_lifecycle(&bucket).await {
+        Ok(rules) => (
+            StatusCode::OK,
+            Json(LifecycleConfigBody {
+                rules: rules.unwrap_or_default(),
+            }),
+        )
+            .into_response(),
+        Err(crate::storage::StorageError::NotFound(_)) => {
+            error(StatusCode::NOT_FOUND, "Bucket not found")
+        }
+        Err(e) => internal(e),
+    }
+}
+
+#[utoipa::path(
+    put,
+    path = "/api/buckets/{bucket}/lifecycle",
+    operation_id = "setBucketLifecycle",
+    tag = "settings",
+    params(("bucket" = String, Path)),
+    request_body = LifecycleConfigBody,
+    responses(
+        (status = 200, description = "The stored rules (IDs generated, dates normalized)", body = LifecycleConfigBody),
+        (status = 400, description = "Invalid lifecycle rules", body = ErrorResponse),
+        (status = 404, description = "Bucket not found", body = ErrorResponse),
+    )
+)]
+pub async fn set_bucket_lifecycle_api(
+    State(state): State<AppState>,
+    Path(bucket): Path<String>,
+    Json(body): Json<LifecycleConfigBody>,
+) -> Response {
+    if let Err(resp) = require_bucket(&state, &bucket).await {
+        return resp;
+    }
+    let mut rules = body.rules;
+    if !rules.is_empty() {
+        if let Err(e) = crate::storage::lifecycle::validate_rules(&mut rules) {
+            return error(StatusCode::BAD_REQUEST, e.message);
+        }
+    }
+    match state
+        .storage
+        .set_bucket_lifecycle(&bucket, Some(rules.clone()))
+        .await
+    {
+        Ok(()) => (StatusCode::OK, Json(LifecycleConfigBody { rules })).into_response(),
+        Err(crate::storage::StorageError::NotFound(_)) => {
+            error(StatusCode::NOT_FOUND, "Bucket not found")
+        }
+        Err(e) => internal(e),
     }
 }
 
@@ -1295,6 +1910,24 @@ pub fn console_router(state: AppState) -> Router<AppState> {
         .route(
             "/buckets/{bucket}/versions/{version_id}/download/{*key}",
             get(download_version),
+        )
+        .route(
+            "/buckets/{bucket}/versions/{version_id}/restore/{*key}",
+            post(restore_version),
+        )
+        .route("/buckets/{bucket}/object-info/{*key}", get(get_object_info))
+        .route(
+            "/buckets/{bucket}/object-tags/{*key}",
+            get(get_object_tags).put(set_object_tags),
+        )
+        .route(
+            "/buckets/{bucket}/tags",
+            get(get_bucket_tags).put(set_bucket_tags),
+        )
+        .route("/buckets/{bucket}/policy", get(get_bucket_policy_view))
+        .route(
+            "/buckets/{bucket}/lifecycle",
+            get(get_bucket_lifecycle_api).put(set_bucket_lifecycle_api),
         )
         .layer(json_body_limit);
 
@@ -1340,6 +1973,9 @@ mod tests {
                 encryption_config: None,
                 public_read: false,
                 public_list: false,
+                versioning_suspended: false,
+                tags: None,
+                lifecycle: None,
             })
             .await
             .unwrap();

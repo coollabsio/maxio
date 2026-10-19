@@ -12,6 +12,7 @@ export const bucketKeys = {
 export const objectKeys = {
   all: ['objects'] as const,
   list: (bucket: string, prefix: string) => [...objectKeys.all, 'list', bucket, prefix] as const,
+  info: (bucket: string, key: string) => [...objectKeys.all, 'info', bucket, key] as const,
 }
 
 export const versionKeys = {
@@ -24,4 +25,7 @@ export const settingsKeys = {
   versioning: (bucket: string) => [...settingsKeys.all, 'versioning', bucket] as const,
   encryption: (bucket: string) => [...settingsKeys.all, 'encryption', bucket] as const,
   publicAccess: (bucket: string) => [...settingsKeys.all, 'public', bucket] as const,
+  tags: (bucket: string) => [...settingsKeys.all, 'tags', bucket] as const,
+  policy: (bucket: string) => [...settingsKeys.all, 'policy', bucket] as const,
+  lifecycle: (bucket: string) => [...settingsKeys.all, 'lifecycle', bucket] as const,
 }

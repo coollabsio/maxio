@@ -2,9 +2,11 @@ pub mod chunk_reader;
 pub mod crypto;
 pub mod filesystem;
 pub mod keys;
+pub mod lifecycle;
 
+use base64::Engine;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::pin::Pin;
 use tokio::io::AsyncRead;
 
@@ -24,6 +26,7 @@ pub fn validate_bucket_name(name: &str) -> Result<(), StorageError> {
 pub enum ChecksumAlgorithm {
     CRC32,
     CRC32C,
+    CRC64NVME,
     SHA1,
     SHA256,
 }
@@ -33,20 +36,140 @@ impl ChecksumAlgorithm {
         match self {
             Self::CRC32 => "x-amz-checksum-crc32",
             Self::CRC32C => "x-amz-checksum-crc32c",
+            Self::CRC64NVME => "x-amz-checksum-crc64nvme",
             Self::SHA1 => "x-amz-checksum-sha1",
             Self::SHA256 => "x-amz-checksum-sha256",
         }
+    }
+
+    /// Parse an `x-amz-checksum-*` header name (case-insensitive).
+    pub fn from_header_name(name: &str) -> Option<Self> {
+        let name = name.trim().to_ascii_lowercase();
+        name.strip_prefix("x-amz-checksum-")
+            .and_then(Self::from_header_str)
     }
 
     pub fn from_header_str(s: &str) -> Option<Self> {
         match s.to_uppercase().as_str() {
             "CRC32" => Some(Self::CRC32),
             "CRC32C" => Some(Self::CRC32C),
+            "CRC64NVME" => Some(Self::CRC64NVME),
             "SHA1" => Some(Self::SHA1),
             "SHA256" => Some(Self::SHA256),
             _ => None,
         }
     }
+}
+
+/// Incremental hasher for any `ChecksumAlgorithm`; `finalize_base64` yields the
+/// `x-amz-checksum-*` header value.
+pub(crate) enum ChecksumHasher {
+    Crc32(crc32fast::Hasher),
+    Crc32c(u32),
+    Crc64Nvme(u64),
+    Sha1(sha1::Sha1),
+    Sha256(sha2::Sha256),
+}
+
+impl ChecksumHasher {
+    pub(crate) fn new(algo: ChecksumAlgorithm) -> Self {
+        match algo {
+            ChecksumAlgorithm::CRC32 => Self::Crc32(crc32fast::Hasher::new()),
+            ChecksumAlgorithm::CRC32C => Self::Crc32c(0),
+            ChecksumAlgorithm::CRC64NVME => Self::Crc64Nvme(!0),
+            ChecksumAlgorithm::SHA1 => Self::Sha1(<sha1::Sha1 as sha2::Digest>::new()),
+            ChecksumAlgorithm::SHA256 => Self::Sha256(<sha2::Sha256 as sha2::Digest>::new()),
+        }
+    }
+
+    pub(crate) fn update(&mut self, data: &[u8]) {
+        match self {
+            Self::Crc32(h) => h.update(data),
+            Self::Crc32c(v) => *v = crc32c::crc32c_append(*v, data),
+            Self::Crc64Nvme(v) => *v = crc64nvme_update(*v, data),
+            Self::Sha1(h) => sha2::Digest::update(h, data),
+            Self::Sha256(h) => sha2::Digest::update(h, data),
+        }
+    }
+
+    pub(crate) fn finalize_base64(self) -> String {
+        let b64 = base64::engine::general_purpose::STANDARD;
+        match self {
+            Self::Crc32(h) => b64.encode(h.finalize().to_be_bytes()),
+            Self::Crc32c(v) => b64.encode(v.to_be_bytes()),
+            Self::Crc64Nvme(v) => b64.encode((!v).to_be_bytes()),
+            Self::Sha1(h) => b64.encode(sha2::Digest::finalize(h)),
+            Self::Sha256(h) => b64.encode(sha2::Digest::finalize(h)),
+        }
+    }
+}
+
+/// CRC-64/NVME (reflected poly 0x9A6C9329AC4BC9B5, init/xorout all ones).
+const CRC64NVME_TABLE: [u64; 256] = {
+    let mut table = [0u64; 256];
+    let mut i = 0;
+    while i < 256 {
+        let mut crc = i as u64;
+        let mut j = 0;
+        while j < 8 {
+            crc = if crc & 1 == 1 {
+                (crc >> 1) ^ 0x9A6C_9329_AC4B_C9B5
+            } else {
+                crc >> 1
+            };
+            j += 1;
+        }
+        table[i] = crc;
+        i += 1;
+    }
+    table
+};
+
+fn crc64nvme_update(mut crc: u64, data: &[u8]) -> u64 {
+    for &b in data {
+        crc = CRC64NVME_TABLE[((crc ^ b as u64) & 0xff) as usize] ^ (crc >> 8);
+    }
+    crc
+}
+
+/// S3 tag-set rules shared by object, bucket, console and lifecycle-filter
+/// tags: at most `max` tags, keys 1–128 chars, values ≤256 chars, unique keys,
+/// and (bucket tags) no reserved `aws:` key prefix. Errors are `InvalidTag`.
+pub fn validate_tags<'a>(
+    tags: impl ExactSizeIterator<Item = (&'a str, &'a str)>,
+    max: usize,
+    reject_aws_prefix: bool,
+) -> Result<(), crate::error::S3Error> {
+    use crate::error::S3Error;
+    if tags.len() > max {
+        return Err(S3Error::invalid_tag(&format!(
+            "Tags cannot exceed {max} entries"
+        )));
+    }
+    let mut seen = std::collections::HashSet::new();
+    for (key, value) in tags {
+        if key.is_empty() || key.chars().count() > 128 {
+            return Err(S3Error::invalid_tag(
+                "Tag key must be between 1 and 128 characters",
+            ));
+        }
+        if value.chars().count() > 256 {
+            return Err(S3Error::invalid_tag(
+                "Tag value exceeds maximum length of 256 characters",
+            ));
+        }
+        if reject_aws_prefix && key.starts_with("aws:") {
+            return Err(S3Error::invalid_tag(
+                "Tag keys starting with aws: are reserved",
+            ));
+        }
+        if !seen.insert(key) {
+            return Err(S3Error::invalid_tag(
+                "Cannot provide multiple Tags with the same key",
+            ));
+        }
+    }
+    Ok(())
 }
 
 pub struct PutResult {
@@ -55,6 +178,14 @@ pub struct PutResult {
     pub version_id: Option<String>,
     pub checksum_algorithm: Option<ChecksumAlgorithm>,
     pub checksum_value: Option<String>,
+}
+
+/// One directory level of a bucket's key namespace (see
+/// `FilesystemStorage::list_key_dir`).
+#[derive(Debug, Clone, Default)]
+pub struct KeyDirListing {
+    pub keys: Vec<String>,
+    pub subdirs: Vec<String>,
 }
 
 pub struct DeleteResult {
@@ -93,9 +224,17 @@ pub struct BucketMeta {
     pub public_read: bool,
     #[serde(default, skip_serializing_if = "is_false")]
     pub public_list: bool,
+    /// Versioning was explicitly suspended (only meaningful when `versioning` is false).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub versioning_suspended: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tags: Option<std::collections::BTreeMap<String, String>>,
+    /// Lifecycle rules (`PutBucketLifecycleConfiguration` / console).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lifecycle: Option<Vec<lifecycle::LifecycleRule>>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ObjectMeta {
     pub key: String,
     pub size: u64,
@@ -118,6 +257,60 @@ pub struct ObjectMeta {
     pub part_sizes: Option<Vec<u64>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub encryption: Option<EncryptionMeta>,
+    /// Client-supplied metadata, stored as top-level sidecar fields.
+    #[serde(flatten)]
+    pub metadata: StoredObjectMetadata,
+}
+
+/// Object-level metadata supplied by the client at write time (PutObject,
+/// CreateMultipartUpload, CopyObject) and returned on GET/HEAD.
+/// `user_metadata` holds `x-amz-meta-*` (lower-cased names without the prefix).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StoredObjectMetadata {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_metadata: Option<BTreeMap<String, String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_control: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_disposition: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_encoding: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_language: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires: Option<String>,
+}
+
+impl StoredObjectMetadata {
+    pub fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
+/// Condition evaluated atomically (under the per-key lock) right before a
+/// write is published.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WritePrecondition {
+    /// `If-None-Match: *` — fail if a current (non-delete-marker) object exists.
+    IfNoneMatchAny,
+    /// `If-Match: <etag>` — fail if the current ETag differs; NotFound if absent.
+    IfMatch(String),
+}
+
+/// Optional extras for an object write.
+#[derive(Debug, Clone, Default)]
+pub struct PutOptions {
+    pub metadata: StoredObjectMetadata,
+    pub tags: Option<HashMap<String, String>>,
+    pub precondition: Option<WritePrecondition>,
+}
+
+impl PutOptions {
+    /// Copy metadata + tags into a freshly built sidecar.
+    pub fn apply_to(&self, meta: &mut ObjectMeta) {
+        meta.metadata = self.metadata.clone();
+        meta.tags = self.tags.clone().filter(|t| !t.is_empty());
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -131,6 +324,12 @@ pub struct MultipartUploadMeta {
     pub checksum_algorithm: Option<ChecksumAlgorithm>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub encryption_spec: Option<UploadEncryptionSpec>,
+    /// Metadata applied to the object on CompleteMultipartUpload.
+    #[serde(default, skip_serializing_if = "StoredObjectMetadata::is_empty")]
+    pub object_metadata: StoredObjectMetadata,
+    /// Tags (`x-amz-tagging`) applied on CompleteMultipartUpload.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tags: Option<HashMap<String, String>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -359,6 +558,9 @@ pub async fn provision_default_buckets(
             encryption_config: None,
             public_read: false,
             public_list: false,
+            versioning_suspended: false,
+            tags: None,
+            lifecycle: None,
         };
         match storage.create_bucket(&meta).await {
             Ok(true) => tracing::info!("Created default bucket: {}", bucket_name),
@@ -394,6 +596,8 @@ pub enum StorageError {
     DecryptionError(String),
     #[error("Integrity error: {0}")]
     IntegrityError(String),
+    #[error("Precondition failed")]
+    PreconditionFailed,
 }
 
 #[cfg(test)]
@@ -439,5 +643,38 @@ mod validation_tests {
             let reason = bucket_name_error(name).unwrap_or_default();
             assert!(reason.contains(expected), "{name}: got {reason:?}");
         }
+    }
+}
+
+#[cfg(test)]
+mod sidecar_format_tests {
+    use super::ObjectMeta;
+
+    /// The flattened `metadata` field must keep the pre-flatten on-disk layout
+    /// (top-level keys, same order, absent when empty) — the SSE sidecar MAC
+    /// is computed over this serialization.
+    #[test]
+    fn old_sidecar_json_round_trips_byte_for_byte() {
+        let full = concat!(
+            r#"{"key":"a/b.txt","size":5,"etag":"\"abc\"","content_type":"text/plain","#,
+            r#""last_modified":"2026-01-01T00:00:00.000Z","version_id":"v1","#,
+            r#""checksum_algorithm":"CRC32","checksum_value":"AAAAAA==","#,
+            r#""encryption":{"algorithm":"AES256","mode":"sse_s3","key_id":"k1","#,
+            r#""wrapped_dek":"d","wrap_nonce":"n","nonce_prefix":"p","chunk_size":65536,"#,
+            r#""sidecar_mac":"m"},"user_metadata":{"a":"1","b":"2"},"#,
+            r#""cache_control":"no-cache","content_disposition":"inline","#,
+            r#""content_encoding":"gzip","content_language":"en","expires":"never"}"#
+        );
+        let minimal = concat!(
+            r#"{"key":"k","size":0,"etag":"\"e\"","content_type":"application/octet-stream","#,
+            r#""last_modified":"2026-01-01T00:00:00.000Z"}"#
+        );
+        for json in [full, minimal] {
+            let meta: ObjectMeta = serde_json::from_str(json).unwrap();
+            assert_eq!(serde_json::to_string(&meta).unwrap(), json);
+        }
+        let meta: ObjectMeta = serde_json::from_str(full).unwrap();
+        assert_eq!(meta.metadata.cache_control.as_deref(), Some("no-cache"));
+        assert_eq!(meta.metadata.user_metadata.unwrap()["b"], "2");
     }
 }

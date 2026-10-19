@@ -47,13 +47,22 @@ export function LoginPage() {
   }
 
   return (
-    <div className="flex min-h-screen w-full items-center justify-center bg-gray-50 px-6 py-8 dark:bg-base">
-      <div className="mx-auto w-full max-w-md space-y-8 text-black dark:text-white">
-        <h1 className="text-center text-5xl font-extrabold tracking-tight text-gray-900 dark:text-white">MaxIO</h1>
+    <div className="flex min-h-dvh w-full items-center justify-center bg-app bg-[radial-gradient(circle,rgb(0_0_0/0.1)_1px,transparent_1.3px)] bg-size-[20px_20px] px-6 py-8 dark:bg-[radial-gradient(circle,rgb(255_255_255/0.07)_1px,transparent_1.3px)]">
+      <div className="mx-auto flex w-full max-w-sm flex-col gap-6 text-black dark:text-fg">
+        <div className="flex flex-col items-center gap-3 text-center">
+          <img src={`${import.meta.env.BASE_URL}logo.svg`} alt="" className="size-10" />
+          <div className="flex flex-col gap-1">
+            <h1>MaxIO</h1>
+            <p className="text-[13px] text-neutral-500 dark:text-fg-faint">Sign in to the storage console</p>
+          </div>
+        </div>
 
-        <form onSubmit={handleSubmit} className="flex flex-col gap-4">
+        <form
+          onSubmit={handleSubmit}
+          className="flex flex-col gap-4 rounded-xl border border-neutral-200 bg-white p-6 shadow-[0_1px_2px_rgb(0_0_0/0.05)] dark:border-white/[0.08] dark:bg-panel"
+        >
           <div className="flex flex-col gap-1.5">
-            <label htmlFor="accessKey" className="text-sm text-muted-foreground">
+            <label htmlFor="accessKey" className="text-[13px] font-medium text-neutral-600 dark:text-fg-dim">
               Access Key <Highlighted>*</Highlighted>
             </label>
             <Input
@@ -67,7 +76,7 @@ export function LoginPage() {
           </div>
 
           <div className="flex flex-col gap-1.5">
-            <label htmlFor="secretKey" className="text-sm text-muted-foreground">
+            <label htmlFor="secretKey" className="text-[13px] font-medium text-neutral-600 dark:text-fg-dim">
               Secret Key <Highlighted>*</Highlighted>
             </label>
             <div className="relative">
@@ -83,7 +92,7 @@ export function LoginPage() {
               <button
                 type="button"
                 onClick={() => setShowSecret((shown) => !shown)}
-                className="absolute right-2 top-1/2 -translate-y-1/2 p-1 text-muted-foreground transition-colors hover:text-foreground"
+                className="icon-button absolute top-1/2 right-0.5 -translate-y-1/2"
                 aria-label={showSecret ? 'Hide secret key' : 'Show secret key'}
               >
                 {showSecret ? <EyeOff className="size-4" /> : <Eye className="size-4" />}
@@ -96,7 +105,7 @@ export function LoginPage() {
           <Button
             type="submit"
             variant="highlighted"
-            className="mt-2 h-12 w-full justify-center px-4"
+            className="mt-2 h-9 w-full justify-center px-4"
             disabled={loginMutation.isPending}
           >
             {loginMutation.isPending ? 'Signing in...' : 'Login'}

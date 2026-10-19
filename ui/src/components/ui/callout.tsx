@@ -3,7 +3,7 @@ import { cva, type VariantProps } from 'class-variance-authority'
 import { cn } from '@/lib/utils'
 
 const calloutVariants = cva(
-  'relative flex gap-3 rounded-sm border border-neutral-200 bg-white p-3 text-sm text-black dark:border-coolgray-300 dark:bg-coolgray-100 dark:text-white',
+  'relative flex gap-3 rounded-lg border border-neutral-200 bg-white p-3 text-sm text-black dark:border-white/[0.08] dark:bg-surface dark:text-fg',
   {
     variants: {
       type: {

@@ -20,6 +20,48 @@ pub struct ParsedAuth {
     pub signature: String,
 }
 
+/// Context needed to verify per-chunk signatures of a
+/// `STREAMING-AWS4-HMAC-SHA256-PAYLOAD[-TRAILER]` body. Built by the auth
+/// middleware after the request (seed) signature has been verified and
+/// inserted into the request extensions.
+#[derive(Clone)]
+pub struct StreamingSigningContext {
+    pub signing_key: Vec<u8>,
+    /// Request timestamp (`x-amz-date`, `YYYYMMDDTHHMMSSZ`).
+    pub timestamp: String,
+    /// Credential scope `date/region/s3/aws4_request`.
+    pub scope: String,
+    /// Signature of the request headers; seeds the chunk signature chain.
+    pub seed_signature: String,
+}
+
+impl std::fmt::Debug for StreamingSigningContext {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StreamingSigningContext")
+            .field("signing_key", &"<redacted>")
+            .field("timestamp", &self.timestamp)
+            .field("scope", &self.scope)
+            .finish()
+    }
+}
+
+impl StreamingSigningContext {
+    pub fn new(secret_key: &str, parsed: &ParsedAuth, timestamp: &str) -> Self {
+        Self {
+            signing_key: derive_signing_key(secret_key, &parsed.date, &parsed.region),
+            timestamp: timestamp.to_string(),
+            scope: format!("{}/{}/s3/aws4_request", parsed.date, parsed.region),
+            seed_signature: parsed.signature.to_ascii_lowercase(),
+        }
+    }
+
+    pub fn hmac_hex(&self, string_to_sign: &str) -> String {
+        let mut mac = HmacSha256::new_from_slice(&self.signing_key).unwrap();
+        mac.update(string_to_sign.as_bytes());
+        hex::encode(mac.finalize().into_bytes())
+    }
+}
+
 pub fn parse_authorization_header(header: &str) -> Result<ParsedAuth, &'static str> {
     let header = header
         .strip_prefix("AWS4-HMAC-SHA256 ")
@@ -284,7 +326,16 @@ fn canonical_headers(headers: &HeaderMap, signed_headers: &[String]) -> String {
             .iter()
             .filter_map(|v| v.to_str().ok())
             .collect();
-        let value = values.join(",");
+        let mut value = values.join(",");
+        // A signed `content-length: 0` is dropped by Go reverse proxies on
+        // bodyless requests (AWS CRT signs it on GET). Like MinIO, fall back
+        // to the implied length of a request without a body.
+        if values.is_empty()
+            && name.eq_ignore_ascii_case("content-length")
+            && !headers.contains_key(http::header::TRANSFER_ENCODING)
+        {
+            value = "0".to_string();
+        }
         // Header name is used as supplied in SignedHeaders. AWS SigV4
         // mandates clients send these lowercase; the value lookup below is
         // case-insensitive regardless.

@@ -787,7 +787,7 @@ if [ -d "$EC_SSE_PROBE_DIR" ]; then
     PARITY_COUNT=$(python3 -c "import json,sys; m=json.load(open(sys.argv[1])); print(m.get('parity_shards') or 0)" "$MANIFEST_JSON" 2>/dev/null || echo 0)
     if [ "$PARITY_COUNT" -gt 0 ]; then
         CHUNK0="$DATA_DIR/buckets/$EC_SSE_BUCKET/big.bin.ec/000000"
-        SZ=$(stat -f%z "$CHUNK0" 2>/dev/null || stat -c%s "$CHUNK0")
+        SZ=$(stat -c%s "$CHUNK0" 2>/dev/null || stat -f%z "$CHUNK0")
         dd if=/dev/zero of="$CHUNK0" bs=1 count=$SZ conv=notrunc status=none
         assert "EC+SSE GET recovers from one zeroed chunk via RS" \
             $AWS s3 cp "s3://$EC_SSE_BUCKET/big.bin" "$TMPDIR/ec-sse-recover.out"
@@ -965,7 +965,7 @@ else
 
     # File perms 0600 (Unix only).
     if [ "$(uname)" != "MINGW"* ] && [ "$(uname)" != "CYGWIN"* ]; then
-        PERMS=$(stat -f '%Lp' "$KEYRING_FILE" 2>/dev/null || stat -c '%a' "$KEYRING_FILE")
+        PERMS=$(stat -c '%a' "$KEYRING_FILE" 2>/dev/null || stat -f '%Lp' "$KEYRING_FILE")
         assert_eq "keyring file perms are 600 after rotate" "600" "$PERMS"
     fi
 

@@ -28,6 +28,15 @@ describe('restoreObjectKeySlashes', () => {
     )
     expect(restoreObjectKeySlashes('/api/buckets/b/versioning')).toBe('/api/buckets/b/versioning')
   })
+
+  test('covers object details, object tags and version restore routes', () => {
+    expect(restoreObjectKeySlashes('/api/buckets/b/object-info/a%2Fb.txt')).toBe('/api/buckets/b/object-info/a/b.txt')
+    expect(restoreObjectKeySlashes('/api/buckets/b/object-tags/a%2Fb.txt')).toBe('/api/buckets/b/object-tags/a/b.txt')
+    expect(restoreObjectKeySlashes('/api/buckets/b/versions/v1/restore/a%2Fb')).toBe(
+      '/api/buckets/b/versions/v1/restore/a/b',
+    )
+    expect(restoreObjectKeySlashes('/api/buckets/b/tags')).toBe('/api/buckets/b/tags')
+  })
 })
 
 describe('toApiError', () => {

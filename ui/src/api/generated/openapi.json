@@ -414,6 +414,316 @@
         }
       }
     },
+    "/api/buckets/{bucket}/lifecycle": {
+      "get": {
+        "tags": [
+          "settings"
+        ],
+        "operationId": "getBucketLifecycle",
+        "parameters": [
+          {
+            "name": "bucket",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LifecycleConfigBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Bucket not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      },
+      "put": {
+        "tags": [
+          "settings"
+        ],
+        "operationId": "setBucketLifecycle",
+        "parameters": [
+          {
+            "name": "bucket",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/LifecycleConfigBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "The stored rules (IDs generated, dates normalized)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LifecycleConfigBody"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid lifecycle rules",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Bucket not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/buckets/{bucket}/object-info/{key}": {
+      "get": {
+        "tags": [
+          "objects"
+        ],
+        "operationId": "getObjectInfo",
+        "parameters": [
+          {
+            "name": "bucket",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "key",
+            "in": "path",
+            "description": "Object key; may contain `/`",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "versionId",
+            "in": "query",
+            "description": "Target a specific version instead of the current object.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ObjectInfo"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid version id",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Object or version not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/buckets/{bucket}/object-tags/{key}": {
+      "get": {
+        "tags": [
+          "objects"
+        ],
+        "operationId": "getObjectTags",
+        "parameters": [
+          {
+            "name": "bucket",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "key",
+            "in": "path",
+            "description": "Object key; may contain `/`",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "versionId",
+            "in": "query",
+            "description": "Target a specific version instead of the current object.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TagSetBody"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid version id or delete marker",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Object or version not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      },
+      "put": {
+        "tags": [
+          "objects"
+        ],
+        "operationId": "setObjectTags",
+        "parameters": [
+          {
+            "name": "bucket",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "key",
+            "in": "path",
+            "description": "Object key; may contain `/`",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "versionId",
+            "in": "query",
+            "description": "Target a specific version instead of the current object.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TagSetBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OkResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid tags or version id",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Object or version not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/buckets/{bucket}/objects": {
       "get": {
         "tags": [
@@ -503,6 +813,46 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/OkResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Bucket not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/buckets/{bucket}/policy": {
+      "get": {
+        "tags": [
+          "settings"
+        ],
+        "operationId": "getBucketPolicy",
+        "parameters": [
+          {
+            "name": "bucket",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BucketPolicyResponse"
                 }
               }
             }
@@ -641,6 +991,104 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/OkResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/buckets/{bucket}/tags": {
+      "get": {
+        "tags": [
+          "settings"
+        ],
+        "operationId": "getBucketTags",
+        "parameters": [
+          {
+            "name": "bucket",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TagSetBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Bucket not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      },
+      "put": {
+        "tags": [
+          "settings"
+        ],
+        "operationId": "setBucketTags",
+        "parameters": [
+          {
+            "name": "bucket",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TagSetBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OkResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid tags",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Bucket not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
                 }
               }
             }
@@ -916,10 +1364,90 @@
           }
         }
       }
+    },
+    "/api/buckets/{bucket}/versions/{versionId}/restore/{key}": {
+      "post": {
+        "tags": [
+          "versions"
+        ],
+        "operationId": "restoreVersion",
+        "parameters": [
+          {
+            "name": "bucket",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "versionId",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "key",
+            "in": "path",
+            "description": "Object key; may contain `/`",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RestoreVersionResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid version id, delete marker or SSE-C object",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Version not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
     }
   },
   "components": {
     "schemas": {
+      "AbortIncompleteMultipartUpload": {
+        "type": "object",
+        "required": [
+          "daysAfterInitiation"
+        ],
+        "properties": {
+          "daysAfterInitiation": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          }
+        }
+      },
       "BinaryBody": {
         "type": "string",
         "format": "binary",
@@ -939,13 +1467,31 @@
           }
         }
       },
+      "BucketPolicyResponse": {
+        "type": "object",
+        "required": [
+          "policy"
+        ],
+        "properties": {
+          "policy": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The bucket policy JSON exactly as S3 `GET ?policy` returns it; `null`\nwhen the bucket has no anonymous access."
+          }
+        }
+      },
       "BucketSummary": {
         "type": "object",
         "required": [
           "name",
           "createdAt",
           "versioning",
-          "encryption"
+          "encryption",
+          "publicRead",
+          "publicList",
+          "tagCount"
         ],
         "properties": {
           "createdAt": {
@@ -956,6 +1502,20 @@
           },
           "name": {
             "type": "string"
+          },
+          "publicList": {
+            "type": "boolean",
+            "description": "Anonymous ListBucket allowed (bucket policy)."
+          },
+          "publicRead": {
+            "type": "boolean",
+            "description": "Anonymous GetObject allowed (bucket policy)."
+          },
+          "tagCount": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Number of bucket tags.",
+            "minimum": 0
           },
           "versioning": {
             "type": "boolean"
@@ -995,6 +1555,13 @@
           }
         }
       },
+      "EncryptionModeName": {
+        "type": "string",
+        "enum": [
+          "SSE-S3",
+          "SSE-C"
+        ]
+      },
       "EncryptionResponse": {
         "type": "object",
         "required": [
@@ -1024,6 +1591,150 @@
           }
         }
       },
+      "LifecycleConfigBody": {
+        "type": "object",
+        "description": "A bucket lifecycle configuration (`GET` response and `PUT` body). An\nempty list removes the configuration.",
+        "required": [
+          "rules"
+        ],
+        "properties": {
+          "rules": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/LifecycleRule"
+            }
+          }
+        }
+      },
+      "LifecycleExpiration": {
+        "type": "object",
+        "description": "Expiration of current object versions (`Days` or `Date`), or removal of\nexpired object delete markers (`ExpiredObjectDeleteMarker`).",
+        "properties": {
+          "date": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "ISO 8601 date at midnight UTC, e.g. `2030-01-01T00:00:00.000Z`."
+          },
+          "days": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "minimum": 0
+          },
+          "expiredObjectDeleteMarker": {
+            "type": "boolean"
+          }
+        }
+      },
+      "LifecycleFilter": {
+        "type": "object",
+        "description": "Which objects a rule applies to. All set conditions must match (logical\nAND). An empty filter matches every object in the bucket.",
+        "properties": {
+          "objectSizeGreaterThan": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Only objects strictly larger than this many bytes.",
+            "minimum": 0
+          },
+          "objectSizeLessThan": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Only objects strictly smaller than this many bytes.",
+            "minimum": 0
+          },
+          "prefix": {
+            "type": "string",
+            "description": "Key prefix; empty matches all keys."
+          },
+          "tags": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/LifecycleTag"
+            }
+          }
+        }
+      },
+      "LifecycleRule": {
+        "type": "object",
+        "description": "One bucket lifecycle rule (JSON form, camelCase). Stored in\n`.bucket.json` and used as-is by the console API.",
+        "required": [
+          "status"
+        ],
+        "properties": {
+          "abortIncompleteMultipartUpload": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/AbortIncompleteMultipartUpload"
+              }
+            ]
+          },
+          "expiration": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/LifecycleExpiration"
+              }
+            ]
+          },
+          "filter": {
+            "$ref": "#/components/schemas/LifecycleFilter"
+          },
+          "id": {
+            "type": "string",
+            "description": "Unique rule ID (≤255 chars). Empty → generated by `validate_rules`."
+          },
+          "noncurrentVersionExpiration": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/NoncurrentVersionExpiration"
+              }
+            ]
+          },
+          "status": {
+            "$ref": "#/components/schemas/LifecycleStatus"
+          }
+        }
+      },
+      "LifecycleStatus": {
+        "type": "string",
+        "enum": [
+          "Enabled",
+          "Disabled"
+        ]
+      },
+      "LifecycleTag": {
+        "type": "object",
+        "description": "One object tag a rule filter requires (key and value must match exactly).",
+        "required": [
+          "key"
+        ],
+        "properties": {
+          "key": {
+            "type": "string"
+          },
+          "value": {
+            "type": "string"
+          }
+        }
+      },
       "LoginRequest": {
         "type": "object",
         "required": [
@@ -1036,6 +1747,198 @@
           },
           "secretKey": {
             "type": "string"
+          }
+        }
+      },
+      "NoncurrentVersionExpiration": {
+        "type": "object",
+        "description": "Permanent deletion of noncurrent versions.",
+        "properties": {
+          "newerNoncurrentVersions": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "description": "Number of newest noncurrent versions to retain (1–100).",
+            "minimum": 0
+          },
+          "noncurrentDays": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "description": "Days after the version became noncurrent.",
+            "minimum": 0
+          }
+        }
+      },
+      "ObjectChecksum": {
+        "type": "object",
+        "required": [
+          "algorithm",
+          "value"
+        ],
+        "properties": {
+          "algorithm": {
+            "type": "string",
+            "description": "`CRC32`, `CRC32C`, `CRC64NVME`, `SHA1` or `SHA256`."
+          },
+          "value": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      },
+      "ObjectEncryption": {
+        "type": "object",
+        "description": "Server-side encryption summary. Key material is never exposed.",
+        "required": [
+          "mode",
+          "keyId"
+        ],
+        "properties": {
+          "keyId": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Master key id that wraps the object key (SSE-S3 only)."
+          },
+          "mode": {
+            "$ref": "#/components/schemas/EncryptionModeName"
+          }
+        }
+      },
+      "ObjectInfo": {
+        "type": "object",
+        "required": [
+          "key",
+          "size",
+          "etag",
+          "contentType",
+          "lastModified",
+          "versionId",
+          "isDeleteMarker",
+          "storageFormat",
+          "partCount",
+          "checksum",
+          "encryption",
+          "userMetadata",
+          "cacheControl",
+          "contentDisposition",
+          "contentEncoding",
+          "contentLanguage",
+          "expires",
+          "tags"
+        ],
+        "properties": {
+          "cacheControl": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "checksum": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ObjectChecksum"
+              }
+            ]
+          },
+          "contentDisposition": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "contentEncoding": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "contentLanguage": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "contentType": {
+            "type": "string"
+          },
+          "encryption": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ObjectEncryption"
+              }
+            ]
+          },
+          "etag": {
+            "type": "string"
+          },
+          "expires": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "isDeleteMarker": {
+            "type": "boolean"
+          },
+          "key": {
+            "type": "string"
+          },
+          "lastModified": {
+            "type": "string"
+          },
+          "partCount": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "description": "Number of parts for multipart uploads.",
+            "minimum": 0
+          },
+          "size": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "storageFormat": {
+            "$ref": "#/components/schemas/StorageFormat"
+          },
+          "tags": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/TagEntry"
+            }
+          },
+          "userMetadata": {
+            "type": "object",
+            "description": "User-defined `x-amz-meta-*` metadata (names without the prefix).",
+            "additionalProperties": {
+              "type": "string"
+            },
+            "propertyNames": {
+              "type": "string"
+            }
+          },
+          "versionId": {
+            "type": [
+              "string",
+              "null"
+            ]
           }
         }
       },
@@ -1074,9 +1977,13 @@
           "key",
           "size",
           "lastModified",
-          "etag"
+          "etag",
+          "contentType"
         ],
         "properties": {
+          "contentType": {
+            "type": "string"
+          },
           "etag": {
             "type": "string"
           },
@@ -1168,6 +2075,21 @@
           }
         }
       },
+      "RestoreVersionResponse": {
+        "type": "object",
+        "required": [
+          "versionId"
+        ],
+        "properties": {
+          "versionId": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Version id of the new current version (`null` when versioning is off)."
+          }
+        }
+      },
       "SetEnabledRequest": {
         "type": "object",
         "required": [
@@ -1176,6 +2098,44 @@
         "properties": {
           "enabled": {
             "type": "boolean"
+          }
+        }
+      },
+      "StorageFormat": {
+        "type": "string",
+        "enum": [
+          "plain",
+          "chunked",
+          "erasure"
+        ]
+      },
+      "TagEntry": {
+        "type": "object",
+        "required": [
+          "key",
+          "value"
+        ],
+        "properties": {
+          "key": {
+            "type": "string"
+          },
+          "value": {
+            "type": "string"
+          }
+        }
+      },
+      "TagSetBody": {
+        "type": "object",
+        "description": "A tag set (`GET` response and `PUT` body). An empty list clears the tags.",
+        "required": [
+          "tags"
+        ],
+        "properties": {
+          "tags": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/TagEntry"
+            }
           }
         }
       },

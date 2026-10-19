@@ -155,6 +155,15 @@ This runs both processes concurrently (Ctrl+C kills both):
 | AbortMultipartUpload | DELETE | `/{bucket}/{key}?uploadId=X` |
 | ListParts | GET | `/{bucket}/{key}?uploadId=X` |
 | ListMultipartUploads | GET | `/{bucket}?uploads` |
+| Get/Put/DeleteBucketPolicy | GET/PUT/DELETE | `/{bucket}?policy` (anonymous read/list only) |
+| GetBucketPolicyStatus | GET | `/{bucket}?policyStatus` |
+| Get/Put/DeleteBucketTagging | GET/PUT/DELETE | `/{bucket}?tagging` |
+| Get/Put/DeleteBucketLifecycle | GET/PUT/DELETE | `/{bucket}?lifecycle` (expiration, noncurrent expiration, abort MPU; no transitions) |
+| Get/PutBucketAcl, Get/PutObjectAcl | GET/PUT | `?acl` (owner FULL_CONTROL; PUT `private` only) |
+| GetObjectAttributes | GET | `/{bucket}/{key}?attributes` |
+| Health (MinIO-compatible) | GET/HEAD | `/minio/health/live`, `/ready`, `/cluster` (no auth) |
+
+Unknown or unsupported subresources return `501 NotImplemented` (never the default action). Unconfigured object-lock, website, replication, ownership controls and public access block return their S3 "not found" errors. Streaming uploads (`STREAMING-AWS4-HMAC-SHA256-PAYLOAD[-TRAILER]`, `STREAMING-UNSIGNED-PAYLOAD-TRAILER`) are decoded in `src/api/chunked.rs` with chunk / trailer signature and checksum checks. See `COMPATIBILITY.md` for details.
 
 ### Console API (`/api/`)
 
@@ -178,6 +187,12 @@ This runs both processes concurrently (Ctrl+C kills both):
 | `/api/buckets/{bucket}/versions` | GET | cookie | List versions of one key (`?key=`) |
 | `/api/buckets/{bucket}/versions/{versionId}/objects/{key}` | DELETE | cookie | Delete a version |
 | `/api/buckets/{bucket}/versions/{versionId}/download/{key}` | GET | cookie | Download a version |
+| `/api/buckets/{bucket}/versions/{versionId}/restore/{key}` | POST | cookie | Restore a version as the new current version |
+| `/api/buckets/{bucket}/object-info/{key}` | GET | cookie | Object details: metadata, headers, tags, checksum, encryption (`?versionId=`) |
+| `/api/buckets/{bucket}/object-tags/{key}` | GET/PUT | cookie | Object tags (`{ tags: [{ key, value }] }`, `?versionId=`) |
+| `/api/buckets/{bucket}/tags` | GET/PUT | cookie | Bucket tags (empty list deletes) |
+| `/api/buckets/{bucket}/policy` | GET | cookie | Bucket policy JSON (read-only; set by the public toggles) |
+| `/api/buckets/{bucket}/lifecycle` | GET/PUT | cookie | Lifecycle rules (`{ rules }`; empty list deletes) |
 
 The full contract is `ui/src/api/generated/openapi.json` (generated — do not edit).
 
@@ -300,20 +315,21 @@ bun run bench:quick  # quick smoke test
 
 ## UI Design System
 
-The web console (`ui/`) follows the Coolify design system. The full specification is in [`ui/DESIGN_SYSTEM.md`](ui/DESIGN_SYSTEM.md). Key points:
+The web console (`ui/`) follows the Coolify **v4.5** design system (reference: Coolify `release/v4.5`). The full specification is in [`ui/DESIGN_SYSTEM.md`](ui/DESIGN_SYSTEM.md) — its "Coolify v4.5" section overrides the older sections. Key points:
 
 - **Stack**: React 19 SPA (React Compiler), Vite 8, TypeScript 6, React Router 8, TanStack Query 5, Tailwind CSS v4, shadcn (`base-nova`) on `@base-ui/react`, `lucide-react`, `sonner`. Same stack as Orbit
-- **Theme**: Class-based dark mode (`.dark` on `<html>`), with light/dark CSS variable swap in `ui/src/index.css`
-- **Accent colors**: Coollabs purple `#6b16ed` (light) / warning yellow `#fcd452` (dark). Brand purple (`--color-brand`) is always `#6b16ed` regardless of theme
+- **Theme**: Class-based dark mode (`.dark` on `<html>`), with light/dark CSS variable swap in `ui/src/index.css`. Neutral "graphite" surfaces: `bg-app` (page) → `bg-panel` (top bar, sidebar) → `bg-surface` (cards) → `bg-raised`; text `text-fg` / `text-fg-dim` / `text-fg-faint`
+- **Accent colors**: Coollabs purple (light) / warning yellow (dark). Brand purple (`--color-brand`) is always `#6b16ed` regardless of theme
 - **Font**: Geist Sans + Geist Mono via `@fontsource/geist-sans` / `@fontsource/geist-mono` (Inter fallback)
-- **Inputs**: Inset box-shadow system (4px colored left bar on focus), no standard borders — see `.input-cool` in `index.css`
-- **Buttons**: `border-2`, `h-8`, `rounded-sm`. Variants: `default`, `highlighted`, `destructive`, `outline`, `secondary`, `ghost`, `link`, `brand`
-- **Border radius**: `0.125rem` (2px) everywhere — set via `--radius` in `@theme inline`
-- **Sidebar**: Collapsible 256px → 64px icon-only, uses `--cool-sidebar-*` CSS variables
+- **Layout**: fixed top bar (brand + breadcrumb, `h-12`) and a fixed sidebar below it (224px → 64px collapsed); pages start with `PageHeader` (title, description, actions). Below `lg` (1024px) the sidebar is a sheet from the right
+- **Appearance** (account menu at the bottom of the sidebar, stored in localStorage, applied on `<html>`): theme, **Navigation** `default` / `floating` (`data-nav-style`: framed panels over a dotted backdrop), **Navigation items** `3d` / `flat` (`data-nav-items`)
+- **Buttons**: `h-8`, `rounded-md`, 1px border, 3D depth (`.button-3d`: 2px ledge, lift on hover, press on click). `highlighted` = purple gradient fill. Variants: `default`, `highlighted`, `destructive`, `outline`, `secondary`, `ghost`, `link`, `brand`
+- **Inputs**: `.input-cool` — 1px border, `rounded-md`, accent border on focus
+- **Radius**: `rounded-md` (6px) for controls, `rounded-lg` (8px) for cards, tables, panels
 - **Icons / web app**: `ui/public/logo.svg` is the single source. `cd ui && bun run icons` regenerates the favicon, Apple touch icon, and PWA icons (incl. maskable) in `ui/public/`; `manifest.webmanifest` makes the console installable (start URL `/ui/`)
 
 ## Roadmap
 
 - **Phase 2**: ~~Multipart upload~~, ~~presigned URLs~~, ~~CopyObject~~, ~~DeleteObjects batch~~, ~~CORS~~, ~~Range headers~~
-- **Phase 3**: ~~Web console (SPA at `/ui/`)~~, ~~versioning~~, lifecycle rules, multi-user, metrics
+- **Phase 3**: ~~Web console (SPA at `/ui/`)~~, ~~versioning~~, ~~lifecycle rules (expiration)~~, multi-user, metrics
 - **Phase 4**: Distributed mode, ~~erasure coding~~, replication

@@ -6,7 +6,7 @@ function Tag({ className, ...props }: React.ComponentProps<'span'>) {
     <span
       data-slot="tag"
       className={cn(
-        'inline-flex items-center px-2 py-1 text-xs font-bold rounded-sm text-neutral-500 bg-neutral-100 hover:bg-neutral-200 dark:bg-coolgray-100 dark:hover:bg-coolgray-300 cursor-pointer',
+        'inline-flex items-center px-2 py-1 text-xs font-medium rounded-md text-neutral-500 bg-neutral-100 hover:bg-neutral-200 dark:text-fg-faint dark:bg-white/[0.06] dark:hover:bg-white/[0.1] cursor-pointer',
         className,
       )}
       {...props}

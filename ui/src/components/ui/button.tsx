@@ -2,32 +2,30 @@ import { Button as ButtonPrimitive } from '@base-ui/react/button'
 import { cva, type VariantProps } from 'class-variance-authority'
 import { cn } from '@/lib/utils'
 
+const depth = 'button-3d'
+
 const buttonVariants = cva(
-  "inline-flex min-w-fit shrink-0 cursor-pointer items-center justify-center gap-2 whitespace-nowrap rounded-sm border-2 border-transparent bg-clip-padding px-2 text-sm font-medium normal-case outline-none transition-colors select-none disabled:pointer-events-none disabled:cursor-not-allowed disabled:opacity-100 disabled:border-neutral-300 disabled:bg-neutral-100 disabled:text-neutral-600 dark:disabled:border-coolgray-300 dark:disabled:bg-coolgray-100/60 dark:disabled:text-neutral-400 aria-disabled:pointer-events-none aria-disabled:opacity-100 aria-disabled:border-neutral-300 aria-disabled:bg-neutral-100 aria-disabled:text-neutral-600 dark:aria-disabled:border-coolgray-300 dark:aria-disabled:bg-coolgray-100/60 dark:aria-disabled:text-neutral-400 [&_svg]:pointer-events-none [&_svg]:shrink-0 [&_svg:not([class*='size-'])]:size-4 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-coollabs dark:focus-visible:ring-warning focus-visible:ring-offset-2 focus-visible:ring-offset-background dark:focus-visible:ring-offset-base",
+  "inline-flex min-w-fit shrink-0 cursor-pointer items-center justify-center gap-1.5 whitespace-nowrap rounded-md border border-transparent px-2.5 text-[13px] font-medium normal-case outline-none select-none transition-colors disabled:cursor-not-allowed disabled:border-neutral-200 disabled:bg-control disabled:bg-none disabled:text-neutral-300 dark:disabled:border-white/[0.06] dark:disabled:text-fg-faint aria-disabled:cursor-not-allowed aria-disabled:opacity-60 [&_svg]:pointer-events-none [&_svg]:shrink-0 [&_svg:not([class*='size-'])]:size-4 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring",
   {
     variants: {
       variant: {
-        default:
-          'bg-white text-black border-neutral-200 hover:bg-neutral-100 dark:bg-coolgray-100 dark:text-white dark:border-coolgray-300 dark:hover:bg-coolgray-200',
-        highlighted:
-          'text-coollabs-200 bg-coollabs-50 border-coollabs hover:bg-coollabs hover:text-white dark:text-white dark:bg-coollabs/20 dark:border-coollabs-100 dark:hover:bg-coollabs-100 dark:hover:text-white',
-        destructive:
-          'text-red-800 bg-red-50 border-red-300 hover:bg-error hover:text-white dark:text-red-300 dark:bg-red-900/30 dark:border-red-800 dark:hover:bg-red-800 dark:hover:text-white',
-        outline:
-          'bg-transparent text-black border-neutral-200 hover:bg-neutral-100 dark:text-white dark:border-coolgray-300 dark:hover:bg-coolgray-200',
-        secondary:
-          'bg-neutral-100 text-black border-neutral-200 hover:bg-neutral-200 dark:bg-coolgray-200 dark:text-white dark:border-coolgray-300 dark:hover:bg-coolgray-300',
-        ghost: 'border-transparent text-black hover:bg-neutral-100 dark:text-white dark:hover:bg-coolgray-200',
-        link: 'border-transparent text-coollabs dark:text-warning underline-offset-4 hover:underline',
-        brand: 'bg-brand text-brand-foreground border-brand hover:bg-brand-hover hover:border-brand-hover',
+        default: `${depth} border-neutral-200 bg-control text-black hover:bg-control-hover dark:border-white/[0.08] dark:text-fg`,
+        highlighted: `${depth} button-highlighted border-coollabs-200 bg-linear-to-b from-coollabs-100 to-coollabs-200 text-white hover:to-coollabs dark:border-coollabs-200`,
+        destructive: `${depth} button-error border-red-300 bg-red-50 text-red-800 hover:bg-red-100 hover:text-red-900 dark:border-red-800 dark:bg-red-900/30 dark:text-red-300 dark:hover:bg-red-700 dark:hover:text-white`,
+        outline: `${depth} border-neutral-200 bg-control text-black hover:bg-control-hover dark:border-white/[0.08] dark:text-fg`,
+        secondary: `${depth} border-neutral-200 bg-control-strong text-black hover:bg-control-strong-hover dark:border-white/[0.08] dark:text-fg`,
+        ghost:
+          'text-neutral-500 hover:bg-neutral-100 hover:text-black disabled:border-transparent disabled:bg-transparent dark:text-fg-dim dark:hover:bg-white/[0.07] dark:hover:text-fg dark:disabled:border-transparent',
+        link: 'text-coollabs underline-offset-4 hover:underline dark:text-warning',
+        brand: `${depth} button-highlighted border-coollabs-200 bg-linear-to-b from-coollabs-100 to-coollabs-200 text-white hover:to-coollabs`,
       },
       size: {
-        default: 'h-8 has-[>svg]:px-2',
-        sm: 'h-8 px-2 text-sm has-[>svg]:px-2',
-        lg: 'h-10 px-3 has-[>svg]:px-3',
-        icon: 'size-8',
-        'icon-sm': 'size-8',
-        'icon-lg': 'size-10',
+        default: 'h-8',
+        sm: 'h-7 px-2',
+        lg: 'h-10 px-3 text-sm',
+        icon: 'size-8 px-0',
+        'icon-sm': 'size-7 px-0',
+        'icon-lg': 'size-10 px-0',
       },
     },
     defaultVariants: {

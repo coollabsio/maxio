@@ -12,9 +12,11 @@ use crate::server::AppState;
 use crate::storage::{ChecksumAlgorithm, StorageError};
 use crate::xml::{response::to_xml, types::*};
 
+use super::bucket::require_bucket;
 use super::object::{
-    body_to_reader, encryption_from_bucket_default, extract_checksum, extract_customer_key,
-    extract_sse_request, spec_from_request,
+    Md5VerifyingReader, body_to_reader, encryption_from_bucket_default, extract_checksum,
+    extract_customer_key, extract_object_metadata, extract_sse_request, extract_write_precondition,
+    is_content_md5_mismatch, parse_content_md5, parse_tagging_header, spec_from_request,
 };
 
 const COMPLETE_BODY_MAX: usize = 1024 * 1024;
@@ -24,8 +26,10 @@ pub async fn create_multipart_upload(
     Path((bucket, key)): Path<(String, String)>,
     headers: HeaderMap,
 ) -> Result<Response<Body>, S3Error> {
-    ensure_bucket_exists(&state, &bucket).await?;
+    require_bucket(&state, &bucket).await?;
 
+    let object_metadata = extract_object_metadata(&headers)?;
+    let tags = parse_tagging_header(&headers)?;
     let content_type = headers
         .get("content-type")
         .and_then(|v| v.to_str().ok())
@@ -33,7 +37,9 @@ pub async fn create_multipart_upload(
     let checksum_algorithm = headers
         .get("x-amz-checksum-algorithm")
         .and_then(|v| v.to_str().ok())
-        .and_then(ChecksumAlgorithm::from_header_str);
+        .and_then(ChecksumAlgorithm::from_header_str)
+        // CRC64NVME is full-object only; composite-of-parts would be wrong.
+        .filter(|algo| *algo != ChecksumAlgorithm::CRC64NVME);
 
     // Resolve encryption spec at upload-create time (explicit > bucket default).
     let mut encryption = extract_sse_request(&headers)?;
@@ -53,6 +59,8 @@ pub async fn create_multipart_upload(
             content_type,
             checksum_algorithm,
             encryption_spec,
+            object_metadata,
+            tags,
         )
         .await
         .map_err(map_storage_err)?;
@@ -86,7 +94,7 @@ pub async fn upload_part(
     headers: HeaderMap,
     body: Body,
 ) -> Result<Response<Body>, S3Error> {
-    ensure_bucket_exists(&state, &bucket).await?;
+    require_bucket(&state, &bucket).await?;
 
     let upload_id = params
         .get("uploadId")
@@ -99,7 +107,10 @@ pub async fn upload_part(
 
     let checksum = extract_checksum(&headers);
     let customer_key = extract_customer_key(&headers)?;
-    let reader = body_to_reader(&headers, body).await?;
+    // Content-MD5 is checked while the part streams to its temp file; a
+    // mismatch fails before the part is published.
+    let content_md5 = parse_content_md5(&headers)?;
+    let reader = Md5VerifyingReader::wrap(body_to_reader(&headers, body).await?, content_md5);
     let part = state
         .storage
         .upload_part(
@@ -111,7 +122,13 @@ pub async fn upload_part(
             customer_key,
         )
         .await
-        .map_err(map_storage_err)?;
+        .map_err(|e| {
+            if is_content_md5_mismatch(&e) {
+                S3Error::bad_digest()
+            } else {
+                map_storage_err(e)
+            }
+        })?;
 
     let mut builder = Response::builder()
         .status(StatusCode::OK)
@@ -129,7 +146,7 @@ pub async fn complete_multipart_upload(
     headers: HeaderMap,
     body: Body,
 ) -> Result<Response<Body>, S3Error> {
-    ensure_bucket_exists(&state, &bucket).await?;
+    require_bucket(&state, &bucket).await?;
     let upload_id = params
         .get("uploadId")
         .ok_or_else(|| S3Error::invalid_argument("missing uploadId"))?;
@@ -142,12 +159,23 @@ pub async fn complete_multipart_upload(
 
     // SSE-C customer key, if the upload was SSE-C, arrives here again.
     let customer_key = extract_customer_key(&headers)?;
+    let precondition = extract_write_precondition(&headers)?;
 
     let result = state
         .storage
-        .complete_multipart_upload(&bucket, upload_id, &parts, customer_key)
+        .complete_multipart_upload(
+            &bucket,
+            upload_id,
+            &parts,
+            customer_key,
+            precondition.as_ref(),
+        )
         .await
-        .map_err(map_storage_err)?;
+        .map_err(|e| match e {
+            StorageError::PreconditionFailed => S3Error::precondition_failed(),
+            StorageError::NotFound(_) if precondition.is_some() => S3Error::no_such_key(&key),
+            other => map_storage_err(other),
+        })?;
 
     let xml = to_xml(&CompleteMultipartUploadResult {
         location: format!("/{}/{}", bucket, key),
@@ -163,6 +191,9 @@ pub async fn complete_multipart_upload(
     if let (Some(algo), Some(val)) = (&result.checksum_algorithm, &result.checksum_value) {
         builder = builder.header(algo.header_name(), val.as_str());
     }
+    if let Some(vid) = &result.version_id {
+        builder = builder.header("x-amz-version-id", vid.as_str());
+    }
     Ok(builder.body(Body::from(xml)).unwrap())
 }
 
@@ -171,7 +202,7 @@ pub async fn abort_multipart_upload(
     Path((bucket, _key)): Path<(String, String)>,
     Query(params): Query<HashMap<String, String>>,
 ) -> Result<Response<Body>, S3Error> {
-    ensure_bucket_exists(&state, &bucket).await?;
+    require_bucket(&state, &bucket).await?;
     let upload_id = params
         .get("uploadId")
         .ok_or_else(|| S3Error::invalid_argument("missing uploadId"))?;
@@ -193,7 +224,7 @@ pub async fn list_parts(
     Path((bucket, _key)): Path<(String, String)>,
     Query(params): Query<HashMap<String, String>>,
 ) -> Result<Response<Body>, S3Error> {
-    ensure_bucket_exists(&state, &bucket).await?;
+    require_bucket(&state, &bucket).await?;
     let upload_id = params
         .get("uploadId")
         .ok_or_else(|| S3Error::invalid_argument("missing uploadId"))?;
@@ -232,7 +263,7 @@ pub async fn list_multipart_uploads(
     State(state): State<AppState>,
     Path(bucket): Path<String>,
 ) -> Result<Response<Body>, S3Error> {
-    ensure_bucket_exists(&state, &bucket).await?;
+    require_bucket(&state, &bucket).await?;
 
     let uploads = state
         .storage
@@ -259,14 +290,6 @@ pub async fn list_multipart_uploads(
         .header("content-type", "application/xml")
         .body(Body::from(xml))
         .unwrap())
-}
-
-pub(super) async fn ensure_bucket_exists(state: &AppState, bucket: &str) -> Result<(), S3Error> {
-    match state.storage.head_bucket(bucket).await {
-        Ok(true) => Ok(()),
-        Ok(false) => Err(S3Error::no_such_bucket(bucket)),
-        Err(e) => Err(S3Error::internal(e)),
-    }
 }
 
 pub(super) fn map_storage_err(err: StorageError) -> S3Error {

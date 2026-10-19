@@ -35,6 +35,21 @@ pub enum S3ErrorCode {
     SignatureDoesNotMatch,
     InvalidEncryptionAlgorithm,
     ServerSideEncryptionConfigurationNotFound,
+    IncompleteBody,
+    InvalidRequest,
+    NoSuchLifecycleConfiguration,
+    ObjectLockConfigurationNotFound,
+    NoSuchWebsiteConfiguration,
+    ReplicationConfigurationNotFound,
+    OwnershipControlsNotFound,
+    NoSuchPublicAccessBlockConfiguration,
+    NoSuchBucketPolicy,
+    MalformedPolicy,
+    NoSuchTagSet,
+    InvalidTag,
+    MetadataTooLarge,
+    InvalidDigest,
+    MethodNotAllowed,
 }
 
 impl S3ErrorCode {
@@ -66,6 +81,21 @@ impl S3ErrorCode {
             Self::ServerSideEncryptionConfigurationNotFound => {
                 "ServerSideEncryptionConfigurationNotFoundError"
             }
+            Self::IncompleteBody => "IncompleteBody",
+            Self::InvalidRequest => "InvalidRequest",
+            Self::NoSuchLifecycleConfiguration => "NoSuchLifecycleConfiguration",
+            Self::ObjectLockConfigurationNotFound => "ObjectLockConfigurationNotFoundError",
+            Self::NoSuchWebsiteConfiguration => "NoSuchWebsiteConfiguration",
+            Self::ReplicationConfigurationNotFound => "ReplicationConfigurationNotFoundError",
+            Self::OwnershipControlsNotFound => "OwnershipControlsNotFoundError",
+            Self::NoSuchPublicAccessBlockConfiguration => "NoSuchPublicAccessBlockConfiguration",
+            Self::NoSuchBucketPolicy => "NoSuchBucketPolicy",
+            Self::MalformedPolicy => "MalformedPolicy",
+            Self::NoSuchTagSet => "NoSuchTagSet",
+            Self::InvalidTag => "InvalidTag",
+            Self::MetadataTooLarge => "MetadataTooLarge",
+            Self::InvalidDigest => "InvalidDigest",
+            Self::MethodNotAllowed => "MethodNotAllowed",
         }
     }
 
@@ -80,18 +110,36 @@ impl S3ErrorCode {
             | Self::NoSuchUpload
             | Self::NoSuchVersion
             | Self::NoSuchCORSConfiguration
-            | Self::ServerSideEncryptionConfigurationNotFound => StatusCode::NOT_FOUND,
+            | Self::ServerSideEncryptionConfigurationNotFound
+            | Self::NoSuchLifecycleConfiguration
+            | Self::ObjectLockConfigurationNotFound
+            | Self::NoSuchWebsiteConfiguration
+            | Self::ReplicationConfigurationNotFound
+            | Self::OwnershipControlsNotFound
+            | Self::NoSuchPublicAccessBlockConfiguration
+            | Self::NoSuchBucketPolicy
+            | Self::NoSuchTagSet => StatusCode::NOT_FOUND,
             Self::BucketAlreadyOwnedByYou | Self::BucketNotEmpty => StatusCode::CONFLICT,
             Self::InternalError => StatusCode::INTERNAL_SERVER_ERROR,
             Self::InvalidRange => StatusCode::RANGE_NOT_SATISFIABLE,
             Self::NotImplemented => StatusCode::NOT_IMPLEMENTED,
             Self::PreconditionFailed => StatusCode::PRECONDITION_FAILED,
+            Self::MethodNotAllowed => StatusCode::METHOD_NOT_ALLOWED,
             _ => StatusCode::BAD_REQUEST,
         }
     }
 }
 
 impl S3Error {
+    /// Error with a code and message and no resource.
+    pub fn new(code: S3ErrorCode, message: impl Into<String>) -> Self {
+        Self {
+            code,
+            message: message.into(),
+            resource: None,
+        }
+    }
+
     pub fn internal(err: impl std::fmt::Display) -> Self {
         tracing::error!("Internal error: {}", err);
         Self {
@@ -177,6 +225,14 @@ impl S3Error {
             ),
             resource: None,
         }
+    }
+
+    pub fn incomplete_body(msg: &str) -> Self {
+        Self::new(S3ErrorCode::IncompleteBody, msg)
+    }
+
+    pub fn invalid_request(msg: &str) -> Self {
+        Self::new(S3ErrorCode::InvalidRequest, msg)
     }
 
     pub fn malformed_xml() -> Self {
@@ -300,6 +356,37 @@ impl S3Error {
             message: "The server side encryption configuration was not found.".into(),
             resource: Some(format!("/{}", bucket)),
         }
+    }
+
+    /// Bucket-scoped error with a fixed code (missing subresource configs etc.).
+    pub fn bucket_error(code: S3ErrorCode, bucket: &str, msg: &str) -> Self {
+        Self {
+            code,
+            message: msg.to_string(),
+            resource: Some(format!("/{}", bucket)),
+        }
+    }
+
+    pub fn metadata_too_large() -> Self {
+        Self::new(
+            S3ErrorCode::MetadataTooLarge,
+            "Your metadata headers exceed the maximum allowed metadata size.",
+        )
+    }
+
+    pub fn invalid_digest() -> Self {
+        Self::new(
+            S3ErrorCode::InvalidDigest,
+            "The Content-MD5 you specified is not valid.",
+        )
+    }
+
+    pub fn method_not_allowed(msg: &str) -> Self {
+        Self::new(S3ErrorCode::MethodNotAllowed, msg)
+    }
+
+    pub fn invalid_tag(msg: &str) -> Self {
+        Self::new(S3ErrorCode::InvalidTag, msg)
     }
 }
 

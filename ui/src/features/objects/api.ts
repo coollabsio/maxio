@@ -1,5 +1,6 @@
 import { apiClient } from '@/api/client'
 import * as sdk from '@/api/generated/sdk.gen'
+import type { TagEntry } from '@/api/generated/types.gen'
 
 export async function listObjects(bucket: string, prefix: string) {
   const { data } = await sdk.listObjects({
@@ -40,5 +41,15 @@ export async function presignObject(bucket: string, key: string, expires: number
     query: { expires },
     throwOnError: true,
   })
+  return data
+}
+
+export async function getObjectInfo(bucket: string, key: string) {
+  const { data } = await sdk.getObjectInfo({ client: apiClient, path: { bucket, key }, throwOnError: true })
+  return data
+}
+
+export async function setObjectTags(bucket: string, key: string, tags: TagEntry[]) {
+  const { data } = await sdk.setObjectTags({ client: apiClient, path: { bucket, key }, body: { tags }, throwOnError: true })
   return data
 }

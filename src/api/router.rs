@@ -32,9 +32,9 @@ pub fn s3_router() -> Router<AppState> {
         .route("/{bucket}/", get(list::handle_bucket_get))
         .route("/{bucket}", options(options_handler))
         .route("/{bucket}/", options(options_handler))
-        // POST for DeleteObjects (multi-object delete)
-        .route("/{bucket}", post(object::delete_objects))
-        .route("/{bucket}/", post(object::delete_objects))
+        // POST: DeleteObjects (?delete) only
+        .route("/{bucket}", post(bucket::handle_bucket_post))
+        .route("/{bucket}/", post(bucket::handle_bucket_post))
         // Object routes
         .route("/{bucket}/{*key}", post(object::post_object))
         .route("/{bucket}/{*key}", put(object::put_object))

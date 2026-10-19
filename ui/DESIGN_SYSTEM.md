@@ -2,7 +2,28 @@
 
 > **Purpose**: AI/LLM-consumable reference for replicating Coolify's visual design in new applications. Contains design tokens, component styles, and interactive states — with both Tailwind CSS classes and plain CSS equivalents.
 >
-> **In MaxIO**: tokens and the `.input-cool` class live in `ui/src/index.css` (Tailwind v4, CSS-first). The React primitives in `ui/src/components/ui/*.tsx` (shadcn `base-nova` style on `@base-ui/react`, variants via `class-variance-authority`) implement the component styles below.
+> **In MaxIO**: tokens, `.input-cool`, `.button-3d`, `.menu-item` and the floating navigation rules live in `ui/src/index.css` (Tailwind v4, CSS-first). The React primitives in `ui/src/components/ui/*.tsx` (shadcn `base-nova` style on `@base-ui/react`, variants via `class-variance-authority`) implement the component styles below.
+
+## 0. Coolify v4.5 (current — overrides the sections below)
+
+Reference: Coolify `release/v4.5` (`resources/css/app.css`, `utilities.css`, `layouts/app.blade.php`). Where a later section disagrees, this section wins.
+
+| Topic | v4.5 rule | In MaxIO |
+|---|---|---|
+| Surfaces (dark) | `app` 14.5% → `panel` 19.1% (top bar, sidebar) → `surface` 20% (cards) → `raised` 22.6%, pure neutral oklch | `bg-app`, `bg-panel`, `bg-surface`, `bg-raised`; `coolgray-*` maps to the same ladder |
+| Surfaces (light) | page `oklch(98.5%)`, cards and bars white, hairline borders `neutral-200` | same tokens, light values in `:root` |
+| Text | `fg` 96% / `fg-dim` 77% / `fg-faint` 65% (dark) | `text-fg`, `text-fg-dim`, `text-fg-faint` |
+| Radius | controls `rounded-md` (6px), cards / tables / panels `rounded-lg` (8px), dialogs `rounded-xl` | |
+| Buttons | `h-8 px-2.5 text-[13px] font-medium rounded-md border`; 3D depth: `box-shadow: 0 2px 0 depth`, hover `translateY(-1px)` + 3px, active `translateY(2px)` + none. Highlighted = gradient `coollabs-100 → coollabs-200`, white text | `Button` + `.button-3d` |
+| Inputs | `h-8 px-3 rounded-md border`, recessed fill, accent border on focus (no inset left bar) | `.input-cool` |
+| Tables | `rounded-lg` bordered card; header `h-10 text-[13px] font-medium` muted on `black/2%`; rows `min-h-12`, hover `black/2%` | `Table*` |
+| Settings card | shell + muted header strip (`h2` 14px/500, `p` 12px) + nested body panel | `.settings-section`, `-header`, `-body` |
+| Page header | `h1` 24px/600 tracking-tight, 13px muted description, actions on the right | `PageHeader` |
+| Layout | fixed top bar `h-12` (brand column as wide as the sidebar, then breadcrumb), fixed sidebar below (`w-56` / `w-16`), content `lg:px-10`, `max-w-[1400px]` centered | `AppShell`, `TopBar`, `Sidebar` |
+| Sidebar rows | `.menu-item` `h-8 text-[13px] rounded-md`; section labels `.nav-section` 11px | `index.css` |
+| Navigation items `3d` (default) | each icon in a 32px framed tile with button depth; active tile takes the accent; rows have no background | `html:not([data-nav-items="flat"])` rules |
+| Navigation `floating` | top bar hugs its content, top bar and sidebar are framed panels (`1px` line, `8px` radius, `0.5rem` gap) over a fixed 20px dotted backdrop | `html[data-nav-style="floating"]` rules (≥1024px) |
+| Account menu | button at the sidebar bottom, opens upward: theme, navigation, navigation items, Sign out | `UserMenu` |
 
 ---
 

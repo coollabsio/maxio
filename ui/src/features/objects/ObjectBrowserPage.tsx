@@ -1,5 +1,17 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { Check, Download, File as FileIcon, Folder, FolderPlus, History, Share2, Trash2, Upload } from 'lucide-react'
+import {
+  Check,
+  Download,
+  File as FileIcon,
+  Folder,
+  FolderPlus,
+  History,
+  Info,
+  Settings,
+  Share2,
+  Trash2,
+  Upload,
+} from 'lucide-react'
 import { Fragment, useEffect, useRef, useState, type MouseEvent } from 'react'
 import { Navigate, useNavigate, useParams, useSearchParams } from 'react-router'
 import { ApiError } from '@/api/client'
@@ -9,13 +21,15 @@ import { Callout } from '@/components/ui/callout'
 import { ConfirmDialog } from '@/components/ui/confirm-dialog'
 import { Dialog } from '@/components/ui/dialog'
 import { Input } from '@/components/ui/input'
+import { PageHeader } from '@/components/ui/page-header'
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table'
 import { getVersioning } from '@/features/settings/api'
 import { VersionHistory } from '@/features/versions/VersionHistory'
 import { formatDate, formatSize } from '@/lib/format'
-import { bucketPath, displayName, downloadUrl, normalizePrefix } from '@/lib/paths'
+import { bucketPath, bucketSettingsPath, displayName, downloadUrl, normalizePrefix } from '@/lib/paths'
 import { toast } from '@/lib/toast'
 import { createFolder, deleteObject, listObjects, presignObject, uploadObject } from './api'
+import { ObjectDetailsSheet } from './ObjectDetailsSheet'
 
 const expiryOptions = [
   { label: '1 hour', seconds: 3600 },
@@ -43,6 +57,7 @@ function ObjectBrowser({ bucket }: { bucket: string }) {
   const [showCreateFolder, setShowCreateFolder] = useState(false)
   const [newFolderName, setNewFolderName] = useState('')
   const [versionKey, setVersionKey] = useState<string | null>(null)
+  const [detailsKey, setDetailsKey] = useState<string | null>(null)
   const [pendingDelete, setPendingDelete] = useState<{ key: string; kind: 'object' | 'folder' } | null>(null)
 
   const objectsQuery = useQuery({
@@ -186,34 +201,49 @@ function ObjectBrowser({ bucket }: { bucket: string }) {
 
   return (
     <>
-      <div className="flex flex-col gap-4">
+      <div className="flex flex-col gap-6">
+        <PageHeader
+          title={prefix ? `${displayName(prefix)}/` : bucket}
+          description={prefix ? `${bucket}/${prefix}` : 'Files and folders in this bucket'}
+          actions={
+            <>
+              <Button
+                variant="ghost"
+                size="icon"
+                onClick={() => navigate(bucketSettingsPath(bucket))}
+                title="Bucket settings"
+                aria-label="Open bucket settings"
+              >
+                <Settings />
+              </Button>
+              <Button variant="default" onClick={() => setShowCreateFolder(true)}>
+                <FolderPlus /> New Folder
+              </Button>
+              <Button
+                variant="highlighted"
+                onClick={() => fileInput.current?.click()}
+                disabled={uploadMutation.isPending}
+              >
+                <Upload /> {uploadMutation.isPending ? 'Uploading...' : 'Upload'}
+              </Button>
+            </>
+          }
+        />
+
         {objectsQuery.isError ? (
           <Callout type="danger">
             {objectsQuery.error instanceof ApiError ? objectsQuery.error.message : 'Failed to load objects'}
           </Callout>
         ) : null}
 
-        <div className="flex items-center gap-2">
-          <input
-            ref={fileInput}
-            type="file"
-            multiple
-            className="hidden"
-            onChange={() => void handleUpload()}
-            data-testid="upload-input"
-          />
-          <Button
-            variant="highlighted"
-            className="h-8"
-            onClick={() => fileInput.current?.click()}
-            disabled={uploadMutation.isPending}
-          >
-            <Upload className="size-4 mr-1" /> {uploadMutation.isPending ? 'Uploading...' : 'Upload'}
-          </Button>
-          <Button variant="outline" className="h-8" onClick={() => setShowCreateFolder(true)}>
-            <FolderPlus className="size-4 mr-1" /> New Folder
-          </Button>
-        </div>
+        <input
+          ref={fileInput}
+          type="file"
+          multiple
+          className="hidden"
+          onChange={() => void handleUpload()}
+          data-testid="upload-input"
+        />
 
         {objectsQuery.isPending ? (
           <p className="text-sm text-muted-foreground">Loading...</p>
@@ -229,9 +259,10 @@ function ObjectBrowser({ bucket }: { bucket: string }) {
             <TableHeader>
               <TableRow>
                 <TableHead>Name</TableHead>
+                <TableHead className="hidden w-48 xl:table-cell">Type</TableHead>
                 <TableHead className="w-28 text-right">Size</TableHead>
                 <TableHead className="w-48">Modified</TableHead>
-                <TableHead className="w-24"></TableHead>
+                <TableHead className="w-32"></TableHead>
               </TableRow>
             </TableHeader>
             <TableBody>
@@ -239,17 +270,18 @@ function ObjectBrowser({ bucket }: { bucket: string }) {
                 <TableRow key={folder} className="cursor-pointer" onClick={() => navigateTo(folder)}>
                   <TableCell>
                     <span className="flex items-center gap-2">
-                      <Folder className="size-4 shrink-0 text-muted-foreground" />
-                      <span className="font-medium">{displayName(folder)}/</span>
+                      <Folder className="size-4 shrink-0 text-coollabs dark:text-warning" />
+                      <span className="font-semibold">{displayName(folder)}/</span>
                     </span>
                   </TableCell>
+                  <TableCell className="hidden text-muted-foreground xl:table-cell">&mdash;</TableCell>
                   <TableCell className="text-right text-muted-foreground">&mdash;</TableCell>
                   <TableCell className="text-muted-foreground">&mdash;</TableCell>
-                  <TableCell>
+                  <TableCell className="text-right">
                     {emptyPrefixes.has(folder) ? (
                       <button
                         type="button"
-                        className="text-muted-foreground hover:text-destructive transition-colors"
+                        className="icon-button hover:!text-error"
                         onClick={(event) => {
                           event.stopPropagation()
                           setPendingDelete({ key: folder, kind: 'folder' })
@@ -265,21 +297,36 @@ function ObjectBrowser({ bucket }: { bucket: string }) {
               ))}
               {files.map((file) => (
                 <Fragment key={file.key}>
-                  <TableRow>
+                  <TableRow className="cursor-pointer" onClick={() => setDetailsKey(file.key)}>
                     <TableCell>
                       <span className="flex items-center gap-2">
                         <FileIcon className="size-4 shrink-0 text-muted-foreground" />
                         <span className="font-medium">{displayName(file.key)}</span>
                       </span>
                     </TableCell>
+                    <TableCell className="hidden max-w-48 truncate text-xs text-muted-foreground xl:table-cell">
+                      {file.contentType}
+                    </TableCell>
                     <TableCell className="text-right text-muted-foreground">{formatSize(file.size)}</TableCell>
                     <TableCell className="text-muted-foreground">{formatDate(file.lastModified)}</TableCell>
-                    <TableCell className="w-24">
-                      <span className="flex items-center gap-4">
+                    <TableCell className="w-32">
+                      <span className="flex items-center justify-end gap-1">
+                        <button
+                          type="button"
+                          className="icon-button"
+                          onClick={(event) => {
+                            event.stopPropagation()
+                            setDetailsKey(file.key)
+                          }}
+                          title="Details"
+                          aria-label="Details"
+                        >
+                          <Info className="size-4" />
+                        </button>
                         {versioningEnabled ? (
                           <button
                             type="button"
-                            className="text-muted-foreground hover:text-foreground transition-colors"
+                            className="icon-button"
                             onClick={(event) => {
                               event.stopPropagation()
                               setVersionKey((current) => (current === file.key ? null : file.key))
@@ -292,7 +339,7 @@ function ObjectBrowser({ bucket }: { bucket: string }) {
                         ) : null}
                         <button
                           type="button"
-                          className="text-muted-foreground hover:text-foreground transition-colors"
+                          className="icon-button"
                           onClick={(event) => toggleShareMenu(file.key, event)}
                           title="Copy presigned URL"
                           aria-label="Copy presigned URL"
@@ -305,7 +352,7 @@ function ObjectBrowser({ bucket }: { bucket: string }) {
                         </button>
                         <a
                           href={downloadUrl(bucket, file.key)}
-                          className="text-muted-foreground hover:text-foreground"
+                          className="icon-button"
                           onClick={(event) => event.stopPropagation()}
                           title="Download"
                           aria-label="Download"
@@ -314,7 +361,7 @@ function ObjectBrowser({ bucket }: { bucket: string }) {
                         </a>
                         <button
                           type="button"
-                          className="text-muted-foreground hover:text-destructive transition-colors"
+                          className="icon-button hover:!text-error"
                           onClick={(event) => {
                             event.stopPropagation()
                             setPendingDelete({ key: file.key, kind: 'object' })
@@ -329,13 +376,13 @@ function ObjectBrowser({ bucket }: { bucket: string }) {
                   </TableRow>
                   {versionKey === file.key ? (
                     <TableRow>
-                      <TableCell colSpan={4} className="p-0">
+                      <TableCell colSpan={5} className="p-0">
                         <div className="p-2">
                           <VersionHistory
                             bucket={bucket}
                             objectKey={file.key}
                             onClose={() => setVersionKey(null)}
-                            onVersionDeleted={refreshListing}
+                            onVersionsChanged={refreshListing}
                           />
                         </div>
                       </TableCell>
@@ -379,7 +426,7 @@ function ObjectBrowser({ bucket }: { bucket: string }) {
           }}
           className="flex flex-col gap-1.5"
         >
-          <label htmlFor="folder-name" className="text-sm font-medium text-black dark:text-white">
+          <label htmlFor="folder-name" className="text-[13px] font-medium text-black dark:text-fg">
             Folder name
           </label>
           <Input
@@ -389,7 +436,6 @@ function ObjectBrowser({ bucket }: { bucket: string }) {
             value={newFolderName}
             onChange={(event) => setNewFolderName(event.target.value)}
             placeholder="folder-name"
-            className="bg-white dark:bg-base"
             disabled={createFolderMutation.isPending}
           />
         </form>
@@ -397,7 +443,7 @@ function ObjectBrowser({ bucket }: { bucket: string }) {
 
       {shareMenu ? (
         <div
-          className="fixed z-50 min-w-[8rem] rounded-sm border bg-popover p-1 shadow-md"
+          className="fixed z-50 flex min-w-[8rem] flex-col gap-px rounded-[10px] border border-line bg-white p-1 shadow-dropdown dark:bg-coolgray-200"
           style={{ top: shareMenu.top, left: shareMenu.left, transform: 'translate(-100%, -100%)' }}
           role="menu"
         >
@@ -406,7 +452,7 @@ function ObjectBrowser({ bucket }: { bucket: string }) {
               key={option.seconds}
               type="button"
               role="menuitem"
-              className="w-full rounded-sm px-2 py-1.5 text-left text-sm text-popover-foreground hover:bg-accent hover:text-accent-foreground"
+              className="w-full rounded-md px-2 py-1.5 text-left text-[13px] text-black hover:bg-fill dark:text-fg"
               onClick={() => void shareObject(shareMenu.key, option.seconds)}
             >
               {option.label}
@@ -414,6 +460,8 @@ function ObjectBrowser({ bucket }: { bucket: string }) {
           ))}
         </div>
       ) : null}
+
+      <ObjectDetailsSheet bucket={bucket} objectKey={detailsKey} onClose={() => setDetailsKey(null)} />
 
       {pendingDelete ? (
         <ConfirmDialog

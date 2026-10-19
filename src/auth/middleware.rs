@@ -5,6 +5,7 @@ use axum::{
 };
 use chrono::{NaiveDateTime, Utc};
 
+use crate::api::chunked::{self, StreamingMode};
 use crate::error::S3Error;
 use crate::server::AppState;
 
@@ -81,8 +82,9 @@ pub async fn auth_middleware(
         .headers()
         .get("x-amz-date")
         .and_then(|v| v.to_str().ok())
-        .unwrap_or("");
-    if let Ok(request_time) = NaiveDateTime::parse_from_str(amz_date, "%Y%m%dT%H%M%SZ") {
+        .unwrap_or("")
+        .to_string();
+    if let Ok(request_time) = NaiveDateTime::parse_from_str(&amz_date, "%Y%m%dT%H%M%SZ") {
         let now = Utc::now().naive_utc();
         let skew = (now - request_time).num_seconds().unsigned_abs();
         if skew > 15 * 60 {
@@ -120,9 +122,34 @@ pub async fn auth_middleware(
     }
 
     tracing::debug!("Signature verification OK");
+
+    // aws-chunked bodies: chunk signatures chain from the seed (header) signature.
+    let signing = match StreamingMode::from_headers(request.headers())? {
+        Some(mode) if mode.is_signed() => Some(signature_v4::StreamingSigningContext::new(
+            &state.config.secret_key,
+            &parsed,
+            &amz_date,
+        )),
+        _ => None,
+    };
+    let (request, failure) = chunked::prepare_request(request, signing)?;
+
     let response = next.run(request).await;
+    if let Some(err) = take_body_failure(&failure) {
+        tracing::debug!("{} {} -> aws-chunked body rejected", method, uri);
+        return Err(err);
+    }
     tracing::debug!("{} {} -> {}", method, uri, response.status());
     Ok(response)
+}
+
+/// A rejected aws-chunked body (bad chunk signature, checksum, truncation)
+/// aborts the handler's storage write with an I/O error; report the precise S3
+/// error instead of whatever the handler produced.
+fn take_body_failure(slot: &Option<chunked::FailureSlot>) -> Option<S3Error> {
+    let slot = slot.as_ref()?;
+    let failure = slot.lock().unwrap_or_else(|p| p.into_inner()).take()?;
+    Some(failure.to_s3_error())
 }
 
 fn redact_header_value(name: &str) -> &'static str {
@@ -153,20 +180,14 @@ async fn is_public_bypass_allowed(state: &AppState, method: &str, path: &str, qu
         _ => return false,
     }
 
-    // Reject mutating sub-resource queries that could trigger a POST-like action on GET.
-    for forbidden in [
-        "delete",
-        "uploads",
-        "tagging",
-        "versioning",
-        "cors",
-        "encryption",
-        "policy",
-        "acl",
-    ] {
-        if has_query_key(query, forbidden) {
-            return false;
-        }
+    // Anonymous access covers plain listing and object reads only. Any other
+    // query key (a subresource such as ?policy, ?versions, ?acl) needs auth.
+    if !query
+        .split('&')
+        .map(|pair| pair.split('=').next().unwrap_or(""))
+        .all(is_public_query_key)
+    {
+        return false;
     }
 
     let trimmed = path.trim_start_matches('/');
@@ -197,14 +218,22 @@ async fn is_public_bypass_allowed(state: &AppState, method: &str, path: &str, qu
     }
 }
 
-fn has_query_key(query: &str, key: &str) -> bool {
-    for pair in query.split('&') {
-        let name = pair.split('=').next().unwrap_or("");
-        if name.eq_ignore_ascii_case(key) {
-            return true;
-        }
-    }
-    false
+fn is_public_query_key(name: &str) -> bool {
+    const LIST_KEYS: &[&str] = &[
+        "",
+        "prefix",
+        "delimiter",
+        "marker",
+        "max-keys",
+        "list-type",
+        "continuation-token",
+        "start-after",
+        "encoding-type",
+        "fetch-owner",
+        "partNumber",
+        "x-id",
+    ];
+    LIST_KEYS.contains(&name) || name.starts_with("response-")
 }
 
 async fn handle_presigned(
@@ -276,6 +305,12 @@ async fn handle_presigned(
     }
 
     tracing::debug!("Presigned signature verification OK");
+    // Presigned URLs have no seed signature for chunk signing: only the
+    // unsigned aws-chunked variant is accepted.
+    let (request, failure) = chunked::prepare_request(request, None)?;
     let response = next.run(request).await;
+    if let Some(err) = take_body_failure(&failure) {
+        return Err(err);
+    }
     Ok(response)
 }

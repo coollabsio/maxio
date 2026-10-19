@@ -11,7 +11,7 @@
 @custom-variant dark (&:where(.dark, .dark *));
 
 /* ==============================================
-   COOLIFY DESIGN TOKENS
+   COOLIFY v4.5 DESIGN TOKENS ("graphite")
    Light mode = :root, Dark mode = .dark on <html>
    ============================================== */
 
@@ -20,53 +20,71 @@
   --cool-accent-hover: #5a12c7;
   --cool-accent-fg: #ffffff;
 
-  --cool-bg: #f9fafb;
+  /* Page canvas is off-white so white cards lift off it. */
+  --cool-bg: oklch(98.5% 0 0);
+  --cool-panel: #ffffff;
   --cool-bg-card: #ffffff;
-  --cool-bg-card-hover: #f5f5f5;
-  --cool-bg-input: #ffffff;
+  --cool-bg-card-hover: oklch(97% 0 0);
+  --cool-bg-input: oklch(96% 0 0);
+  --cool-fill: oklch(92.2% 0 0);
 
-  --cool-fg: #000000;
-  --cool-fg-muted: #737373;
+  /* Solid control fills (buttons). In dark mode they are a white tint mixed into the
+     page color, so the floating style's dotted backdrop does not show through. */
+  --cool-control: #ffffff;
+  --cool-control-hover: oklch(97% 0 0);
+  --cool-control-strong: oklch(97% 0 0);
+  --cool-control-strong-hover: oklch(92.2% 0 0);
 
-  --cool-border: #e5e5e5;
-  --cool-border-input: #e5e5e5;
+  --cool-fg: oklch(14.5% 0 0);
+  --cool-fg-dim: oklch(37% 0 0);
+  --cool-fg-muted: oklch(50% 0 0);
+
+  --cool-border: oklch(92.2% 0 0);
+  --cool-border-input: oklch(92.2% 0 0);
+  --cool-line: oklch(14.5% 0 0 / 0.1);
   --cool-ring: #6b16ed;
 
-  --cool-success: #22c55e;
-  --cool-error: #dc2626;
+  --cool-success: oklch(48% 0.135 149.58);
+  --cool-error: oklch(52% 0.2 27.33);
 
-  --cool-sidebar-bg: #ffffff;
-  --cool-sidebar-border: #d4d4d4;
-  --cool-sidebar-hover: #d4d4d4;
-  --cool-sidebar-active-bg: #e5e5e5;
-  --cool-sidebar-active-fg: #000000;
+  --cool-nav-text: oklch(43.86% 0 0);
+  --cool-nav-muted: oklch(51.03% 0 0);
+  --cool-nav-active: oklch(20.46% 0 0);
 }
 
 .dark {
-  --cool-accent: #fcd452;
-  --cool-accent-hover: #facc15;
+  --cool-accent: oklch(88.13% 0.1507 91.7);
+  --cool-accent-hover: oklch(86.06% 0.1731 91.94);
   --cool-accent-fg: #101010;
 
-  --cool-bg: #101010;
-  --cool-bg-card: #181818;
-  --cool-bg-card-hover: #202020;
-  --cool-bg-input: #181818;
+  /* Content canvas → panel (top bar, sidebar) → surface (cards) → raised. */
+  --cool-bg: oklch(14.48% 0 0);
+  --cool-panel: oklch(19.13% 0 0);
+  --cool-bg-card: oklch(20.02% 0 0);
+  --cool-bg-card-hover: oklch(22.64% 0 0);
+  --cool-bg-input: color-mix(in oklab, #fff 3%, var(--cool-bg));
+  --cool-fill: oklch(29.31% 0 0);
 
-  --cool-fg: #e5e5e5;
-  --cool-fg-muted: #a3a3a3;
+  --cool-control: color-mix(in oklab, #fff 6%, var(--cool-bg));
+  --cool-control-hover: color-mix(in oklab, #fff 10%, var(--cool-bg));
+  --cool-control-strong: color-mix(in oklab, #fff 10%, var(--cool-bg));
+  --cool-control-strong-hover: color-mix(in oklab, #fff 14%, var(--cool-bg));
 
-  --cool-border: #242424;
-  --cool-border-input: #242424;
-  --cool-ring: #fcd452;
+  --cool-fg: oklch(96.12% 0 0);
+  --cool-fg-dim: oklch(76.99% 0 0);
+  --cool-fg-muted: oklch(65% 0 0);
 
-  --cool-success: #22c55e;
-  --cool-error: #dc2626;
+  --cool-border: oklch(100% 0 0 / 0.08);
+  --cool-border-input: oklch(100% 0 0 / 0.08);
+  --cool-line: oklch(32% 0 0);
+  --cool-ring: oklch(88.13% 0.1507 91.7);
 
-  --cool-sidebar-bg: #101010;
-  --cool-sidebar-border: #202020;
-  --cool-sidebar-hover: #181818;
-  --cool-sidebar-active-bg: #202020;
-  --cool-sidebar-active-fg: #fcd452;
+  --cool-success: oklch(72.27% 0.192 149.58);
+  --cool-error: oklch(66% 0.2 27.33);
+
+  --cool-nav-text: oklch(73.8% 0 0);
+  --cool-nav-muted: oklch(61% 0 0);
+  --cool-nav-active: oklch(96.12% 0 0);
 }
 
 /* ==============================================
@@ -76,6 +94,23 @@
 @theme inline {
   --color-background: var(--cool-bg);
   --color-foreground: var(--cool-fg);
+
+  --color-app: var(--cool-bg);
+  --color-panel: var(--cool-panel);
+  --color-surface: var(--cool-bg-card);
+  --color-raised: var(--cool-bg-card-hover);
+  --color-fill: var(--cool-fill);
+  --color-control: var(--cool-control);
+  --color-control-hover: var(--cool-control-hover);
+  --color-control-strong: var(--cool-control-strong);
+  --color-control-strong-hover: var(--cool-control-strong-hover);
+  --color-fg: var(--cool-fg);
+  --color-fg-dim: var(--cool-fg-dim);
+  --color-fg-faint: var(--cool-fg-muted);
+  --color-line: var(--cool-line);
+  --color-nav-text: var(--cool-nav-text);
+  --color-nav-muted: var(--cool-nav-muted);
+  --color-nav-active: var(--cool-nav-active);
 
   --color-card: var(--cool-bg-card);
   --color-card-foreground: var(--cool-fg);
@@ -114,48 +149,41 @@
   --color-input-border: var(--cool-border-input);
   --color-ring: var(--cool-ring);
 
-  --color-sidebar-background: var(--cool-sidebar-bg);
-  --color-sidebar-foreground: var(--cool-fg);
-  --color-sidebar-primary: var(--cool-accent);
-  --color-sidebar-primary-foreground: var(--cool-accent-fg);
-  --color-sidebar-accent: var(--cool-sidebar-hover);
-  --color-sidebar-accent-foreground: var(--cool-fg);
-  --color-sidebar-border: var(--cool-sidebar-border);
-  --color-sidebar-ring: var(--cool-ring);
-  --color-sidebar-active: var(--cool-sidebar-active-bg);
-  --color-sidebar-active-foreground: var(--cool-sidebar-active-fg);
-
   /* Coollabs (brand) scale */
-  --color-coollabs: #6b16ed;
-  --color-coollabs-50: #f5f0ff;
-  --color-coollabs-100: #7317ff;
-  --color-coollabs-200: #5a12c7;
-  --color-coollabs-300: #4a0fa3;
+  --color-coollabs: oklch(49.65% 0.2709 289.33);
+  --color-coollabs-50: oklch(96.33% 0.0206 301.15);
+  --color-coollabs-100: oklch(52.34% 0.287 289.16);
+  --color-coollabs-200: oklch(43.76% 0.2369 289.82);
+  --color-coollabs-300: oklch(38.04% 0.2031 290.47);
 
   /* Warning scale — used for dark-mode accent + callouts */
-  --color-warning: #fcd452;
-  --color-warning-50: #fefce8;
-  --color-warning-100: #fef9c3;
-  --color-warning-200: #fef08a;
-  --color-warning-300: #fde047;
-  --color-warning-400: #fcd452;
-  --color-warning-500: #facc15;
-  --color-warning-600: #ca8a04;
-  --color-warning-700: #a16207;
-  --color-warning-800: #854d0e;
-  --color-warning-900: #713f12;
+  --color-warning: oklch(88.13% 0.1507 91.7);
+  --color-warning-50: oklch(98.73% 0.0262 102.21);
+  --color-warning-100: oklch(97.29% 0.0693 103.19);
+  --color-warning-200: oklch(94.51% 0.1243 101.54);
+  --color-warning-300: oklch(90.52% 0.1657 98.11);
+  --color-warning-400: oklch(88.13% 0.1507 91.7);
+  --color-warning-500: oklch(86.06% 0.1731 91.94);
+  --color-warning-600: oklch(68.06% 0.1423 75.83);
+  --color-warning-700: oklch(55.38% 0.1207 66.44);
+  --color-warning-800: oklch(47.62% 0.1034 61.91);
+  --color-warning-900: oklch(42.1% 0.0897 57.71);
 
-  /* Coolgray scale — dark mode background hierarchy */
-  --color-base: #101010;
-  --color-coolgray-100: #181818;
-  --color-coolgray-200: #202020;
-  --color-coolgray-300: #242424;
-  --color-coolgray-400: #282828;
-  --color-coolgray-500: #323232;
+  /* Coolgray scale — the dark surface ladder (neutral, no blue cast) */
+  --color-base: oklch(14.48% 0 0);
+  --color-coolgray-100: oklch(20.02% 0 0);
+  --color-coolgray-200: oklch(22.64% 0 0);
+  --color-coolgray-300: oklch(26.86% 0 0);
+  --color-coolgray-400: oklch(29.31% 0 0);
+  --color-coolgray-500: oklch(32% 0 0);
 
-  --radius: 0.125rem;
+  --radius: 0.375rem;
 
-  --font-sans: "Geist", "Geist Sans", Inter, ui-sans-serif, system-ui, sans-serif,
+  --shadow-dropdown: 0 4px 12px rgb(0 0 0 / 0.12), 0 2px 4px rgb(0 0 0 / 0.08);
+  --shadow-modal: 0 24px 64px rgb(0 0 0 / 0.55), 0 4px 16px rgb(0 0 0 / 0.4);
+  --ease-out: cubic-bezier(0.23, 1, 0.32, 1);
+
+  --font-sans: "Geist Sans", "Geist", Inter, ui-sans-serif, system-ui, sans-serif,
     "Apple Color Emoji", "Segoe UI Emoji", "Segoe UI Symbol", "Noto Color Emoji";
   --font-mono: "Geist Mono", ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas,
     "Liberation Mono", "Courier New", monospace;
@@ -165,13 +193,23 @@
    GLOBAL BASE STYLES
    ============================================== */
 
+html,
 body {
   background-color: var(--cool-bg);
+}
+
+body {
+  min-height: 100dvh;
   color: var(--cool-fg);
   font-family: var(--font-sans);
   font-size: 0.875rem;
+  overflow-x: clip;
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
+}
+
+.dark body {
+  color: var(--cool-fg-dim);
 }
 
 @layer base {
@@ -180,21 +218,11 @@ body {
   ::before,
   ::backdrop,
   ::file-selector-button {
-    border-color: var(--color-coolgray-200, var(--color-border, currentcolor));
-  }
-  :root *,
-  :root ::after,
-  :root ::before {
-    border-color: var(--color-border);
-  }
-  .dark *,
-  .dark ::after,
-  .dark ::before {
-    border-color: var(--color-coolgray-200);
+    border-color: var(--color-border, currentcolor);
   }
 
   h1 {
-    @apply text-3xl font-bold text-black dark:text-white;
+    @apply text-[24px] leading-7 font-semibold tracking-tight text-black dark:text-white;
   }
   h2 {
     @apply text-xl font-bold text-black dark:text-white;
@@ -213,7 +241,7 @@ body {
   height: 6px;
 }
 ::-webkit-scrollbar-track {
-  background: var(--cool-bg-card-hover);
+  background: transparent;
 }
 ::-webkit-scrollbar-thumb {
   background: var(--color-coollabs-100);
@@ -221,7 +249,7 @@ body {
 }
 
 /* ==============================================
-   COOLIFY INPUT — inset box-shadow system
+   COOLIFY INPUT — 1px border, accent border on focus
    ============================================== */
 
 @layer components {
@@ -233,25 +261,312 @@ body {
     font-size: 0.875rem;
     color: var(--cool-fg);
     background: var(--cool-bg-input);
-    border: 0;
-    border-radius: 0.125rem;
-    box-shadow: inset 4px 0 0 transparent, inset 0 0 0 2px var(--cool-border-input);
+    border: 1px solid var(--cool-border-input);
+    border-radius: 0.375rem;
     outline: none;
-    transition: box-shadow 150ms;
+    transition: border-color 120ms var(--ease-out), background-color 120ms var(--ease-out);
   }
 
   .input-cool::placeholder {
     color: var(--cool-fg-muted);
-    opacity: 0.5;
+    opacity: 0.8;
   }
 
-  .input-cool:focus {
-    box-shadow: inset 4px 0 0 var(--cool-ring), inset 0 0 0 2px var(--cool-border-input);
+  .input-cool:focus-visible {
+    border-color: var(--cool-ring);
   }
 
   .input-cool:disabled {
     cursor: not-allowed;
-    opacity: 0.5;
-    box-shadow: none;
+    color: var(--cool-fg-muted);
+    opacity: 0.6;
+  }
+}
+
+/* ==============================================
+   SETTINGS SECTION — layered card: a muted header strip
+   on the card shell, then a nested body panel.
+   ============================================== */
+
+:root {
+  --section-shell: oklch(98% 0 0);
+  --section-body: oklch(100% 0 0);
+  --section-hairline: oklch(85.5% 0 0);
+}
+
+.dark {
+  --section-shell: oklch(20.02% 0 0);
+  --section-body: oklch(22.64% 0 0);
+  --section-hairline: oklch(32% 0 0);
+}
+
+.settings-section {
+  display: flex;
+  flex-direction: column;
+  border-radius: 8px;
+  background: var(--section-shell);
+  box-shadow: 0 0 0 1px var(--section-hairline), 0 1px 2px 0 rgb(0 0 0 / 0.05);
+}
+
+.settings-section-header {
+  display: flex;
+  min-height: 3rem;
+  flex-direction: column;
+  justify-content: center;
+  padding: 0.5rem 1rem;
+}
+
+.settings-section-header h2 {
+  font-size: 0.875rem;
+  font-weight: 500;
+  line-height: 1.25rem;
+  color: oklch(40% 0 0);
+}
+
+.dark .settings-section-header h2 {
+  color: var(--cool-fg-dim);
+}
+
+.settings-section-header p {
+  margin-top: 0.125rem;
+  font-size: 0.75rem;
+  line-height: 1rem;
+  color: var(--cool-fg-muted);
+}
+
+.settings-section-body {
+  border-radius: 8px;
+  background: var(--section-body);
+  box-shadow: 0 0 0 1px var(--section-hairline);
+}
+
+/* ==============================================
+   3D BUTTONS — a 2px ledge; hover lifts the face,
+   pressing pushes it down and the depth goes away.
+   ============================================== */
+
+.button-3d:not(:disabled) {
+  --button-depth-color: rgb(0 0 0 / 0.22);
+  box-shadow: 0 2px 0 var(--button-depth-color);
+  transition:
+    color 120ms var(--ease-out),
+    background-color 120ms var(--ease-out),
+    border-color 120ms var(--ease-out),
+    box-shadow 80ms var(--ease-out),
+    transform 80ms var(--ease-out);
+}
+
+.dark .button-3d:not(:disabled) {
+  --button-depth-color: rgb(255 255 255 / 0.08);
+}
+
+.button-3d.button-highlighted:not(:disabled),
+.dark .button-3d.button-highlighted:not(:disabled) {
+  --button-depth-color: var(--color-coollabs-300);
+}
+
+.button-3d.button-error:not(:disabled) {
+  --button-depth-color: var(--color-red-300);
+}
+
+.dark .button-3d.button-error:not(:disabled) {
+  --button-depth-color: var(--color-red-800);
+}
+
+.button-3d:not(:disabled):hover {
+  transform: translateY(-1px);
+  box-shadow: 0 3px 0 var(--button-depth-color);
+}
+
+.button-3d:not(:disabled):active {
+  transform: translateY(2px);
+  box-shadow: none;
+}
+
+.button-3d:not(:disabled):focus-visible {
+  box-shadow: 0 2px 0 var(--button-depth-color), 0 0 0 1px var(--cool-ring);
+}
+
+/* ==============================================
+   NAVIGATION ITEMS (sidebar rows)
+   ============================================== */
+
+@layer components {
+  .menu-item {
+    @apply relative flex h-8 w-full min-w-0 items-center gap-2.5 truncate rounded-md px-2.5 text-left text-[13px] font-medium text-nav-text transition-colors hover:bg-black/[0.04] hover:text-nav-active dark:hover:bg-white/[0.05];
+  }
+  .menu-item-icon {
+    @apply size-[18px] shrink-0 opacity-90;
+  }
+  .menu-item-label {
+    @apply min-w-0 flex-1 truncate;
+  }
+  .menu-item-active {
+    @apply bg-black/[0.05] text-nav-active hover:bg-black/[0.05] dark:bg-white/[0.06] dark:hover:bg-white/[0.06];
+  }
+  .nav-section {
+    @apply px-2.5 pt-1 pb-1 text-[11px] font-medium text-nav-muted select-none;
+  }
+  .menu-item:focus-visible {
+    @apply outline-none ring-1 ring-ring;
+  }
+
+  /* Compact icon-only control (gear, trash, …) */
+  .icon-button {
+    @apply inline-flex size-7 shrink-0 items-center justify-center rounded-md border border-transparent text-neutral-400 outline-0 transition-colors hover:bg-neutral-100 hover:text-black focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring disabled:pointer-events-none disabled:opacity-35 dark:text-fg-faint dark:hover:bg-white/[0.07] dark:hover:text-fg;
+  }
+}
+
+/* 3D navigation items (Appearance → Navigation items → 3D, the default): each
+   sidebar icon sits in a framed tile with the depth of a 3D button. Only the tile
+   reacts; the row has no background. data-nav-items="flat" on <html> turns these
+   rules off and brings back the plain rows. */
+html:where(:not([data-nav-items="flat"])) .menu-item:not(.sidebar-toggle) {
+  height: 2.5rem;
+  padding-left: 0.25rem;
+}
+
+@layer utilities {
+  html:where(:not([data-nav-items="flat"])) .menu-item:not(.sidebar-toggle),
+  html:where(:not([data-nav-items="flat"])) .menu-item:not(.sidebar-toggle):hover {
+    background-color: transparent;
+  }
+}
+
+html:where(:not([data-nav-items="flat"])) .menu-item:not(.sidebar-toggle) .menu-item-icon {
+  box-sizing: content-box;
+  width: 1rem;
+  height: 1rem;
+  padding: 0.4375rem;
+  border: 1px solid oklch(0% 0 0 / 0.09);
+  border-radius: 8px;
+  background: #fafafa;
+  opacity: 1;
+  --button-depth-color: rgb(0 0 0 / 0.22);
+  box-shadow: 0 2px 0 var(--button-depth-color);
+  transition: border-color 120ms, background-color 120ms, box-shadow 80ms, transform 80ms;
+}
+
+html.dark:where(:not([data-nav-items="flat"])) .menu-item:not(.sidebar-toggle) .menu-item-icon {
+  --button-depth-color: rgb(255 255 255 / 0.08);
+  border-color: oklch(100% 0 0 / 0.09);
+  background: oklch(100% 0 0 / 0.04);
+}
+
+html:where(:not([data-nav-items="flat"])) .menu-item:not(.sidebar-toggle):hover .menu-item-icon {
+  transform: translateY(-1px);
+  box-shadow: 0 3px 0 var(--button-depth-color);
+}
+
+html:where(:not([data-nav-items="flat"])) .menu-item:not(.sidebar-toggle):active .menu-item-icon {
+  transform: translateY(2px);
+  box-shadow: none;
+}
+
+html:where(:not([data-nav-items="flat"])) .menu-item:not(.sidebar-toggle):hover .menu-item-icon,
+html:where(:not([data-nav-items="flat"])) .menu-item-active .menu-item-icon {
+  border-color: oklch(0% 0 0 / 0.18);
+  background: #fff;
+}
+
+html.dark:where(:not([data-nav-items="flat"])) .menu-item:not(.sidebar-toggle):hover .menu-item-icon,
+html.dark:where(:not([data-nav-items="flat"])) .menu-item-active .menu-item-icon {
+  border-color: oklch(100% 0 0 / 0.18);
+  background: oklch(100% 0 0 / 0.08);
+}
+
+/* The current item's tile takes the accent. */
+html:where(:not([data-nav-items="flat"])) .menu-item-active .menu-item-icon {
+  color: var(--color-coollabs);
+  border-color: color-mix(in oklab, var(--color-coollabs) 45%, transparent);
+  --button-depth-color: color-mix(in oklab, var(--color-coollabs) 45%, transparent);
+}
+
+html.dark:where(:not([data-nav-items="flat"])) .menu-item-active .menu-item-icon {
+  color: var(--color-warning);
+  border-color: color-mix(in oklab, var(--color-warning) 40%, transparent);
+  --button-depth-color: color-mix(in oklab, var(--color-warning) 35%, transparent);
+}
+
+html:where(:not([data-nav-items="flat"])) .menu-item:not(.sidebar-toggle):focus-visible {
+  --tw-ring-shadow: none;
+}
+
+html:where(:not([data-nav-items="flat"])) .menu-item:not(.sidebar-toggle):focus-visible .menu-item-icon {
+  outline: 1px solid var(--cool-ring);
+  outline-offset: 2px;
+}
+
+@media (min-width: 1024px) {
+  /* The collapsed rail is 64px wide with 40px of content: center the 32px tile. */
+  html:where(:not([data-nav-items="flat"])) .sidebar-collapsed .menu-item:not(.sidebar-toggle) {
+    padding-left: 0.25rem;
+    padding-right: 0.25rem;
+  }
+}
+
+/* ==============================================
+   FLOATING NAVIGATION (Appearance → Navigation → Floating)
+   The top bar and sidebar float as framed panels over a dotted
+   backdrop. data-nav-style="floating" on <html>; the default style
+   keeps edge-to-edge bars.
+   ============================================== */
+
+@media (min-width: 1024px) {
+  html[data-nav-style="floating"] {
+    --floating-gap: 0.5rem;
+    --floating-radius: 8px;
+    --floating-line: oklch(0% 0 0 / 0.09);
+    --floating-dot: rgb(0 0 0 / 0.13);
+    /* Bottom edge of the top bar panel plus one gap. */
+    --floating-top: calc(3rem + var(--floating-gap) * 2);
+  }
+
+  html.dark[data-nav-style="floating"] {
+    --floating-line: oklch(100% 0 0 / 0.08);
+    --floating-dot: rgb(255 255 255 / 0.09);
+  }
+
+  /* Fixed so the dots stay still while content scrolls. */
+  html[data-nav-style="floating"] .app-shell {
+    background-image: radial-gradient(circle, var(--floating-dot) 1px, transparent 1.3px);
+    background-size: 20px 20px;
+    background-attachment: fixed;
+  }
+
+  html[data-nav-style="floating"] .app-main {
+    background-color: transparent;
+    margin-left: calc(var(--sidebar-w) + var(--floating-gap));
+    padding-top: var(--floating-top);
+  }
+
+  html[data-nav-style="floating"] :is(.app-topbar, .app-sidebar-panel) {
+    border: 1px solid var(--floating-line);
+    border-radius: var(--floating-radius);
+  }
+
+  /* The top bar hugs its content (brand + breadcrumb) instead of spanning the screen. */
+  html[data-nav-style="floating"] .app-topbar {
+    top: var(--floating-gap);
+    left: var(--floating-gap);
+    right: auto;
+    max-width: calc(100vw - var(--floating-gap) * 2);
+    background-color: var(--cool-panel);
+    backdrop-filter: none;
+  }
+
+  /* The panel border replaces the inner dividers of the top bar. */
+  html[data-nav-style="floating"] .app-topbar > div {
+    border-bottom-width: 0;
+  }
+
+  html[data-nav-style="floating"] .app-sidebar {
+    top: var(--floating-top);
+    bottom: var(--floating-gap);
+    left: var(--floating-gap);
+  }
+
+  html[data-nav-style="floating"] .app-sidebar-footer {
+    border-radius: 0 0 var(--floating-radius) var(--floating-radius);
   }
 }

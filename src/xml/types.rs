@@ -9,7 +9,7 @@ pub struct ListAllMyBucketsResult {
     pub buckets: Buckets,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Clone)]
 pub struct Owner {
     #[serde(rename = "ID")]
     pub id: String,
@@ -59,6 +59,8 @@ pub struct ListBucketResult {
     pub delimiter: Option<String>,
     #[serde(rename = "StartAfter", skip_serializing_if = "Option::is_none")]
     pub start_after: Option<String>,
+    #[serde(rename = "EncodingType", skip_serializing_if = "Option::is_none")]
+    pub encoding_type: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -73,6 +75,8 @@ pub struct ObjectEntry {
     pub size: u64,
     #[serde(rename = "StorageClass")]
     pub storage_class: String,
+    #[serde(rename = "Owner", skip_serializing_if = "Option::is_none")]
+    pub owner: Option<Owner>,
 }
 
 #[derive(Serialize)]
@@ -102,6 +106,8 @@ pub struct ListBucketResultV1 {
     pub common_prefixes: Vec<CommonPrefix>,
     #[serde(rename = "Delimiter", skip_serializing_if = "Option::is_none")]
     pub delimiter: Option<String>,
+    #[serde(rename = "EncodingType", skip_serializing_if = "Option::is_none")]
+    pub encoding_type: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -176,20 +182,20 @@ pub struct ListMultipartUploadsResult {
     pub uploads: Vec<MultipartUploadEntry>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize)]
 #[serde(rename = "Tagging")]
 pub struct Tagging {
     #[serde(rename = "TagSet")]
     pub tag_set: TagSet,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize)]
 pub struct TagSet {
-    #[serde(rename = "Tag", skip_serializing_if = "Vec::is_empty")]
+    #[serde(rename = "Tag", default, skip_serializing_if = "Vec::is_empty")]
     pub tags: Vec<Tag>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize)]
 pub struct Tag {
     #[serde(rename = "Key")]
     pub key: String,
@@ -233,14 +239,33 @@ pub struct ListVersionsResult {
     pub key_marker: String,
     #[serde(rename = "VersionIdMarker")]
     pub version_id_marker: String,
+    #[serde(rename = "NextKeyMarker", skip_serializing_if = "Option::is_none")]
+    pub next_key_marker: Option<String>,
+    #[serde(
+        rename = "NextVersionIdMarker",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub next_version_id_marker: Option<String>,
     #[serde(rename = "MaxKeys")]
     pub max_keys: i32,
+    #[serde(rename = "Delimiter", skip_serializing_if = "Option::is_none")]
+    pub delimiter: Option<String>,
+    #[serde(rename = "EncodingType", skip_serializing_if = "Option::is_none")]
+    pub encoding_type: Option<String>,
     #[serde(rename = "IsTruncated")]
     pub is_truncated: bool,
-    #[serde(rename = "Version", skip_serializing_if = "Vec::is_empty")]
-    pub versions: Vec<VersionEntry>,
-    #[serde(rename = "DeleteMarker", skip_serializing_if = "Vec::is_empty")]
-    pub delete_markers: Vec<DeleteMarkerEntry>,
+    /// `<Version>` and `<DeleteMarker>` interleaved in listing order, as S3
+    /// returns them (clients such as minio-go depend on the order).
+    #[serde(rename = "$value")]
+    pub entries: Vec<VersionListEntry>,
+    #[serde(rename = "CommonPrefixes", skip_serializing_if = "Vec::is_empty")]
+    pub common_prefixes: Vec<CommonPrefix>,
+}
+
+#[derive(Serialize)]
+pub enum VersionListEntry {
+    Version(VersionEntry),
+    DeleteMarker(DeleteMarkerEntry),
 }
 
 #[derive(Serialize)]

@@ -1,5 +1,6 @@
 import { apiClient } from '@/api/client'
 import * as sdk from '@/api/generated/sdk.gen'
+import type { TagEntry } from '@/api/generated/types.gen'
 
 export async function getVersioning(bucket: string) {
   const { data } = await sdk.getVersioning({ client: apiClient, path: { bucket }, throwOnError: true })
@@ -33,5 +34,20 @@ export async function setPublicAccess(bucket: string, read: boolean, list: boole
     body: { read, list },
     throwOnError: true,
   })
+  return data
+}
+
+export async function getBucketTags(bucket: string) {
+  const { data } = await sdk.getBucketTags({ client: apiClient, path: { bucket }, throwOnError: true })
+  return data
+}
+
+export async function setBucketTags(bucket: string, tags: TagEntry[]) {
+  const { data } = await sdk.setBucketTags({ client: apiClient, path: { bucket }, body: { tags }, throwOnError: true })
+  return data
+}
+
+export async function getBucketPolicy(bucket: string) {
+  const { data } = await sdk.getBucketPolicy({ client: apiClient, path: { bucket }, throwOnError: true })
   return data
 }

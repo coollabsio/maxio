@@ -110,7 +110,12 @@ test('all console features work end to end', async ({ page, baseURL }) => {
   await confirm(page, 'Delete empty folder?', 'Delete folder')
   await expect(folderRow).toHaveCount(0)
 
-  // Theme switch.
+  // Theme and navigation style switch (in the account menu).
+  await page.getByRole('button', { name: 'Account menu' }).click()
+  await page.getByRole('button', { name: 'Floating navigation' }).click()
+  await expect(page.locator('html')).toHaveAttribute('data-nav-style', 'floating')
+  await page.getByRole('button', { name: 'Default navigation' }).click()
+  await expect(page.locator('html')).toHaveAttribute('data-nav-style', 'default')
   await page.getByRole('button', { name: 'Use Dark theme' }).click()
   await expect(page.locator('html')).toHaveClass(/dark/)
   await page.getByRole('button', { name: 'Use Light theme' }).click()

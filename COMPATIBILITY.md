@@ -13,43 +13,46 @@ Status: ✅ supported · 🟡 partial · ❌ not supported
 | HeadBucket | ✅ | |
 | DeleteBucket | ✅ | |
 | GetBucketLocation | ✅ | |
-| Get/PutBucketVersioning | ✅ | |
+| Get/PutBucketVersioning | ✅ | Reports `Suspended` |
 | Get/Put/DeleteBucketCors | ✅ | |
 | Get/Put/DeleteBucketEncryption | ✅ | SSE-S3 only as bucket default |
-| Get/Put/DeleteBucketPolicy | ❌ | |
-| Get/Put/DeleteBucketLifecycle | ❌ | On roadmap |
-| Get/Put/DeleteBucketTagging | ❌ | |
+| Get/Put/DeleteBucketPolicy, GetBucketPolicyStatus | 🟡 | Only anonymous read (`s3:GetObject`) and list (`s3:ListBucket`) policies, as set by `mc anonymous set download`. Other policies get `NotImplemented` |
+| Get/Put/DeleteBucketLifecycle | 🟡 | Expiration (`Days` / `Date`, `ExpiredObjectDeleteMarker`), `NoncurrentVersionExpiration` (`NoncurrentDays`, `NewerNoncurrentVersions`) and `AbortIncompleteMultipartUpload`; filters by prefix, tags and object size (`And`, legacy `<Prefix>`). `Transition` / `NoncurrentVersionTransition` return `NotImplemented`; unknown elements (including MinIO's `DelMarkerExpiration` / `AllVersionsExpiration` / `ExpiredObjectAllVersions`) return `MalformedXML`. GET/PUT always answer `x-amz-transition-default-minimum-object-size: all_storage_classes_128K` (the request header is ignored). Applied by the hourly background sweep, so actions run up to one hour after they become due. In versioning-suspended buckets expiration deletes the current object like `DeleteObject` does (no null delete marker) |
+| Get/Put/DeleteBucketTagging | ✅ | |
 | Bucket notifications | ❌ | |
 | Bucket replication | ❌ | On roadmap |
-| Object Lock / retention / legal hold | ❌ | |
-| Bucket ACLs | ❌ | |
+| Object Lock / retention / legal hold | ❌ | GET object-lock returns `ObjectLockConfigurationNotFoundError`; object retention / legal hold return `InvalidRequest` |
+| Bucket ACLs | 🟡 | GET returns owner `FULL_CONTROL`; PUT accepts `private` only |
+| Website, replication, ownership controls, public access block | ❌ | GET returns the S3 "not found" error, DELETE is a no-op |
+| Logging, notifications, request payment, accelerate | 🟡 | GET returns the empty default; PUT is not implemented |
+| Unknown bucket / object subresources | ✅ | `501 NotImplemented`, never the default action |
 
 ## Listing
 
 | Operation | Status | Notes |
 |---|---|---|
-| ListObjects (V1) | ✅ | `prefix`, `marker`, `max-keys`, `delimiter` |
-| ListObjectsV2 | ✅ | |
-| ListObjectVersions | ✅ | |
-| ListMultipartUploads | ✅ | |
+| ListObjects (V1) | ✅ | `prefix`, `marker`, `max-keys`, `delimiter`, `encoding-type` |
+| ListObjectsV2 | ✅ | `max-keys` counts keys and CommonPrefixes; `encoding-type`, `fetch-owner` |
+| ListObjectVersions | ✅ | `prefix`, `delimiter`, `key-marker`, `version-id-marker`, `max-keys` |
+| ListMultipartUploads | 🟡 | No prefix / marker pagination |
 
 ## Objects
 
 | Operation | Status | Notes |
 |---|---|---|
-| PutObject | ✅ | |
-| GetObject | ✅ | Includes `versionId` |
+| PutObject | ✅ | Conditional writes (`If-None-Match: *`, `If-Match`), `x-amz-tagging`, `Content-MD5` |
+| GetObject | ✅ | `versionId` (also with Range / `partNumber`), `response-*` overrides, `x-amz-delete-marker` |
 | HeadObject | ✅ | |
 | DeleteObject | ✅ | Includes `versionId` |
-| DeleteObjects (batch) | ✅ | |
-| CopyObject | ✅ | `x-amz-metadata-directive` |
+| DeleteObjects (batch) | ✅ | Per-key `VersionId`, `Quiet`, `Content-MD5` |
+| CopyObject | ✅ | `x-amz-metadata-directive`, `x-amz-tagging-directive`, `?versionId=` source, `x-amz-copy-source-if-*` |
 | Get/Put/DeleteObjectTagging | ✅ | |
 | Range requests | ✅ | HTTP 206 |
 | Conditional requests | ✅ | `If-Match`, `If-None-Match`, `If-Modified-Since`, `If-Unmodified-Since` |
-| Checksums | ✅ | CRC32, CRC32C, SHA-1, SHA-256 |
-| User metadata (`x-amz-meta-*`) | ❌ | Not stored |
-| Object ACLs | ❌ | |
-| GetObjectAttributes | ❌ | |
+| Checksums | ✅ | CRC32, CRC32C, SHA-1, SHA-256, CRC64NVME (header or trailer) |
+| User metadata (`x-amz-meta-*`) | ✅ | Plus Cache-Control, Content-Disposition, Content-Encoding, Content-Language, Expires |
+| Object ACLs | 🟡 | GET returns owner `FULL_CONTROL`; PUT accepts `private` only |
+| GetObjectAttributes | ✅ | ETag, Checksum, ObjectSize, StorageClass |
 | SelectObjectContent | ❌ | |
 | RestoreObject | ❌ | |
 
@@ -60,7 +63,7 @@ Status: ✅ supported · 🟡 partial · ❌ not supported
 | CreateMultipartUpload | ✅ | |
 | UploadPart | ✅ | |
 | UploadPartCopy | ✅ | |
-| CompleteMultipartUpload | ✅ | |
+| CompleteMultipartUpload | ✅ | Conditional writes |
 | AbortMultipartUpload | ✅ | |
 | ListParts | ✅ | |
 
@@ -71,7 +74,10 @@ Status: ✅ supported · 🟡 partial · ❌ not supported
 | AWS Signature V4 (header) | ✅ | |
 | Presigned URLs (SigV4 query) | ✅ | |
 | `UNSIGNED-PAYLOAD` | ✅ | |
-| `STREAMING-AWS4-HMAC-SHA256-PAYLOAD` | ✅ | |
+| `STREAMING-AWS4-HMAC-SHA256-PAYLOAD` | ✅ | Streamed, chunk signatures verified |
+| `STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER` | ✅ | Trailer signature and checksum verified |
+| `STREAMING-UNSIGNED-PAYLOAD-TRAILER` | ✅ | Trailer checksum verified (AWS CLI v2 / SDK default over HTTPS) |
+| POST policy (browser form upload) | ❌ | |
 | AWS Signature V2 | ❌ | |
 | Multiple users / IAM policies | ❌ | Single root access key only |
 | STS | ❌ | |
@@ -99,7 +105,8 @@ Status: ✅ supported · 🟡 partial · ❌ not supported
 | `MINIO_ACCESS_KEY` / `MINIO_SECRET_KEY` env vars | ✅ | |
 | `MINIO_REGION_NAME` / `MINIO_REGION` env vars | ✅ | |
 | `MINIO_DEFAULT_BUCKETS` env var | ✅ | |
-| `mc` client (basic commands) | ✅ | `mb`, `rb`, `cp`, `ls`, `cat`, `rm` |
+| `mc` client | ✅ | `mb`, `rb`, `cp`, `ls`, `cat`, `rm`, `stat`, `tag`, `anonymous set download`, `ls/rm --versions` |
+| Health checks `/minio/health/live`, `/ready`, `/cluster` | ✅ | No auth |
 | Erasure coding | 🟡 | Single node only, different on-disk format |
 | MinIO on-disk data format | ❌ | Cannot read an existing MinIO data dir |
 | MinIO Admin API (`mc admin`) | ❌ | |

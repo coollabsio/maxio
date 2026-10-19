@@ -76,14 +76,14 @@ function ConfirmDialog({
     >
       {confirmationText ? (
         <>
-          <div className="mt-4 rounded-sm border border-red-300 bg-red-50 p-3 text-sm text-red-800 dark:border-red-800 dark:bg-red-900/30 dark:text-red-300">
+          <div className="mt-4 rounded-lg border border-red-300 bg-red-50 p-3 text-sm text-red-800 dark:border-red-800 dark:bg-red-900/30 dark:text-red-300">
             Type <span className="font-mono font-bold">{confirmationText}</span> to confirm this destructive action.
           </div>
           <label className="mt-3 flex flex-col gap-1.5 text-sm font-medium text-black dark:text-white">
             {confirmationLabel ?? 'Confirmation'}
             <Input
               ref={confirmationInput}
-              className="bg-white dark:bg-base"
+              className=""
               value={typedConfirmation}
               onChange={(event) => setTypedConfirmation(event.target.value)}
               autoComplete="off"

@@ -2,7 +2,7 @@
 
 import type { Client, ClientMeta, Options as Options2, RequestResult, TDataShape } from './client';
 import { client } from './client.gen';
-import type { CheckAuthData, CheckAuthErrors, CheckAuthResponses, CreateBucketData, CreateBucketErrors, CreateBucketResponses, CreateFolderData, CreateFolderErrors, CreateFolderResponses, DeleteBucketData, DeleteBucketErrors, DeleteBucketResponses, DeleteObjectData, DeleteObjectErrors, DeleteObjectResponses, DeleteVersionData, DeleteVersionResponses, DownloadObjectData, DownloadObjectErrors, DownloadObjectResponses, DownloadVersionData, DownloadVersionErrors, DownloadVersionResponses, GetEncryptionData, GetEncryptionResponses, GetPublicAccessData, GetPublicAccessResponses, GetVersioningData, GetVersioningResponses, ListBucketsData, ListBucketsErrors, ListBucketsResponses, ListObjectsData, ListObjectsErrors, ListObjectsResponses, ListVersionsData, ListVersionsResponses, LoginData, LoginErrors, LoginResponses, LogoutData, LogoutResponses, PresignObjectData, PresignObjectErrors, PresignObjectResponses, SetEncryptionData, SetEncryptionResponses, SetPublicAccessData, SetPublicAccessResponses, SetVersioningData, SetVersioningResponses, UploadObjectData, UploadObjectErrors, UploadObjectResponses } from './types.gen';
+import type { CheckAuthData, CheckAuthErrors, CheckAuthResponses, CreateBucketData, CreateBucketErrors, CreateBucketResponses, CreateFolderData, CreateFolderErrors, CreateFolderResponses, DeleteBucketData, DeleteBucketErrors, DeleteBucketResponses, DeleteObjectData, DeleteObjectErrors, DeleteObjectResponses, DeleteVersionData, DeleteVersionResponses, DownloadObjectData, DownloadObjectErrors, DownloadObjectResponses, DownloadVersionData, DownloadVersionErrors, DownloadVersionResponses, GetBucketLifecycleData, GetBucketLifecycleErrors, GetBucketLifecycleResponses, GetBucketPolicyData, GetBucketPolicyErrors, GetBucketPolicyResponses, GetBucketTagsData, GetBucketTagsErrors, GetBucketTagsResponses, GetEncryptionData, GetEncryptionResponses, GetObjectInfoData, GetObjectInfoErrors, GetObjectInfoResponses, GetObjectTagsData, GetObjectTagsErrors, GetObjectTagsResponses, GetPublicAccessData, GetPublicAccessResponses, GetVersioningData, GetVersioningResponses, ListBucketsData, ListBucketsErrors, ListBucketsResponses, ListObjectsData, ListObjectsErrors, ListObjectsResponses, ListVersionsData, ListVersionsResponses, LoginData, LoginErrors, LoginResponses, LogoutData, LogoutResponses, PresignObjectData, PresignObjectErrors, PresignObjectResponses, RestoreVersionData, RestoreVersionErrors, RestoreVersionResponses, SetBucketLifecycleData, SetBucketLifecycleErrors, SetBucketLifecycleResponses, SetBucketTagsData, SetBucketTagsErrors, SetBucketTagsResponses, SetEncryptionData, SetEncryptionResponses, SetObjectTagsData, SetObjectTagsErrors, SetObjectTagsResponses, SetPublicAccessData, SetPublicAccessResponses, SetVersioningData, SetVersioningResponses, UploadObjectData, UploadObjectErrors, UploadObjectResponses } from './types.gen';
 
 export type Options<TData extends TDataShape = TDataShape, ThrowOnError extends boolean = boolean, TResponse = unknown> = Options2<TData, ThrowOnError, TResponse> & {
     /**
@@ -121,6 +121,64 @@ export const createFolder = <ThrowOnError extends boolean = false>(options: Opti
     }
 });
 
+export const getBucketLifecycle = <ThrowOnError extends boolean = false>(options: Options<GetBucketLifecycleData, ThrowOnError>): RequestResult<GetBucketLifecycleResponses, GetBucketLifecycleErrors, ThrowOnError> => (options.client ?? client).get<GetBucketLifecycleResponses, GetBucketLifecycleErrors, ThrowOnError>({
+    security: [{
+            in: 'cookie',
+            name: 'maxio_session',
+            type: 'apiKey'
+        }],
+    url: '/api/buckets/{bucket}/lifecycle',
+    ...options
+});
+
+export const setBucketLifecycle = <ThrowOnError extends boolean = false>(options: Options<SetBucketLifecycleData, ThrowOnError>): RequestResult<SetBucketLifecycleResponses, SetBucketLifecycleErrors, ThrowOnError> => (options.client ?? client).put<SetBucketLifecycleResponses, SetBucketLifecycleErrors, ThrowOnError>({
+    security: [{
+            in: 'cookie',
+            name: 'maxio_session',
+            type: 'apiKey'
+        }],
+    url: '/api/buckets/{bucket}/lifecycle',
+    ...options,
+    headers: {
+        'Content-Type': 'application/json',
+        ...options.headers
+    }
+});
+
+export const getObjectInfo = <ThrowOnError extends boolean = false>(options: Options<GetObjectInfoData, ThrowOnError>): RequestResult<GetObjectInfoResponses, GetObjectInfoErrors, ThrowOnError> => (options.client ?? client).get<GetObjectInfoResponses, GetObjectInfoErrors, ThrowOnError>({
+    security: [{
+            in: 'cookie',
+            name: 'maxio_session',
+            type: 'apiKey'
+        }],
+    url: '/api/buckets/{bucket}/object-info/{key}',
+    ...options
+});
+
+export const getObjectTags = <ThrowOnError extends boolean = false>(options: Options<GetObjectTagsData, ThrowOnError>): RequestResult<GetObjectTagsResponses, GetObjectTagsErrors, ThrowOnError> => (options.client ?? client).get<GetObjectTagsResponses, GetObjectTagsErrors, ThrowOnError>({
+    security: [{
+            in: 'cookie',
+            name: 'maxio_session',
+            type: 'apiKey'
+        }],
+    url: '/api/buckets/{bucket}/object-tags/{key}',
+    ...options
+});
+
+export const setObjectTags = <ThrowOnError extends boolean = false>(options: Options<SetObjectTagsData, ThrowOnError>): RequestResult<SetObjectTagsResponses, SetObjectTagsErrors, ThrowOnError> => (options.client ?? client).put<SetObjectTagsResponses, SetObjectTagsErrors, ThrowOnError>({
+    security: [{
+            in: 'cookie',
+            name: 'maxio_session',
+            type: 'apiKey'
+        }],
+    url: '/api/buckets/{bucket}/object-tags/{key}',
+    ...options,
+    headers: {
+        'Content-Type': 'application/json',
+        ...options.headers
+    }
+});
+
 export const listObjects = <ThrowOnError extends boolean = false>(options: Options<ListObjectsData, ThrowOnError>): RequestResult<ListObjectsResponses, ListObjectsErrors, ThrowOnError> => (options.client ?? client).get<ListObjectsResponses, ListObjectsErrors, ThrowOnError>({
     security: [{
             in: 'cookie',
@@ -138,6 +196,16 @@ export const deleteObject = <ThrowOnError extends boolean = false>(options: Opti
             type: 'apiKey'
         }],
     url: '/api/buckets/{bucket}/objects/{key}',
+    ...options
+});
+
+export const getBucketPolicy = <ThrowOnError extends boolean = false>(options: Options<GetBucketPolicyData, ThrowOnError>): RequestResult<GetBucketPolicyResponses, GetBucketPolicyErrors, ThrowOnError> => (options.client ?? client).get<GetBucketPolicyResponses, GetBucketPolicyErrors, ThrowOnError>({
+    security: [{
+            in: 'cookie',
+            name: 'maxio_session',
+            type: 'apiKey'
+        }],
+    url: '/api/buckets/{bucket}/policy',
     ...options
 });
 
@@ -168,6 +236,30 @@ export const setPublicAccess = <ThrowOnError extends boolean = false>(options: O
             type: 'apiKey'
         }],
     url: '/api/buckets/{bucket}/public',
+    ...options,
+    headers: {
+        'Content-Type': 'application/json',
+        ...options.headers
+    }
+});
+
+export const getBucketTags = <ThrowOnError extends boolean = false>(options: Options<GetBucketTagsData, ThrowOnError>): RequestResult<GetBucketTagsResponses, GetBucketTagsErrors, ThrowOnError> => (options.client ?? client).get<GetBucketTagsResponses, GetBucketTagsErrors, ThrowOnError>({
+    security: [{
+            in: 'cookie',
+            name: 'maxio_session',
+            type: 'apiKey'
+        }],
+    url: '/api/buckets/{bucket}/tags',
+    ...options
+});
+
+export const setBucketTags = <ThrowOnError extends boolean = false>(options: Options<SetBucketTagsData, ThrowOnError>): RequestResult<SetBucketTagsResponses, SetBucketTagsErrors, ThrowOnError> => (options.client ?? client).put<SetBucketTagsResponses, SetBucketTagsErrors, ThrowOnError>({
+    security: [{
+            in: 'cookie',
+            name: 'maxio_session',
+            type: 'apiKey'
+        }],
+    url: '/api/buckets/{bucket}/tags',
     ...options,
     headers: {
         'Content-Type': 'application/json',
@@ -241,5 +333,15 @@ export const deleteVersion = <ThrowOnError extends boolean = false>(options: Opt
             type: 'apiKey'
         }],
     url: '/api/buckets/{bucket}/versions/{versionId}/objects/{key}',
+    ...options
+});
+
+export const restoreVersion = <ThrowOnError extends boolean = false>(options: Options<RestoreVersionData, ThrowOnError>): RequestResult<RestoreVersionResponses, RestoreVersionErrors, ThrowOnError> => (options.client ?? client).post<RestoreVersionResponses, RestoreVersionErrors, ThrowOnError>({
+    security: [{
+            in: 'cookie',
+            name: 'maxio_session',
+            type: 'apiKey'
+        }],
+    url: '/api/buckets/{bucket}/versions/{versionId}/restore/{key}',
     ...options
 });

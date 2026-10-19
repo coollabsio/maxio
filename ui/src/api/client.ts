@@ -28,7 +28,7 @@ export function toApiError(payload: unknown, status: number): ApiError {
 
 // Routes whose trailing `{key}` is a `{*key}` wildcard on the server: the key keeps its `/` separators.
 const OBJECT_KEY_ROUTE =
-  /^(\/api\/buckets\/[^/]+\/(?:objects|upload|download|presign|versions\/[^/]+\/(?:objects|download))\/)(.+)$/
+  /^(\/api\/buckets\/[^/]+\/(?:objects|upload|download|presign|object-info|object-tags|versions\/[^/]+\/(?:objects|download|restore))\/)(.+)$/
 
 /**
  * hey-api encodes path params with `encodeURIComponent`, which turns the `/` inside object keys into `%2F`.

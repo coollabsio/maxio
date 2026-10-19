@@ -14,3 +14,13 @@ export async function deleteVersion(bucket: string, key: string, versionId: stri
   })
   return data
 }
+
+/** Copies the version on top of the key, making it the current version again. */
+export async function restoreVersion(bucket: string, key: string, versionId: string) {
+  const { data } = await sdk.restoreVersion({
+    client: apiClient,
+    path: { bucket, versionId, key },
+    throwOnError: true,
+  })
+  return data
+}

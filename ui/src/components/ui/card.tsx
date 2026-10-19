@@ -3,14 +3,14 @@ import { cva, type VariantProps } from 'class-variance-authority'
 import { cn } from '@/lib/utils'
 
 const cardVariants = cva(
-  'group bg-card text-card-foreground flex flex-col gap-6 rounded-sm border border-border py-6 shadow-sm min-h-16 transition-colors',
+  'group bg-card text-card-foreground flex flex-col gap-6 rounded-lg border border-neutral-200 py-6 min-h-16 transition-colors dark:border-white/[0.06]',
   {
     variants: {
       variant: {
         default: '',
-        box: 'cursor-pointer hover:bg-neutral-100 dark:hover:bg-coollabs-100 dark:hover:text-white hover:text-black dark:group-hover:[&_[data-slot=card-title]]:text-white dark:group-hover:[&_[data-slot=card-description]]:text-white group-hover:[&_[data-slot=card-description]]:text-black',
+        box: 'cursor-pointer hover:bg-neutral-50 dark:hover:border-white/[0.1] dark:hover:bg-raised',
         coolbox:
-          'rounded cursor-pointer border-neutral-200 dark:border-coolgray-400 hover:ring-2 hover:ring-coollabs dark:hover:ring-warning',
+          'rounded-2xl cursor-pointer transition-all duration-150 hover:border-neutral-300 hover:shadow-[0_4px_16px_rgba(0,0,0,0.35)] dark:hover:border-white/[0.12] dark:hover:bg-raised',
       },
     },
     defaultVariants: {

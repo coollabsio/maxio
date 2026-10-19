@@ -34,6 +34,11 @@ pub fn build_router(state: AppState) -> Router {
         .nest("/api", console_router(state.clone()))
         .route("/healthz", get(healthz))
         .route("/readyz", get(readyz))
+        // MinIO-compatible probes (GET and HEAD, unauthenticated). Registered
+        // here, outside the S3 router, so the SigV4 auth layer never runs.
+        .route("/minio/health/live", get(healthz))
+        .route("/minio/health/ready", get(readyz))
+        .route("/minio/health/cluster", get(readyz))
         .route("/ui", get(redirect_to_ui_root))
         .route("/ui/", get(ui_handler))
         .route("/ui/{*path}", get(ui_handler))

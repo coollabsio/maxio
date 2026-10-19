@@ -1,6 +1,6 @@
 import { useSyncExternalStore } from 'react'
 
-/** Tracks a CSS media query, e.g. `useMediaQuery('(min-width: 768px)')`. */
+/** Tracks a CSS media query, e.g. `useMediaQuery('(min-width: 1024px)')`. */
 export function useMediaQuery(query: string): boolean {
   return useSyncExternalStore(
     (onChange) => {
@@ -12,5 +12,5 @@ export function useMediaQuery(query: string): boolean {
   )
 }
 
-/** Tailwind `md` breakpoint: the sidebar is a drawer below it. */
-export const DESKTOP_QUERY = '(min-width: 768px)'
+/** Tailwind `lg` breakpoint (Coolify): the sidebar is a sheet below it. */
+export const DESKTOP_QUERY = '(min-width: 1024px)'

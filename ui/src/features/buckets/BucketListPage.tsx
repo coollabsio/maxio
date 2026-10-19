@@ -1,5 +1,5 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { Database, Plus, Settings, Trash2 } from 'lucide-react'
+import { Database, Globe, Plus, Settings, Tag, Trash2 } from 'lucide-react'
 import { useRef, useState, type MouseEvent } from 'react'
 import { useNavigate } from 'react-router'
 import { ApiError } from '@/api/client'
@@ -10,6 +10,7 @@ import { Callout } from '@/components/ui/callout'
 import { ConfirmDialog } from '@/components/ui/confirm-dialog'
 import { Dialog } from '@/components/ui/dialog'
 import { Input } from '@/components/ui/input'
+import { PageHeader } from '@/components/ui/page-header'
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table'
 import { formatDate } from '@/lib/format'
 import { bucketPath, bucketSettingsPath } from '@/lib/paths'
@@ -82,18 +83,22 @@ export function BucketListPage() {
 
   return (
     <>
-      <div className="flex flex-col gap-4">
+      <div className="flex flex-col gap-6">
+        <PageHeader
+          title="Buckets"
+          description="Object storage containers for your files"
+          actions={
+            <Button variant="highlighted" onClick={() => setShowCreate(true)}>
+              <Plus /> Create Bucket
+            </Button>
+          }
+        />
+
         {bucketsQuery.isError ? (
           <Callout type="danger">
             {bucketsQuery.error instanceof ApiError ? bucketsQuery.error.message : 'Failed to load buckets'}
           </Callout>
         ) : null}
-
-        <div className="flex items-center gap-2">
-          <Button variant="highlighted" className="h-8" onClick={() => setShowCreate(true)}>
-            <Plus className="size-4 mr-1" /> Create Bucket
-          </Button>
-        </div>
 
         {bucketsQuery.isPending ? (
           <p className="text-sm text-muted-foreground">Loading...</p>
@@ -118,7 +123,30 @@ export function BucketListPage() {
             <TableBody>
               {buckets.map((bucket) => (
                 <TableRow key={bucket.name} className="cursor-pointer" onClick={() => navigate(bucketPath(bucket.name))}>
-                  <TableCell className="font-medium">{bucket.name}</TableCell>
+                  <TableCell>
+                    <span className="flex items-center gap-3">
+                      <span className="flex size-8 shrink-0 items-center justify-center rounded-md border border-neutral-200 bg-neutral-50 text-neutral-500 dark:border-white/[0.08] dark:bg-white/[0.04] dark:text-fg-dim">
+                        <Database className="size-4" />
+                      </span>
+                      <span className="font-semibold">{bucket.name}</span>
+                      {bucket.publicRead || bucket.publicList ? (
+                        <span
+                          className="inline-flex items-center gap-1 rounded-md bg-warning-100 px-1.5 py-0.5 text-[11px] font-medium text-warning-800 dark:bg-warning/15 dark:text-warning"
+                          title={publicTitle(bucket.publicRead, bucket.publicList)}
+                        >
+                          <Globe className="size-3" /> Public
+                        </span>
+                      ) : null}
+                      {bucket.tagCount > 0 ? (
+                        <span
+                          className="inline-flex items-center gap-1 rounded-md bg-neutral-100 px-1.5 py-0.5 text-[11px] font-medium text-neutral-600 dark:bg-white/[0.06] dark:text-fg-dim"
+                          title={`${bucket.tagCount} bucket tag${bucket.tagCount === 1 ? '' : 's'}`}
+                        >
+                          <Tag className="size-3" /> {bucket.tagCount}
+                        </span>
+                      ) : null}
+                    </span>
+                  </TableCell>
                   <TableCell>
                     {bucket.versioning ? (
                       <Badge variant="success" label="Enabled" />
@@ -128,19 +156,17 @@ export function BucketListPage() {
                   </TableCell>
                   <TableCell>
                     {bucket.encryption ? (
-                      <span className="inline-flex items-center rounded-sm bg-green-500/10 px-1.5 py-0.5 text-[11px] font-medium text-green-500">
-                        Enabled
-                      </span>
+                      <Badge variant="success" label="Enabled" />
                     ) : (
                       <span className="text-xs text-muted-foreground">Disabled</span>
                     )}
                   </TableCell>
                   <TableCell className="text-muted-foreground">{formatDate(bucket.createdAt)}</TableCell>
                   <TableCell className="w-20">
-                    <div className="flex items-center gap-4">
+                    <div className="flex items-center justify-end gap-1">
                       <button
                         type="button"
-                        className="text-muted-foreground hover:text-foreground transition-colors"
+                        className="icon-button"
                         onClick={(event) => stop(event, () => navigate(bucketSettingsPath(bucket.name)))}
                         title="Bucket settings"
                         aria-label="Bucket settings"
@@ -149,7 +175,7 @@ export function BucketListPage() {
                       </button>
                       <button
                         type="button"
-                        className="text-muted-foreground hover:text-destructive transition-colors"
+                        className="icon-button hover:!text-error"
                         onClick={(event) => stop(event, () => setBucketToDelete(bucket.name))}
                         title="Delete bucket"
                         aria-label="Delete bucket"
@@ -196,7 +222,7 @@ export function BucketListPage() {
           }}
           className="flex flex-col gap-1.5"
         >
-          <label htmlFor="bucket-name" className="text-sm font-medium text-black dark:text-white">
+          <label htmlFor="bucket-name" className="text-[13px] font-medium text-black dark:text-fg">
             Bucket name
           </label>
           <Input
@@ -209,7 +235,6 @@ export function BucketListPage() {
               setCreateError('')
             }}
             placeholder="bucket-name"
-            className="bg-white dark:bg-base"
             disabled={createBucketMutation.isPending}
             aria-invalid={createError ? true : undefined}
             aria-describedby="bucket-name-hint"
@@ -240,4 +265,9 @@ export function BucketListPage() {
       />
     </>
   )
+}
+
+function publicTitle(read: boolean, list: boolean): string {
+  if (read && list) return 'Anyone can list and download objects'
+  return read ? 'Anyone can download objects' : 'Anyone can list object keys'
 }

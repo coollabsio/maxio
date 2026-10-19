@@ -188,9 +188,9 @@ async fn main() -> anyhow::Result<()> {
         login_rate_limiter: Arc::new(api::console::LoginRateLimiter::new()),
     };
 
-    // Background housekeeping: abort stale multipart uploads (>7 days) and
-    // remove leftover temp files from crashed writes. Runs once at startup,
-    // then hourly.
+    // Background housekeeping: abort stale multipart uploads (>7 days),
+    // remove leftover temp files from crashed writes, and apply bucket
+    // lifecycle rules. Runs once at startup, then hourly.
     {
         let storage = state.storage.clone();
         tokio::spawn(async move {
@@ -205,6 +205,20 @@ async fn main() -> anyhow::Result<()> {
                         uploads,
                         temps
                     );
+                }
+                let stats = storage::lifecycle::run_lifecycle(&storage, chrono::Utc::now()).await;
+                if stats.did_something() {
+                    tracing::info!(
+                        "lifecycle: expired {} object(s), {} noncurrent version(s), \
+                         {} delete marker(s), aborted {} upload(s)",
+                        stats.expired_objects,
+                        stats.noncurrent_versions_expired,
+                        stats.delete_markers_removed,
+                        stats.uploads_aborted,
+                    );
+                }
+                if stats.errors > 0 {
+                    tracing::warn!("lifecycle: {} error(s) during sweep", stats.errors);
                 }
             }
         });

@@ -1,7 +1,10 @@
+pub mod authz;
 pub mod bucket;
 pub mod chunked;
 pub mod console;
 pub mod cors;
+pub mod iam_api;
+pub mod iam_console;
 pub mod lifecycle;
 pub mod list;
 pub mod multipart;

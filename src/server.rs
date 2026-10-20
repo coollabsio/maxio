@@ -4,6 +4,7 @@ use axum::http::{HeaderValue, StatusCode, header};
 use axum::routing::get;
 use std::sync::Arc;
 
+use crate::api::authz::s3_authz_middleware;
 use crate::api::console::{LoginRateLimiter, console_router};
 use crate::api::cors::cors_middleware;
 use crate::api::router::s3_router;
@@ -21,6 +22,10 @@ pub struct AppState {
 
 pub fn build_router(state: AppState) -> Router {
     let s3_routes = s3_router()
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            s3_authz_middleware,
+        ))
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             auth_middleware,

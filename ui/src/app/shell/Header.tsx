@@ -41,12 +41,44 @@ export function Breadcrumbs({ className }: { className?: string }) {
   const [searchParams] = useSearchParams()
   const settingsMatch = useMatch('/buckets/:bucket/settings')
   const objectsMatch = useMatch('/buckets/:bucket')
+  const usersMatch = useMatch('/users/:name')
+  const usersIndex = useMatch('/users')
+  const policyMatch = useMatch('/policies/:name')
+  const policiesIndex = useMatch('/policies')
   const bucket = settingsMatch?.params.bucket ?? objectsMatch?.params.bucket ?? null
   const prefix = normalizePrefix(searchParams.get('prefix'))
   const crumbs = bucket ? buildBreadcrumbs(bucket, prefix) : []
 
   let trail: ReactNode
-  if (!bucket) {
+  if (usersIndex || usersMatch) {
+    trail = usersMatch?.params.name ? (
+      <>
+        <Crumb onClick={() => navigate('/users')}>Users</Crumb>
+        <Separator />
+        <Current>{usersMatch.params.name}</Current>
+      </>
+    ) : (
+      <Current>Users</Current>
+    )
+  } else if (policiesIndex || policyMatch) {
+    const policyName = policyMatch?.params.name
+    trail =
+      policyName && policyName !== 'new' ? (
+        <>
+          <Crumb onClick={() => navigate('/policies')}>Policies</Crumb>
+          <Separator />
+          <Current>{policyName}</Current>
+        </>
+      ) : policyName === 'new' ? (
+        <>
+          <Crumb onClick={() => navigate('/policies')}>Policies</Crumb>
+          <Separator />
+          <Current>New policy</Current>
+        </>
+      ) : (
+        <Current>Policies</Current>
+      )
+  } else if (!bucket) {
     trail = <Current>Buckets</Current>
   } else if (settingsMatch) {
     trail = (

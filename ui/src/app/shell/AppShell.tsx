@@ -1,8 +1,9 @@
-import { useMutation, useQueryClient } from '@tanstack/react-query'
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { useEffect, useState, type CSSProperties } from 'react'
 import { Outlet, useNavigate } from 'react-router'
 import { Toaster } from '@/components/ui/sonner'
-import { logout } from '@/features/auth/api'
+import { authKeys } from '@/api/queryKeys'
+import { checkAuth, logout } from '@/features/auth/api'
 import { useTheme } from '@/lib/theme'
 import { DESKTOP_QUERY, useMediaQuery } from '@/lib/useMediaQuery'
 import { cn } from '@/lib/utils'
@@ -22,6 +23,15 @@ export function AppShell() {
   const [collapsedSetting, setCollapsed] = useState(readSidebarCollapsed)
   const [menuOpen, setMenuOpen] = useState(false)
   const collapsed = collapsedSetting && isDesktop
+  const session = useQuery({ queryKey: authKeys.check(), queryFn: checkAuth })
+  const accountName = session.data?.root
+    ? 'Admin'
+    : (session.data?.userName ?? session.data?.label ?? 'Account')
+  const accountDetail = session.data?.root
+    ? 'Root credentials'
+    : session.data?.kind === 'service'
+      ? 'Service key'
+      : 'IAM user'
 
   useEffect(() => {
     if (!menuOpen) return
@@ -74,6 +84,9 @@ export function AppShell() {
             setMenuOpen(false)
             navigate('/')
           }}
+          iamAdmin={session.data?.iamAdmin === true}
+          accountName={accountName}
+          accountDetail={accountDetail}
           onLogout={() => {
             setMenuOpen(false)
             logoutMutation.mutate()

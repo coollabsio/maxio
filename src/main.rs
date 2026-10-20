@@ -20,6 +20,7 @@ mod auth;
 mod config;
 mod embedded;
 mod error;
+mod iam;
 mod openapi;
 mod server;
 mod storage;

@@ -8,7 +8,7 @@ use http::StatusCode;
 
 use crate::server::AppState;
 
-use super::{bucket, list, object};
+use super::{bucket, iam_api, list, object};
 
 /// Dummy OPTIONS handler — the real preflight logic runs in the CORS middleware.
 async fn options_handler() -> Response<Body> {
@@ -20,7 +20,7 @@ async fn options_handler() -> Response<Body> {
 
 pub fn s3_router() -> Router<AppState> {
     Router::new()
-        .route("/", get(bucket::list_buckets))
+        .route("/", get(bucket::list_buckets).post(iam_api::handle))
         // Bucket routes — with and without trailing slash
         .route("/{bucket}", put(bucket::handle_bucket_put))
         .route("/{bucket}/", put(bucket::handle_bucket_put))

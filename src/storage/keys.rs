@@ -207,6 +207,56 @@ impl Keyring {
         Ok(dek)
     }
 
+    /// Encrypt a small blob with the active master key (AES-256-GCM).
+    ///
+    /// IAM access-key secrets use this: SigV4 needs the raw secret, so it cannot
+    /// be stored as a hash, but it is not written to disk in plaintext.
+    pub fn seal(
+        &self,
+        aad: &[u8],
+        plaintext: &[u8],
+    ) -> anyhow::Result<(String, [u8; 12], Vec<u8>)> {
+        let key_id = self.active_id.clone();
+        let master = self.get_key(&key_id)?;
+        let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(master));
+        let mut nonce_bytes = [0u8; 12];
+        rand::rng().fill(&mut nonce_bytes[..]);
+        let nonce = Nonce::from_slice(&nonce_bytes);
+        let ciphertext = cipher
+            .encrypt(
+                nonce,
+                Payload {
+                    msg: plaintext,
+                    aad,
+                },
+            )
+            .map_err(|_| anyhow::anyhow!("failed to seal blob"))?;
+        Ok((key_id, nonce_bytes, ciphertext))
+    }
+
+    /// Decrypt a blob sealed by [`Keyring::seal`]. `key_id` may be a retired
+    /// master key still held in the ring.
+    pub fn open(
+        &self,
+        aad: &[u8],
+        key_id: &str,
+        nonce: &[u8; 12],
+        ciphertext: &[u8],
+    ) -> anyhow::Result<Vec<u8>> {
+        let master = self.get_key(key_id)?;
+        let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(master));
+        let nonce = Nonce::from_slice(nonce);
+        cipher
+            .decrypt(
+                nonce,
+                Payload {
+                    msg: ciphertext,
+                    aad,
+                },
+            )
+            .map_err(|_| anyhow::anyhow!("failed to open sealed blob"))
+    }
+
     fn get_key(&self, key_id: &str) -> anyhow::Result<&[u8; 32]> {
         self.keys
             .get(key_id)

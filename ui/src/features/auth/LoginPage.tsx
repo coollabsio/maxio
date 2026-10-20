@@ -29,8 +29,8 @@ export function LoginPage() {
 
   const loginMutation = useMutation({
     mutationFn: login,
-    onSuccess: () => {
-      queryClient.setQueryData(authKeys.check(), { ok: true })
+    onSuccess: (data) => {
+      queryClient.setQueryData(authKeys.check(), data)
       navigate(redirectTarget(location.state), { replace: true })
     },
   })

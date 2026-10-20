@@ -1722,6 +1722,85 @@ EOF
     mc alias rm "$MC_ALIAS" > /dev/null 2>&1 || true
 fi
 
+# --- IAM users, scoped keys, and mc ---
+IAM_USER="scoped$$"
+IAM_BUCKET="iam-scope-$$"
+echo "scoped-body" > "$TMPDIR/iam-ok.txt"
+echo "other-body" > "$TMPDIR/iam-other.txt"
+assert "iam create scope bucket" $AWS s3 mb "s3://$IAM_BUCKET"
+assert "iam create other bucket" $AWS s3 mb "s3://iam-other-$$"
+assert "iam put readable object" $AWS s3 cp "$TMPDIR/iam-ok.txt" "s3://$IAM_BUCKET/albums/note.txt"
+assert "iam put other object" $AWS s3 cp "$TMPDIR/iam-other.txt" "s3://iam-other-$$/secret.txt"
+
+assert "iam create-user" $AWS iam create-user --user-name "$IAM_USER"
+cat > "$TMPDIR/iam-scope.json" <<EOF
+{"Version":"2012-10-17","Statement":[
+  {"Effect":"Allow","Action":["s3:ListBucket","s3:GetBucketLocation"],"Resource":"arn:aws:s3:::$IAM_BUCKET","Condition":{"StringLike":{"s3:prefix":["albums*"]}}},
+  {"Effect":"Allow","Action":["s3:GetObject","s3:GetObjectVersion"],"Resource":"arn:aws:s3:::$IAM_BUCKET/albums*"},
+  {"Effect":"Deny","Action":"s3:GetObject","Resource":"arn:aws:s3:::$IAM_BUCKET/albums/blocked*"}
+]}
+EOF
+assert "iam put-user-policy" $AWS iam put-user-policy --user-name "$IAM_USER" \
+    --policy-name scope --policy-document "file://$TMPDIR/iam-scope.json"
+KEY_JSON=$($AWS iam create-access-key --user-name "$IAM_USER" --output json)
+SCOPED_KEY=$(printf '%s' "$KEY_JSON" | python3 -c 'import json,sys; print(json.load(sys.stdin)["AccessKey"]["AccessKeyId"])')
+SCOPED_SECRET=$(printf '%s' "$KEY_JSON" | python3 -c 'import json,sys; print(json.load(sys.stdin)["AccessKey"]["SecretAccessKey"])')
+if [ -n "$SCOPED_KEY" ] && [ -n "$SCOPED_SECRET" ]; then
+    green "PASS: iam create-access-key"
+    PASS=$((PASS + 1))
+else
+    red "FAIL: iam create-access-key ($KEY_JSON)"
+    FAIL=$((FAIL + 1))
+fi
+
+ROOT_KEY="$AWS_ACCESS_KEY_ID"
+ROOT_SECRET="$AWS_SECRET_ACCESS_KEY"
+export AWS_ACCESS_KEY_ID="$SCOPED_KEY"
+export AWS_SECRET_ACCESS_KEY="$SCOPED_SECRET"
+assert "scoped key reads allowed object" $AWS s3 cp "s3://$IAM_BUCKET/albums/note.txt" "$TMPDIR/iam-down.txt"
+assert_eq "scoped key object body" "scoped-body" "$(cat "$TMPDIR/iam-down.txt")"
+assert_fail "scoped key cannot write" $AWS s3 cp "$TMPDIR/iam-ok.txt" "s3://$IAM_BUCKET/albums/new.txt"
+assert_fail "scoped key cannot read another bucket" $AWS s3 cp "s3://iam-other-$$/secret.txt" "$TMPDIR/iam-denied.txt"
+assert_fail "scoped key cannot list every bucket" $AWS s3 ls
+export AWS_ACCESS_KEY_ID="$ROOT_KEY"
+export AWS_SECRET_ACCESS_KEY="$ROOT_SECRET"
+echo "blocked" > "$TMPDIR/iam-blocked.txt"
+assert "root writes denied prefix" $AWS s3 cp "$TMPDIR/iam-blocked.txt" "s3://$IAM_BUCKET/albums/blocked.txt"
+export AWS_ACCESS_KEY_ID="$SCOPED_KEY"
+export AWS_SECRET_ACCESS_KEY="$SCOPED_SECRET"
+assert_fail "explicit deny beats the prefix allow" $AWS s3 cp "s3://$IAM_BUCKET/albums/blocked.txt" "$TMPDIR/iam-blocked-down.txt"
+
+if command -v mc >/dev/null 2>&1; then
+    MC_SCOPED="scoped$$"
+    assert "mc alias scoped key" mc alias set "$MC_SCOPED" "$ENDPOINT" "$SCOPED_KEY" "$SCOPED_SECRET"
+    MC_BODY=$(mc cat "$MC_SCOPED/$IAM_BUCKET/albums/note.txt" 2>/dev/null || true)
+    assert_eq "mc cat allowed object" "scoped-body" "$MC_BODY"
+    assert_fail "mc cp into the bucket is denied" mc cp "$TMPDIR/iam-ok.txt" "$MC_SCOPED/$IAM_BUCKET/albums/from-mc.txt"
+    mc alias rm "$MC_SCOPED" >/dev/null 2>&1 || true
+fi
+
+export AWS_ACCESS_KEY_ID="$ROOT_KEY"
+export AWS_SECRET_ACCESS_KEY="$ROOT_SECRET"
+assert "iam deactivate key" $AWS iam update-access-key --user-name "$IAM_USER" \
+    --access-key-id "$SCOPED_KEY" --status Inactive
+export AWS_ACCESS_KEY_ID="$SCOPED_KEY"
+export AWS_SECRET_ACCESS_KEY="$SCOPED_SECRET"
+assert_fail "deactivated key cannot read" $AWS s3 cp "s3://$IAM_BUCKET/albums/note.txt" "$TMPDIR/iam-inactive.txt"
+export AWS_ACCESS_KEY_ID="$ROOT_KEY"
+export AWS_SECRET_ACCESS_KEY="$ROOT_SECRET"
+assert "iam delete key" $AWS iam delete-access-key --user-name "$IAM_USER" --access-key-id "$SCOPED_KEY"
+export AWS_ACCESS_KEY_ID="$SCOPED_KEY"
+export AWS_SECRET_ACCESS_KEY="$SCOPED_SECRET"
+assert_fail "deleted key cannot read" $AWS s3 cp "s3://$IAM_BUCKET/albums/note.txt" "$TMPDIR/iam-deleted.txt"
+export AWS_ACCESS_KEY_ID="$ROOT_KEY"
+export AWS_SECRET_ACCESS_KEY="$ROOT_SECRET"
+assert "iam delete-user-policy" $AWS iam delete-user-policy --user-name "$IAM_USER" --policy-name scope
+assert "iam delete-user" $AWS iam delete-user --user-name "$IAM_USER"
+$AWS s3 rm "s3://$IAM_BUCKET" --recursive >/dev/null 2>&1 || true
+$AWS s3 rm "s3://iam-other-$$" --recursive >/dev/null 2>&1 || true
+assert "iam delete scope bucket" $AWS s3 rb "s3://$IAM_BUCKET"
+assert "iam delete other bucket" $AWS s3 rb "s3://iam-other-$$"
+
 # --- Summary ---
 echo ""
 echo "=== Results: $PASS passed, $FAIL failed ==="

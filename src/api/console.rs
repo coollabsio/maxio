@@ -84,48 +84,6 @@ fn extract_client_ip(headers: &HeaderMap, addr: &SocketAddr) -> String {
     addr.ip().to_string()
 }
 
-fn generate_token(access_key: &str, secret_key: &str, issued_at: i64) -> String {
-    let issued_hex = format!("{:x}", issued_at);
-    let mut mac =
-        HmacSha256::new_from_slice(secret_key.as_bytes()).expect("HMAC can take key of any size");
-    mac.update(format!("{}:{}", access_key, issued_hex).as_bytes());
-    let sig = hex::encode(mac.finalize().into_bytes());
-    format!("{}.{}", issued_hex, sig)
-}
-
-fn verify_token(token: &str, access_key: &str, secret_key: &str) -> bool {
-    let Some((issued_hex, signature)) = token.split_once('.') else {
-        return false;
-    };
-
-    let Ok(issued_at) = i64::from_str_radix(issued_hex, 16) else {
-        return false;
-    };
-
-    let now = chrono::Utc::now().timestamp();
-    if now - issued_at > TOKEN_MAX_AGE_SECS || issued_at > now + 60 {
-        return false;
-    }
-
-    let mut mac =
-        HmacSha256::new_from_slice(secret_key.as_bytes()).expect("HMAC can take key of any size");
-    mac.update(format!("{}:{}", access_key, issued_hex).as_bytes());
-    let expected = hex::encode(mac.finalize().into_bytes());
-
-    constant_time_eq(signature.as_bytes(), expected.as_bytes())
-}
-
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    let mut diff = 0u8;
-    for (x, y) in a.iter().zip(b.iter()) {
-        diff |= x ^ y;
-    }
-    diff == 0
-}
-
 fn extract_cookie(headers: &HeaderMap) -> Option<String> {
     headers
         .get("cookie")
@@ -151,6 +109,31 @@ fn make_cookie(value: &str, max_age: i64, secure: bool) -> String {
 #[derive(Serialize, ToSchema)]
 pub struct OkResponse {
     ok: bool,
+}
+
+#[derive(Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionResponse {
+    ok: bool,
+    root: bool,
+    iam_admin: bool,
+    /// `root`, `user`, or `service`.
+    kind: String,
+    user_name: Option<String>,
+    label: Option<String>,
+    access_key_id: String,
+}
+
+fn session_response(identity: &crate::iam::ConsoleIdentity) -> SessionResponse {
+    SessionResponse {
+        ok: true,
+        root: identity.authenticated.principal.is_root(),
+        iam_admin: identity.iam_admin,
+        kind: identity.kind.to_string(),
+        user_name: identity.user_name.clone(),
+        label: identity.label.clone(),
+        access_key_id: identity.access_key_id.clone(),
+    }
 }
 
 #[derive(Serialize, ToSchema)]
@@ -187,13 +170,32 @@ async fn console_auth_middleware(
     request: Request,
     next: Next,
 ) -> Response {
-    let authenticated = extract_cookie(request.headers())
-        .map(|token| verify_token(&token, &state.config.access_key, &state.config.secret_key))
-        .unwrap_or(false);
-
-    if !authenticated {
+    let Some(token) = extract_cookie(request.headers()) else {
         return error(StatusCode::UNAUTHORIZED, "Not authenticated");
+    };
+    let identity = match crate::iam::console_from_token(&state.config, &token).await {
+        Ok(identity) => identity,
+        Err(()) => return error(StatusCode::UNAUTHORIZED, "Not authenticated"),
+    };
+    let path = request.uri().path().to_string();
+    let query = request.uri().query().unwrap_or("").to_string();
+    let method = request.method().to_string();
+    if let Err(err) = crate::api::authz::authorize_console(
+        &state,
+        &identity.authenticated.principal,
+        &method,
+        &path,
+        &query,
+    )
+    .await
+    {
+        let status = err.code.status_code();
+        return error(status, err.message);
     }
+    let mut request = request;
+    request
+        .extensions_mut()
+        .insert(identity.authenticated.clone());
     next.run(request).await
 }
 
@@ -212,8 +214,9 @@ pub struct LoginRequest {
     security(()),
     request_body = LoginRequest,
     responses(
-        (status = 200, body = OkResponse),
+        (status = 200, body = SessionResponse),
         (status = 401, description = "Invalid credentials", body = ErrorResponse),
+        (status = 403, description = "Access key or user is disabled", body = ErrorResponse),
         (status = 429, description = "Too many login attempts", body = ErrorResponse),
     )
 )]
@@ -236,21 +239,23 @@ pub async fn login(
             .into_response();
     }
 
-    // Use constant-time comparison to prevent timing side-channel attacks
-    let key_match = constant_time_eq(
-        body.access_key.as_bytes(),
-        state.config.access_key.as_bytes(),
-    );
-    let secret_match = constant_time_eq(
-        body.secret_key.as_bytes(),
-        state.config.secret_key.as_bytes(),
-    );
-    if !key_match || !secret_match {
-        return error(StatusCode::UNAUTHORIZED, "Invalid credentials");
-    }
-
-    let now = chrono::Utc::now().timestamp();
-    let token = generate_token(&state.config.access_key, &state.config.secret_key, now);
+    let identity = match crate::iam::login(&state.config, &body.access_key, &body.secret_key).await
+    {
+        Ok(identity) => identity,
+        Err(crate::iam::LoginError::Disabled) => {
+            return error(
+                StatusCode::FORBIDDEN,
+                "This access key is inactive or the user is disabled",
+            );
+        }
+        Err(crate::iam::LoginError::Invalid) => {
+            return error(StatusCode::UNAUTHORIZED, "Invalid credentials");
+        }
+    };
+    let token = match crate::iam::issue_session_token(&state.config, &identity).await {
+        Ok(token) => token,
+        Err(()) => return error(StatusCode::INTERNAL_SERVER_ERROR, "Could not start session"),
+    };
     let cookie = make_cookie(
         &token,
         TOKEN_MAX_AGE_SECS,
@@ -259,7 +264,7 @@ pub async fn login(
 
     let mut resp_headers = HeaderMap::new();
     resp_headers.insert("Set-Cookie", cookie.parse().unwrap());
-    (resp_headers, ok()).into_response()
+    (resp_headers, Json(session_response(&identity))).into_response()
 }
 
 #[utoipa::path(
@@ -269,19 +274,17 @@ pub async fn login(
     tag = "auth",
     security(()),
     responses(
-        (status = 200, body = OkResponse),
+        (status = 200, body = SessionResponse),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
     )
 )]
 pub async fn check(State(state): State<AppState>, headers: HeaderMap) -> Response {
-    let authenticated = extract_cookie(&headers)
-        .map(|token| verify_token(&token, &state.config.access_key, &state.config.secret_key))
-        .unwrap_or(false);
-
-    if authenticated {
-        ok()
-    } else {
-        error(StatusCode::UNAUTHORIZED, "Not authenticated")
+    let Some(token) = extract_cookie(&headers) else {
+        return error(StatusCode::UNAUTHORIZED, "Not authenticated");
+    };
+    match crate::iam::console_from_token(&state.config, &token).await {
+        Ok(identity) => (StatusCode::OK, Json(session_response(&identity))).into_response(),
+        Err(()) => error(StatusCode::UNAUTHORIZED, "Not authenticated"),
     }
 }
 
@@ -435,10 +438,26 @@ pub struct BucketListResponse {
         (status = 500, body = ErrorResponse),
     )
 )]
-pub async fn list_buckets(State(state): State<AppState>) -> Response {
+pub async fn list_buckets(
+    State(state): State<AppState>,
+    authn: Option<axum::extract::Extension<crate::iam::Authenticated>>,
+) -> Response {
+    let Some(axum::extract::Extension(authn)) = authn else {
+        return error(StatusCode::UNAUTHORIZED, "Not authenticated");
+    };
     match state.storage.list_buckets().await {
         Ok(buckets) => {
-            let buckets = buckets
+            let mut visible = Vec::new();
+            for bucket in buckets {
+                match crate::iam::bucket_visible(&state.config, &authn.principal, &bucket.name)
+                    .await
+                {
+                    Ok(true) => visible.push(bucket),
+                    Ok(false) => {}
+                    Err(err) => return internal(err),
+                }
+            }
+            let buckets = visible
                 .into_iter()
                 .map(|b| BucketSummary {
                     name: b.name,
@@ -475,10 +494,26 @@ pub struct CreateBucketRequest {
 )]
 pub async fn create_bucket(
     State(state): State<AppState>,
+    authn: Option<axum::extract::Extension<crate::iam::Authenticated>>,
     Json(body): Json<CreateBucketRequest>,
 ) -> Response {
+    let Some(axum::extract::Extension(authn)) = authn else {
+        return error(StatusCode::UNAUTHORIZED, "Not authenticated");
+    };
     if let Some(reason) = crate::storage::bucket_name_error(&body.name) {
         return error(StatusCode::BAD_REQUEST, reason);
+    }
+    if let Err(err) = crate::api::authz::authorize_s3(
+        &state,
+        &authn.principal,
+        "s3:CreateBucket",
+        &body.name,
+        None,
+        None,
+    )
+    .await
+    {
+        return error(err.code.status_code(), err.message);
     }
     let now = chrono::Utc::now()
         .format("%Y-%m-%dT%H:%M:%S%.3fZ")
@@ -868,6 +903,32 @@ pub struct PresignResponse {
     expires_in: u64,
 }
 
+async fn signing_credentials(
+    state: &AppState,
+    principal: &crate::iam::Principal,
+) -> Result<(String, String), Response> {
+    if principal.is_root() {
+        return Ok((
+            state.config.access_key.clone(),
+            state.config.secret_key.clone(),
+        ));
+    }
+    let access_key_id = principal
+        .access_key_id(&state.config.access_key)
+        .to_string();
+    let store = match crate::iam::store::store_for(&state.config).await {
+        Ok(store) => store,
+        Err(err) => return Err(internal(err)),
+    };
+    match store.lookup_key(&access_key_id).await {
+        Some(key) => Ok((access_key_id, key.secret)),
+        None => Err(error(
+            StatusCode::UNAUTHORIZED,
+            "Access key no longer exists",
+        )),
+    }
+}
+
 #[utoipa::path(
     get,
     path = "/api/buckets/{bucket}/presign/{key}",
@@ -885,10 +946,14 @@ pub struct PresignResponse {
 )]
 pub async fn presign_object(
     State(state): State<AppState>,
+    authn: Option<axum::extract::Extension<crate::iam::Authenticated>>,
     Path((bucket, key)): Path<(String, String)>,
     Query(params): Query<PresignParams>,
     headers: HeaderMap,
 ) -> Response {
+    let Some(axum::extract::Extension(authn)) = authn else {
+        return error(StatusCode::UNAUTHORIZED, "Not authenticated");
+    };
     // Verify object exists
     if state.storage.head_object(&bucket, &key).await.is_err() {
         return error(StatusCode::NOT_FOUND, "Object not found");
@@ -906,7 +971,10 @@ pub async fn presign_object(
     let date_stamp = now.format("%Y%m%d").to_string();
     let amz_date = now.format("%Y%m%dT%H%M%SZ").to_string();
     let region = &state.config.region;
-    let access_key = &state.config.access_key;
+    let (access_key, secret_key) = match signing_credentials(&state, &authn.principal).await {
+        Ok(pair) => pair,
+        Err(resp) => return resp,
+    };
 
     let credential = format!("{}/{}/{}/s3/aws4_request", access_key, date_stamp, region);
 
@@ -956,8 +1024,7 @@ pub async fn presign_object(
         amz_date, scope, canonical_hash
     );
 
-    let signing_key =
-        signature_v4::derive_signing_key(&state.config.secret_key, &date_stamp, region);
+    let signing_key = signature_v4::derive_signing_key(&secret_key, &date_stamp, region);
 
     let mut mac = HmacSha256::new_from_slice(&signing_key).unwrap();
     mac.update(string_to_sign.as_bytes());
@@ -1009,15 +1076,31 @@ pub struct CreateFolderRequest {
 )]
 pub async fn create_folder(
     State(state): State<AppState>,
+    authn: Option<axum::extract::Extension<crate::iam::Authenticated>>,
     Path(bucket): Path<String>,
     Json(body): Json<CreateFolderRequest>,
 ) -> Response {
+    let Some(axum::extract::Extension(authn)) = authn else {
+        return error(StatusCode::UNAUTHORIZED, "Not authenticated");
+    };
     let name = body.name.trim().trim_matches('/');
     if name.is_empty() {
         return error(StatusCode::BAD_REQUEST, "Folder name is required");
     }
 
     let key = format!("{}/", name);
+    if let Err(err) = crate::api::authz::authorize_s3(
+        &state,
+        &authn.principal,
+        "s3:PutObject",
+        &bucket,
+        Some(&key),
+        None,
+    )
+    .await
+    {
+        return error(err.code.status_code(), err.message);
+    }
     let encryption = match bucket_default_encryption(&state, &bucket).await {
         Ok(encryption) => encryption,
         Err(resp) => return resp,
@@ -1963,6 +2046,7 @@ pub fn console_router(state: AppState) -> Router<AppState> {
 
     let protected = protected_limited
         .merge(protected_streaming)
+        .merge(super::iam_console::routes())
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             console_csrf_middleware,

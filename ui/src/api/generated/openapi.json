@@ -25,7 +25,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/OkResponse"
+                  "$ref": "#/components/schemas/SessionResponse"
                 }
               }
             }
@@ -68,13 +68,23 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/OkResponse"
+                  "$ref": "#/components/schemas/SessionResponse"
                 }
               }
             }
           },
           "401": {
             "description": "Invalid credentials",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Access key or user is disabled",
             "content": {
               "application/json": {
                 "schema": {
@@ -1431,6 +1441,770 @@
           }
         }
       }
+    },
+    "/api/iam/policies": {
+      "get": {
+        "tags": [
+          "iam"
+        ],
+        "operationId": "listIamPolicies",
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PolicyListResponse"
+                }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "tags": [
+          "iam"
+        ],
+        "operationId": "createIamPolicy",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PolicyWriteBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PolicyView"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/iam/policies/{name}": {
+      "get": {
+        "tags": [
+          "iam"
+        ],
+        "operationId": "getIamPolicy",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PolicyView"
+                }
+              }
+            }
+          }
+        }
+      },
+      "put": {
+        "tags": [
+          "iam"
+        ],
+        "operationId": "updateIamPolicy",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PolicyUpdateBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PolicyView"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "iam"
+        ],
+        "operationId": "deleteIamPolicy",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Custom policy deleted"
+          }
+        }
+      }
+    },
+    "/api/iam/preview": {
+      "post": {
+        "tags": [
+          "iam"
+        ],
+        "operationId": "previewIamPolicy",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PreviewBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DocumentResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/iam/service-keys": {
+      "get": {
+        "tags": [
+          "iam"
+        ],
+        "operationId": "listServiceKeys",
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/KeyListResponse"
+                }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "tags": [
+          "iam"
+        ],
+        "operationId": "createServiceKey",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ServiceKeyBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CreatedKeyResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/iam/service-keys/{id}": {
+      "put": {
+        "tags": [
+          "iam"
+        ],
+        "operationId": "setServiceKeyStatus",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/KeyStatusBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/KeyView"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "iam"
+        ],
+        "operationId": "deleteServiceKey",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Service key deleted"
+          }
+        }
+      }
+    },
+    "/api/iam/users": {
+      "get": {
+        "tags": [
+          "iam"
+        ],
+        "operationId": "listIamUsers",
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UserListResponse"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "tags": [
+          "iam"
+        ],
+        "operationId": "createIamUser",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateUserBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UserView"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/iam/users/{name}": {
+      "get": {
+        "tags": [
+          "iam"
+        ],
+        "operationId": "getIamUser",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UserView"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "iam"
+        ],
+        "operationId": "deleteIamUser",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "User, keys, and inline policies removed"
+          }
+        }
+      }
+    },
+    "/api/iam/users/{name}/inline/{policy}": {
+      "put": {
+        "tags": [
+          "iam"
+        ],
+        "operationId": "putInlineUserPolicy",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "policy",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/DocumentBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Inline policy saved"
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "iam"
+        ],
+        "operationId": "deleteInlineUserPolicy",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "policy",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Inline policy deleted"
+          }
+        }
+      }
+    },
+    "/api/iam/users/{name}/keys": {
+      "get": {
+        "tags": [
+          "iam"
+        ],
+        "operationId": "listAccessKeys",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/KeyListResponse"
+                }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "tags": [
+          "iam"
+        ],
+        "operationId": "createAccessKey",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateKeyBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Secret is returned once",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CreatedKeyResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/iam/users/{name}/keys/{id}": {
+      "put": {
+        "tags": [
+          "iam"
+        ],
+        "operationId": "setAccessKeyStatus",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/KeyStatusBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/KeyView"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "iam"
+        ],
+        "operationId": "deleteAccessKey",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Key deleted"
+          }
+        }
+      }
+    },
+    "/api/iam/users/{name}/policies": {
+      "post": {
+        "tags": [
+          "iam"
+        ],
+        "operationId": "attachUserPolicy",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AttachBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Policy attached"
+          }
+        }
+      }
+    },
+    "/api/iam/users/{name}/policies/{policy}": {
+      "delete": {
+        "tags": [
+          "iam"
+        ],
+        "operationId": "detachUserPolicy",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "policy",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Policy detached"
+          }
+        }
+      }
+    },
+    "/api/iam/users/{name}/status": {
+      "put": {
+        "tags": [
+          "iam"
+        ],
+        "operationId": "setIamUserStatus",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/EnabledBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UserView"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/iam/validate": {
+      "post": {
+        "tags": [
+          "iam"
+        ],
+        "operationId": "validateIamPolicy",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/DocumentBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DocumentResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
     }
   },
   "components": {
@@ -1445,6 +2219,17 @@
             "type": "integer",
             "format": "int32",
             "minimum": 0
+          }
+        }
+      },
+      "AttachBody": {
+        "type": "object",
+        "required": [
+          "name"
+        ],
+        "properties": {
+          "name": {
+            "type": "string"
           }
         }
       },
@@ -1544,6 +2329,113 @@
           }
         }
       },
+      "CreateKeyBody": {
+        "type": "object",
+        "properties": {
+          "access": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "`read`, `write`, `readwrite`, or `admin`."
+          },
+          "buckets": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Bucket names. Empty with `access` set means every bucket."
+          },
+          "documentJson": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Raw policy JSON. Used instead of `access` when set."
+          },
+          "keyOnly": {
+            "type": "boolean",
+            "description": "Store the policy on this key only. It cannot grant more than the user already has."
+          },
+          "prefix": {
+            "type": "string"
+          }
+        }
+      },
+      "CreateUserBody": {
+        "type": "object",
+        "required": [
+          "name"
+        ],
+        "properties": {
+          "name": {
+            "type": "string"
+          }
+        }
+      },
+      "CreatedKeyResponse": {
+        "type": "object",
+        "required": [
+          "accessKeyId",
+          "secretAccessKey",
+          "createdAt",
+          "status"
+        ],
+        "properties": {
+          "accessKeyId": {
+            "type": "string"
+          },
+          "createdAt": {
+            "type": "string"
+          },
+          "documentJson": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Policy saved with this key, when the request included a scope or document."
+          },
+          "secretAccessKey": {
+            "type": "string"
+          },
+          "status": {
+            "type": "string"
+          }
+        }
+      },
+      "DocumentBody": {
+        "type": "object",
+        "required": [
+          "documentJson"
+        ],
+        "properties": {
+          "documentJson": {
+            "type": "string"
+          }
+        }
+      },
+      "DocumentResponse": {
+        "type": "object",
+        "required": [
+          "documentJson"
+        ],
+        "properties": {
+          "documentJson": {
+            "type": "string"
+          }
+        }
+      },
+      "EnabledBody": {
+        "type": "object",
+        "required": [
+          "enabled"
+        ],
+        "properties": {
+          "enabled": {
+            "type": "boolean"
+          }
+        }
+      },
       "EnabledResponse": {
         "type": "object",
         "required": [
@@ -1580,6 +2472,17 @@
           }
         }
       },
+      "ErrorBody": {
+        "type": "object",
+        "required": [
+          "error"
+        ],
+        "properties": {
+          "error": {
+            "type": "string"
+          }
+        }
+      },
       "ErrorResponse": {
         "type": "object",
         "required": [
@@ -1588,6 +2491,79 @@
         "properties": {
           "error": {
             "type": "string"
+          }
+        }
+      },
+      "InlinePolicyView": {
+        "type": "object",
+        "required": [
+          "name",
+          "documentJson"
+        ],
+        "properties": {
+          "documentJson": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          }
+        }
+      },
+      "KeyListResponse": {
+        "type": "object",
+        "required": [
+          "keys"
+        ],
+        "properties": {
+          "keys": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/KeyView"
+            }
+          }
+        }
+      },
+      "KeyStatusBody": {
+        "type": "object",
+        "required": [
+          "status"
+        ],
+        "properties": {
+          "status": {
+            "type": "string"
+          }
+        }
+      },
+      "KeyView": {
+        "type": "object",
+        "required": [
+          "accessKeyId",
+          "label",
+          "status",
+          "createdAt",
+          "hasPolicy"
+        ],
+        "properties": {
+          "accessKeyId": {
+            "type": "string"
+          },
+          "createdAt": {
+            "type": "string"
+          },
+          "hasPolicy": {
+            "type": "boolean"
+          },
+          "label": {
+            "type": "string"
+          },
+          "status": {
+            "type": "string"
+          },
+          "userName": {
+            "type": [
+              "string",
+              "null"
+            ]
           }
         }
       },
@@ -2043,6 +3019,86 @@
           }
         }
       },
+      "PolicyListResponse": {
+        "type": "object",
+        "required": [
+          "policies"
+        ],
+        "properties": {
+          "policies": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/PolicyView"
+            }
+          }
+        }
+      },
+      "PolicyUpdateBody": {
+        "type": "object",
+        "required": [
+          "documentJson"
+        ],
+        "properties": {
+          "description": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "documentJson": {
+            "type": "string"
+          }
+        }
+      },
+      "PolicyView": {
+        "type": "object",
+        "required": [
+          "name",
+          "description",
+          "builtin",
+          "createdAt",
+          "updatedAt",
+          "documentJson"
+        ],
+        "properties": {
+          "builtin": {
+            "type": "boolean"
+          },
+          "createdAt": {
+            "type": "string"
+          },
+          "description": {
+            "type": "string"
+          },
+          "documentJson": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "updatedAt": {
+            "type": "string"
+          }
+        }
+      },
+      "PolicyWriteBody": {
+        "type": "object",
+        "required": [
+          "name",
+          "documentJson"
+        ],
+        "properties": {
+          "description": {
+            "type": "string"
+          },
+          "documentJson": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          }
+        }
+      },
       "PresignResponse": {
         "type": "object",
         "required": [
@@ -2056,6 +3112,26 @@
             "minimum": 0
           },
           "url": {
+            "type": "string"
+          }
+        }
+      },
+      "PreviewBody": {
+        "type": "object",
+        "required": [
+          "access"
+        ],
+        "properties": {
+          "access": {
+            "type": "string"
+          },
+          "buckets": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "prefix": {
             "type": "string"
           }
         }
@@ -2087,6 +3163,78 @@
               "null"
             ],
             "description": "Version id of the new current version (`null` when versioning is off)."
+          }
+        }
+      },
+      "ServiceKeyBody": {
+        "type": "object",
+        "required": [
+          "name"
+        ],
+        "properties": {
+          "access": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "buckets": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "documentJson": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "name": {
+            "type": "string"
+          },
+          "prefix": {
+            "type": "string"
+          }
+        }
+      },
+      "SessionResponse": {
+        "type": "object",
+        "required": [
+          "ok",
+          "root",
+          "iamAdmin",
+          "kind",
+          "accessKeyId"
+        ],
+        "properties": {
+          "accessKeyId": {
+            "type": "string"
+          },
+          "iamAdmin": {
+            "type": "boolean"
+          },
+          "kind": {
+            "type": "string",
+            "description": "`root`, `user`, or `service`."
+          },
+          "label": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "ok": {
+            "type": "boolean"
+          },
+          "root": {
+            "type": "boolean"
+          },
+          "userName": {
+            "type": [
+              "string",
+              "null"
+            ]
           }
         }
       },
@@ -2157,6 +3305,62 @@
             "type": "integer",
             "format": "int64",
             "minimum": 0
+          }
+        }
+      },
+      "UserListResponse": {
+        "type": "object",
+        "required": [
+          "users"
+        ],
+        "properties": {
+          "users": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/UserView"
+            }
+          }
+        }
+      },
+      "UserView": {
+        "type": "object",
+        "required": [
+          "name",
+          "userId",
+          "enabled",
+          "createdAt",
+          "keyCount",
+          "attachedPolicies",
+          "inlinePolicies"
+        ],
+        "properties": {
+          "attachedPolicies": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "createdAt": {
+            "type": "string"
+          },
+          "enabled": {
+            "type": "boolean"
+          },
+          "inlinePolicies": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/InlinePolicyView"
+            }
+          },
+          "keyCount": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "name": {
+            "type": "string"
+          },
+          "userId": {
+            "type": "string"
           }
         }
       },

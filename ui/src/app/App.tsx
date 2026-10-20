@@ -3,6 +3,10 @@ import { AppShell } from '@/app/shell/AppShell'
 import { RequireAuth } from '@/features/auth/RequireAuth'
 import { LoginPage } from '@/features/auth/LoginPage'
 import { BucketListPage } from '@/features/buckets/BucketListPage'
+import { PoliciesPage } from '@/features/iam/PoliciesPage'
+import { PolicyEditorPage } from '@/features/iam/PolicyEditorPage'
+import { UserDetailPage } from '@/features/iam/UserDetailPage'
+import { UsersPage } from '@/features/iam/UsersPage'
 import { ObjectBrowserPage } from '@/features/objects/ObjectBrowserPage'
 import { BucketSettingsPage } from '@/features/settings/BucketSettingsPage'
 
@@ -20,6 +24,10 @@ export default function App() {
         <Route index element={<BucketListPage />} />
         <Route path="buckets/:bucket" element={<ObjectBrowserPage />} />
         <Route path="buckets/:bucket/settings" element={<BucketSettingsPage />} />
+        <Route path="users" element={<UsersPage />} />
+        <Route path="users/:name" element={<UserDetailPage />} />
+        <Route path="policies" element={<PoliciesPage />} />
+        <Route path="policies/:name" element={<PolicyEditorPage />} />
       </Route>
       <Route path="*" element={<Navigate to="/" replace />} />
     </Routes>

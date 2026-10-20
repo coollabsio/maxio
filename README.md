@@ -119,6 +119,46 @@ The report lists stale temp files, stranded backups, object bytes without a side
 
 It does not invent bucket configuration, rewrite encrypted sidecars (those are MAC-protected), or choose between a plain file and an erasure-coded directory for the same key. Those are reported and left unchanged.
 
+## Shutdown and limits
+
+`SIGTERM` and `SIGINT` stop the accept loop, finish requests already in progress, and exit. The drain waits up to `MAXIO_SHUTDOWN_TIMEOUT_SECS` (default 8) and then aborts what is left. Docker sends `SIGTERM` and, after its own stop timeout (default 10 seconds), `SIGKILL`. The default drain finishes inside that window. To let a long upload complete, raise both the MaxIO timeout and `docker stop -t`.
+
+One client cannot hold the process open without bound. Over-limit calls return S3 errors: `EntityTooLarge` (400) when a single PUT, part, copy, or finished multipart object is too big, and `SlowDown` (503) when the connection or in-flight request cap is hit. A header block larger than the cap is rejected, an idle keep-alive connection is closed, and a request that runs too long returns `RequestTimeout` (400).
+
+| Variable | Default | Description |
+|---|---|---|
+| `MAXIO_SHUTDOWN_TIMEOUT_SECS` | `8` | Drain timeout after SIGTERM/SIGINT |
+| `MAXIO_MAX_OBJECT_SIZE` | 5 GiB | Max PutObject / CopyObject. Use multipart above this |
+| `MAXIO_MAX_PART_SIZE` | 5 GiB | Max one multipart part |
+| `MAXIO_MAX_MULTIPART_OBJECT_SIZE` | 5 TiB | Max assembled multipart object |
+| `MAXIO_MAX_HEADER_BYTES` | `65536` | Max request header bytes (hyper's floor is 8192) |
+| `MAXIO_MAX_CONNECTIONS` | `1024` | Accepted connections. Further connections get `SlowDown`. `0` disables |
+| `MAXIO_MAX_CONCURRENT_REQUESTS` | `256` | In-flight requests. Further requests get `SlowDown`. Health checks are exempt. `0` disables |
+| `MAXIO_REQUEST_TIMEOUT_SECS` | `3600` | Max request duration, including the body. `0` disables |
+| `MAXIO_IDLE_TIMEOUT_SECS` | `60` | Keep-alive idle timeout. `0` disables |
+
+## Load test
+
+`tests/loadtest.py` starts MaxIO and measures small-object PUT/GET, a multipart upload, mixed reads and writes, and a listing. It prints throughput, latency percentiles, and peak RSS.
+
+```bash
+SKIP_FRONTEND=1 cargo build
+python3 tests/loadtest.py
+```
+
+`MAXIO_LOAD_SMALL`, `MAXIO_LOAD_CONCURRENCY`, `MAXIO_LOAD_MULTIPART_MB`, and `MAXIO_LOAD_PART_MB` change the size of the run. A run on this development machine (`MAXIO_LOAD_SMALL=2000`, `MAXIO_LOAD_CONCURRENCY=16`, `MAXIO_LOAD_MULTIPART_MB=64`, one Python client) produced:
+
+| Scenario | Result |
+|---|---|
+| PUT 4 KiB × 2000 | 1721 obj/s, p50 8.6 ms, p95 13.7 ms, p99 16.3 ms |
+| GET 4 KiB × 2000 | 2387 obj/s, p50 6.1 ms, p95 11.3 ms, p99 13.9 ms |
+| Multipart 64 MiB (8 × 8 MiB, serial) | 34.0 MiB/s, 1.9 s |
+| Mixed read/write × 2000 | 2030 op/s, p50 7.4 ms, p95 13.7 ms, p99 16.9 ms |
+| List 2001 keys (two pages) | 255 ms |
+| Peak RSS | 48.7 MiB |
+
+The multipart figure is one client uploading parts one after another, not the parallel warp number in Benchmarks. The process stayed up and RSS stayed under 50 MiB. No crash or leak showed up in this run.
+
 ## Benchmarks
 
 MaxIO vs MinIO on a Hetzner CCX13 (`./tests/bench-remote.sh`, MaxIO >= 0.3.2):

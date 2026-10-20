@@ -1114,6 +1114,7 @@ dependencies = [
  "hmac",
  "http",
  "hyper",
+ "hyper-util",
  "md-5",
  "mime_guess",
  "percent-encoding",

@@ -1824,6 +1824,31 @@ EOF
     stop_robust
     mc alias rm "$MC_ROBUST" >/dev/null 2>&1 || true
     rm -rf "$ROBUST_DATA"
+
+    # A tiny object cap must fail a normal PUT with EntityTooLarge.
+    LIMIT_DATA=$(mktemp -d)
+    LIMIT_PORT=$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1]); s.close()')
+    RUST_LOG=warn "$ROBUST_BIN" --data-dir "$LIMIT_DATA" --port "$LIMIT_PORT" \
+        --address 127.0.0.1 --allow-insecure-dev --max-object-size 1024 \
+        >"$LIMIT_DATA/server.log" 2>&1 &
+    LIMIT_PID=$!
+    LIMIT_EP="http://127.0.0.1:$LIMIT_PORT"
+    for _ in $(seq 1 50); do
+        curl -sf "$LIMIT_EP/healthz" >/dev/null 2>&1 && break
+        sleep 0.1
+    done
+    dd if=/dev/zero of="$TMPDIR/too-big.bin" bs=1024 count=2 status=none
+    LIMIT_OUT=$(aws --endpoint-url "$LIMIT_EP" s3 cp "$TMPDIR/too-big.bin" s3://limit-bucket/too-big.bin 2>&1 || true)
+    # The bucket does not exist yet; create it, then the size check runs.
+    aws --endpoint-url "$LIMIT_EP" s3 mb s3://limit-bucket >/dev/null
+    LIMIT_OUT=$(aws --endpoint-url "$LIMIT_EP" s3 cp "$TMPDIR/too-big.bin" s3://limit-bucket/too-big.bin 2>&1 || true)
+    assert_eq "put over max object size is EntityTooLarge" "true" \
+        "$(printf '%s' "$LIMIT_OUT" | grep -q EntityTooLarge && echo true || echo false)"
+    echo "ok" > "$TMPDIR/small-ok.txt"
+    assert "put under max object size" aws --endpoint-url "$LIMIT_EP" s3 cp "$TMPDIR/small-ok.txt" s3://limit-bucket/small-ok.txt
+    kill -TERM "$LIMIT_PID" 2>/dev/null || true
+    wait "$LIMIT_PID" 2>/dev/null || true
+    rm -rf "$LIMIT_DATA"
 fi
 
 # --- Summary ---

@@ -60,6 +60,9 @@ pub struct FilesystemStorage {
     /// `cfg(test)` only. Kept on the struct so publish can fail one step
     /// without a process-global flag (tests run in parallel).
     fault: AtomicU8,
+    max_object_size: u64,
+    max_part_size: u64,
+    max_multipart_object_size: u64,
 }
 
 fn shard_index(parts: &[&str], shards: usize) -> usize {
@@ -341,6 +344,9 @@ impl FilesystemStorage {
                 .map(|_| Default::default())
                 .collect(),
             fault: AtomicU8::new(FAULT_NONE),
+            max_object_size: u64::MAX,
+            max_part_size: u64::MAX,
+            max_multipart_object_size: u64::MAX,
         };
         // Nothing is in flight during construction, so crash leftovers (temp
         // files, stranded EC backups, upload dirs with no readable metadata)
@@ -348,6 +354,30 @@ impl FilesystemStorage {
         // so it cannot delete a live request's temp file.
         storage.startup_recover().await;
         Ok(storage)
+    }
+
+    /// Caps for a single PutObject, one multipart part, and an assembled
+    /// multipart object. `u64::MAX` disables a cap. Set from server config.
+    pub fn set_upload_limits(&mut self, max_object: u64, max_part: u64, max_multipart: u64) {
+        self.max_object_size = max_object;
+        self.max_part_size = max_part;
+        self.max_multipart_object_size = max_multipart;
+    }
+
+    fn check_object_size(&self, size: u64) -> Result<(), StorageError> {
+        if size > self.max_object_size {
+            Err(StorageError::EntityTooLarge)
+        } else {
+            Ok(())
+        }
+    }
+
+    fn check_part_size(&self, size: u64) -> Result<(), StorageError> {
+        if size > self.max_part_size {
+            Err(StorageError::EntityTooLarge)
+        } else {
+            Ok(())
+        }
     }
 
     /// Test-only: the next publish fails once at `point` (`FAULT_*`).
@@ -738,6 +768,7 @@ impl FilesystemStorage {
                 ch.update(&buf[..n]);
             }
             size += n as u64;
+            self.check_object_size(size)?;
             if let Some(ref cipher) = cipher_opt {
                 frame_buf.extend_from_slice(&buf[..n]);
                 while frame_buf.len() >= FRAME_CHUNK_SIZE {
@@ -912,6 +943,7 @@ impl FilesystemStorage {
                 ch.update(&read_buf[..n]);
             }
             total_size += n as u64;
+            self.check_object_size(total_size)?;
             chunk_buf.extend_from_slice(&read_buf[..n]);
 
             while chunk_buf.len() >= self.chunk_size as usize {
@@ -1145,6 +1177,7 @@ impl FilesystemStorage {
                 ch.update(&read_buf[..n]);
             }
             plaintext_size += n as u64;
+            self.check_object_size(plaintext_size)?;
             frame_buf.extend_from_slice(&read_buf[..n]);
             while frame_buf.len() >= FRAME_CHUNK_SIZE {
                 let frame_data: Vec<u8> = frame_buf.drain(..FRAME_CHUNK_SIZE).collect();
@@ -2673,6 +2706,7 @@ impl FilesystemStorage {
                 ch.update(&buf[..n]);
             }
             size += n as u64;
+            self.check_part_size(size)?;
             if let Some(ref cipher) = cipher_opt {
                 frame_buf.extend_from_slice(&buf[..n]);
                 while frame_buf.len() >= FRAME_CHUNK_SIZE {
@@ -2791,6 +2825,12 @@ impl FilesystemStorage {
                 return Err(StorageError::InvalidKey("part too small".into()));
             }
             selected.push(meta);
+        }
+        let assembled = selected
+            .iter()
+            .fold(0u64, |acc, part| acc.saturating_add(part.size));
+        if assembled > self.max_multipart_object_size {
+            return Err(StorageError::EntityTooLarge);
         }
 
         if self.erasure_coding {
@@ -5325,5 +5365,30 @@ mod durability_tests {
             artifacts >= 1,
             "fresh temp removed at startup, got {artifacts}"
         );
+    }
+
+    #[tokio::test]
+    async fn put_over_the_object_cap_is_rejected_and_not_published() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut storage = storage_at(tmp.path()).await;
+        storage.set_upload_limits(4, 100, 150);
+        storage.create_bucket(&bucket_meta("bkt")).await.unwrap();
+        let err = storage
+            .put_object(
+                "bkt",
+                "big.txt",
+                "text/plain",
+                Box::pin(Cursor::new(b"hello".to_vec())),
+                None,
+                None,
+            )
+            .await;
+        assert!(matches!(err, Err(StorageError::EntityTooLarge)));
+        assert!(storage.get_object("bkt", "big.txt", None).await.is_err());
+
+        put(&storage, "ok.txt", b"hey").await;
+        let (body, size) = read_obj(&storage, "ok.txt").await;
+        assert_eq!(body, b"hey");
+        assert_eq!(size, 3);
     }
 }

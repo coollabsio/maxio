@@ -164,6 +164,16 @@
                 }
               }
             }
+          },
+          "500": {
+            "description": "The session was revoked in memory but could not be saved",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
           }
         }
       }

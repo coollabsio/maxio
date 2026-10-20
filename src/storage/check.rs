@@ -9,8 +9,14 @@
 //! adopted: those bytes may be SSE-S3 ciphertext, and a plaintext sidecar
 //! would serve them without encryption headers. A checksum that does not match
 //! the payload is the same kind of finding: `--repair` moves the object into
-//! `.maxio-quarantine/` and does not rewrite the checksum. `--accept-current-checksums`
-//! with `--repair` records the payload's checksum instead. A sidecar is never deleted
+//! `.maxio-quarantine/` and does not rewrite the checksum. A single-part etag
+//! (the MD5 of the object) is checked the same way when the sidecar has no
+//! checksum. `--accept-current-checksums` with `--repair` records the payload's
+//! checksum or single-part etag instead. A multipart etag (`-N`) is not the MD5
+//! of the whole object: it is reported as unverifiable and left unchanged.
+//! When the current bytes of a versioned object are quarantined and an intact
+//! version remains, `--repair` copies that version back to the current object.
+//! A sidecar is never deleted
 //! while a promote directory for that key still holds the bytes (the sidecar
 //! is where an SSE-S3 wrapped data key lives).
 //!
@@ -30,7 +36,7 @@ use super::{
 use base64::Engine;
 use md5::{Digest, Md5};
 use sha2::Sha256;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::io::AsyncReadExt;
 
@@ -59,6 +65,8 @@ pub enum IssueKind {
     LegacyReservedKey,
     /// Bucket directory `maxio` or `ui`, reserved by this version.
     ReservedBucket,
+    /// The current object does not match the newest version (or a delete marker).
+    CurrentVersionMismatch,
 }
 
 impl IssueKind {
@@ -83,6 +91,7 @@ impl IssueKind {
             Self::PromoteLeftover => "promote-leftover",
             Self::LegacyReservedKey => "legacy-reserved-key",
             Self::ReservedBucket => "reserved-bucket",
+            Self::CurrentVersionMismatch => "current-version-mismatch",
         }
     }
 }
@@ -617,6 +626,24 @@ async fn scan_bucket(
             }
             stack.push((path.clone(), format!("{prefix}{name}/")));
         }
+
+        // After current objects are quarantined, put an intact version back
+        // in place (or apply a newest delete marker). Running this earlier
+        // would restore a payload that the etag check then quarantines.
+        if let Some((_, path, _)) = entries.iter().find(|(n, _, d)| n == ".versions" && *d) {
+            reconcile_versions_in(
+                path,
+                bucket_dir,
+                bucket,
+                data_dir,
+                &prefix,
+                repair,
+                accept_current_checksums,
+                keyring,
+                report,
+            )
+            .await?;
+        }
     }
     Ok(())
 }
@@ -789,23 +816,86 @@ async fn check_meta_pair(
             );
             if repair {
                 meta.size = file_len;
-                meta.etag = file_md5_quoted(data_path).await?;
-                meta.part_sizes = None;
+                if etag_is_multipart(&meta.etag) {
+                    report.note(
+                        IssueKind::EtagMismatch,
+                        data_path,
+                        format!(
+                            "sidecar etag {} is a multipart etag (-N) and cannot be verified from the whole object. It was not rewritten.",
+                            meta.etag
+                        ),
+                    );
+                } else {
+                    meta.etag = file_md5_quoted(data_path).await?;
+                    meta.part_sizes = None;
+                }
                 dirty = true;
             }
-        } else if !meta.etag.trim_matches('"').contains('-') {
-            let etag = file_md5_quoted(data_path).await?;
-            if etag != meta.etag {
-                let repaired = repair;
-                report.push(
+        } else if etag_is_multipart(&meta.etag) {
+            if meta.checksum_algorithm.is_none() {
+                report.note(
                     IssueKind::EtagMismatch,
                     data_path,
-                    format!("sidecar etag is {}, file hashes to {etag}", meta.etag),
-                    repaired,
+                    format!(
+                        "sidecar etag {} is a multipart etag (-N) and cannot be verified from the whole object. It was not rewritten.",
+                        meta.etag
+                    ),
                 );
-                if repair {
+            }
+        } else {
+            let etag = file_md5_quoted(data_path).await?;
+            if etag != meta.etag {
+                if repair && flags.accept_current_checksums {
+                    report.push(
+                        IssueKind::EtagMismatch,
+                        data_path,
+                        format!(
+                            "sidecar etag is {}, file hashes to {etag}. Recorded the payload etag because --accept-current-checksums was set.",
+                            meta.etag
+                        ),
+                        true,
+                    );
                     meta.etag = etag;
                     dirty = true;
+                } else if repair {
+                    match quarantine_payload(data_dir, bucket, bucket_dir, data_path, meta_path)
+                        .await
+                    {
+                        Ok(dest) => {
+                            report.push(
+                                IssueKind::EtagMismatch,
+                                data_path,
+                                format!(
+                                    "sidecar etag is {}, file hashes to {etag}. Quarantined at {} without deleting the bytes and without adopting the payload etag.",
+                                    meta.etag,
+                                    dest.display()
+                                ),
+                                true,
+                            );
+                        }
+                        Err(err) => {
+                            report.push(
+                                IssueKind::EtagMismatch,
+                                data_path,
+                                format!(
+                                    "sidecar etag is {}, file hashes to {etag}. Quarantine failed: {err}. The object was left in place and the etag was not rewritten.",
+                                    meta.etag
+                                ),
+                                false,
+                            );
+                        }
+                    }
+                    return Ok(());
+                } else {
+                    report.push(
+                        IssueKind::EtagMismatch,
+                        data_path,
+                        format!(
+                            "sidecar etag is {}, file hashes to {etag}. The etag was not rewritten. --repair moves the object under .maxio-quarantine. --accept-current-checksums with --repair records the payload etag instead.",
+                            meta.etag
+                        ),
+                        false,
+                    );
                 }
             }
         }
@@ -1160,6 +1250,537 @@ async fn scan_versions(
     Ok(())
 }
 
+fn etag_is_multipart(etag: &str) -> bool {
+    let bare = etag.trim_matches('"');
+    let Some((hash, count)) = bare.rsplit_once('-') else {
+        return false;
+    };
+    !hash.is_empty()
+        && hash.chars().all(|c| c.is_ascii_hexdigit())
+        && count.parse::<u32>().is_ok_and(|n| n >= 1)
+}
+
+async fn reconcile_versions_in(
+    versions_dir: &Path,
+    bucket_dir: &Path,
+    bucket: &str,
+    data_dir: &Path,
+    prefix: &str,
+    repair: bool,
+    accept_current_checksums: bool,
+    keyring: Option<&Arc<super::keys::Keyring>>,
+    report: &mut CheckReport,
+) -> anyhow::Result<()> {
+    let mut keys = match tokio::fs::read_dir(versions_dir).await {
+        Ok(rd) => rd,
+        Err(_) => return Ok(()),
+    };
+    while let Some(entry) = keys.next_entry().await? {
+        if !entry.file_type().await?.is_dir() {
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().to_string();
+        let key = format!("{prefix}{name}");
+        if key_contains_reserved_segment(&key) {
+            continue;
+        }
+        reconcile_one_key(
+            &entry.path(),
+            bucket_dir,
+            bucket,
+            data_dir,
+            &key,
+            repair,
+            accept_current_checksums,
+            keyring,
+            report,
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+enum CurrentExpectation {
+    DeleteMarker { vid: String },
+    Intact { vid: String, meta: Box<ObjectMeta> },
+    NoIntactVersion,
+}
+
+async fn reconcile_one_key(
+    ver_dir: &Path,
+    bucket_dir: &Path,
+    bucket: &str,
+    data_dir: &Path,
+    key: &str,
+    repair: bool,
+    accept_current_checksums: bool,
+    keyring: Option<&Arc<super::keys::Keyring>>,
+    report: &mut CheckReport,
+) -> anyhow::Result<()> {
+    let ids = list_version_ids(ver_dir).await?;
+    if ids.is_empty() {
+        return Ok(());
+    }
+    let (plain, inline, meta_path, ec_path) = object_locations(bucket_dir, key);
+    let data_path = current_data_path(&plain, &inline).await;
+    if let Some(meta) = read_object_meta(&meta_path).await {
+        // A null version written while versioning was suspended is newer than
+        // every archived version and stays the current object.
+        if meta.version_id.is_none() && !meta.is_delete_marker && is_file(&data_path).await {
+            return Ok(());
+        }
+    }
+
+    let expected = version_expectation(ver_dir, &ids, bucket, key, keyring).await?;
+    let current_present = is_file(&data_path).await || is_file(&meta_path).await;
+    match expected {
+        CurrentExpectation::DeleteMarker { vid } => {
+            if !current_present {
+                return Ok(());
+            }
+            let detail = format!(
+                "newest version {vid} of {bucket}/{key} is a delete marker, but a current object is still present"
+            );
+            if repair {
+                remove_current_object(&plain, &inline, &meta_path, &ec_path).await;
+                report.push(
+                    IssueKind::CurrentVersionMismatch,
+                    &meta_path,
+                    format!("{detail}. Removed the current object so a plain GET stays deleted."),
+                    true,
+                );
+            } else {
+                report.push(
+                    IssueKind::CurrentVersionMismatch,
+                    &meta_path,
+                    format!("{detail}. Not modified."),
+                    false,
+                );
+            }
+        }
+        CurrentExpectation::Intact { vid, meta } => {
+            if current_matches_version(&data_path, &meta_path, &vid, ver_dir).await {
+                return Ok(());
+            }
+            if repair
+                && accept_current_checksums
+                && sidecar_matches_payload(&data_path, &meta_path, bucket, key, keyring).await
+            {
+                if let Some(current) = read_object_meta(&meta_path).await {
+                    if current.version_id.as_deref() == Some(vid.as_str()) {
+                        publish_version_from_current(ver_dir, &vid, &data_path, &current).await?;
+                        report.push(
+                            IssueKind::CurrentVersionMismatch,
+                            &data_path,
+                            format!(
+                                "current object {bucket}/{key} was kept and version {vid} was updated from it because --accept-current-checksums was set."
+                            ),
+                            true,
+                        );
+                        return Ok(());
+                    }
+                }
+            }
+            let detail = if current_present {
+                format!("current object {bucket}/{key} does not match intact version {vid}")
+            } else {
+                format!(
+                    "current object {bucket}/{key} is missing while intact version {vid} is still stored"
+                )
+            };
+            if !repair {
+                report.push(
+                    IssueKind::CurrentVersionMismatch,
+                    &meta_path,
+                    format!(
+                        "{detail}. Not modified. --repair restores the current object from that version."
+                    ),
+                    false,
+                );
+                return Ok(());
+            }
+            let quarantined = if current_present && is_file(&data_path).await {
+                match quarantine_payload(data_dir, bucket, bucket_dir, &data_path, &meta_path).await
+                {
+                    Ok(dest) => Some(dest),
+                    Err(err) => {
+                        report.push(
+                            IssueKind::CurrentVersionMismatch,
+                            &data_path,
+                            format!(
+                                "{detail}. Quarantine failed: {err}. The current object was left in place."
+                            ),
+                            false,
+                        );
+                        return Ok(());
+                    }
+                }
+            } else {
+                if current_present {
+                    remove_current_object(&plain, &inline, &meta_path, &ec_path).await;
+                }
+                None
+            };
+            restore_version_payload(ver_dir, &vid, &meta, &data_path, &meta_path, &ec_path).await?;
+            let action = match &quarantined {
+                Some(dest) => format!(
+                    "{detail}. Quarantined the current bytes at {} and restored the current object from version {vid}.",
+                    dest.display()
+                ),
+                None => format!("{detail}. Restored the current object from version {vid}."),
+            };
+            report.push(IssueKind::CurrentVersionMismatch, &meta_path, action, true);
+        }
+        CurrentExpectation::NoIntactVersion => {
+            if !current_present {
+                report.push(
+                    IssueKind::CurrentVersionMismatch,
+                    &meta_path,
+                    format!(
+                        "current object {bucket}/{key} is missing and no intact version can restore it"
+                    ),
+                    false,
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn version_expectation(
+    ver_dir: &Path,
+    ids: &[String],
+    bucket: &str,
+    key: &str,
+    keyring: Option<&Arc<super::keys::Keyring>>,
+) -> anyhow::Result<CurrentExpectation> {
+    for vid in ids {
+        let meta_path = ver_dir.join(format!("{vid}.meta.json"));
+        let Some(meta) = read_object_meta(&meta_path).await else {
+            continue;
+        };
+        if meta.is_delete_marker {
+            return Ok(CurrentExpectation::DeleteMarker { vid: vid.clone() });
+        }
+        if version_payload_intact(ver_dir, vid, &meta, bucket, key, keyring).await {
+            return Ok(CurrentExpectation::Intact {
+                vid: vid.clone(),
+                meta: Box::new(meta),
+            });
+        }
+    }
+    Ok(CurrentExpectation::NoIntactVersion)
+}
+
+async fn list_version_ids(ver_dir: &Path) -> anyhow::Result<Vec<String>> {
+    let mut ids = Vec::new();
+    let mut read = tokio::fs::read_dir(ver_dir).await?;
+    while let Some(entry) = read.next_entry().await? {
+        let name = entry.file_name().to_string_lossy().to_string();
+        if let Some(vid) = name.strip_suffix(".meta.json") {
+            if !vid.is_empty() {
+                ids.push(vid.to_string());
+            }
+        }
+    }
+    ids.sort_by(|a, b| match (a.as_str() == "null", b.as_str() == "null") {
+        (true, false) => std::cmp::Ordering::Greater,
+        (false, true) => std::cmp::Ordering::Less,
+        _ => b.cmp(a),
+    });
+    Ok(ids)
+}
+
+fn object_locations(bucket_dir: &Path, key: &str) -> (PathBuf, PathBuf, PathBuf, PathBuf) {
+    let key_path = Path::new(key);
+    let parent = key_path.parent().unwrap_or(Path::new(""));
+    let name = key_path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| key.to_string());
+    let dir = bucket_dir.join(parent);
+    let plain = dir.join(&name);
+    let inline = plain.join(INLINE_OBJECT_PAYLOAD);
+    let meta = dir.join(format!("{name}.meta.json"));
+    let ec = dir.join(format!("{name}.ec"));
+    (plain, inline, meta, ec)
+}
+
+async fn current_data_path(plain: &Path, inline: &Path) -> std::path::PathBuf {
+    if is_file(inline).await
+        || tokio::fs::metadata(plain)
+            .await
+            .map(|meta| meta.is_dir())
+            .unwrap_or(false)
+    {
+        inline.to_path_buf()
+    } else {
+        plain.to_path_buf()
+    }
+}
+
+async fn read_object_meta(path: &Path) -> Option<ObjectMeta> {
+    let raw = tokio::fs::read_to_string(path).await.ok()?;
+    serde_json::from_str(&raw).ok()
+}
+
+async fn version_payload_intact(
+    ver_dir: &Path,
+    vid: &str,
+    meta: &ObjectMeta,
+    bucket: &str,
+    key: &str,
+    keyring: Option<&Arc<super::keys::Keyring>>,
+) -> bool {
+    let data = ver_dir.join(format!("{vid}.data"));
+    let ec = ver_dir.join(format!("{vid}.ec"));
+    let ec_exists = tokio::fs::metadata(&ec)
+        .await
+        .map(|meta| meta.is_dir())
+        .unwrap_or(false);
+    let data_exists = is_file(&data).await;
+    if ec_exists && data_exists {
+        return false;
+    }
+    if ec_exists {
+        return tokio::fs::try_exists(ec.join("manifest.json"))
+            .await
+            .unwrap_or(false);
+    }
+    if !data_exists {
+        return false;
+    }
+    if meta.encryption.is_some() {
+        return checksum_field_matches(&data, meta, bucket, key, keyring).await;
+    }
+    let Ok(len) = tokio::fs::metadata(&data).await.map(|m| m.len()) else {
+        return false;
+    };
+    if len != meta.size {
+        return false;
+    }
+    if !etag_is_multipart(&meta.etag) {
+        match file_md5_quoted(&data).await {
+            Ok(etag) if etag == meta.etag => {}
+            _ => return false,
+        }
+    }
+    checksum_field_matches(&data, meta, bucket, key, keyring).await
+}
+
+async fn checksum_field_matches(
+    data_path: &Path,
+    meta: &ObjectMeta,
+    bucket: &str,
+    key: &str,
+    keyring: Option<&Arc<super::keys::Keyring>>,
+) -> bool {
+    let (Some(algo), Some(expected)) = (meta.checksum_algorithm, meta.checksum_value.as_deref())
+    else {
+        return true;
+    };
+    match payload_checksum(data_path, meta, algo, bucket, key, keyring).await {
+        Ok(actual) => actual == expected,
+        Err(_) => false,
+    }
+}
+
+async fn sidecar_matches_payload(
+    data_path: &Path,
+    meta_path: &Path,
+    bucket: &str,
+    key: &str,
+    keyring: Option<&Arc<super::keys::Keyring>>,
+) -> bool {
+    if !is_file(data_path).await {
+        return false;
+    }
+    let Some(meta) = read_object_meta(meta_path).await else {
+        return false;
+    };
+    if meta.encryption.is_some() {
+        return checksum_field_matches(data_path, &meta, bucket, key, keyring).await;
+    }
+    let Ok(len) = tokio::fs::metadata(data_path).await.map(|m| m.len()) else {
+        return false;
+    };
+    if len != meta.size {
+        return false;
+    }
+    if !etag_is_multipart(&meta.etag) {
+        match file_md5_quoted(data_path).await {
+            Ok(etag) if etag == meta.etag => {}
+            _ => return false,
+        }
+    }
+    checksum_field_matches(data_path, &meta, bucket, key, keyring).await
+}
+
+async fn current_matches_version(
+    data_path: &Path,
+    meta_path: &Path,
+    vid: &str,
+    ver_dir: &Path,
+) -> bool {
+    let Some(meta) = read_object_meta(meta_path).await else {
+        return false;
+    };
+    if meta.version_id.as_deref() != Some(vid) {
+        return false;
+    }
+    let ver_data = ver_dir.join(format!("{vid}.data"));
+    let ver_ec = ver_dir.join(format!("{vid}.ec"));
+    if tokio::fs::metadata(&ver_ec)
+        .await
+        .map(|meta| meta.is_dir())
+        .unwrap_or(false)
+    {
+        return tokio::fs::try_exists(ver_ec.join("manifest.json"))
+            .await
+            .unwrap_or(false);
+    }
+    if !is_file(data_path).await || !is_file(&ver_data).await {
+        return false;
+    }
+    match (
+        file_md5_quoted(data_path).await,
+        file_md5_quoted(&ver_data).await,
+    ) {
+        (Ok(current), Ok(archived)) => current == archived,
+        _ => false,
+    }
+}
+
+async fn remove_current_object(plain: &Path, inline: &Path, meta: &Path, ec: &Path) {
+    if tokio::fs::metadata(plain)
+        .await
+        .map(|meta| meta.is_dir())
+        .unwrap_or(false)
+    {
+        if is_file(inline).await {
+            remove_path(inline).await;
+        }
+    } else if is_file(plain).await {
+        remove_path(plain).await;
+    }
+    if is_file(meta).await {
+        remove_path(meta).await;
+    }
+    if tokio::fs::metadata(ec)
+        .await
+        .map(|meta| meta.is_dir())
+        .unwrap_or(false)
+    {
+        remove_path(ec).await;
+    }
+}
+
+async fn restore_version_payload(
+    ver_dir: &Path,
+    vid: &str,
+    meta: &ObjectMeta,
+    data_path: &Path,
+    meta_path: &Path,
+    ec_path: &Path,
+) -> anyhow::Result<()> {
+    let ver_data = ver_dir.join(format!("{vid}.data"));
+    let ver_ec = ver_dir.join(format!("{vid}.ec"));
+    if tokio::fs::metadata(&ver_ec)
+        .await
+        .map(|meta| meta.is_dir())
+        .unwrap_or(false)
+    {
+        if tokio::fs::try_exists(ec_path).await.unwrap_or(false) {
+            remove_path(ec_path).await;
+        }
+        copy_dir_all(&ver_ec, ec_path).await?;
+        if is_file(data_path).await {
+            remove_path(data_path).await;
+        }
+    } else {
+        let dest = if tokio::fs::metadata(data_path)
+            .await
+            .map(|meta| meta.is_dir())
+            .unwrap_or(false)
+        {
+            data_path.join(INLINE_OBJECT_PAYLOAD)
+        } else {
+            data_path.to_path_buf()
+        };
+        copy_payload(&ver_data, &dest).await?;
+        if tokio::fs::metadata(ec_path)
+            .await
+            .map(|meta| meta.is_dir())
+            .unwrap_or(false)
+        {
+            remove_path(ec_path).await;
+        }
+    }
+    write_file_atomic(meta_path, serde_json::to_vec_pretty(meta)?.as_slice())
+        .await
+        .map_err(|err| anyhow::anyhow!(err))?;
+    if vid == "null" {
+        let _ = tokio::fs::remove_file(ver_dir.join("null.data")).await;
+        let _ = tokio::fs::remove_dir_all(ver_dir.join("null.ec")).await;
+        let _ = tokio::fs::remove_file(ver_dir.join("null.meta.json")).await;
+    }
+    Ok(())
+}
+
+async fn publish_version_from_current(
+    ver_dir: &Path,
+    vid: &str,
+    current_data: &Path,
+    current_meta: &ObjectMeta,
+) -> anyhow::Result<()> {
+    let ver_data = ver_dir.join(format!("{vid}.data"));
+    let ver_ec = ver_dir.join(format!("{vid}.ec"));
+    if tokio::fs::metadata(&ver_ec)
+        .await
+        .map(|meta| meta.is_dir())
+        .unwrap_or(false)
+    {
+        anyhow::bail!("version {vid} is erasure-coded; its snapshot was not replaced");
+    }
+    copy_payload(current_data, &ver_data).await?;
+    write_file_atomic(
+        &ver_dir.join(format!("{vid}.meta.json")),
+        serde_json::to_vec_pretty(current_meta)?.as_slice(),
+    )
+    .await
+    .map_err(|err| anyhow::anyhow!(err))?;
+    Ok(())
+}
+
+async fn copy_payload(src: &Path, dest: &Path) -> anyhow::Result<()> {
+    if let Some(parent) = dest.parent() {
+        tokio::fs::create_dir_all(parent).await?;
+    }
+    let tmp = dest.with_extension("maxio-restore-tmp");
+    tokio::fs::copy(src, &tmp).await?;
+    tokio::fs::rename(&tmp, dest).await?;
+    Ok(())
+}
+
+fn copy_dir_all<'a>(
+    src: &'a Path,
+    dest: &'a Path,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<()>> + Send + 'a>> {
+    Box::pin(async move {
+        tokio::fs::create_dir_all(dest).await?;
+        let mut read = tokio::fs::read_dir(src).await?;
+        while let Some(entry) = read.next_entry().await? {
+            let to = dest.join(entry.file_name());
+            if entry.file_type().await?.is_dir() {
+                copy_dir_all(&entry.path(), &to).await?;
+            } else {
+                tokio::fs::copy(entry.path(), &to).await?;
+            }
+        }
+        Ok(())
+    })
+}
+
 async fn repair_backup(
     dir: &Path,
     orig_name: &str,
@@ -1418,6 +2039,7 @@ mod tests {
     use crate::storage::filesystem::FilesystemStorage;
     use crate::storage::keys::Keyring;
     use crate::storage::{BucketMeta, ObjectMeta};
+    use md5::Digest;
     use std::sync::Arc;
 
     fn bucket_meta(name: &str) -> BucketMeta {
@@ -2389,6 +3011,422 @@ mod tests {
         let kept = std::fs::read_to_string(quarantine.join("plain.txt.meta.json")).unwrap();
         assert_eq!(kept, plain_sum);
         assert!(!kept.contains("adopt"), "{kept}");
+    }
+
+    fn flip_first_byte(path: &std::path::Path) -> Vec<u8> {
+        let mut bytes = std::fs::read(path).unwrap();
+        bytes[0] ^= 0xff;
+        std::fs::write(path, &bytes).unwrap();
+        bytes
+    }
+
+    #[tokio::test]
+    async fn single_part_etag_without_checksum_is_quarantined() {
+        // curl and mc PUT an object with no checksum. The etag is the MD5.
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = storage_at(tmp.path()).await;
+        storage.create_bucket(&bucket_meta("bkt")).await.unwrap();
+        storage
+            .put_object(
+                "bkt",
+                "curl.txt",
+                "text/plain",
+                Box::pin(&b"curl-body"[..]),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        storage
+            .put_object(
+                "bkt",
+                "mc.txt",
+                "text/plain",
+                Box::pin(&b"mc-body"[..]),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let bucket = tmp.path().join("buckets/bkt");
+        let original_meta = std::fs::read_to_string(bucket.join("curl.txt.meta.json")).unwrap();
+        assert!(
+            !original_meta.contains("checksum_value"),
+            "curl/mc objects store no checksum: {original_meta}"
+        );
+        let flipped = flip_first_byte(&bucket.join("curl.txt"));
+        let reported = check(tmp.path(), false).await.unwrap();
+        assert!(
+            reported.issues.iter().any(|issue| {
+                issue.kind == IssueKind::EtagMismatch && !issue.repaired && !issue.advisory
+            }),
+            "{:?}",
+            reported.issues
+        );
+        assert_eq!(
+            std::fs::read_to_string(bucket.join("curl.txt.meta.json")).unwrap(),
+            original_meta,
+            "a read-only check must not rewrite the etag"
+        );
+
+        let repaired = check(tmp.path(), true).await.unwrap();
+        assert!(
+            repaired.issues.iter().any(|issue| {
+                issue.kind == IssueKind::EtagMismatch
+                    && issue.repaired
+                    && issue.detail.contains("Quarantined")
+                    && issue.detail.contains("without adopting")
+            }),
+            "{:?}",
+            repaired.issues
+        );
+        assert!(!bucket.join("curl.txt").exists());
+        assert!(bucket.join("mc.txt").is_file(), "untampered object stays");
+        let quarantine = tmp.path().join(".maxio-quarantine/bkt");
+        assert_eq!(std::fs::read(quarantine.join("curl.txt")).unwrap(), flipped);
+        let kept = std::fs::read_to_string(quarantine.join("curl.txt.meta.json")).unwrap();
+        assert_eq!(kept, original_meta);
+        assert!(
+            repaired.unresolved() == 0,
+            "quarantine resolves the etag mismatch: {:?}",
+            repaired.issues
+        );
+    }
+
+    #[tokio::test]
+    async fn accept_current_checksums_records_single_part_etag() {
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = storage_at(tmp.path()).await;
+        storage.create_bucket(&bucket_meta("bkt")).await.unwrap();
+        storage
+            .put_object(
+                "bkt",
+                "note.txt",
+                "text/plain",
+                Box::pin(&b"note"[..]),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let bucket = tmp.path().join("buckets/bkt");
+        flip_first_byte(&bucket.join("note.txt"));
+        let repaired = check_with_opts(tmp.path(), true, None, true).await.unwrap();
+        assert!(
+            repaired.issues.iter().any(|issue| {
+                issue.kind == IssueKind::EtagMismatch
+                    && issue.repaired
+                    && issue.detail.contains("--accept-current-checksums")
+            }),
+            "{:?}",
+            repaired.issues
+        );
+        assert!(bucket.join("note.txt").is_file());
+        assert!(!tmp.path().join(".maxio-quarantine").exists());
+        let meta: ObjectMeta = serde_json::from_str(
+            &std::fs::read_to_string(bucket.join("note.txt.meta.json")).unwrap(),
+        )
+        .unwrap();
+        let file_md5 = format!(
+            "\"{}\"",
+            hex::encode(md5::Md5::digest(
+                std::fs::read(bucket.join("note.txt")).unwrap()
+            ))
+        );
+        assert_eq!(meta.etag, file_md5);
+        let again = check(tmp.path(), false).await.unwrap();
+        assert_eq!(again.unresolved(), 0, "{:?}", again.issues);
+    }
+
+    #[tokio::test]
+    async fn data450_era_sidecar_etag_mismatch_is_quarantined() {
+        // Pre-checksum sidecars stored only key, size, etag, content type, and mtime.
+        let tmp = tempfile::tempdir().unwrap();
+        let bucket = tmp.path().join("buckets/bkt");
+        std::fs::create_dir_all(&bucket).unwrap();
+        let body = b"hello";
+        std::fs::write(bucket.join("old.txt"), body).unwrap();
+        let real = format!("\"{}\"", hex::encode(md5::Md5::digest(body)));
+        let sidecar = r#"{"key":"old.txt","size":5,"etag":"\"00000000000000000000000000000000\"","content_type":"text/plain","last_modified":"2024-04-01T00:00:00.000Z"}"#;
+        std::fs::write(bucket.join("old.txt.meta.json"), &sidecar).unwrap();
+        assert_ne!(real, "\"00000000000000000000000000000000\"");
+
+        let reported = check(tmp.path(), false).await.unwrap();
+        assert!(
+            reported.unresolved() >= 1,
+            "data450-era etag mismatch must be reported: {:?}",
+            reported.issues
+        );
+        assert_eq!(
+            std::fs::read_to_string(bucket.join("old.txt.meta.json")).unwrap(),
+            sidecar
+        );
+
+        let repaired = check(tmp.path(), true).await.unwrap();
+        assert!(
+            repaired.issues.iter().any(|issue| {
+                issue.kind == IssueKind::EtagMismatch
+                    && issue.repaired
+                    && issue.detail.contains("Quarantined")
+            }),
+            "{:?}",
+            repaired.issues
+        );
+        assert!(!bucket.join("old.txt").exists());
+        let kept =
+            std::fs::read_to_string(tmp.path().join(".maxio-quarantine/bkt/old.txt.meta.json"))
+                .unwrap();
+        assert!(
+            kept.contains("00000000000000000000000000000000"),
+            "repair must not adopt the corrupted etag: {kept}"
+        );
+        assert!(!kept.contains("checksum"), "{kept}");
+    }
+
+    #[tokio::test]
+    async fn multipart_etag_is_unverifiable_and_not_rewritten() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bucket = tmp.path().join("buckets/bkt");
+        std::fs::create_dir_all(&bucket).unwrap();
+        let body = b"not-the-part-md5s";
+        std::fs::write(bucket.join("multi.bin"), body).unwrap();
+        let meta = ObjectMeta {
+            key: "multi.bin".into(),
+            size: body.len() as u64,
+            etag: "\"0123456789abcdef0123456789abcdef-2\"".into(),
+            content_type: "application/octet-stream".into(),
+            last_modified: "2024-04-01T00:00:00.000Z".into(),
+            ..ObjectMeta::default()
+        };
+        let sidecar = serde_json::to_vec_pretty(&meta).unwrap();
+        std::fs::write(bucket.join("multi.bin.meta.json"), &sidecar).unwrap();
+
+        let repaired = check(tmp.path(), true).await.unwrap();
+        assert!(
+            repaired.issues.iter().any(|issue| {
+                issue.kind == IssueKind::EtagMismatch
+                    && issue.advisory
+                    && !issue.repaired
+                    && issue.detail.contains("cannot be verified")
+            }),
+            "{:?}",
+            repaired.issues
+        );
+        assert_eq!(
+            std::fs::read(bucket.join("multi.bin.meta.json")).unwrap(),
+            sidecar
+        );
+        assert_eq!(std::fs::read(bucket.join("multi.bin")).unwrap(), body);
+        assert!(
+            !tmp.path().join(".maxio-quarantine").exists(),
+            "a multipart etag must not be quarantined just because it is not a whole-object MD5"
+        );
+        assert_eq!(repaired.unresolved(), 0, "{:?}", repaired.issues);
+    }
+
+    async fn read_version(storage: &FilesystemStorage, key: &str, version_id: &str) -> Vec<u8> {
+        let (mut reader, _) = storage
+            .get_object_version("bkt", key, version_id, None)
+            .await
+            .unwrap();
+        let mut buf = Vec::new();
+        tokio::io::AsyncReadExt::read_to_end(&mut reader, &mut buf)
+            .await
+            .unwrap();
+        buf
+    }
+
+    #[tokio::test]
+    async fn repair_restores_current_object_from_the_intact_version() {
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = storage_at(tmp.path()).await;
+        storage.create_bucket(&bucket_meta("bkt")).await.unwrap();
+        storage.set_versioning("bkt", true).await.unwrap();
+        storage
+            .put_object(
+                "bkt",
+                "obj",
+                "text/plain",
+                Box::pin(&b"one"[..]),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        storage
+            .put_object(
+                "bkt",
+                "obj",
+                "text/plain",
+                Box::pin(&b"two"[..]),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let bucket = tmp.path().join("buckets/bkt");
+        let meta: ObjectMeta =
+            serde_json::from_str(&std::fs::read_to_string(bucket.join("obj.meta.json")).unwrap())
+                .unwrap();
+        let vid = meta.version_id.clone().unwrap();
+        let ver_data = bucket.join(".versions/obj").join(format!("{vid}.data"));
+        assert_eq!(std::fs::read(&ver_data).unwrap(), b"two");
+        let flipped = flip_first_byte(&bucket.join("obj"));
+        assert_ne!(flipped, b"two");
+
+        let reported = check(tmp.path(), false).await.unwrap();
+        assert!(
+            reported.issues.iter().any(|issue| {
+                issue.kind == IssueKind::CurrentVersionMismatch && !issue.repaired
+            }),
+            "check must see the current/version split: {:?}",
+            reported.issues
+        );
+        assert_eq!(std::fs::read(bucket.join("obj")).unwrap(), flipped);
+
+        let repaired = check(tmp.path(), true).await.unwrap();
+        assert!(
+            repaired.issues.iter().any(|issue| {
+                issue.kind == IssueKind::CurrentVersionMismatch
+                    && issue.repaired
+                    && issue.detail.to_lowercase().contains("restored")
+            }),
+            "{:?}",
+            repaired.issues
+        );
+        assert_eq!(repaired.unresolved(), 0, "{:?}", repaired.issues);
+        assert_eq!(read_key(&storage, "obj").await, b"two");
+        let listed = storage.list_objects("bkt", "").await.unwrap();
+        assert!(
+            listed.iter().any(|obj| obj.key == "obj"),
+            "list-objects must show the restored current object: {listed:?}"
+        );
+        assert_eq!(read_version(&storage, "obj", &vid).await, b"two");
+        let versions = storage.list_object_versions("bkt", "obj").await.unwrap();
+        assert!(
+            versions
+                .iter()
+                .any(|obj| obj.version_id.as_deref() == Some(vid.as_str())),
+            "{versions:?}"
+        );
+        let again = check(tmp.path(), false).await.unwrap();
+        assert_eq!(again.unresolved(), 0, "{:?}", again.issues);
+    }
+
+    #[tokio::test]
+    async fn missing_current_version_is_reported_and_restored() {
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = storage_at(tmp.path()).await;
+        storage.create_bucket(&bucket_meta("bkt")).await.unwrap();
+        storage.set_versioning("bkt", true).await.unwrap();
+        storage
+            .put_object(
+                "bkt",
+                "obj",
+                "text/plain",
+                Box::pin(&b"kept"[..]),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let bucket = tmp.path().join("buckets/bkt");
+        std::fs::remove_file(bucket.join("obj")).unwrap();
+        std::fs::remove_file(bucket.join("obj.meta.json")).unwrap();
+
+        let reported = check(tmp.path(), false).await.unwrap();
+        assert!(
+            reported.issues.iter().any(|issue| {
+                issue.kind == IssueKind::CurrentVersionMismatch
+                    && !issue.repaired
+                    && issue.detail.contains("missing")
+            }),
+            "{:?}",
+            reported.issues
+        );
+        assert!(!bucket.join("obj").exists());
+
+        let repaired = check(tmp.path(), true).await.unwrap();
+        assert_eq!(repaired.unresolved(), 0, "{:?}", repaired.issues);
+        assert_eq!(read_key(&storage, "obj").await, b"kept");
+        let listed = storage.list_objects("bkt", "").await.unwrap();
+        assert!(listed.iter().any(|obj| obj.key == "obj"));
+        let again = check(tmp.path(), false).await.unwrap();
+        assert_eq!(again.unresolved(), 0, "{:?}", again.issues);
+    }
+
+    #[tokio::test]
+    async fn newest_delete_marker_removes_a_stale_current_object() {
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = storage_at(tmp.path()).await;
+        storage.create_bucket(&bucket_meta("bkt")).await.unwrap();
+        storage.set_versioning("bkt", true).await.unwrap();
+        storage
+            .put_object(
+                "bkt",
+                "obj",
+                "text/plain",
+                Box::pin(&b"gone"[..]),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let deleted = storage.delete_object("bkt", "obj").await.unwrap();
+        assert!(deleted.is_delete_marker);
+        let bucket = tmp.path().join("buckets/bkt");
+        assert!(!bucket.join("obj").exists());
+        let consistent = check(tmp.path(), false).await.unwrap();
+        assert_eq!(consistent.unresolved(), 0, "{:?}", consistent.issues);
+
+        let ver_dir = bucket.join(".versions/obj");
+        let data_name = std::fs::read_dir(&ver_dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .find(|name| name.ends_with(".data"))
+            .expect("the put must leave a version payload");
+        let vid = data_name.trim_end_matches(".data");
+        std::fs::copy(ver_dir.join(&data_name), bucket.join("obj")).unwrap();
+        std::fs::copy(
+            ver_dir.join(format!("{vid}.meta.json")),
+            bucket.join("obj.meta.json"),
+        )
+        .unwrap();
+
+        let reported = check(tmp.path(), false).await.unwrap();
+        assert!(
+            reported.issues.iter().any(|issue| {
+                issue.kind == IssueKind::CurrentVersionMismatch
+                    && !issue.repaired
+                    && issue.detail.contains("delete marker")
+            }),
+            "{:?}",
+            reported.issues
+        );
+        let repaired = check(tmp.path(), true).await.unwrap();
+        assert!(
+            repaired.issues.iter().any(|issue| {
+                issue.kind == IssueKind::CurrentVersionMismatch
+                    && issue.repaired
+                    && issue.detail.contains("delete marker")
+            }),
+            "{:?}",
+            repaired.issues
+        );
+        assert!(!bucket.join("obj").exists());
+        assert!(!bucket.join("obj.meta.json").exists());
+        match storage.get_object("bkt", "obj", None).await {
+            Err(crate::storage::StorageError::NotFound(_)) => {}
+            Err(err) => panic!("deleted current object must be NotFound, got {err}"),
+            Ok(_) => panic!("deleted current object must not be readable"),
+        }
+        let versions = storage.list_object_versions("bkt", "obj").await.unwrap();
+        assert!(
+            versions.iter().any(|obj| obj.is_delete_marker),
+            "{versions:?}"
+        );
+        let again = check(tmp.path(), false).await.unwrap();
+        assert_eq!(again.unresolved(), 0, "{:?}", again.issues);
     }
 }
 

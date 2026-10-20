@@ -101,8 +101,8 @@ enum Commands {
         #[arg(long)]
         master_key_file: Option<std::path::PathBuf>,
 
-        /// With `--repair`, write a mismatched checksum to match the payload.
-        /// Without this flag a checksum mismatch is quarantined, not adopted.
+        /// With `--repair`, record a mismatched checksum or single-part etag
+        /// from the payload instead of quarantining the object.
         #[arg(long)]
         accept_current_checksums: bool,
     },

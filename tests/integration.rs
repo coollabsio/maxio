@@ -1027,6 +1027,115 @@ async fn logout_stays_revoked_after_restart_and_sessions_are_distinct() {
     assert_eq!(other.status(), 200, "the live session survives a restart");
 }
 
+#[tokio::test]
+async fn corrupt_revocation_file_fails_closed_and_logout_write_failure_is_500() {
+    let tmp = TempDir::new().unwrap();
+    let data_dir = tmp.path().to_str().unwrap();
+    let first = spawn_console(data_dir).await;
+    let login = client()
+        .post(format!("{first}/maxio/api/auth/login"))
+        .json(&serde_json::json!({
+            "accessKey": ACCESS_KEY,
+            "secretKey": SECRET_KEY
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(login.status(), 200);
+    let session = login
+        .headers()
+        .get("set-cookie")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap()
+        .to_string();
+    assert!(tmp.path().join(".maxio-revoked-sessions.json").is_file());
+    assert!(
+        tmp.path().join(".maxio-revoked-sessions.ready").is_file(),
+        "first start writes a marker so a later deletion is not a first start"
+    );
+
+    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    std::fs::write(tmp.path().join(".maxio-revoked-sessions.json"), b"{").unwrap();
+    let second = spawn_console(data_dir).await;
+    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    let rejected = client()
+        .get(format!("{second}/maxio/api/version"))
+        .header("cookie", &session)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        rejected.status(),
+        401,
+        "a corrupt revocation file revokes sessions issued before this process: {}",
+        rejected.text().await.unwrap()
+    );
+    let fresh_login = client()
+        .post(format!("{second}/maxio/api/auth/login"))
+        .json(&serde_json::json!({
+            "accessKey": ACCESS_KEY,
+            "secretKey": SECRET_KEY
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        fresh_login.status(),
+        200,
+        "a login after the epoch still works"
+    );
+    let fresh = fresh_login
+        .headers()
+        .get("set-cookie")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap()
+        .to_string();
+    let alive = client()
+        .get(format!("{second}/maxio/api/version"))
+        .header("cookie", &fresh)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(alive.status(), 200, "{}", alive.text().await.unwrap());
+
+    let path = tmp.path().join(".maxio-revoked-sessions.json");
+    std::fs::remove_file(&path).unwrap();
+    std::fs::create_dir(&path).unwrap();
+    let logout = client()
+        .post(format!("{second}/maxio/api/auth/logout"))
+        .header("cookie", &fresh)
+        .send()
+        .await
+        .unwrap();
+    let status = logout.status();
+    let body = logout.text().await.unwrap();
+    assert_eq!(status, 500, "{body}");
+    assert!(
+        body.contains("could not be saved"),
+        "logout must not pretend the revocation was saved: {body}"
+    );
+    let after = client()
+        .get(format!("{second}/maxio/api/version"))
+        .header("cookie", &fresh)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        after.status(),
+        401,
+        "the session is revoked in memory even when the write fails: {}",
+        after.text().await.unwrap()
+    );
+}
+
 async fn spawn_console(data_dir: &str) -> String {
     let keyring = Arc::new(Keyring::load(data_dir, None).await.unwrap());
     let storage = FilesystemStorage::new(data_dir, false, 10 * 1024 * 1024, 0, keyring)

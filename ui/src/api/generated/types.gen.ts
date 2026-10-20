@@ -523,6 +523,15 @@ export type LogoutData = {
     url: '/maxio/api/auth/logout';
 };
 
+export type LogoutErrors = {
+    /**
+     * The session was revoked in memory but could not be saved
+     */
+    500: ErrorResponse;
+};
+
+export type LogoutError = LogoutErrors[keyof LogoutErrors];
+
 export type LogoutResponses = {
     200: OkResponse;
 };

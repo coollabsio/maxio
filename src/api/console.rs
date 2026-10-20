@@ -27,15 +27,26 @@ const COOKIE_NAME: &str = "maxio_session";
 
 /// Sessions logout has already accepted. The set is written to the data
 /// directory so a restart does not make a revoked cookie valid again.
+///
+/// `{data_dir}/.maxio-revoked-sessions.ready` is created with the revocation
+/// file on first start. A later process that finds the marker but no readable
+/// revocation file treats every session issued at or before that start as
+/// revoked. A data directory that has neither file has no prior revocations.
 #[derive(Clone)]
 pub struct RevokedSessions {
     path: Option<std::path::PathBuf>,
     /// jti → unix expiry. Expired entries are dropped on load and on revoke.
     entries: Arc<Mutex<HashMap<String, i64>>>,
+    /// Sessions with `issued_at <= not_before` are rejected. Set when the
+    /// revocation file is missing after first start, or is unreadable or corrupt.
+    not_before: Arc<Mutex<Option<i64>>>,
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
 struct RevocationFile {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    not_before: Option<i64>,
+    #[serde(default)]
     entries: Vec<RevocationEntry>,
 }
 
@@ -45,37 +56,113 @@ struct RevocationEntry {
     expires_at: i64,
 }
 
+const REVOKED_SESSIONS_FILE: &str = ".maxio-revoked-sessions.json";
+const REVOKED_SESSIONS_MARKER: &str = ".maxio-revoked-sessions.ready";
+
+enum LoadedRevocations {
+    Missing,
+    Unreadable(String),
+    Corrupt(String),
+    Ready(RevocationFile),
+}
+
 impl RevokedSessions {
     #[allow(dead_code)]
     pub fn new() -> Self {
         Self {
             path: None,
             entries: Arc::new(Mutex::new(HashMap::new())),
+            not_before: Arc::new(Mutex::new(None)),
         }
     }
 
     /// Load `{data_dir}/.maxio-revoked-sessions.json`, dropping expired rows.
+    ///
+    /// The first successful open writes an empty revocation file and a marker.
+    /// A missing, unreadable, or corrupt file after that marker exists fails
+    /// closed: `not_before` is this process's start time.
     pub async fn open(data_dir: &std::path::Path) -> Self {
-        let path = data_dir.join(".maxio-revoked-sessions.json");
+        let path = data_dir.join(REVOKED_SESSIONS_FILE);
+        let marker = data_dir.join(REVOKED_SESSIONS_MARKER);
         let now = chrono::Utc::now().timestamp();
-        let mut map = read_revocations(&path).await;
-        let before = map.len();
-        map.retain(|_, exp| *exp > now);
+        let loaded = load_revocation_file(&path).await;
+        let marker_exists = tokio::fs::try_exists(&marker).await.unwrap_or(false);
+
+        let (map, not_before, write, failed_closed) = match loaded {
+            LoadedRevocations::Ready(file) => {
+                let mut map: HashMap<String, i64> = file
+                    .entries
+                    .into_iter()
+                    .map(|entry| (entry.jti, entry.expires_at))
+                    .collect();
+                let before = map.len();
+                map.retain(|_, exp| *exp > now);
+                let pruned = map.len() != before;
+                (map, file.not_before, pruned || !marker_exists, false)
+            }
+            LoadedRevocations::Missing if !marker_exists => (HashMap::new(), None, true, false),
+            LoadedRevocations::Missing => {
+                tracing::warn!("{}", revocation_deleted_warning(&path, &marker));
+                (HashMap::new(), Some(now), true, true)
+            }
+            LoadedRevocations::Unreadable(err) => {
+                tracing::warn!(
+                    "{}",
+                    revocation_fail_closed_warning(&path, &format!("unreadable ({err})"))
+                );
+                (HashMap::new(), Some(now), true, true)
+            }
+            LoadedRevocations::Corrupt(err) => {
+                tracing::warn!(
+                    "{}",
+                    revocation_fail_closed_warning(&path, &format!("corrupt ({err})"))
+                );
+                (HashMap::new(), Some(now), true, true)
+            }
+        };
+
         let store = Self {
             path: Some(path),
             entries: Arc::new(Mutex::new(map)),
+            not_before: Arc::new(Mutex::new(not_before)),
         };
-        if store.len() != before {
-            store.persist().await;
+        if write {
+            if let Err(err) = store.persist().await {
+                if failed_closed {
+                    tracing::error!(
+                        "failed to record the session epoch in {}: {err}. Sessions issued at or before this process start stay revoked until the process exits.",
+                        store
+                            .path
+                            .as_ref()
+                            .map(|p| p.display().to_string())
+                            .unwrap_or_default()
+                    );
+                } else {
+                    tracing::error!(
+                        "failed to create the revoked-sessions file {}: {err}. A later logout cannot be saved until this path is writable.",
+                        store
+                            .path
+                            .as_ref()
+                            .map(|p| p.display().to_string())
+                            .unwrap_or_default()
+                    );
+                }
+            }
         }
         store
     }
 
-    fn len(&self) -> usize {
-        self.entries.lock().map(|g| g.len()).unwrap_or(0)
+    /// Unix time at or before which issued sessions are rejected.
+    pub fn session_epoch(&self) -> Option<i64> {
+        match self.not_before.lock() {
+            Ok(guard) => *guard,
+            Err(poisoned) => *poisoned.into_inner(),
+        }
     }
 
-    pub async fn revoke(&self, jti: &str, expires_at: i64) {
+    /// Record a logout. The session is revoked in memory even when the file
+    /// cannot be replaced. The error is the write failure.
+    pub async fn revoke(&self, jti: &str, expires_at: i64) -> Result<(), String> {
         let now = chrono::Utc::now().timestamp();
         {
             let mut guard = match self.entries.lock() {
@@ -85,7 +172,18 @@ impl RevokedSessions {
             guard.retain(|_, exp| *exp > now);
             guard.insert(jti.to_string(), expires_at);
         }
-        self.persist().await;
+        if let Err(err) = self.persist().await {
+            let where_ = self
+                .path
+                .as_ref()
+                .map(|path| path.display().to_string())
+                .unwrap_or_else(|| REVOKED_SESSIONS_FILE.to_string());
+            tracing::error!(
+                "failed to write revoked sessions to {where_}: {err}. The session is revoked in this process only."
+            );
+            return Err(err);
+        }
+        Ok(())
     }
 
     pub fn contains(&self, jti: &str) -> bool {
@@ -97,60 +195,126 @@ impl RevokedSessions {
         guard.get(jti).is_some_and(|exp| *exp > now)
     }
 
-    async fn persist(&self) {
+    /// True when this cookie was logged out or was issued at or before a
+    /// fail-closed session epoch.
+    pub fn rejects(&self, issued_at: i64, jti: &str) -> bool {
+        if self.session_epoch().is_some_and(|cut| issued_at <= cut) {
+            return true;
+        }
+        self.contains(jti)
+    }
+
+    async fn persist(&self) -> Result<(), String> {
         let Some(path) = &self.path else {
-            return;
+            return Ok(());
         };
-        let entries: Vec<RevocationEntry> = {
+        let (entries, not_before) = {
             let guard = match self.entries.lock() {
                 Ok(guard) => guard,
                 Err(poisoned) => poisoned.into_inner(),
             };
-            guard
+            let not_before = match self.not_before.lock() {
+                Ok(guard) => *guard,
+                Err(poisoned) => *poisoned.into_inner(),
+            };
+            let entries = guard
                 .iter()
                 .map(|(jti, expires_at)| RevocationEntry {
                     jti: jti.clone(),
                     expires_at: *expires_at,
                 })
-                .collect()
+                .collect();
+            (entries, not_before)
         };
-        let Ok(body) = serde_json::to_vec_pretty(&RevocationFile { entries }) else {
-            return;
-        };
-        let tmp = path.with_extension("json.tmp");
+        let body = serde_json::to_vec_pretty(&RevocationFile {
+            not_before,
+            entries,
+        })
+        .map_err(|err| err.to_string())?;
         if let Some(parent) = path.parent() {
-            let _ = tokio::fs::create_dir_all(parent).await;
+            tokio::fs::create_dir_all(parent)
+                .await
+                .map_err(|err| err.to_string())?;
         }
+        let tmp = path.with_extension("json.tmp");
         let mut opts = tokio::fs::OpenOptions::new();
         opts.write(true).create(true).truncate(true);
         #[cfg(unix)]
         {
             opts.mode(0o600);
         }
-        if opts.open(&tmp).await.is_ok() {
-            if tokio::fs::write(&tmp, &body).await.is_ok() {
-                let _ = tokio::fs::rename(&tmp, path).await;
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::PermissionsExt;
-                    let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
-                }
-            }
+        {
+            use tokio::io::AsyncWriteExt;
+            let mut file = opts
+                .open(&tmp)
+                .await
+                .map_err(|err| format!("cannot write {}: {err}", tmp.display()))?;
+            file.write_all(&body)
+                .await
+                .map_err(|err| format!("cannot write {}: {err}", tmp.display()))?;
+            file.sync_all()
+                .await
+                .map_err(|err| format!("cannot sync {}: {err}", tmp.display()))?;
         }
+        tokio::fs::rename(&tmp, path).await.map_err(|err| {
+            let _ = std::fs::remove_file(&tmp);
+            format!("cannot replace {}: {err}", path.display())
+        })?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+                .map_err(|err| format!("cannot set permissions on {}: {err}", path.display()))?;
+        }
+        let marker = path.with_file_name(REVOKED_SESSIONS_MARKER);
+        if !tokio::fs::try_exists(&marker).await.unwrap_or(false) {
+            let mut marker_opts = tokio::fs::OpenOptions::new();
+            marker_opts.write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                marker_opts.mode(0o600);
+            }
+            marker_opts.open(&marker).await.map_err(|err| {
+                format!(
+                    "cannot write session-store marker {}: {err}",
+                    marker.display()
+                )
+            })?;
+        }
+        Ok(())
     }
 }
 
-async fn read_revocations(path: &std::path::Path) -> HashMap<String, i64> {
-    let Ok(raw) = tokio::fs::read_to_string(path).await else {
-        return HashMap::new();
-    };
-    let Ok(file) = serde_json::from_str::<RevocationFile>(&raw) else {
-        return HashMap::new();
-    };
-    file.entries
-        .into_iter()
-        .map(|entry| (entry.jti, entry.expires_at))
-        .collect()
+fn revocation_fail_closed_warning(path: &std::path::Path, reason: &str) -> String {
+    format!(
+        "revoked-sessions file {} is {reason}. Failing closed: every console session issued at or before this process start is revoked",
+        path.display()
+    )
+}
+
+fn revocation_deleted_warning(path: &std::path::Path, marker: &std::path::Path) -> String {
+    format!(
+        "revoked-sessions file {} is missing, but {} shows this data directory already had a session store. Failing closed: every console session issued at or before this process start is revoked",
+        path.display(),
+        marker.display()
+    )
+}
+
+async fn load_revocation_file(path: &std::path::Path) -> LoadedRevocations {
+    match tokio::fs::metadata(path).await {
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => LoadedRevocations::Missing,
+        Err(err) => LoadedRevocations::Unreadable(err.to_string()),
+        Ok(meta) if meta.is_dir() => {
+            LoadedRevocations::Unreadable("path is a directory".to_string())
+        }
+        Ok(_) => match tokio::fs::read_to_string(path).await {
+            Err(err) => LoadedRevocations::Unreadable(err.to_string()),
+            Ok(raw) => match serde_json::from_str::<RevocationFile>(&raw) {
+                Ok(file) => LoadedRevocations::Ready(file),
+                Err(err) => LoadedRevocations::Corrupt(err.to_string()),
+            },
+        },
+    }
 }
 const TOKEN_MAX_AGE_SECS: i64 = 7 * 24 * 60 * 60; // 7 days
 
@@ -303,7 +467,10 @@ async fn console_auth_middleware(
         return error(StatusCode::UNAUTHORIZED, "Not authenticated");
     };
     if let Some(parsed) = crate::iam::session::parse_token(&token) {
-        if state.revoked_sessions.contains(parsed.revocation_id()) {
+        if state
+            .revoked_sessions
+            .rejects(parsed.issued_at, parsed.revocation_id())
+        {
             return error(StatusCode::UNAUTHORIZED, "Not authenticated");
         }
     }
@@ -493,7 +660,10 @@ pub async fn check(State(state): State<AppState>, headers: HeaderMap) -> Respons
         return error(StatusCode::UNAUTHORIZED, "Not authenticated");
     };
     if let Some(parsed) = crate::iam::session::parse_token(&token) {
-        if state.revoked_sessions.contains(parsed.revocation_id()) {
+        if state
+            .revoked_sessions
+            .rejects(parsed.issued_at, parsed.revocation_id())
+        {
             return error(StatusCode::UNAUTHORIZED, "Not authenticated");
         }
     }
@@ -508,24 +678,44 @@ pub async fn check(State(state): State<AppState>, headers: HeaderMap) -> Respons
     path = "/maxio/api/auth/logout",
     operation_id = "logout",
     tag = "auth",
-    responses((status = 200, body = OkResponse))
+    responses(
+        (status = 200, body = OkResponse),
+        (status = 500, description = "The session was revoked in memory but could not be saved", body = ErrorResponse)
+    )
 )]
 pub async fn logout(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    let mut saved = true;
     if let Some(token) = extract_cookie(&headers) {
         if let Some(parsed) = crate::iam::session::parse_token(&token) {
             let expires_at = parsed
                 .issued_at
                 .saturating_add(crate::iam::session::TOKEN_MAX_AGE_SECS);
-            state
+            if let Err(err) = state
                 .revoked_sessions
                 .revoke(parsed.revocation_id(), expires_at)
-                .await;
+                .await
+            {
+                tracing::error!(
+                    "logout revoked the session in memory but could not save it: {err}"
+                );
+                saved = false;
+            }
         }
     }
     let cookie = make_cookie("", 0, console_cookie_secure(&state.config, &headers));
-    let mut resp_headers = HeaderMap::new();
-    resp_headers.insert("Set-Cookie", cookie.parse().unwrap());
-    (resp_headers, ok()).into_response()
+    if saved {
+        let mut resp_headers = HeaderMap::new();
+        resp_headers.insert("Set-Cookie", cookie.parse().unwrap());
+        return (resp_headers, ok()).into_response();
+    }
+    let mut resp = error(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "session was revoked in memory but could not be saved",
+    );
+    if let Ok(value) = cookie.parse() {
+        resp.headers_mut().insert("Set-Cookie", value);
+    }
+    resp
 }
 
 async fn console_csrf_middleware(
@@ -2531,5 +2721,117 @@ mod tests {
         let public_host = header_map(&[("host", "storage.example.com")]);
         assert!(!console_cookie_secure(&insecure, &public_host));
         assert!(!console_cookie_secure(&opted_out, &public_host));
+    }
+
+    fn revocation_path(dir: &std::path::Path) -> std::path::PathBuf {
+        dir.join(".maxio-revoked-sessions.json")
+    }
+
+    fn marker_path(dir: &std::path::Path) -> std::path::PathBuf {
+        dir.join(".maxio-revoked-sessions.ready")
+    }
+
+    #[test]
+    fn revocation_warnings_name_the_fail_closed_epoch() {
+        let path = std::path::Path::new("/data/.maxio-revoked-sessions.json");
+        let marker = std::path::Path::new("/data/.maxio-revoked-sessions.ready");
+        let corrupt = revocation_fail_closed_warning(path, "corrupt (expected value)");
+        assert!(corrupt.contains("Failing closed"), "{corrupt}");
+        assert!(corrupt.contains("issued at or before"), "{corrupt}");
+        assert!(corrupt.contains(path.to_str().unwrap()), "{corrupt}");
+        let deleted = revocation_deleted_warning(path, marker);
+        assert!(deleted.contains("Failing closed"), "{deleted}");
+        assert!(deleted.contains("already had a session store"), "{deleted}");
+        assert!(deleted.contains(marker.to_str().unwrap()), "{deleted}");
+    }
+
+    #[tokio::test]
+    async fn first_open_writes_an_empty_store_and_does_not_revoke() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = RevokedSessions::open(temp.path()).await;
+        assert!(store.session_epoch().is_none());
+        assert!(revocation_path(temp.path()).is_file());
+        assert!(marker_path(temp.path()).is_file());
+        let raw = std::fs::read_to_string(revocation_path(temp.path())).unwrap();
+        let file: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert!(file["entries"].as_array().unwrap().is_empty(), "{raw}");
+        assert!(file.get("not_before").is_none(), "{raw}");
+        let now = chrono::Utc::now().timestamp();
+        assert!(!store.rejects(now - 60, "never-issued"));
+
+        let again = RevokedSessions::open(temp.path()).await;
+        assert!(again.session_epoch().is_none());
+        assert!(!again.rejects(now - 60, "never-issued"));
+    }
+
+    #[tokio::test]
+    async fn deleted_revocation_file_fails_closed_and_keeps_the_epoch() {
+        let temp = tempfile::tempdir().unwrap();
+        RevokedSessions::open(temp.path()).await;
+        std::fs::remove_file(revocation_path(temp.path())).unwrap();
+        assert!(marker_path(temp.path()).is_file());
+
+        let closed = RevokedSessions::open(temp.path()).await;
+        let epoch = closed
+            .session_epoch()
+            .expect("deleted file must set an epoch");
+        assert!(closed.rejects(epoch, "old-session"));
+        assert!(closed.rejects(epoch - 10, "older-session"));
+        assert!(!closed.rejects(epoch + 2, "fresh-session"));
+        let saved: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(revocation_path(temp.path())).unwrap())
+                .unwrap();
+        assert_eq!(saved["not_before"], epoch);
+
+        let reloaded = RevokedSessions::open(temp.path()).await;
+        assert_eq!(reloaded.session_epoch(), Some(epoch));
+        assert!(reloaded.rejects(epoch, "old-session"));
+        assert!(!reloaded.rejects(epoch + 2, "fresh-session"));
+    }
+
+    #[tokio::test]
+    async fn corrupt_or_directory_revocation_file_fails_closed() {
+        let temp = tempfile::tempdir().unwrap();
+        RevokedSessions::open(temp.path()).await;
+        std::fs::write(revocation_path(temp.path()), b"{not-json").unwrap();
+        let corrupt = RevokedSessions::open(temp.path()).await;
+        let epoch = corrupt
+            .session_epoch()
+            .expect("corrupt file must set an epoch");
+        assert!(corrupt.rejects(epoch, "any"));
+        assert!(!corrupt.rejects(epoch + 5, "later"));
+
+        let blocked = tempfile::tempdir().unwrap();
+        RevokedSessions::open(blocked.path()).await;
+        std::fs::remove_file(revocation_path(blocked.path())).unwrap();
+        std::fs::create_dir(revocation_path(blocked.path())).unwrap();
+        let dir_store = RevokedSessions::open(blocked.path()).await;
+        let dir_epoch = dir_store
+            .session_epoch()
+            .expect("directory must set an epoch");
+        assert!(dir_store.rejects(dir_epoch, "any"));
+        let err = dir_store.revoke("logged-out", dir_epoch + 10_000).await;
+        assert!(err.is_err(), "replacing a directory must fail the write");
+        assert!(
+            dir_store.rejects(dir_epoch + 5, "logged-out"),
+            "the logout stays revoked in memory"
+        );
+        assert!(!dir_store.rejects(dir_epoch + 5, "other-session"));
+    }
+
+    #[tokio::test]
+    async fn legacy_revocation_file_without_epoch_still_loads() {
+        let temp = tempfile::tempdir().unwrap();
+        let future = chrono::Utc::now().timestamp() + 86_400;
+        std::fs::write(
+            revocation_path(temp.path()),
+            format!(r#"{{"entries":[{{"jti":"old","expires_at":{future}}}]}}"#),
+        )
+        .unwrap();
+        let store = RevokedSessions::open(temp.path()).await;
+        assert!(store.session_epoch().is_none());
+        assert!(store.rejects(1, "old"));
+        assert!(!store.rejects(1, "new"));
+        assert!(marker_path(temp.path()).is_file());
     }
 }

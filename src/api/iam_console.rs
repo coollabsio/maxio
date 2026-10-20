@@ -86,6 +86,10 @@ pub struct CreatedKeyResponse {
     document_json: Option<String>,
 }
 
+fn default_key_only() -> bool {
+    true
+}
+
 #[derive(Deserialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct CreateKeyBody {
@@ -96,8 +100,9 @@ pub struct CreateKeyBody {
     prefix: String,
     /// `read`, `write`, `readwrite`, or `admin`.
     access: Option<String>,
-    /// Store the policy on this key only. It cannot grant more than the user already has.
-    #[serde(default)]
+    /// Omitted means true. The scope is stored on this key only. `false` is rejected: creating a key never grants the user.
+    #[serde(default = "default_key_only")]
+    #[schema(default = true)]
     key_only: bool,
     /// Raw policy JSON. Used instead of `access` when set.
     document_json: Option<String>,
@@ -441,11 +446,14 @@ pub async fn create_key(
         Ok(document) => document,
         Err(err) => return iam_err(err),
     };
+    if !body.key_only {
+        return error(
+            StatusCode::BAD_REQUEST,
+            "Creating an access key cannot add permissions to the user. Grant scope with an inline or managed policy, then create the key.",
+        );
+    }
     let document_json = document.as_ref().and_then(|doc| json_doc(doc).ok());
-    match store
-        .create_access_key(&name, document, body.key_only)
-        .await
-    {
+    match store.create_access_key(&name, document).await {
         Ok(created) => (
             StatusCode::OK,
             Json(CreatedKeyResponse {

@@ -285,7 +285,7 @@ impl IamStore {
                 .map_err(|e| IamError::Internal(e.to_string()))?,
         );
         let path = Path::new(data_dir).join("iam.json");
-        let memory = load_memory(&path, &keyring).await?;
+        let memory = load_and_tighten(&path, &keyring).await?;
         let store = Arc::new(Self {
             path,
             keyring,
@@ -381,11 +381,12 @@ impl IamStore {
         .await
     }
 
+    /// Stores `policy` on this key only. It never attaches an inline policy to
+    /// the user. Granting the user is `put_inline_policy` or a managed policy.
     pub async fn create_access_key(
         &self,
         user_name: &str,
         policy: Option<PolicyDocument>,
-        key_only: bool,
     ) -> Result<CreatedKey, IamError> {
         if let Some(doc) = &policy {
             policy::validate_policy(doc).map_err(IamError::Invalid)?;
@@ -406,17 +407,8 @@ impl IamStore {
                     "user {user_name} already has {MAX_KEYS_PER_USER} access keys"
                 )));
             }
-            let (info, secret) = push_key(
-                mem,
-                Some(user_name.to_string()),
-                user_name,
-                policy.clone(),
-                key_only,
-            )?;
-            if let (Some(doc), false) = (policy, key_only) {
-                let inline_name = format!("scope-{}", info.access_key_id);
-                attach_inline(mem, user_name, &inline_name, doc)?;
-            }
+            let (info, secret) =
+                push_key(mem, Some(user_name.to_string()), user_name, policy.clone())?;
             Ok(CreatedKey { info, secret })
         })
         .await
@@ -445,7 +437,7 @@ impl IamStore {
                     "at most {MAX_SERVICE_KEYS} service keys are supported"
                 )));
             }
-            let (info, secret) = push_key(mem, None, label, Some(policy), true)?;
+            let (info, secret) = push_key(mem, None, label, Some(policy))?;
             Ok(CreatedKey { info, secret })
         })
         .await
@@ -931,6 +923,8 @@ fn find_key_mut<'a>(
 
 fn remove_key_at(mem: &mut Memory, idx: usize) {
     let access_key_id = mem.keys[idx].access_key_id.clone();
+    // Older builds attached `scope-<key id>` to the user when a key was created.
+    // Deleting that key still removes the accidental grant.
     let inline_name = format!("scope-{access_key_id}");
     let owner = mem.keys[idx].user_name.clone();
     mem.keys.remove(idx);
@@ -973,14 +967,12 @@ fn push_key(
     user_name: Option<String>,
     label: &str,
     policy: Option<PolicyDocument>,
-    keep_policy_on_key: bool,
 ) -> Result<(KeyInfo, String), IamError> {
     let secret = random_secret();
     let mut access_key_id = random_id("MXIA");
     while mem.keys.iter().any(|k| k.access_key_id == access_key_id) {
         access_key_id = random_id("MXIA");
     }
-    let key_policy = if keep_policy_on_key { policy } else { None };
     let key = MemoryKey {
         access_key_id,
         user_name,
@@ -988,7 +980,7 @@ fn push_key(
         status: KeyStatus::Active,
         created_at: now_iso(),
         secret: secret.clone(),
-        policy: key_policy,
+        policy,
     };
     let info = key_info(&key);
     mem.keys.push(key);
@@ -1057,6 +1049,83 @@ fn seed_builtins(policies: &mut Vec<ManagedRecord>) {
             });
         }
     }
+}
+
+async fn load_and_tighten(path: &Path, keyring: &Keyring) -> Result<Memory, IamError> {
+    let mut memory = load_memory(path, keyring).await?;
+    let notes = tighten_memory(&mut memory);
+    if notes.is_empty() {
+        return Ok(memory);
+    }
+    persist(path, keyring, &memory).await?;
+    tracing::warn!(
+        "Rewrote IAM policies that used a prefix without a directory slash (bucket/uploads* also allowed uploads-private and uploadsX): {}",
+        notes.join("; ")
+    );
+    Ok(memory)
+}
+
+/// One-time rewrite of `bucket/prefix*` policies saved before directory scopes.
+///
+/// Returns a line per change. An empty list means `iam.json` was already tight
+/// or absent. The caller logs the lines at startup.
+pub async fn rewrite_loose_prefix_policies(
+    data_dir: &str,
+    keyring: &Keyring,
+) -> Result<Vec<String>, String> {
+    let path = Path::new(data_dir).join("iam.json");
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    let mut memory = load_memory(&path, keyring)
+        .await
+        .map_err(|err| format!("Refusing to start: {err}"))?;
+    let notes = tighten_memory(&mut memory);
+    if notes.is_empty() {
+        return Ok(notes);
+    }
+    persist(&path, keyring, &memory).await.map_err(|err| {
+        format!(
+            "Refusing to start: could not save rewritten IAM prefix policies in {}: {err}",
+            path.display()
+        )
+    })?;
+    Ok(notes)
+}
+
+fn tighten_memory(mem: &mut Memory) -> Vec<String> {
+    let mut notes = Vec::new();
+    for user in &mut mem.users {
+        for inline in &mut user.inline_policies {
+            for note in policy::tighten_loose_scope_prefixes(&mut inline.document) {
+                notes.push(format!(
+                    "user {} inline policy {}: {note}",
+                    user.name, inline.name
+                ));
+            }
+        }
+    }
+    for key in &mut mem.keys {
+        let Some(document) = &mut key.policy else {
+            continue;
+        };
+        let owner = match &key.user_name {
+            Some(name) => format!("user {name} access key {}", key.access_key_id),
+            None => format!("service key {} ({})", key.access_key_id, key.label),
+        };
+        for note in policy::tighten_loose_scope_prefixes(document) {
+            notes.push(format!("{owner}: {note}"));
+        }
+    }
+    for managed in &mut mem.policies {
+        if managed.builtin {
+            continue;
+        }
+        for note in policy::tighten_loose_scope_prefixes(&mut managed.document) {
+            notes.push(format!("managed policy {}: {note}", managed.name));
+        }
+    }
+    notes
 }
 
 async fn load_memory(path: &Path, keyring: &Keyring) -> Result<Memory, IamError> {
@@ -1223,7 +1292,7 @@ mod tests {
     async fn secrets_are_encrypted_at_rest_and_round_trip() {
         let (dir, store) = fresh().await;
         store.create_user("alice").await.unwrap();
-        let created = store.create_access_key("alice", None, false).await.unwrap();
+        let created = store.create_access_key("alice", None).await.unwrap();
         let raw = tokio::fs::read_to_string(dir.path().join("iam.json"))
             .await
             .unwrap();
@@ -1254,7 +1323,7 @@ mod tests {
     async fn disable_user_and_delete_conflict() {
         let (_dir, store) = fresh().await;
         store.create_user("alice").await.unwrap();
-        store.create_access_key("alice", None, false).await.unwrap();
+        store.create_access_key("alice", None).await.unwrap();
         let err = store.delete_user("alice", false).await.unwrap_err();
         assert!(matches!(err, IamError::Conflict(_)));
         store.set_user_enabled("alice", false).await.unwrap();
@@ -1285,7 +1354,7 @@ mod tests {
     async fn wrong_master_key_fails_before_a_request_with_a_startup_error() {
         let (dir, store) = fresh().await;
         store.create_user("alice").await.unwrap();
-        store.create_access_key("alice", None, true).await.unwrap();
+        store.create_access_key("alice", None).await.unwrap();
         let other = tempfile::tempdir().unwrap();
         let other_keyring = Keyring::load(other.path().to_str().unwrap(), None)
             .await
@@ -1316,5 +1385,85 @@ mod tests {
             .unwrap();
         let auth = store.lookup_key(&created.info.access_key_id).await.unwrap();
         assert_eq!(auth.status, KeyStatus::Inactive);
+    }
+
+    #[tokio::test]
+    async fn create_access_key_never_attaches_a_user_policy() {
+        let (_dir, store) = fresh().await;
+        store.create_user("bob").await.unwrap();
+        let read = policy::policy_for_scope(&["photos".into()], "", ScopeAccess::Read);
+        store.put_inline_policy("bob", "read", read).await.unwrap();
+        let first = store.create_access_key("bob", None).await.unwrap();
+        let write = policy::policy_for_scope(&["photos".into()], "uploads/", ScopeAccess::Write);
+        let second = store.create_access_key("bob", Some(write)).await.unwrap();
+        let names = store.list_inline_names("bob").await.unwrap();
+        assert_eq!(names, vec!["read".to_string()]);
+        assert!(!first.info.has_policy);
+        assert!(second.info.has_policy);
+        let summary = second.info.policy_summary.unwrap();
+        assert!(summary.contains("uploads/*"), "{summary}");
+        assert!(!summary.contains("uploads*\""));
+    }
+
+    #[tokio::test]
+    async fn loose_prefix_policies_are_rewritten_once() {
+        let (dir, store) = fresh().await;
+        store.create_user("alice").await.unwrap();
+        let loose = policy::parse_policy_str(
+            r#"{"Version":"2012-10-17","Statement":[
+                {"Effect":"Allow","Action":"s3:ListBucket","Resource":"arn:aws:s3:::photos",
+                 "Condition":{"StringLike":{"s3:prefix":["uploads*"]}}},
+                {"Effect":"Allow","Action":"s3:GetObject","Resource":"arn:aws:s3:::photos/uploads*"}
+            ]}"#,
+        )
+        .unwrap();
+        store
+            .put_inline_policy("alice", "old-scope", loose.clone())
+            .await
+            .unwrap();
+        let on_key = store.create_access_key("alice", Some(loose)).await.unwrap();
+        let path = dir.path().to_str().unwrap();
+        let keyring = Keyring::load(path, None).await.unwrap();
+        let notes = rewrite_loose_prefix_policies(path, &keyring).await.unwrap();
+        assert!(
+            notes
+                .iter()
+                .any(|n| n.contains("user alice inline policy old-scope")),
+            "{notes:?}"
+        );
+        assert!(
+            notes.iter().any(|n| n.contains(&on_key.info.access_key_id)),
+            "{notes:?}"
+        );
+        let memory = load_memory(&dir.path().join("iam.json"), &keyring)
+            .await
+            .unwrap();
+        let inline = memory
+            .users
+            .iter()
+            .find(|u| u.name == "alice")
+            .unwrap()
+            .inline_policies
+            .iter()
+            .find(|p| p.name == "old-scope")
+            .unwrap();
+        let json = inline.document.to_canonical_json().unwrap();
+        assert!(json.contains("arn:aws:s3:::photos/uploads/*"), "{json}");
+        assert!(
+            !json.replace("uploads/*", "").contains("uploads*"),
+            "{json}"
+        );
+        let key = memory
+            .keys
+            .iter()
+            .find(|k| k.access_key_id == on_key.info.access_key_id)
+            .unwrap();
+        let key_json = key.policy.as_ref().unwrap().to_canonical_json().unwrap();
+        assert!(
+            !key_json.replace("uploads/*", "").contains("uploads*"),
+            "{key_json}"
+        );
+        let again = rewrite_loose_prefix_policies(path, &keyring).await.unwrap();
+        assert!(again.is_empty(), "{again:?}");
     }
 }

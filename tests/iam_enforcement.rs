@@ -597,6 +597,173 @@ async fn explicit_deny_beats_public_bucket_policy() {
     assert_eq!(got.status(), 403);
 }
 
+#[tokio::test]
+async fn create_key_scope_does_not_grant_the_user() {
+    let (base, _tmp) = start_server().await;
+    assert_eq!(
+        call(
+            "PUT",
+            &format!("{base}/photos"),
+            ROOT_KEY,
+            ROOT_SECRET,
+            "s3",
+            b"",
+            &[]
+        )
+        .await
+        .status(),
+        200
+    );
+    assert_eq!(
+        call(
+            "PUT",
+            &format!("{base}/photos/uploads/a.txt"),
+            ROOT_KEY,
+            ROOT_SECRET,
+            "s3",
+            b"pic",
+            &[]
+        )
+        .await
+        .status(),
+        200
+    );
+    let (status, cookie, _) = console_login(&base, ROOT_KEY, ROOT_SECRET).await;
+    assert_eq!(status, 200);
+    let client = reqwest::Client::new();
+    let cookie = format!("maxio_session={cookie}");
+    assert_eq!(
+        client
+            .post(format!("{base}/api/iam/users"))
+            .header("cookie", &cookie)
+            .json(&serde_json::json!({ "name": "bob" }))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        200
+    );
+    let read = r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["s3:GetObject","s3:GetObjectVersion"],"Resource":"arn:aws:s3:::photos/*"}]}"#;
+    assert_eq!(
+        client
+            .put(format!("{base}/api/iam/users/bob/inline/read"))
+            .header("cookie", &cookie)
+            .json(&serde_json::json!({ "documentJson": read }))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        200
+    );
+    let first = client
+        .post(format!("{base}/api/iam/users/bob/keys"))
+        .header("cookie", &cookie)
+        .json(&serde_json::json!({}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(first.status(), 200, "{}", first.text().await.unwrap());
+    let first: serde_json::Value = first.json().await.unwrap();
+    let first_id = first["accessKeyId"].as_str().unwrap();
+    let first_secret = first["secretAccessKey"].as_str().unwrap();
+
+    let second = client
+        .post(format!("{base}/api/iam/users/bob/keys"))
+        .header("cookie", &cookie)
+        .json(&serde_json::json!({
+            "buckets": ["photos"],
+            "prefix": "uploads/",
+            "access": "write"
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(second.status(), 200, "{}", second.text().await.unwrap());
+    let second: serde_json::Value = second.json().await.unwrap();
+    let second_doc = second["documentJson"].as_str().unwrap();
+    assert!(second_doc.contains("uploads/*"), "{second_doc}");
+    assert!(!second_doc.replace("uploads/*", "").contains("uploads*"));
+
+    let user = client
+        .get(format!("{base}/api/iam/users/bob"))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap()
+        .json::<serde_json::Value>()
+        .await
+        .unwrap();
+    let inline = user["inlinePolicies"].as_array().unwrap();
+    assert_eq!(inline.len(), 1, "{user}");
+    assert_eq!(inline[0]["name"], "read");
+
+    let keys = client
+        .get(format!("{base}/api/iam/users/bob/keys"))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap()
+        .json::<serde_json::Value>()
+        .await
+        .unwrap();
+    let second_id = second["accessKeyId"].as_str().unwrap();
+    let listed = keys["keys"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|key| key["accessKeyId"] == second_id)
+        .unwrap();
+    let summary = listed["policySummary"].as_str().unwrap();
+    assert!(summary.contains("uploads/*"), "{summary}");
+
+    let read_ok = call(
+        "GET",
+        &format!("{base}/photos/uploads/a.txt"),
+        first_id,
+        first_secret,
+        "s3",
+        b"",
+        &[],
+    )
+    .await;
+    assert_eq!(read_ok.status(), 200);
+    let widened = call(
+        "PUT",
+        &format!("{base}/photos/uploads/new.txt"),
+        first_id,
+        first_secret,
+        "s3",
+        b"nope",
+        &[],
+    )
+    .await;
+    assert_eq!(widened.status(), 403);
+
+    let rejected = client
+        .post(format!("{base}/api/iam/users/bob/keys"))
+        .header("cookie", &cookie)
+        .json(&serde_json::json!({
+            "buckets": ["finance"],
+            "prefix": "uploads/",
+            "access": "read",
+            "keyOnly": false
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(rejected.status(), 400, "{}", rejected.text().await.unwrap());
+    let user = client
+        .get(format!("{base}/api/iam/users/bob"))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap()
+        .json::<serde_json::Value>()
+        .await
+        .unwrap();
+    assert_eq!(user["inlinePolicies"].as_array().unwrap().len(), 1);
+}
+
 fn urlencoding(value: &str) -> String {
     let engine = percent_encoding::NON_ALPHANUMERIC;
     percent_encoding::utf8_percent_encode(value, engine).to_string()

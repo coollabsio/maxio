@@ -117,7 +117,7 @@ async fn dispatch(
                 .cloned()
                 .or_else(|| calling_user(principal))
                 .ok_or_else(|| IamError::Invalid("UserName is required for the root key".into()))?;
-            let created = store.create_access_key(&name, None, false).await?;
+            let created = store.create_access_key(&name, None).await?;
             Ok(access_key_xml(&created, true))
         }
         "ListAccessKeys" => {

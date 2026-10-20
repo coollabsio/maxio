@@ -94,7 +94,7 @@ mc cp file.txt maxio/my-bucket/
 
 The root access key (`MAXIO_ACCESS_KEY` / `MAXIO_SECRET_KEY`) is the administrator. Additional callers are IAM users or standalone service keys. Policies are AWS-style JSON: `Effect`, wildcard actions such as `s3:Get*`, and resource ARNs such as `arn:aws:s3:::bucket` and `arn:aws:s3:::bucket/prefix/*`. An explicit `Deny` wins. Built-in policies are `readonly`, `readwrite`, `writeonly`, and `admin`.
 
-A prefix in the console is a directory. `uploads` and `uploads/` both allow `bucket/uploads/file` and do not allow `bucket/uploads-private` or `bucket/uploadsX`.
+A prefix in the console is a directory. `uploads` and `uploads/` both allow `bucket/uploads/file` and do not allow `bucket/uploads-private` or `bucket/uploadsX`. Policies saved by the first IAM build used `bucket/uploads*` (no slash). On startup MaxIO rewrites those resource ARNs and `s3:prefix` values to the directory form and logs each one.
 
 Create a user and a key with the AWS CLI (the key secret is printed once):
 
@@ -105,7 +105,7 @@ aws --endpoint-url http://localhost:9000 iam attach-user-policy \
 aws --endpoint-url http://localhost:9000 iam create-access-key --user-name alice
 ```
 
-A key policy only narrows what that user's policies already allow. Granting access is a separate step: attach a policy, or use **Grant scope to user** in the console. **Create access key** does not add permissions to the user.
+A key policy only narrows what that user's policies already allow. Granting access is a separate step: attach a policy, or use **Grant scope to user** in the console (or `PUT /api/iam/users/{name}/inline/{policy}`). **Create access key** (`POST /api/iam/users/{name}/keys`) never adds a policy to the user. The scope is stored on that key only. Omitting `keyOnly` means key-only. Sending `keyOnly: false` is rejected.
 
 The console at `/ui/users` and `/ui/policies` is available to root and to anyone whose policy allows IAM administration. Other IAM users can sign in and see only the buckets their policy allows.
 

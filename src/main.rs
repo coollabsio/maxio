@@ -171,6 +171,15 @@ async fn main() -> anyhow::Result<()> {
     iam::store::ensure_secrets_readable(&config.data_dir, &keyring)
         .await
         .map_err(anyhow::Error::msg)?;
+    let rewritten = iam::store::rewrite_loose_prefix_policies(&config.data_dir, &keyring)
+        .await
+        .map_err(anyhow::Error::msg)?;
+    if !rewritten.is_empty() {
+        tracing::warn!(
+            "Rewrote IAM policies that used a prefix without a directory slash (bucket/uploads* also allowed uploads-private and uploadsX): {}",
+            rewritten.join("; ")
+        );
+    }
     if config.master_key.is_none() {
         tracing::info!(
             "SSE-S3 keyring: active key id {} (file {}/.maxio-keys.json — BACK THIS UP)",

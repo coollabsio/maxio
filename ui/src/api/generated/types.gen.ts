@@ -85,7 +85,7 @@ export type CreateKeyBody = {
      */
     documentJson?: string | null;
     /**
-     * Store the policy on this key only. It cannot grant more than the user already has.
+     * Omitted means true. The scope is stored on this key only. `false` is rejected: creating a key never grants the user.
      */
     keyOnly?: boolean;
     prefix?: string;

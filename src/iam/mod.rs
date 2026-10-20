@@ -531,7 +531,7 @@ mod tests {
             .put_inline_policy("alice", "scope", document)
             .await
             .unwrap();
-        let key = store.create_access_key("alice", None, true).await.unwrap();
+        let key = store.create_access_key("alice", None).await.unwrap();
         let principal = Principal::User {
             name: "alice".into(),
             access_key_id: key.info.access_key_id,

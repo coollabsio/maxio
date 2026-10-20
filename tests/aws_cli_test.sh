@@ -3,8 +3,10 @@ set -euo pipefail
 
 # Integration tests using the AWS CLI and MinIO mc against a running maxio server.
 # Usage: ./tests/aws_cli_test.sh [port] [data_dir]
-# Expects maxio to be running on localhost:${PORT:-9000} with the default
-# maxioadmin/maxioadmin credentials (start it with --allow-insecure-dev).
+# Expects maxio to be running on localhost:${PORT:-9000}.
+# Credentials default to maxioadmin/maxioadmin (start that server with
+# --allow-insecure-dev). Override them to match a server that uses its own keys:
+#   MAXIO_TEST_ACCESS_KEY=... MAXIO_TEST_SECRET_KEY=... ./tests/aws_cli_test.sh
 # Requires aws (AWS CLI v2), mc, python3, and curl.
 
 PORT="${1:-9000}"
@@ -15,8 +17,10 @@ TMPDIR=$(mktemp -d)
 PASS=0
 FAIL=0
 
-export AWS_ACCESS_KEY_ID=maxioadmin
-export AWS_SECRET_ACCESS_KEY=maxioadmin
+MAXIO_TEST_ACCESS_KEY="${MAXIO_TEST_ACCESS_KEY:-maxioadmin}"
+MAXIO_TEST_SECRET_KEY="${MAXIO_TEST_SECRET_KEY:-maxioadmin}"
+export AWS_ACCESS_KEY_ID="$MAXIO_TEST_ACCESS_KEY"
+export AWS_SECRET_ACCESS_KEY="$MAXIO_TEST_SECRET_KEY"
 export AWS_DEFAULT_REGION=us-east-1
 # A developer AWS config can switch the transfer client off the CRT path that
 # sends streaming trailer checksums. These tests must not inherit that.
@@ -1812,7 +1816,7 @@ assert "prefix put uploads object" $AWS s3 cp "$TMPDIR/prefix-inside.txt" "s3://
 assert "prefix put uploads-private object" $AWS s3 cp "$TMPDIR/prefix-sibling.txt" "s3://$PREFIX_BUCKET/uploads-private/x.txt"
 assert "prefix put uploadsX object" $AWS s3 cp "$TMPDIR/prefix-glued.txt" "s3://$PREFIX_BUCKET/uploadsX.txt"
 curl -sS -c "$TMPDIR/iam.cookies" -H 'content-type: application/json' \
-    -d '{"accessKey":"maxioadmin","secretKey":"maxioadmin"}' \
+    -d "{\"accessKey\":\"$MAXIO_TEST_ACCESS_KEY\",\"secretKey\":\"$MAXIO_TEST_SECRET_KEY\"}" \
     "$ENDPOINT/api/auth/login" > /dev/null
 PREVIEW=$(curl -sS -b "$TMPDIR/iam.cookies" -H 'content-type: application/json' \
     -d "{\"buckets\":[\"$PREFIX_BUCKET\"],\"prefix\":\"uploads/\",\"access\":\"readwrite\"}" \
@@ -1850,6 +1854,58 @@ assert "prefix delete-user-policy" $AWS iam delete-user-policy --user-name "$PRE
 assert "prefix delete-user" $AWS iam delete-user --user-name "$PREFIX_USER"
 $AWS s3 rm "s3://$PREFIX_BUCKET" --recursive >/dev/null 2>&1 || true
 assert "prefix delete bucket" $AWS s3 rb "s3://$PREFIX_BUCKET"
+
+# Creating a key must not attach a user policy, even when keyOnly is omitted.
+NOGRANT_BUCKET="iam-nogrant-$$"
+NOGRANT_USER="nogrant$$"
+assert "nogrant bucket" $AWS s3 mb "s3://$NOGRANT_BUCKET"
+echo "keep" > "$TMPDIR/nogrant.txt"
+assert "nogrant seed object" $AWS s3 cp "$TMPDIR/nogrant.txt" "s3://$NOGRANT_BUCKET/uploads/keep.txt"
+assert "nogrant create-user" $AWS iam create-user --user-name "$NOGRANT_USER"
+cat > "$TMPDIR/nogrant-read.json" <<EOF
+{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["s3:GetObject","s3:GetObjectVersion"],"Resource":"arn:aws:s3:::$NOGRANT_BUCKET/*"}]}
+EOF
+assert "nogrant put-user-policy" $AWS iam put-user-policy --user-name "$NOGRANT_USER" \
+    --policy-name read --policy-document "file://$TMPDIR/nogrant-read.json"
+NOGRANT_FIRST=$($AWS iam create-access-key --user-name "$NOGRANT_USER" --output json)
+NOGRANT_KEY=$(printf '%s' "$NOGRANT_FIRST" | python3 -c 'import json,sys; print(json.load(sys.stdin)["AccessKey"]["AccessKeyId"])')
+NOGRANT_SECRET=$(printf '%s' "$NOGRANT_FIRST" | python3 -c 'import json,sys; print(json.load(sys.stdin)["AccessKey"]["SecretAccessKey"])')
+NOGRANT_STATUS=$(curl -sS -o "$TMPDIR/nogrant-key.json" -w '%{http_code}' -b "$TMPDIR/iam.cookies" \
+    -H 'content-type: application/json' \
+    -d "{\"buckets\":[\"$NOGRANT_BUCKET\"],\"prefix\":\"uploads/\",\"access\":\"write\"}" \
+    "$ENDPOINT/api/iam/users/$NOGRANT_USER/keys")
+assert_eq "nogrant create key without keyOnly" "200" "$NOGRANT_STATUS"
+assert "nogrant key document is directory scoped" python3 -c \
+    'import json,sys; doc=json.load(open(sys.argv[1])).get("documentJson") or ""; rest=doc.replace("uploads/*",""); raise SystemExit(0 if "uploads/*" in doc and "uploads*" not in rest else 1)' \
+    "$TMPDIR/nogrant-key.json"
+NOGRANT_POLICIES=$($AWS iam list-user-policies --user-name "$NOGRANT_USER" --output json)
+assert_eq "nogrant user policies stay read" "read" \
+    "$(printf '%s' "$NOGRANT_POLICIES" | python3 -c 'import json,sys; print(",".join(json.load(sys.stdin)["PolicyNames"]))')"
+export AWS_ACCESS_KEY_ID="$NOGRANT_KEY"
+export AWS_SECRET_ACCESS_KEY="$NOGRANT_SECRET"
+assert "nogrant existing key can read" $AWS s3 cp "s3://$NOGRANT_BUCKET/uploads/keep.txt" "$TMPDIR/nogrant-down.txt"
+assert_fail "nogrant existing key did not gain write" \
+    $AWS s3 cp "$TMPDIR/nogrant.txt" "s3://$NOGRANT_BUCKET/uploads/new.txt"
+export AWS_ACCESS_KEY_ID="$ROOT_KEY"
+export AWS_SECRET_ACCESS_KEY="$ROOT_SECRET"
+NOGRANT_FALSE=$(curl -sS -o "$TMPDIR/nogrant-false.json" -w '%{http_code}' -b "$TMPDIR/iam.cookies" \
+    -H 'content-type: application/json' \
+    -d "{\"buckets\":[\"$NOGRANT_BUCKET\"],\"prefix\":\"uploads/\",\"access\":\"read\",\"keyOnly\":false}" \
+    "$ENDPOINT/api/iam/users/$NOGRANT_USER/keys")
+assert_eq "nogrant keyOnly false is rejected" "400" "$NOGRANT_FALSE"
+NOGRANT_POLICIES=$($AWS iam list-user-policies --user-name "$NOGRANT_USER" --output json)
+assert_eq "nogrant user policies after rejection" "read" \
+    "$(printf '%s' "$NOGRANT_POLICIES" | python3 -c 'import json,sys; print(",".join(json.load(sys.stdin)["PolicyNames"]))')"
+assert "nogrant delete-user-policy" $AWS iam delete-user-policy --user-name "$NOGRANT_USER" --policy-name read
+NOGRANT_KEYS=$($AWS iam list-access-keys --user-name "$NOGRANT_USER" --output json)
+while read -r NOGRANT_ID; do
+    [ -n "$NOGRANT_ID" ] || continue
+    assert "nogrant delete-access-key $NOGRANT_ID" $AWS iam delete-access-key \
+        --user-name "$NOGRANT_USER" --access-key-id "$NOGRANT_ID"
+done < <(printf '%s' "$NOGRANT_KEYS" | python3 -c 'import json,sys; [print(k["AccessKeyId"]) for k in json.load(sys.stdin)["AccessKeyMetadata"]]')
+assert "nogrant delete-user" $AWS iam delete-user --user-name "$NOGRANT_USER"
+$AWS s3 rm "s3://$NOGRANT_BUCKET" --recursive >/dev/null 2>&1 || true
+assert "nogrant delete bucket" $AWS s3 rb "s3://$NOGRANT_BUCKET"
 
 # --- Summary ---
 echo ""

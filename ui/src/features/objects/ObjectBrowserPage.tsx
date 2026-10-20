@@ -26,9 +26,10 @@ import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@
 import { getVersioning } from '@/features/settings/api'
 import { VersionHistory } from '@/features/versions/VersionHistory'
 import { formatDate, formatSize } from '@/lib/format'
-import { bucketPath, bucketSettingsPath, displayName, downloadUrl, normalizePrefix } from '@/lib/paths'
+import { bucketPath, bucketSettingsPath, displayName, normalizePrefix } from '@/lib/paths'
 import { toast } from '@/lib/toast'
 import { createFolder, deleteObject, getCapabilities, listObjects, presignObject, uploadObject } from './api'
+import { downloadObjectFile } from './download'
 import { ObjectDetailsSheet } from './ObjectDetailsSheet'
 
 const expiryOptions = [
@@ -173,6 +174,15 @@ function ObjectBrowser({ bucket }: { bucket: string }) {
     }
     const rect = event.currentTarget.getBoundingClientRect()
     setShareMenu({ key, top: rect.top, left: rect.right })
+  }
+
+  async function downloadFile(key: string) {
+    try {
+      await downloadObjectFile(bucket, key)
+    } catch (err) {
+      console.error('download failed:', err)
+      toast.error(err instanceof ApiError ? err.message : 'Download failed')
+    }
   }
 
   async function shareObject(key: string, expires: number) {
@@ -362,15 +372,18 @@ function ObjectBrowser({ bucket }: { bucket: string }) {
                             <Share2 className="size-4" />
                           )}
                         </button>
-                        <a
-                          href={downloadUrl(bucket, file.key)}
+                        <button
+                          type="button"
                           className="icon-button"
-                          onClick={(event) => event.stopPropagation()}
+                          onClick={(event) => {
+                            event.stopPropagation()
+                            void downloadFile(file.key)
+                          }}
                           title="Download"
                           aria-label="Download"
                         >
                           <Download className="size-4" />
-                        </a>
+                        </button>
                         {canDelete ? (
                           <button
                             type="button"

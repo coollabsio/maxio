@@ -279,6 +279,10 @@ export type ObjectInfo = {
     encryption: null | ObjectEncryption;
     etag: string;
     expires: string | null;
+    /**
+     * Bytes are at `{key}/.maxio.object` because this key is also a prefix.
+     */
+    inlinePayload: boolean;
     isDeleteMarker: boolean;
     key: string;
     lastModified: string;

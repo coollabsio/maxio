@@ -7,8 +7,8 @@ import { Button } from '@/components/ui/button'
 import { Callout } from '@/components/ui/callout'
 import { ConfirmDialog } from '@/components/ui/confirm-dialog'
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table'
+import { downloadObjectFile } from '@/features/objects/download'
 import { formatDate, formatVersionSize, truncateId } from '@/lib/format'
-import { versionDownloadUrl } from '@/lib/paths'
 import { toast } from '@/lib/toast'
 import { deleteVersion, listVersions, restoreVersion } from './api'
 
@@ -158,15 +158,22 @@ export function VersionHistory({ bucket, objectKey, onClose, onVersionsChanged }
                         </button>
                       ) : null}
                       {!version.isDeleteMarker && version.versionId ? (
-                        // The server sends `Content-Disposition: attachment`, so a plain link downloads without a popup.
-                        <a
-                          href={versionDownloadUrl(bucket, objectKey, version.versionId)}
+                        <button
+                          type="button"
                           className="icon-button"
                           title="Download this version"
                           aria-label="Download this version"
+                          onClick={() => {
+                            const versionId = version.versionId
+                            if (!versionId) return
+                            void downloadObjectFile(bucket, objectKey, versionId).catch((err: unknown) => {
+                              console.error('version download failed:', err)
+                              toast.error(err instanceof ApiError ? err.message : 'Download failed')
+                            })
+                          }}
                         >
                           <Download className="size-4" />
-                        </a>
+                        </button>
                       ) : null}
                       {version.versionId ? (
                         <button

@@ -2886,6 +2886,7 @@
           "versionId",
           "isDeleteMarker",
           "storageFormat",
+          "inlinePayload",
           "partCount",
           "checksum",
           "encryption",
@@ -2953,6 +2954,10 @@
               "string",
               "null"
             ]
+          },
+          "inlinePayload": {
+            "type": "boolean",
+            "description": "Bytes are at `{key}/.maxio.object` because this key is also a prefix."
           },
           "isDeleteMarker": {
             "type": "boolean"

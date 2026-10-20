@@ -7,6 +7,7 @@ import { Callout } from '@/components/ui/callout'
 import { Dialog } from '@/components/ui/dialog'
 import { Input } from '@/components/ui/input'
 import { previewIamPolicy } from './api'
+import { folderScopeHint } from './grantName'
 
 export type ScopeAccess = 'read' | 'write' | 'readwrite' | 'admin'
 
@@ -162,8 +163,17 @@ export function CreateKeyDialog({
           />
         </label>
         <label className="flex flex-col gap-1.5 text-[13px] font-medium text-neutral-600 dark:text-fg-dim">
-          Prefix
-          <Input value={prefix} onChange={(event) => setPrefix(event.target.value)} placeholder="Optional, such as albums" />
+          Folder (prefix)
+          <Input
+            value={prefix}
+            onChange={(event) => setPrefix(event.target.value)}
+            placeholder="reports"
+            aria-label="Folder (prefix)"
+            aria-describedby="folder-prefix-hint"
+          />
+          <span id="folder-prefix-hint" className="text-xs font-normal text-neutral-500 dark:text-fg-faint">
+            {folderScopeHint(bucketList, prefix)}
+          </span>
         </label>
         <label className="flex flex-col gap-1.5 text-[13px] font-medium text-neutral-600 dark:text-fg-dim">
           Access

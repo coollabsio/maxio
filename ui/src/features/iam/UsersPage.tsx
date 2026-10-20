@@ -194,7 +194,7 @@ export function UsersPage() {
         <Dialog
           open
           title="Create user"
-          description="The user starts with no policies. Create an access key to grant a scope."
+          description="The user starts with no policies. Grant a scope on the user page so keys can read or write. Creating an access key only narrows that key."
           loading={createUser.isPending}
           onClose={() => {
             setShowUser(false)

@@ -3,7 +3,7 @@ import { Check, Copy, LoaderCircle } from 'lucide-react'
 import { useState, type ReactNode } from 'react'
 import { ApiError } from '@/api/client'
 import { objectKeys } from '@/api/queryKeys'
-import type { ObjectInfo, TagEntry } from '@/api/generated/types.gen'
+import type { TagEntry } from '@/api/generated/types.gen'
 import { Callout } from '@/components/ui/callout'
 import { Sheet } from '@/components/ui/sheet'
 import { TagSetForm } from '@/features/tags/TagEditor'
@@ -12,17 +12,12 @@ import { formatDate, formatSize } from '@/lib/format'
 import { displayName } from '@/lib/paths'
 import { toast } from '@/lib/toast'
 import { getObjectInfo, setObjectTags } from './api'
+import { storageFormatLabel } from './storageFormat'
 
 interface ObjectDetailsSheetProps {
   bucket: string
   objectKey: string | null
   onClose: () => void
-}
-
-const storageFormatLabels: Record<ObjectInfo['storageFormat'], string> = {
-  plain: 'Plain file',
-  chunked: 'Chunked',
-  erasure: 'Erasure coded',
 }
 
 /** Right-hand drawer with every stored attribute of one object and its tag editor. */
@@ -96,7 +91,7 @@ function ObjectDetails({ bucket, objectKey }: { bucket: string; objectKey: strin
         {info.versionId ? (
           <DetailRow label="Version ID" value={<CopyValue value={info.versionId} label="version ID" />} />
         ) : null}
-        <DetailRow label="Storage format" value={storageFormatLabels[info.storageFormat]} />
+        <DetailRow label="Storage format" value={storageFormatLabel(info)} />
         {info.partCount ? <DetailRow label="Parts" value={String(info.partCount)} /> : null}
       </DetailSection>
 

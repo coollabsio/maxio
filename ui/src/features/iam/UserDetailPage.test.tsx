@@ -87,7 +87,7 @@ test('creating a key stores a narrowing policy and does not grant the user', asy
   expect(dialog.getByText(/does not grant the user/)).toBeTruthy()
 
   await userEvents.type(dialog.getByLabelText('Buckets'), 'photos')
-  await userEvents.type(dialog.getByLabelText('Prefix'), 'uploads/')
+  await userEvents.type(dialog.getByLabelText('Folder (prefix)'), 'uploads/')
   await screen.findByDisplayValue(/photos\/uploads\/\*/)
   await userEvents.click(dialog.getByRole('button', { name: 'Create key' }))
 
@@ -118,6 +118,20 @@ test('shows a key policy and does not claim the user has no policies', async () 
   expect(await screen.findByText('Key policy: arn:aws:s3:::photos/uploads/*')).toBeTruthy()
   expect(screen.getByText(/Limits this key only/)).toBeTruthy()
   expect(screen.queryByText(/This user has no policies/)).toBeNull()
+})
+
+test('a star key policy is described as inheriting the user', async () => {
+  const { screen } = renderUser((request) => {
+    const url = new URL(request.url)
+    if (url.pathname === '/api/iam/users/alice/keys' && request.method === 'GET') {
+      return json(200, {
+        keys: [{ ...existingKey, hasPolicy: true, policySummary: 'Key policy: *' }],
+      })
+    }
+    return route(request)
+  })
+  expect(await screen.findByText('Inherits user permissions (no key restriction)')).toBeTruthy()
+  expect(screen.queryByText('Key policy: *')).toBeNull()
 })
 
 test('deleting an access key asks for confirmation', async () => {
@@ -157,13 +171,16 @@ test('granting a scope is a separate action from creating a key', async () => {
   expect(dialog.getByText(/does not create an access key/)).toBeTruthy()
   expect(dialog.queryByRole('checkbox')).toBeNull()
   await userEvents.type(dialog.getByLabelText('Buckets'), 'photos')
+  await userEvents.type(dialog.getByLabelText('Folder (prefix)'), 'reports')
+  expect(dialog.getByText(/arn:aws:s3:::photos\/reports\/\*/)).toBeTruthy()
+  expect(dialog.getByText(/not reportsX/)).toBeTruthy()
   await userEvents.selectOptions(dialog.getByLabelText('Access'), 'read')
   await screen.findByDisplayValue(/Allow/)
   await userEvents.click(dialog.getByRole('button', { name: 'Grant scope' }))
 
   await waitFor(() => expect(posts.some((post) => post.path.includes('/inline/'))).toBe(true))
   const grant = posts.find((post) => post.path.includes('/inline/'))
-  expect(grant?.path).toBe('/api/iam/users/alice/inline/grant-photos-read')
+  expect(grant?.path).toBe('/api/iam/users/alice/inline/grant-photos-reports-read')
   expect(grant?.body).toMatchObject({ documentJson: expect.stringContaining('Allow') })
   expect(posts.some((post) => post.path.endsWith('/keys'))).toBe(false)
 })

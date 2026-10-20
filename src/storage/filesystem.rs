@@ -672,6 +672,16 @@ impl FilesystemStorage {
         }
     }
 
+    /// True when this key's bytes are at `{key}/.maxio.object` because the key
+    /// is also a prefix of other keys.
+    pub async fn object_inline_payload(&self, bucket: &str, key: &str) -> bool {
+        if key.is_empty() || key.ends_with('/') {
+            return false;
+        }
+        let path = self.plain_object_read_path(bucket, key).await;
+        path.file_name().and_then(|name| name.to_str()) == Some(INLINE_OBJECT_PAYLOAD)
+    }
+
     /// Path to read a plain object's bytes (the file, or the inline payload
     /// when the key is also a prefix).
     async fn plain_object_read_path(&self, bucket: &str, key: &str) -> PathBuf {

@@ -26,6 +26,7 @@ import {
   setIamUserStatus,
 } from './api'
 import { CreateKeyDialog } from './CreateKeyDialog'
+import { grantPolicyName, unrestrictedKeyPolicy } from './grantName'
 
 export function UserDetailPage() {
   const { name = '' } = useParams()
@@ -201,10 +202,21 @@ export function UserDetailPage() {
                     <div className="font-mono text-xs">{key.accessKeyId}</div>
                     {key.policySummary ? (
                       <div className="mt-1 max-w-xl font-sans text-xs text-neutral-600 dark:text-fg-dim">
-                        {key.policySummary}
-                        <div className="text-[11px] text-neutral-400 dark:text-fg-faint">
-                          Limits this key only. It does not grant access by itself.
-                        </div>
+                        {unrestrictedKeyPolicy(key.policySummary) ? (
+                          <>
+                            Inherits user permissions (no key restriction)
+                            <div className="text-[11px] text-neutral-400 dark:text-fg-faint">
+                              This key does not add its own limit.
+                            </div>
+                          </>
+                        ) : (
+                          <>
+                            {key.policySummary}
+                            <div className="text-[11px] text-neutral-400 dark:text-fg-faint">
+                              Limits this key only. It does not grant access by itself.
+                            </div>
+                          </>
+                        )}
                       </div>
                     ) : (
                       <div className="mt-1 font-sans text-[11px] text-neutral-400 dark:text-fg-faint">
@@ -267,8 +279,8 @@ export function UserDetailPage() {
           saving={grant.isPending}
           onClose={() => setShowGrant(false)}
           onCreate={async (input) => {
-            const label = input.buckets[0] ? input.buckets[0] : 'all'
-            const policyName = `grant-${label}-${input.access}`.replace(/[^A-Za-z0-9+=,.@_-]/g, '').slice(0, 64)
+            const taken = user?.inlinePolicies.map((policy) => policy.name) ?? []
+            const policyName = grantPolicyName(input.buckets, input.prefix, input.access, taken)
             await grant.mutateAsync({ policy: policyName, documentJson: input.documentJson })
             setShowGrant(false)
           }}

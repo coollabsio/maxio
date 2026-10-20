@@ -1504,7 +1504,8 @@ pub struct TagSetBody {
 #[derive(Serialize, ToSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum StorageFormat {
-    /// Single file on disk.
+    /// Single object file. Encryption is reported separately. A key that is also
+    /// a prefix stores this file at `{key}/.maxio.object` (`inlinePayload`).
     Plain,
     /// Split into checksummed chunks.
     Chunked,
@@ -1550,6 +1551,8 @@ pub struct ObjectInfo {
     version_id: Option<String>,
     is_delete_marker: bool,
     storage_format: StorageFormat,
+    /// Bytes are at `{key}/.maxio.object` because this key is also a prefix.
+    inline_payload: bool,
     /// Number of parts for multipart uploads.
     #[schema(required = true)]
     part_count: Option<u32>,
@@ -1581,7 +1584,7 @@ fn sorted_tags<I: IntoIterator<Item = (String, String)>>(tags: I) -> Vec<TagEntr
     out
 }
 
-fn object_info(meta: crate::storage::ObjectMeta) -> ObjectInfo {
+fn object_info(meta: crate::storage::ObjectMeta, inline_payload: bool) -> ObjectInfo {
     use crate::storage::EncryptionMode;
     let storage_format = match meta.storage_format.as_deref() {
         None => StorageFormat::Plain,
@@ -1605,6 +1608,7 @@ fn object_info(meta: crate::storage::ObjectMeta) -> ObjectInfo {
     ObjectInfo {
         part_count: meta.part_sizes.as_ref().map(|p| p.len() as u32),
         storage_format,
+        inline_payload,
         checksum,
         encryption,
         user_metadata: meta.metadata.user_metadata.unwrap_or_default(),
@@ -1688,7 +1692,14 @@ pub async fn get_object_info(
     Query(params): Query<VersionParams>,
 ) -> Response {
     match resolve_object_meta(&state, &bucket, &key, params.version_id.as_deref()).await {
-        Ok(meta) => (StatusCode::OK, Json(object_info(meta))).into_response(),
+        Ok(meta) => {
+            let inline_payload = if params.version_id.is_some() {
+                false
+            } else {
+                state.storage.object_inline_payload(&bucket, &key).await
+            };
+            (StatusCode::OK, Json(object_info(meta, inline_payload))).into_response()
+        }
         Err(resp) => resp,
     }
 }

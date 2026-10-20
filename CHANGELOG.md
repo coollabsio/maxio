@@ -11,7 +11,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - React web console with a generated OpenAPI client
 - Bucket lifecycle, bucket tags, anonymous read/list policy, and streaming trailer checksums
-- On-disk format marker (`.maxio-format`) and a no-op migration hook for future data upgrades
+- On-disk format marker (`.maxio-format`) and a no-op migration hook for future data upgrades. `serve`, `check`, `check --repair`, and `keyring merge` refuse a newer marker
+- Format 2 is reserved for the one-way key-and-prefix layout: a key that is also a prefix is stored at `<key>/.maxio.object`. This binary does not write that layout. A directory marked version 2 is refused, so an older build does not open that path as a file
+- Virtual-hosted bucket addressing (`--domain`)
+- `maxio check`, `maxio check --repair`, and `maxio keyring merge`
+- Graceful connection drain on SIGINT and SIGTERM
 - `GET /version` and a version field on `GET /healthz`; the same version is shown in the console
 - Release binaries for Linux (static musl) and macOS, with SHA256 checksums, multi-arch container images, and changelog-backed GitHub Release notes
 - Upgrade guide, supported platforms, and a production deployment checklist

@@ -61,6 +61,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Matches rust-toolchain.toml. Cargo.toml rust-version (1.89) is the MSRV.
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@1.97.1
         with:

@@ -1,3 +1,5 @@
+# Pinned for local builds, CI, the release workflow, and the Docker builder.
+# Cargo.toml rust-version (1.89) is the minimum supported compiler.
 [toolchain]
 channel = "1.97.1"
 components = ["clippy", "rustfmt"]

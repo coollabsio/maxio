@@ -9,18 +9,34 @@
 //! A missing marker is format 0. That covers a brand-new directory and any
 //! directory created before the marker existed. Startup walks [`MIGRATIONS`]
 //! until [`CURRENT_FORMAT_VERSION`] and writes the marker after each step.
-//! A marker newer than this binary is a hard error: starting would risk
-//! writing a layout this release does not understand.
+//! A marker newer than this binary is a hard error: opening the directory
+//! would risk writing a layout this release does not understand. `serve`,
+//! `check`, `check --repair`, and `keyring merge` all use that check.
+//!
+//! Format 2 ([`KEY_AND_PREFIX_FORMAT_VERSION`]) is the one-way key-and-prefix
+//! layout: a key that is also a prefix is stored at `<key>/.maxio.object`.
+//! This binary does not read or write that layout. A marker of version 2 is
+//! refused so an older build does not open the directory as a file.
 //!
 //! Add a future upgrade by appending one step whose `to` is `from + 1` and
-//! bumping [`CURRENT_FORMAT_VERSION`]. The step's `apply` changes object data;
-//! the framework writes the new version only after `apply` returns.
+//! bumping [`CURRENT_FORMAT_VERSION`] before the first write of the new
+//! layout. The step's `apply` changes object data; the framework writes the
+//! new version only after `apply` returns.
 
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
 /// Layout this binary can read and write.
+///
+/// Format 2 is reserved for the key-and-prefix layout. Do not raise this
+/// until the binary actually reads `<key>/.maxio.object`.
 pub const CURRENT_FORMAT_VERSION: u32 = 1;
+
+/// One-way layout for a key that is also a prefix (`<key>/.maxio.object`).
+///
+/// Older binaries that only understand [`CURRENT_FORMAT_VERSION`] refuse a
+/// data directory marked with this version.
+pub const KEY_AND_PREFIX_FORMAT_VERSION: u32 = 2;
 
 /// File name of the marker, relative to the data directory.
 pub const FORMAT_FILENAME: &str = ".maxio-format";
@@ -52,23 +68,26 @@ fn noop_migration(_data_dir: &Path) -> Result<(), String> {
 #[derive(Debug, thiserror::Error)]
 pub enum FormatError {
     #[error(
-        "refusing to start: data directory {path} uses on-disk format version {found}, \
+        "refusing to open data directory {path}: it uses on-disk format version {found}, \
          but this MaxIO release only understands version {supported}. \
-         Install a newer MaxIO binary before opening this data directory"
+         Install a newer MaxIO binary before using this data directory.{hint}"
     )]
     Newer {
         path: String,
         found: u32,
         supported: u32,
+        hint: &'static str,
     },
-    #[error("refusing to start: {path} is not a readable MaxIO format marker ({message})")]
+    #[error("refusing to open {path}: it is not a readable MaxIO format marker ({message})")]
     Invalid { path: String, message: String },
     #[error(
-        "refusing to start: no migration from on-disk format {from} to {target} \
+        "refusing to open this data directory: no migration from on-disk format {from} to {target} \
          (this release understands version {target})"
     )]
     NoMigration { from: u32, target: u32 },
-    #[error("refusing to start: migration '{name}' ({from} -> {to}) failed: {message}")]
+    #[error(
+        "refusing to open this data directory: migration '{name}' ({from} -> {to}) failed: {message}"
+    )]
     Migration {
         name: &'static str,
         from: u32,
@@ -84,10 +103,40 @@ struct FormatFile {
     version: u32,
 }
 
+/// Refuse a newer marker without creating the directory or writing the marker.
+///
+/// Used by read-only `maxio check`. `serve`, `check --repair`, and
+/// `keyring merge` call [`ensure_current`], which also migrates.
+pub async fn ensure_readable(data_dir: impl AsRef<Path>) -> Result<u32, FormatError> {
+    let data_dir = data_dir.as_ref();
+    if !tokio::fs::try_exists(data_dir).await? {
+        return Ok(0);
+    }
+    let found = read_format_version(data_dir).await?;
+    if found > CURRENT_FORMAT_VERSION {
+        return Err(newer_error(data_dir, found, CURRENT_FORMAT_VERSION));
+    }
+    Ok(found)
+}
+
 /// Create the data directory if needed, refuse a newer marker, and run any
 /// pending migrations up to [`CURRENT_FORMAT_VERSION`].
 pub async fn ensure_current(data_dir: impl AsRef<Path>) -> Result<u32, FormatError> {
     apply_migrations(data_dir.as_ref(), CURRENT_FORMAT_VERSION, MIGRATIONS).await
+}
+
+fn newer_error(data_dir: &Path, found: u32, supported: u32) -> FormatError {
+    let hint = if found == KEY_AND_PREFIX_FORMAT_VERSION {
+        " Format 2 stores a key that is also a prefix at <key>/.maxio.object. That layout is one-way: this binary does not read it."
+    } else {
+        ""
+    };
+    FormatError::Newer {
+        path: data_dir.display().to_string(),
+        found,
+        supported,
+        hint,
+    }
 }
 
 /// Migration engine used by [`ensure_current`]. Tests pass a private migration
@@ -100,11 +149,7 @@ pub async fn apply_migrations(
     tokio::fs::create_dir_all(data_dir).await?;
     let found = read_format_version(data_dir).await?;
     if found > target {
-        return Err(FormatError::Newer {
-            path: data_dir.display().to_string(),
-            found,
-            supported: target,
-        });
+        return Err(newer_error(data_dir, found, target));
     }
 
     let mut current = found;
@@ -250,7 +295,7 @@ mod tests {
 
         let err = ensure_current(dir.path()).await.unwrap_err();
         let message = err.to_string();
-        assert!(message.contains("refusing to start"), "{message}");
+        assert!(message.contains("refusing to open"), "{message}");
         assert!(message.contains("version 99"), "{message}");
         assert!(message.contains("version 1"), "{message}");
         assert!(
@@ -261,13 +306,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn key_prefix_format_is_refused_and_names_the_object_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(FORMAT_FILENAME);
+        let original = b"{\"version\":2}\n";
+        std::fs::write(&path, original).unwrap();
+
+        for err in [
+            ensure_readable(dir.path()).await.unwrap_err(),
+            ensure_current(dir.path()).await.unwrap_err(),
+        ] {
+            let message = err.to_string();
+            assert!(message.contains("refusing to open"), "{message}");
+            assert!(message.contains("version 2"), "{message}");
+            assert!(message.contains("version 1"), "{message}");
+            assert!(message.contains(".maxio.object"), "{message}");
+        }
+        assert_eq!(std::fs::read(path).unwrap(), original);
+    }
+
+    #[tokio::test]
+    async fn readable_check_does_not_create_a_missing_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("absent");
+        assert_eq!(ensure_readable(&missing).await.unwrap(), 0);
+        assert!(!missing.exists());
+    }
+
+    #[tokio::test]
     async fn corrupt_marker_refuses_to_start_without_replacing_the_file() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join(FORMAT_FILENAME);
         std::fs::write(&path, b"not-json").unwrap();
 
         let err = ensure_current(dir.path()).await.unwrap_err();
-        assert!(err.to_string().contains("refusing to start"), "{err}");
+        assert!(err.to_string().contains("refusing to open"), "{err}");
         assert_eq!(std::fs::read(path).unwrap(), b"not-json");
     }
 

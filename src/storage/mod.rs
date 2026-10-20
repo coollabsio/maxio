@@ -1,9 +1,11 @@
+pub mod check;
 pub mod chunk_reader;
 pub mod crypto;
 pub mod filesystem;
 pub mod format;
 pub mod keys;
 pub mod lifecycle;
+pub mod lock;
 
 use base64::Engine;
 use serde::{Deserialize, Serialize};
@@ -599,6 +601,8 @@ pub enum StorageError {
     IntegrityError(String),
     #[error("Precondition failed")]
     PreconditionFailed,
+    #[error("entity exceeds the configured size limit")]
+    EntityTooLarge,
 }
 
 #[cfg(test)]

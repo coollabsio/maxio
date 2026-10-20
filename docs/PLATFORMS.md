@@ -33,7 +33,7 @@ tar -xzf maxio-linux-amd64-1.0.0.tar.gz
 
 ## Building from source
 
-Source builds need the Rust toolchain in `rust-toolchain.toml` and bun 1.4.2. `cargo build --release` produces a binary for the host (glibc on typical Linux installs, not the musl artifact).
+`Cargo.toml` `rust-version` is **1.89** (the oldest compiler this crate claims to support). CI, the release workflow, and the container image build with the pinned toolchain in `rust-toolchain.toml`, currently **1.97.1**. A source build needs that toolchain (or any newer one) and bun 1.4.2. `cargo build --release` produces a binary for the host (glibc on typical Linux installs, not the musl artifact).
 
 Windows binaries are not published. The SSE-S3 key file is created with mode `0600` on Unix only; on Windows you would have to restrict access yourself.
 

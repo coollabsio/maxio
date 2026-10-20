@@ -54,11 +54,13 @@ Keep the previous image on the host until you are sure you do not need to roll b
 
 ## On-disk format
 
-`<data-dir>/.maxio-format` records the layout version (`{"version":1}`).
+`<data-dir>/.maxio-format` records the layout version (`{"version":1}` for this binary).
 
-- A missing marker is format 0. Current releases run a no-op migration and write version 1. Object bytes are not rewritten.
-- The same version starts with no further migration.
-- A **newer** marker than this binary understands makes MaxIO refuse to start. The message names both versions. The data directory is left unchanged. Install the newer release instead of deleting the marker.
+- A missing marker is format 0. `serve`, `check --repair`, and `keyring merge` run a no-op migration and write version 1. Object bytes are not rewritten. Read-only `maxio check` does not write the marker.
+- The same version opens with no further migration.
+- A **newer** marker than this binary understands makes `serve`, `check`, `check --repair`, and `keyring merge` refuse to open the directory. The message names both versions. The data directory is left unchanged. Install the newer release instead of deleting the marker.
+
+Format 2 is the one-way key-and-prefix layout. A key that is also a prefix (`photos/cat.jpg` and `photos/cat.jpg/thumb`) is stored at `photos/cat.jpg/.maxio.object`. A binary that only understands format 1 refuses that marker. It does not open the directory as a file (that path returns `InternalError` on a build that has no format check). This 1.0.0 binary does not write format 2. The release that introduces the layout must bump the marker to 2 before the first `.maxio.object` write.
 
 Future releases append a migration step and bump the marker only after that step succeeds. A failed migration leaves the previous marker in place.
 

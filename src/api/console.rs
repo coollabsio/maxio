@@ -703,7 +703,15 @@ pub async fn upload_object(
             }),
         )
             .into_response(),
-        Err(e) => internal(e),
+        Err(e) => {
+            if matches!(e, crate::storage::StorageError::EntityTooLarge) {
+                return error(
+                    StatusCode::BAD_REQUEST,
+                    "upload exceeds the maximum object size",
+                );
+            }
+            internal(e)
+        }
     }
 }
 
@@ -2094,6 +2102,8 @@ mod tests {
             secret_key: "test-credential".into(),
             region: "us-east-1".into(),
             master_key: None,
+            master_key_file: None,
+            allow_missing_master_key: false,
             allow_insecure_dev,
             secure_cookies,
             erasure_coding: false,
@@ -2101,6 +2111,7 @@ mod tests {
             parity_shards: 0,
             default_buckets: String::new(),
             max_console_body_bytes: 1024 * 1024,
+            ..Default::default()
         }
     }
 

@@ -65,7 +65,7 @@ The full marker-filtered run, before name-based skips, was 316/613 (52%) at base
 
 These were wrong for clients that already work against AWS, and each has a regression test in `tests/integration.rs` (and, where the AWS CLI can see it, `tests/aws_cli_test.sh`):
 
-- A key that is also a prefix of another key (`foo/bar` and `foo/bar/baz`) can both be stored. The prefix object's bytes live at `{key}/.maxio.object` so the directory can hold children.
+- A key that is also a prefix of another key (`foo/bar` and `foo/bar/baz`) can both be stored. The prefix object's bytes live at `{key}/.maxio.object` so the directory can hold children. The layout is one-way: an older MaxIO build returns `InternalError` on GET of a promoted key, because it opens that path as a file.
 - In `us-east-1`, creating a bucket you already own returns 200. Other regions still return `BucketAlreadyOwnedByYou`.
 - `CopyObject` onto the same key without a metadata, tagging, or encryption change returns `InvalidRequest`.
 - `CompleteMultipartUpload` with an empty body returns `MalformedXML`. Repeating a successful complete returns the same result, so a client retry does not see `NoSuchUpload`.

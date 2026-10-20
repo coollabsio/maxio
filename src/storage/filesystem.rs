@@ -358,9 +358,10 @@ impl FilesystemStorage {
             max_multipart_object_size: u64::MAX,
         };
         // Nothing is in flight during construction, so crash leftovers (temp
-        // files, stranded EC backups, upload dirs with no readable metadata)
-        // are safe to clear immediately. The hourly sweep keeps an age gate
-        // so it cannot delete a live request's temp file.
+        // files, stranded EC backups, half-finished key promotions, upload
+        // dirs with no readable metadata) are safe to clear immediately. The
+        // hourly sweep keeps an age gate so it cannot delete a live request's
+        // temp file or promote directory.
         storage.startup_recover().await;
         Ok(storage)
     }
@@ -1471,6 +1472,21 @@ async fn write_chunk_file(path: &Path, index: u32, data: &[u8]) -> Result<ChunkI
 /// Payload file stored inside a key directory when that key is also a prefix.
 pub(crate) const INLINE_OBJECT_PAYLOAD: &str = ".maxio.object";
 
+/// Directory that holds a key's bytes while that key is promoted from a file
+/// to a directory (`p` and `p/q` both exist). The suffix is a UUID; the
+/// target file name lives in [`PROMOTE_TARGET_FILE`] so recovery does not
+/// have to parse the directory name.
+pub(crate) const PROMOTE_DIR_PREFIX: &str = ".maxio-promote-";
+
+/// Single path component (the key's file name) this promote directory belongs
+/// to. Written before the payload is unlinked.
+pub(crate) const PROMOTE_TARGET_FILE: &str = ".maxio-promote-target";
+
+/// Empty marker written only after the payload copy has been fsynced. Recovery
+/// will not publish a promote directory that lacks it, unless the payload is
+/// the original file renamed by an older build (no marker at all).
+pub(crate) const PROMOTE_READY_FILE: &str = ".maxio-promote-ready";
+
 /// Create `dir`, turning any file along the path into a directory that keeps
 /// the object's bytes in `.maxio.object`. S3 keys are a flat namespace, so
 /// `a/b` and `a/b/c` must both exist.
@@ -1504,20 +1520,470 @@ async fn ensure_dir_preserving_objects(dir: &Path) -> Result<(), StorageError> {
     }
 }
 
+fn valid_promote_target(name: &str) -> bool {
+    !name.is_empty()
+        && name != "."
+        && name != ".."
+        && !name.contains('/')
+        && !name.contains('\\')
+        && !name.contains('\0')
+        && !name.contains('\n')
+        && !name.contains('\r')
+}
+
+async fn duplicate_file(src: &Path, dest: &Path) -> Result<(), StorageError> {
+    let src_pb = src.to_path_buf();
+    let dest_pb = dest.to_path_buf();
+    let linked = tokio::task::spawn_blocking(move || std::fs::hard_link(&src_pb, &dest_pb))
+        .await
+        .map_err(|e| {
+            StorageError::Io(std::io::Error::other(format!(
+                "promote hard link task failed: {e}"
+            )))
+        })?;
+    if let Err(err) = linked {
+        tracing::debug!("promote hard link failed ({err}); copying payload");
+        fs::copy(src, dest).await.map_err(StorageError::Io)?;
+    }
+    // The directory entry (hard link) or the copied bytes must hit disk
+    // before the original name is removed.
+    sync_file(dest).await?;
+    Ok(())
+}
+
+/// Turn the file at `path` into a directory whose bytes live in
+/// `.maxio.object`, without a window where those bytes have no name.
+///
+/// The original file stays in place until a second copy has been fsynced and
+/// a target marker names the destination. A crash before that unlink leaves
+/// the original readable. A crash after it leaves `.maxio-promote-*/`, which
+/// startup and `maxio check --repair` move back.
 async fn promote_file_to_directory(path: &Path) -> Result<(), StorageError> {
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
-    let tmp = parent.join(format!(".maxio-promote-{}", uuid::Uuid::new_v4()));
-    fs::create_dir(&tmp).await.map_err(StorageError::Io)?;
-    if let Err(e) = fs::rename(path, tmp.join(INLINE_OBJECT_PAYLOAD)).await {
-        let _ = fs::remove_dir_all(&tmp).await;
+    let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+        return Err(StorageError::Io(std::io::Error::other(
+            "object path has no UTF-8 file name",
+        )));
+    };
+    if !valid_promote_target(name) {
+        return Err(StorageError::Io(std::io::Error::other(
+            "object path is not a single file name",
+        )));
+    }
+
+    let promote = parent.join(format!("{PROMOTE_DIR_PREFIX}{}", uuid::Uuid::new_v4()));
+    fs::create_dir(&promote).await.map_err(StorageError::Io)?;
+    // Armed until the copy is durable. Drop removes the directory if we fail
+    // before the original name is unlinked.
+    let mut guard = TempPathGuard::dir(promote.clone());
+
+    write_file_atomic(&promote.join(PROMOTE_TARGET_FILE), name.as_bytes()).await?;
+    duplicate_file(path, &promote.join(INLINE_OBJECT_PAYLOAD)).await?;
+    sync_dir(&promote).await?;
+    write_file_atomic(&promote.join(PROMOTE_READY_FILE), b"").await?;
+    sync_dir(&promote).await?;
+
+    // Past this point the promote directory is the crash copy. Do not let
+    // the guard delete it if publishing fails.
+    guard.disarm();
+    if let Err(e) = fs::remove_file(path).await {
+        let _ = fs::remove_dir_all(&promote).await;
         return Err(StorageError::Io(e));
     }
-    if let Err(e) = fs::rename(&tmp, path).await {
-        let _ = fs::rename(tmp.join(INLINE_OBJECT_PAYLOAD), path).await;
-        let _ = fs::remove_dir_all(&tmp).await;
-        return Err(StorageError::Io(e));
+    sync_dir(parent).await?;
+    if let Err(e) = publish_promoted(parent, &promote, name).await {
+        // Bytes are only in the promote directory. Put them back at `name`
+        // (or into `name/.maxio.object` if that directory now exists) so a
+        // failed promote does not depend on a later restart.
+        let _ = recover_promotes_in(parent, None).await;
+        return Err(e);
     }
     Ok(())
+}
+
+async fn publish_promoted(parent: &Path, promote: &Path, name: &str) -> Result<(), StorageError> {
+    let dest = parent.join(name);
+    match fs::metadata(&dest).await {
+        Ok(meta) if meta.is_dir() => {
+            let inline = dest.join(INLINE_OBJECT_PAYLOAD);
+            if fs::metadata(&inline)
+                .await
+                .map(|m| m.is_file())
+                .unwrap_or(false)
+            {
+                fs::remove_dir_all(promote)
+                    .await
+                    .map_err(StorageError::Io)?;
+            } else {
+                fs::rename(promote.join(INLINE_OBJECT_PAYLOAD), &inline)
+                    .await
+                    .map_err(StorageError::Io)?;
+                sync_dir(&dest).await?;
+                fs::remove_dir_all(promote)
+                    .await
+                    .map_err(StorageError::Io)?;
+            }
+            sync_dir(parent).await?;
+        }
+        Ok(meta) if meta.is_file() => {
+            // A newer object landed at this name. Keep it.
+            fs::remove_dir_all(promote)
+                .await
+                .map_err(StorageError::Io)?;
+            sync_dir(parent).await?;
+        }
+        Ok(_) => {
+            return Err(StorageError::Io(std::io::Error::other(
+                "promote destination is not a file or directory",
+            )));
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            fs::rename(promote, &dest).await.map_err(StorageError::Io)?;
+            sync_dir(parent).await?;
+            let _ = fs::remove_file(dest.join(PROMOTE_TARGET_FILE)).await;
+            let _ = fs::remove_file(dest.join(PROMOTE_READY_FILE)).await;
+            let _ = sync_dir(&dest).await;
+        }
+        Err(e) => return Err(StorageError::Io(e)),
+    }
+    Ok(())
+}
+
+/// What recovery did with one `.maxio-promote-*` directory.
+#[derive(Debug)]
+pub(crate) struct PromoteOutcome {
+    pub path: PathBuf,
+    pub target: Option<String>,
+    /// Bytes are reachable again and the promote directory is gone, or it
+    /// held nothing worth keeping.
+    pub resolved: bool,
+    pub detail: String,
+}
+
+/// Restore or discard promote directories directly inside `dir`.
+///
+/// `max_age` of `None` handles every directory (startup, `check --repair`).
+/// `Some(secs)` skips a directory newer than that, so the hourly sweep cannot
+/// race a promote that is still running.
+pub(crate) async fn recover_promotes_in(dir: &Path, max_age: Option<u64>) -> Vec<PromoteOutcome> {
+    let mut listed = match fs::read_dir(dir).await {
+        Ok(rd) => rd,
+        Err(_) => return Vec::new(),
+    };
+    let mut promotes = Vec::new();
+    while let Ok(Some(entry)) = listed.next_entry().await {
+        let name = entry.file_name().to_string_lossy().to_string();
+        if !name.starts_with(PROMOTE_DIR_PREFIX) {
+            continue;
+        }
+        if !matches!(entry.file_type().await, Ok(ft) if ft.is_dir()) {
+            continue;
+        }
+        let path = entry.path();
+        if !FilesystemStorage::is_stale(&path, max_age).await {
+            continue;
+        }
+        promotes.push(path);
+    }
+
+    let mut outcomes = Vec::new();
+    let mut unmarked = Vec::new();
+    for promote in promotes {
+        match read_promote_target(&promote).await {
+            Some(target) => outcomes.push(recover_marked_promote(dir, &promote, &target).await),
+            None => unmarked.push(promote),
+        }
+    }
+    if !unmarked.is_empty() {
+        let blocked: std::collections::HashSet<String> = outcomes
+            .iter()
+            .filter(|outcome| !outcome.resolved)
+            .filter_map(|outcome| outcome.target.clone())
+            .collect();
+        outcomes.extend(recover_unmarked_promotes(dir, unmarked, &blocked).await);
+    }
+    outcomes
+}
+
+/// Promote directories in `dir` and the target name recorded in each, if any.
+/// Does not change the disk.
+pub(crate) async fn list_promotes(dir: &Path) -> Vec<(PathBuf, Option<String>)> {
+    let mut listed = match fs::read_dir(dir).await {
+        Ok(rd) => rd,
+        Err(_) => return Vec::new(),
+    };
+    let mut found = Vec::new();
+    while let Ok(Some(entry)) = listed.next_entry().await {
+        let name = entry.file_name().to_string_lossy().to_string();
+        if !name.starts_with(PROMOTE_DIR_PREFIX) {
+            continue;
+        }
+        if !matches!(entry.file_type().await, Ok(ft) if ft.is_dir()) {
+            continue;
+        }
+        let path = entry.path();
+        let target = read_promote_target(&path).await;
+        found.push((path, target));
+    }
+    found
+}
+
+async fn read_promote_target(promote: &Path) -> Option<String> {
+    let raw = fs::read(promote.join(PROMOTE_TARGET_FILE)).await.ok()?;
+    let text = String::from_utf8(raw).ok()?;
+    if !valid_promote_target(&text) {
+        return None;
+    }
+    Some(text)
+}
+
+fn promote_outcome(
+    path: &Path,
+    target: Option<String>,
+    resolved: bool,
+    detail: impl Into<String>,
+) -> PromoteOutcome {
+    PromoteOutcome {
+        path: path.to_path_buf(),
+        target,
+        resolved,
+        detail: detail.into(),
+    }
+}
+
+async fn promote_payload_ready(promote: &Path) -> bool {
+    let ready = promote.join(PROMOTE_READY_FILE);
+    let payload = promote.join(INLINE_OBJECT_PAYLOAD);
+    fs::metadata(&ready)
+        .await
+        .map(|m| m.is_file())
+        .unwrap_or(false)
+        && fs::metadata(&payload)
+            .await
+            .map(|m| m.is_file())
+            .unwrap_or(false)
+}
+
+async fn recover_marked_promote(dir: &Path, promote: &Path, target: &str) -> PromoteOutcome {
+    let dest = dir.join(target);
+    let original_file = fs::metadata(&dest)
+        .await
+        .map(|m| m.is_file())
+        .unwrap_or(false);
+    let inline_present = fs::metadata(dest.join(INLINE_OBJECT_PAYLOAD))
+        .await
+        .map(|m| m.is_file())
+        .unwrap_or(false);
+    if original_file || inline_present {
+        let removed = fs::remove_dir_all(promote).await.is_ok();
+        let _ = sync_dir(dir).await;
+        return promote_outcome(
+            promote,
+            Some(target.to_string()),
+            removed,
+            format!("original object {target} is already in place; promote directory removed"),
+        );
+    }
+    if !promote_payload_ready(promote).await {
+        return promote_outcome(
+            promote,
+            Some(target.to_string()),
+            false,
+            format!(
+                "promote copy of {target} is incomplete and the original file is missing; sidecar kept"
+            ),
+        );
+    }
+    install_promote_payload(dir, promote, target).await
+}
+
+/// Move a complete `.maxio.object` out of `promote` to `target` or, when
+/// `target` is already a directory, to `target/.maxio.object`.
+async fn install_promote_payload(dir: &Path, promote: &Path, target: &str) -> PromoteOutcome {
+    let dest = dir.join(target);
+    let payload = promote.join(INLINE_OBJECT_PAYLOAD);
+    let target_owned = target.to_string();
+    match fs::metadata(&dest).await {
+        Ok(meta) if meta.is_file() => {
+            let removed = fs::remove_dir_all(promote).await.is_ok();
+            let _ = sync_dir(dir).await;
+            promote_outcome(
+                promote,
+                Some(target_owned),
+                removed,
+                format!("original file {target} is still present; promote directory removed"),
+            )
+        }
+        Ok(meta) if meta.is_dir() => {
+            let inline = dest.join(INLINE_OBJECT_PAYLOAD);
+            if fs::metadata(&inline)
+                .await
+                .map(|m| m.is_file())
+                .unwrap_or(false)
+            {
+                let removed = fs::remove_dir_all(promote).await.is_ok();
+                let _ = sync_dir(dir).await;
+                return promote_outcome(
+                    promote,
+                    Some(target_owned),
+                    removed,
+                    format!(
+                        "{target}/{INLINE_OBJECT_PAYLOAD} already exists; promote directory removed"
+                    ),
+                );
+            }
+            match fs::rename(&payload, &inline).await {
+                Ok(()) => {
+                    let _ = sync_dir(&dest).await;
+                    let _ = fs::remove_dir_all(promote).await;
+                    let _ = sync_dir(dir).await;
+                    tracing::warn!("restored promote payload into {}", inline.display());
+                    promote_outcome(
+                        promote,
+                        Some(target_owned),
+                        true,
+                        format!("restored payload into {target}/{INLINE_OBJECT_PAYLOAD}"),
+                    )
+                }
+                Err(e) => promote_outcome(
+                    promote,
+                    Some(target_owned),
+                    false,
+                    format!("failed to restore payload into {}: {e}", inline.display()),
+                ),
+            }
+        }
+        Ok(_) => promote_outcome(
+            promote,
+            Some(target_owned),
+            false,
+            format!("promote destination {target} is not a file or directory"),
+        ),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            match fs::rename(&payload, &dest).await {
+                Ok(()) => {
+                    let _ = sync_dir(dir).await;
+                    let _ = fs::remove_dir_all(promote).await;
+                    let _ = sync_dir(dir).await;
+                    tracing::warn!("restored promote payload back to {}", dest.display());
+                    promote_outcome(
+                        promote,
+                        Some(target_owned),
+                        true,
+                        format!("restored payload back to {target}"),
+                    )
+                }
+                Err(e) => promote_outcome(
+                    promote,
+                    Some(target_owned),
+                    false,
+                    format!("failed to restore payload to {}: {e}", dest.display()),
+                ),
+            }
+        }
+        Err(e) => promote_outcome(
+            promote,
+            Some(target_owned),
+            false,
+            format!("cannot stat promote destination {target}: {e}"),
+        ),
+    }
+}
+
+async fn recover_unmarked_promotes(
+    dir: &Path,
+    unmarked: Vec<PathBuf>,
+    blocked: &std::collections::HashSet<String>,
+) -> Vec<PromoteOutcome> {
+    let mut outcomes = Vec::new();
+    let mut with_payload = Vec::new();
+    for promote in unmarked {
+        let payload = promote.join(INLINE_OBJECT_PAYLOAD);
+        if fs::metadata(&payload)
+            .await
+            .map(|m| m.is_file())
+            .unwrap_or(false)
+        {
+            with_payload.push(promote);
+        } else {
+            let removed = fs::remove_dir_all(&promote).await.is_ok();
+            let _ = sync_dir(dir).await;
+            outcomes.push(promote_outcome(
+                &promote,
+                None,
+                removed,
+                "empty promote directory removed",
+            ));
+        }
+    }
+    if with_payload.is_empty() {
+        return outcomes;
+    }
+
+    // Older builds renamed `p` to `.maxio-promote-<uuid>/.maxio.object` with
+    // no marker. The payload is the original file. When exactly one sidecar
+    // in this directory is missing its bytes, that key is the destination.
+    let candidates = missing_payload_stems(dir, blocked).await;
+    if with_payload.len() == 1 && candidates.len() == 1 {
+        outcomes.push(install_promote_payload(dir, &with_payload[0], &candidates[0]).await);
+        return outcomes;
+    }
+    for promote in with_payload {
+        outcomes.push(promote_outcome(
+            &promote,
+            None,
+            false,
+            "promote directory has object bytes but no target marker; left in place so the sidecar is not deleted",
+        ));
+    }
+    outcomes
+}
+
+/// Stems of `*.meta.json` in `dir` whose object bytes are neither the file
+/// nor `<stem>/.maxio.object`.
+async fn missing_payload_stems(
+    dir: &Path,
+    blocked: &std::collections::HashSet<String>,
+) -> Vec<String> {
+    let mut listed = match fs::read_dir(dir).await {
+        Ok(rd) => rd,
+        Err(_) => return Vec::new(),
+    };
+    let mut stems = Vec::new();
+    while let Ok(Some(entry)) = listed.next_entry().await {
+        let name = entry.file_name().to_string_lossy().to_string();
+        if entry
+            .file_type()
+            .await
+            .map(|ft| ft.is_dir())
+            .unwrap_or(true)
+        {
+            continue;
+        }
+        let Some(stem) = name.strip_suffix(".meta.json") else {
+            continue;
+        };
+        if !valid_promote_target(stem) || blocked.contains(stem) {
+            continue;
+        }
+        let dest = dir.join(stem);
+        let dest_meta = fs::metadata(&dest).await;
+        let missing = match dest_meta {
+            Ok(meta) if meta.is_file() => false,
+            Ok(meta) if meta.is_dir() => !fs::metadata(dest.join(INLINE_OBJECT_PAYLOAD))
+                .await
+                .map(|m| m.is_file())
+                .unwrap_or(false),
+            Ok(_) => true,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => true,
+            Err(_) => false,
+        };
+        if missing {
+            stems.push(stem.to_string());
+        }
+    }
+    stems.sort();
+    stems
 }
 
 /// Remove a plain object payload. A directory that also holds child keys is
@@ -3437,7 +3903,8 @@ impl FilesystemStorage {
     /// Clear crash leftovers that cannot belong to a live request.
     ///
     /// Called from `new` (process start). Removes every `.maxio-tmp-*` and
-    /// resolves every `.maxio-bak-*` immediately, and deletes multipart upload
+    /// resolves every `.maxio-bak-*` immediately, restores object bytes left
+    /// in `.maxio-promote-*` directories, and deletes multipart upload
     /// directories whose `.meta.json` is missing or unreadable. Uploads with
     /// valid metadata are left for the client to complete or abort; the hourly
     /// sweep removes those that stay idle for 7 days.
@@ -3617,6 +4084,11 @@ impl FilesystemStorage {
     ///   the publish died mid-swap and the backup IS the committed object —
     ///   restore it; if `<name>` exists the publish completed and the backup
     ///   is garbage.
+    /// * `.maxio-promote-*` directories older than `backup_max_age` are
+    ///   restored (payload back at the target key, or into `<key>/.maxio.object`
+    ///   when that directory exists) or discarded when the original file is
+    ///   still in place. The sweep does not recurse into them: the payload is
+    ///   the object, not a temp file.
     fn sweep_stale_artifacts<'a>(
         dir: &'a Path,
         temp_max_age: Option<u64>,
@@ -3624,9 +4096,25 @@ impl FilesystemStorage {
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = u64> + Send + 'a>> {
         Box::pin(async move {
             let mut removed = 0u64;
+            for outcome in recover_promotes_in(dir, backup_max_age).await {
+                if outcome.resolved {
+                    removed += 1;
+                    tracing::info!(
+                        "housekeeping: {} ({})",
+                        outcome.detail,
+                        outcome.path.display()
+                    );
+                } else {
+                    tracing::warn!(
+                        "housekeeping: {} ({})",
+                        outcome.detail,
+                        outcome.path.display()
+                    );
+                }
+            }
             let mut entries = match fs::read_dir(dir).await {
                 Ok(e) => e,
-                Err(_) => return 0,
+                Err(_) => return removed,
             };
             while let Ok(Some(entry)) = entries.next_entry().await {
                 let name = entry.file_name().to_string_lossy().to_string();
@@ -3680,6 +4168,29 @@ impl FilesystemStorage {
                             ),
                         }
                     }
+                    continue;
+                }
+
+                if name == PROMOTE_TARGET_FILE || name == PROMOTE_READY_FILE {
+                    // Markers left inside a published key directory after a
+                    // crash between the rename and the marker cleanup. The
+                    // in-progress copies live inside `.maxio-promote-*`, which
+                    // this sweep does not recurse into.
+                    if !Self::is_stale(&path, backup_max_age).await {
+                        continue;
+                    }
+                    match fs::remove_file(&path).await {
+                        Ok(()) => removed += 1,
+                        Err(e) => tracing::warn!(
+                            "housekeeping: failed to remove promote marker {}: {}",
+                            path.display(),
+                            e
+                        ),
+                    }
+                    continue;
+                }
+
+                if is_dir && name.starts_with(PROMOTE_DIR_PREFIX) {
                     continue;
                 }
 

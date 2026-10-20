@@ -28,12 +28,19 @@ The server refuses to start with the built-in `maxioadmin` / `maxioadmin` keys. 
 ### Docker
 
 ```bash
+# Local credentials for this server. The secret is generated, not a shared default.
+export MAXIO_ACCESS_KEY="local-admin"
+export MAXIO_SECRET_KEY="$(openssl rand -hex 24)"
+
 docker run -d --name maxio -p 9000:9000 -v "$(pwd)/data:/data" \
-  -e MAXIO_ACCESS_KEY=myadmin -e MAXIO_SECRET_KEY=mysecret \
+  -e MAXIO_ACCESS_KEY -e MAXIO_SECRET_KEY \
   ghcr.io/coollabsio/maxio
+
+printf 'Open http://localhost:9000/ui/ and sign in with %s / %s\n' \
+  "$MAXIO_ACCESS_KEY" "$MAXIO_SECRET_KEY"
 ```
 
-Open `http://localhost:9000/ui/` and sign in with `myadmin` / `mysecret`. Images are on [GHCR](https://ghcr.io/coollabsio/maxio) and Docker Hub (`coollabsio/maxio`).
+Images are on [GHCR](https://ghcr.io/coollabsio/maxio) and Docker Hub (`coollabsio/maxio`).
 
 ### Build from source
 
@@ -43,12 +50,15 @@ Install [Rust](https://rustup.rs) (the version in `rust-toolchain.toml`) and [bu
 curl -fsSL https://bun.sh/install | bash -s "bun-v1.4.2"
 export PATH="$HOME/.bun/bin:$PATH"
 
-cargo build --release
-./target/release/maxio --data-dir ./data --port 9000 \
-  --access-key myadmin --secret-key mysecret
-```
+export MAXIO_ACCESS_KEY="local-admin"
+export MAXIO_SECRET_KEY="$(openssl rand -hex 24)"
 
-Open `http://localhost:9000/ui/` and sign in with `myadmin` / `mysecret`.
+cargo build --release
+./target/release/maxio --data-dir ./data --port 9000
+
+printf 'Open http://localhost:9000/ui/ and sign in with %s / %s\n' \
+  "$MAXIO_ACCESS_KEY" "$MAXIO_SECRET_KEY"
+```
 
 ## Configuration
 
@@ -74,7 +84,8 @@ Each variable also has a CLI flag (for example `--port`). Run `maxio --help` for
 ## Usage
 
 ```bash
-mc alias set maxio http://localhost:9000 myadmin mysecret
+# MAXIO_ACCESS_KEY and MAXIO_SECRET_KEY are the values exported in Quick Start.
+mc alias set maxio http://localhost:9000 "$MAXIO_ACCESS_KEY" "$MAXIO_SECRET_KEY"
 mc mb maxio/my-bucket
 mc cp file.txt maxio/my-bucket/
 ```

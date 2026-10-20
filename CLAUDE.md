@@ -14,10 +14,11 @@ Always spell the product name **MaxIO** (capital M, capital I, capital O). Never
 
 ```bash
 # bun 1.4.2 is required; build.rs runs `bun run build` and embeds ui/dist
+export MAXIO_ACCESS_KEY="local-admin"
+export MAXIO_SECRET_KEY="$(openssl rand -hex 24)"
 cargo build --release
-./target/release/maxio --data-dir ./data --port 9000 \
-  --access-key myadmin --secret-key mysecret
-# Console: http://localhost:9000/ui/  (myadmin / mysecret)
+./target/release/maxio --data-dir ./data --port 9000
+# Console: http://localhost:9000/ui/  (sign in with $MAXIO_ACCESS_KEY / $MAXIO_SECRET_KEY)
 ```
 
 Environment variables: `MAXIO_PORT`, `MAXIO_ADDRESS`, `MAXIO_DATA_DIR`, `MAXIO_ACCESS_KEY` (aliases: `MINIO_ROOT_USER`, `MINIO_ACCESS_KEY`), `MAXIO_SECRET_KEY` (aliases: `MINIO_ROOT_PASSWORD`, `MINIO_SECRET_KEY`), `MAXIO_REGION` (aliases: `MINIO_REGION_NAME`, `MINIO_REGION`)

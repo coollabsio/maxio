@@ -149,8 +149,7 @@ async fn main() -> anyhow::Result<()> {
     {
         anyhow::bail!(
             "refusing to start with the default credentials (maxioadmin/maxioadmin). \
-             Set --access-key and --secret-key (or MAXIO_ACCESS_KEY and MAXIO_SECRET_KEY), \
-             then open http://localhost:9000/ui/. \
+             Set MAXIO_ACCESS_KEY and MAXIO_SECRET_KEY, then open http://localhost:9000/ui/. \
              Pass --allow-insecure-dev only for a trusted local machine that should keep the defaults."
         );
     }

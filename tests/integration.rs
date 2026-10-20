@@ -763,12 +763,12 @@ async fn test_security_headers_are_applied() {
 
 #[tokio::test]
 async fn console_login_on_loopback_http_omits_secure_and_authenticates() {
-    let (base_url, _tmp) = start_server_with_keys("myadmin", "mysecret", true, false).await;
+    let (base_url, _tmp) = start_server_with_keys("test-access", "test-credential", true, false).await;
     let resp = client()
         .post(format!("{base_url}/api/auth/login"))
         .json(&serde_json::json!({
-            "accessKey": "myadmin",
-            "secretKey": "mysecret"
+            "accessKey": "test-access",
+            "secretKey": "test-credential"
         }))
         .send()
         .await
@@ -802,13 +802,13 @@ async fn console_login_on_loopback_http_omits_secure_and_authenticates() {
 
 #[tokio::test]
 async fn console_login_marks_cookie_secure_for_https_and_public_hosts() {
-    let (base_url, _tmp) = start_server_with_keys("myadmin", "mysecret", true, false).await;
+    let (base_url, _tmp) = start_server_with_keys("test-access", "test-credential", true, false).await;
     let https = client()
         .post(format!("{base_url}/api/auth/login"))
         .header("x-forwarded-proto", "https")
         .json(&serde_json::json!({
-            "accessKey": "myadmin",
-            "secretKey": "mysecret"
+            "accessKey": "test-access",
+            "secretKey": "test-credential"
         }))
         .send()
         .await
@@ -824,8 +824,8 @@ async fn console_login_marks_cookie_secure_for_https_and_public_hosts() {
         .post(format!("{base_url}/api/auth/login"))
         .header("host", "storage.example.com")
         .json(&serde_json::json!({
-            "accessKey": "myadmin",
-            "secretKey": "mysecret"
+            "accessKey": "test-access",
+            "secretKey": "test-credential"
         }))
         .send()
         .await

@@ -230,6 +230,106 @@ pub async fn bucket_visible(
     Ok(policy::bucket_visible(&docs, key, bucket))
 }
 
+/// What the web console should offer for this principal.
+///
+/// `bucket` and `prefix` scope object writes and deletes. `create_bucket` is
+/// independent of the current bucket. Root can do all of them.
+#[derive(Debug, Clone, Copy)]
+pub struct ConsoleCapabilities {
+    pub create_bucket: bool,
+    pub delete_bucket: bool,
+    pub put_object: bool,
+    pub delete_object: bool,
+}
+
+pub async fn console_capabilities(
+    config: &Config,
+    principal: &Principal,
+    bucket: Option<&str>,
+    prefix: Option<&str>,
+) -> Result<ConsoleCapabilities, store::IamError> {
+    if principal.is_root() {
+        let in_bucket = bucket.is_some();
+        return Ok(ConsoleCapabilities {
+            create_bucket: true,
+            delete_bucket: in_bucket,
+            put_object: in_bucket,
+            delete_object: in_bucket,
+        });
+    }
+    let create_bucket = identity_allows(
+        config,
+        principal,
+        "s3:CreateBucket",
+        "*",
+        None,
+        false,
+        false,
+    )
+    .await?
+        || identity_allows(
+            config,
+            principal,
+            "s3:CreateBucket",
+            "arn:aws:s3:::new-bucket",
+            None,
+            false,
+            false,
+        )
+        .await?;
+    let Some(bucket) = bucket else {
+        return Ok(ConsoleCapabilities {
+            create_bucket,
+            delete_bucket: false,
+            put_object: false,
+            delete_object: false,
+        });
+    };
+    let prefix = prefix.unwrap_or("");
+    let probe = if prefix.is_empty() {
+        "object".to_string()
+    } else if prefix.ends_with('/') {
+        format!("{prefix}object")
+    } else {
+        format!("{prefix}/object")
+    };
+    let object = policy::object_arn(bucket, &probe);
+    let bucket_arn = policy::bucket_arn(bucket);
+    Ok(ConsoleCapabilities {
+        create_bucket,
+        delete_bucket: identity_allows(
+            config,
+            principal,
+            "s3:DeleteBucket",
+            &bucket_arn,
+            None,
+            false,
+            false,
+        )
+        .await?,
+        put_object: identity_allows(
+            config,
+            principal,
+            "s3:PutObject",
+            &object,
+            None,
+            false,
+            false,
+        )
+        .await?,
+        delete_object: identity_allows(
+            config,
+            principal,
+            "s3:DeleteObject",
+            &object,
+            None,
+            false,
+            false,
+        )
+        .await?,
+    })
+}
+
 pub async fn is_iam_admin(config: &Config, principal: &Principal) -> Result<bool, store::IamError> {
     if principal.is_root() {
         return Ok(true);
@@ -393,4 +493,71 @@ async fn identity_from_key(
         user_name,
         label,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::Config;
+
+    fn test_config(data_dir: &str) -> Config {
+        Config {
+            port: 0,
+            address: "127.0.0.1".into(),
+            data_dir: data_dir.into(),
+            access_key: "root".into(),
+            secret_key: "root".into(),
+            region: "us-east-1".into(),
+            master_key: None,
+            allow_insecure_dev: true,
+            secure_cookies: false,
+            erasure_coding: false,
+            chunk_size: 1024,
+            parity_shards: 0,
+            default_buckets: String::new(),
+            max_console_body_bytes: 1024,
+        }
+    }
+
+    #[tokio::test]
+    async fn readonly_prefix_cannot_create_write_or_delete() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path().to_str().unwrap());
+        let store = store::store_for(&config).await.unwrap();
+        store.create_user("alice").await.unwrap();
+        let document =
+            policy::policy_for_scope(&["photos".into()], "uploads/", policy::ScopeAccess::Read);
+        store
+            .put_inline_policy("alice", "scope", document)
+            .await
+            .unwrap();
+        let key = store.create_access_key("alice", None, true).await.unwrap();
+        let principal = Principal::User {
+            name: "alice".into(),
+            access_key_id: key.info.access_key_id,
+        };
+        let caps = console_capabilities(&config, &principal, Some("photos"), Some("uploads/"))
+            .await
+            .unwrap();
+        assert!(!caps.create_bucket);
+        assert!(!caps.delete_bucket);
+        assert!(!caps.put_object);
+        assert!(!caps.delete_object);
+
+        let document = policy::policy_for_scope(
+            &["photos".into()],
+            "uploads/",
+            policy::ScopeAccess::ReadWrite,
+        );
+        store
+            .put_inline_policy("alice", "scope", document)
+            .await
+            .unwrap();
+        let caps = console_capabilities(&config, &principal, Some("photos"), Some("uploads/"))
+            .await
+            .unwrap();
+        assert!(caps.put_object);
+        assert!(caps.delete_object);
+        assert!(!caps.create_bucket);
+    }
 }

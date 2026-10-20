@@ -399,7 +399,10 @@ pub async fn authorize_console(
         .unwrap_or(path)
         .trim_end_matches('/');
     let q = query_map(query);
-    if path == "/auth/logout" || path == "/buckets" && method == "GET" {
+    if path == "/auth/logout"
+        || (path == "/buckets" && method == "GET")
+        || (path == "/auth/capabilities" && method == "GET")
+    {
         return Ok(ConsoleGate::Allow);
     }
     if path == "/buckets" && method == "POST" {

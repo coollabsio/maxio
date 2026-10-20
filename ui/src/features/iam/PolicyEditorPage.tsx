@@ -100,8 +100,7 @@ function Editor({
   async function validate() {
     const problem = policyJsonError(documentJson)
     if (problem) {
-      setMessageType('danger')
-      setMessage(problem)
+      setMessage('')
       return
     }
     try {
@@ -185,7 +184,7 @@ function Editor({
         />
       </label>
       {localError && !builtin ? <Callout type="danger">{localError}</Callout> : null}
-      {message ? <Callout type={messageType}>{message}</Callout> : null}
+      {message && message !== localError ? <Callout type={messageType}>{message}</Callout> : null}
     </div>
   )
 }

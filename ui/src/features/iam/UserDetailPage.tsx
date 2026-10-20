@@ -37,6 +37,7 @@ export function UserDetailPage() {
   const [showKey, setShowKey] = useState(false)
   const [showGrant, setShowGrant] = useState(false)
   const [confirmDelete, setConfirmDelete] = useState(false)
+  const [keyToDelete, setKeyToDelete] = useState<string | null>(null)
   const [attachName, setAttachName] = useState('')
 
   const refresh = () => {
@@ -148,10 +149,13 @@ export function UserDetailPage() {
             </Button>
           </div>
         </div>
-        {user && user.attachedPolicies.length === 0 && user.inlinePolicies.length === 0 ? (
+        {user &&
+        user.attachedPolicies.length === 0 &&
+        user.inlinePolicies.length === 0 &&
+        !(keysQuery.data?.keys.some((key) => key.policySummary) ?? false) ? (
           <Callout type="info">
-            This user has no policies, so a new key cannot access data. Use Grant scope to user to add access.
-            Creating a key only limits that key.
+            This user has no policies, so a new key cannot access data. Use Grant scope to user to add access. Creating a
+            key only limits that key.
           </Callout>
         ) : null}
         <div className="flex flex-wrap gap-2">
@@ -193,7 +197,21 @@ export function UserDetailPage() {
             <TableBody>
               {keysQuery.data?.keys.map((key) => (
                 <TableRow key={key.accessKeyId}>
-                  <TableCell className="font-mono text-xs">{key.accessKeyId}</TableCell>
+                  <TableCell>
+                    <div className="font-mono text-xs">{key.accessKeyId}</div>
+                    {key.policySummary ? (
+                      <div className="mt-1 max-w-xl font-sans text-xs text-neutral-600 dark:text-fg-dim">
+                        {key.policySummary}
+                        <div className="text-[11px] text-neutral-400 dark:text-fg-faint">
+                          Limits this key only. It does not grant access by itself.
+                        </div>
+                      </div>
+                    ) : (
+                      <div className="mt-1 font-sans text-[11px] text-neutral-400 dark:text-fg-faint">
+                        No key policy. Uses the user's policies.
+                      </div>
+                    )}
+                  </TableCell>
                   <TableCell>
                     <Badge variant={key.status === 'Active' ? 'success' : 'warning'} label={key.status} />
                   </TableCell>
@@ -209,7 +227,7 @@ export function UserDetailPage() {
                       >
                         {key.status === 'Active' ? 'Deactivate' : 'Activate'}
                       </Button>
-                      <Button variant="destructive" size="sm" onClick={() => removeKey.mutate(key.accessKeyId)}>
+                      <Button variant="destructive" size="sm" onClick={() => setKeyToDelete(key.accessKeyId)}>
                         Delete
                       </Button>
                     </div>
@@ -253,6 +271,22 @@ export function UserDetailPage() {
             const policyName = `grant-${label}-${input.access}`.replace(/[^A-Za-z0-9+=,.@_-]/g, '').slice(0, 64)
             await grant.mutateAsync({ policy: policyName, documentJson: input.documentJson })
             setShowGrant(false)
+          }}
+        />
+      ) : null}
+
+      {keyToDelete ? (
+        <ConfirmDialog
+          open
+          title="Delete access key?"
+          description={`This permanently deletes ${keyToDelete}. Anything using it will stop working.`}
+          confirmLabel="Delete key"
+          confirmVariant="destructive"
+          loading={removeKey.isPending}
+          onClose={() => setKeyToDelete(null)}
+          onConfirm={() => {
+            const id = keyToDelete
+            removeKey.mutate(id, { onSuccess: () => setKeyToDelete(null) })
           }}
         />
       ) : null}

@@ -779,6 +779,29 @@ fn stmt(
     }
 }
 
+/// One line for the console key table: the resources a key policy allows.
+pub fn summarize_key_policy(doc: &PolicyDocument) -> String {
+    let mut resources = Vec::new();
+    for stmt in doc.statements() {
+        if stmt.effect != Effect::Allow {
+            continue;
+        }
+        let Some(list) = &stmt.resource else {
+            continue;
+        };
+        for value in list.values() {
+            if !resources.iter().any(|existing: &String| existing == value) {
+                resources.push(value.to_string());
+            }
+        }
+    }
+    if resources.is_empty() {
+        "Key policy (limits this key)".to_string()
+    } else {
+        format!("Key policy: {}", resources.join(", "))
+    }
+}
+
 pub fn builtin_policies() -> Vec<(&'static str, &'static str, PolicyDocument)> {
     vec![
         (

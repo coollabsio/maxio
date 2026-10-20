@@ -65,6 +65,9 @@ pub struct KeyView {
     status: String,
     created_at: String,
     has_policy: bool,
+    /// Set when the key has its own policy. That policy only narrows the user.
+    policy_summary: Option<String>,
+    policy_json: Option<String>,
 }
 
 #[derive(Serialize, ToSchema)]
@@ -222,6 +225,8 @@ fn key_view(key: store::KeyInfo) -> KeyView {
         status: key.status.as_str().to_string(),
         created_at: key.created_at,
         has_policy: key.has_policy,
+        policy_summary: key.policy_summary,
+        policy_json: key.policy_json,
     }
 }
 

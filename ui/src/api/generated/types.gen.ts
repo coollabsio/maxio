@@ -19,6 +19,10 @@ export type BinaryBody = Blob | File;
 
 export type BucketListResponse = {
     buckets: Array<BucketSummary>;
+    /**
+     * Caller may create a bucket.
+     */
+    createBucket: boolean;
 };
 
 export type BucketPolicyResponse = {
@@ -30,6 +34,10 @@ export type BucketPolicyResponse = {
 };
 
 export type BucketSummary = {
+    /**
+     * Caller may call DeleteBucket on this bucket.
+     */
+    canDelete: boolean;
     createdAt: string;
     encryption: boolean;
     name: string;
@@ -46,6 +54,13 @@ export type BucketSummary = {
      */
     tagCount: number;
     versioning: boolean;
+};
+
+export type Capabilities = {
+    createBucket: boolean;
+    deleteBucket: boolean;
+    deleteObject: boolean;
+    putObject: boolean;
 };
 
 export type CreateBucketRequest = {
@@ -140,6 +155,11 @@ export type KeyView = {
     createdAt: string;
     hasPolicy: boolean;
     label: string;
+    policyJson?: string | null;
+    /**
+     * Set when the key has its own policy. That policy only narrows the user.
+     */
+    policySummary?: string | null;
     status: string;
     userName?: string | null;
 };
@@ -416,6 +436,25 @@ export type UserView = {
 export type VersionListResponse = {
     versions: Array<ObjectVersion>;
 };
+
+export type GetCapabilitiesData = {
+    body?: never;
+    path?: never;
+    query?: {
+        /**
+         * When set, `putObject` and `deleteObject` are evaluated under this prefix.
+         */
+        bucket?: string;
+        prefix?: string;
+    };
+    url: '/api/auth/capabilities';
+};
+
+export type GetCapabilitiesResponses = {
+    200: Capabilities;
+};
+
+export type GetCapabilitiesResponse = GetCapabilitiesResponses[keyof GetCapabilitiesResponses];
 
 export type CheckAuthData = {
     body?: never;

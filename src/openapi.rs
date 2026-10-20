@@ -16,6 +16,7 @@ use crate::api::{console, iam_console};
     paths(
         console::login,
         console::check,
+        console::capabilities,
         console::logout,
         console::list_buckets,
         console::create_bucket,
@@ -134,6 +135,7 @@ mod tests {
                 "getBucketLifecycle",
                 "getBucketPolicy",
                 "getBucketTags",
+                "getCapabilities",
                 "getEncryption",
                 "getIamPolicy",
                 "getIamUser",

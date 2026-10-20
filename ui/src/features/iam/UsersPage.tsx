@@ -7,6 +7,7 @@ import { iamKeys } from '@/api/queryKeys'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Callout } from '@/components/ui/callout'
+import { ConfirmDialog } from '@/components/ui/confirm-dialog'
 import { Dialog } from '@/components/ui/dialog'
 import { Input } from '@/components/ui/input'
 import { PageHeader } from '@/components/ui/page-header'
@@ -25,6 +26,7 @@ export function UsersPage() {
   const [userName, setUserName] = useState('')
   const [userError, setUserError] = useState('')
   const [showService, setShowService] = useState(false)
+  const [serviceKeyToDelete, setServiceKeyToDelete] = useState<string | null>(null)
 
   const createUser = useMutation({
     mutationFn: createIamUser,
@@ -160,7 +162,7 @@ export function UsersPage() {
                       >
                         {key.status === 'Active' ? 'Deactivate' : 'Activate'}
                       </Button>
-                      <Button variant="destructive" size="sm" onClick={() => void removeService.mutateAsync(key.accessKeyId)}>
+                      <Button variant="destructive" size="sm" onClick={() => setServiceKeyToDelete(key.accessKeyId)}>
                         Delete
                       </Button>
                     </div>
@@ -171,6 +173,22 @@ export function UsersPage() {
           </Table>
         )}
       </div>
+
+      {serviceKeyToDelete ? (
+        <ConfirmDialog
+          open
+          title="Delete service key?"
+          description={`This permanently deletes ${serviceKeyToDelete}. Anything using it will stop working.`}
+          confirmLabel="Delete key"
+          confirmVariant="destructive"
+          loading={removeService.isPending}
+          onClose={() => setServiceKeyToDelete(null)}
+          onConfirm={() => {
+            const id = serviceKeyToDelete
+            removeService.mutate(id, { onSuccess: () => setServiceKeyToDelete(null) })
+          }}
+        />
+      ) : null}
 
       {showUser ? (
         <Dialog

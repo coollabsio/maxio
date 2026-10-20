@@ -13,6 +13,45 @@
     "version": "maxio-console-v1"
   },
   "paths": {
+    "/api/auth/capabilities": {
+      "get": {
+        "tags": [
+          "auth"
+        ],
+        "operationId": "getCapabilities",
+        "parameters": [
+          {
+            "name": "bucket",
+            "in": "query",
+            "description": "When set, `putObject` and `deleteObject` are evaluated under this prefix.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "prefix",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Capabilities"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/auth/check": {
       "get": {
         "tags": [
@@ -2241,7 +2280,8 @@
       "BucketListResponse": {
         "type": "object",
         "required": [
-          "buckets"
+          "buckets",
+          "createBucket"
         ],
         "properties": {
           "buckets": {
@@ -2249,6 +2289,10 @@
             "items": {
               "$ref": "#/components/schemas/BucketSummary"
             }
+          },
+          "createBucket": {
+            "type": "boolean",
+            "description": "Caller may create a bucket."
           }
         }
       },
@@ -2276,9 +2320,14 @@
           "encryption",
           "publicRead",
           "publicList",
-          "tagCount"
+          "tagCount",
+          "canDelete"
         ],
         "properties": {
+          "canDelete": {
+            "type": "boolean",
+            "description": "Caller may call DeleteBucket on this bucket."
+          },
           "createdAt": {
             "type": "string"
           },
@@ -2303,6 +2352,29 @@
             "minimum": 0
           },
           "versioning": {
+            "type": "boolean"
+          }
+        }
+      },
+      "Capabilities": {
+        "type": "object",
+        "required": [
+          "createBucket",
+          "deleteBucket",
+          "putObject",
+          "deleteObject"
+        ],
+        "properties": {
+          "createBucket": {
+            "type": "boolean"
+          },
+          "deleteBucket": {
+            "type": "boolean"
+          },
+          "deleteObject": {
+            "type": "boolean"
+          },
+          "putObject": {
             "type": "boolean"
           }
         }
@@ -2555,6 +2627,19 @@
           },
           "label": {
             "type": "string"
+          },
+          "policyJson": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "policySummary": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Set when the key has its own policy. That policy only narrows the user."
           },
           "status": {
             "type": "string"

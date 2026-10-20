@@ -128,6 +128,9 @@ pub struct KeyInfo {
     pub status: KeyStatus,
     pub created_at: String,
     pub has_policy: bool,
+    /// Present when this key has its own policy. That policy only narrows the user.
+    pub policy_summary: Option<String>,
+    pub policy_json: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -853,6 +856,13 @@ fn user_info(user: &UserRecord, key_count: usize) -> UserInfo {
 }
 
 fn key_info(key: &MemoryKey) -> KeyInfo {
+    let (policy_summary, policy_json) = match &key.policy {
+        Some(document) => (
+            Some(policy::summarize_key_policy(document)),
+            serde_json::to_string_pretty(document).ok(),
+        ),
+        None => (None, None),
+    };
     KeyInfo {
         access_key_id: key.access_key_id.clone(),
         user_name: key.user_name.clone(),
@@ -860,6 +870,8 @@ fn key_info(key: &MemoryKey) -> KeyInfo {
         status: key.status,
         created_at: key.created_at.clone(),
         has_policy: key.policy.is_some(),
+        policy_summary,
+        policy_json,
     }
 }
 

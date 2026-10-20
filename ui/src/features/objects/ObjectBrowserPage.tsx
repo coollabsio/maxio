@@ -28,7 +28,7 @@ import { VersionHistory } from '@/features/versions/VersionHistory'
 import { formatDate, formatSize } from '@/lib/format'
 import { bucketPath, bucketSettingsPath, displayName, downloadUrl, normalizePrefix } from '@/lib/paths'
 import { toast } from '@/lib/toast'
-import { createFolder, deleteObject, listObjects, presignObject, uploadObject } from './api'
+import { createFolder, deleteObject, getCapabilities, listObjects, presignObject, uploadObject } from './api'
 import { ObjectDetailsSheet } from './ObjectDetailsSheet'
 
 const expiryOptions = [
@@ -68,6 +68,12 @@ function ObjectBrowser({ bucket }: { bucket: string }) {
     queryKey: settingsKeys.versioning(bucket),
     queryFn: () => getVersioning(bucket),
   })
+  const capabilitiesQuery = useQuery({
+    queryKey: ['capabilities', bucket, prefix],
+    queryFn: () => getCapabilities(bucket, prefix),
+  })
+  const canWrite = capabilitiesQuery.data?.putObject === true
+  const canDelete = capabilitiesQuery.data?.deleteObject === true
 
   const files = objectsQuery.data?.files ?? []
   const prefixes = objectsQuery.data?.prefixes ?? []
@@ -216,16 +222,20 @@ function ObjectBrowser({ bucket }: { bucket: string }) {
               >
                 <Settings />
               </Button>
-              <Button variant="default" onClick={() => setShowCreateFolder(true)}>
-                <FolderPlus /> New Folder
-              </Button>
-              <Button
-                variant="highlighted"
-                onClick={() => fileInput.current?.click()}
-                disabled={uploadMutation.isPending}
-              >
-                <Upload /> {uploadMutation.isPending ? 'Uploading...' : 'Upload'}
-              </Button>
+              {canWrite ? (
+                <Button variant="default" onClick={() => setShowCreateFolder(true)}>
+                  <FolderPlus /> New Folder
+                </Button>
+              ) : null}
+              {canWrite ? (
+                <Button
+                  variant="highlighted"
+                  onClick={() => fileInput.current?.click()}
+                  disabled={uploadMutation.isPending}
+                >
+                  <Upload /> {uploadMutation.isPending ? 'Uploading...' : 'Upload'}
+                </Button>
+              ) : null}
             </>
           }
         />
@@ -251,7 +261,9 @@ function ObjectBrowser({ bucket }: { bucket: string }) {
           <Callout type="info">
             <span className="inline-flex items-center gap-2">
               <Folder className="size-4 opacity-70" />
-              This location is empty — upload a file or create a folder to get started.
+              {canWrite
+                ? 'This location is empty — upload a file or create a folder to get started.'
+                : 'This location is empty.'}
             </span>
           </Callout>
         ) : (
@@ -278,7 +290,7 @@ function ObjectBrowser({ bucket }: { bucket: string }) {
                   <TableCell className="text-right text-muted-foreground">&mdash;</TableCell>
                   <TableCell className="text-muted-foreground">&mdash;</TableCell>
                   <TableCell className="text-right">
-                    {emptyPrefixes.has(folder) ? (
+                    {canDelete && emptyPrefixes.has(folder) ? (
                       <button
                         type="button"
                         className="icon-button hover:!text-error"
@@ -359,18 +371,20 @@ function ObjectBrowser({ bucket }: { bucket: string }) {
                         >
                           <Download className="size-4" />
                         </a>
-                        <button
-                          type="button"
-                          className="icon-button hover:!text-error"
-                          onClick={(event) => {
-                            event.stopPropagation()
-                            setPendingDelete({ key: file.key, kind: 'object' })
-                          }}
-                          title="Delete"
-                          aria-label="Delete"
-                        >
-                          <Trash2 className="size-4" />
-                        </button>
+                        {canDelete ? (
+                          <button
+                            type="button"
+                            className="icon-button hover:!text-error"
+                            onClick={(event) => {
+                              event.stopPropagation()
+                              setPendingDelete({ key: file.key, kind: 'object' })
+                            }}
+                            title="Delete"
+                            aria-label="Delete"
+                          >
+                            <Trash2 className="size-4" />
+                          </button>
+                        ) : null}
                       </span>
                     </TableCell>
                   </TableRow>

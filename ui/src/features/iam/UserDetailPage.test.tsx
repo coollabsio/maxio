@@ -96,6 +96,48 @@ test('creating a key stores a narrowing policy and does not grant the user', asy
   expect(screen.queryByRole('dialog', { name: 'Grant scope to user' })).toBeNull()
 })
 
+test('shows a key policy and does not claim the user has no policies', async () => {
+  const { screen } = renderUser((request) => {
+    const url = new URL(request.url)
+    if (url.pathname === '/api/iam/users/alice' && request.method === 'GET') {
+      return json(200, { ...user, attachedPolicies: [], inlinePolicies: [] })
+    }
+    if (url.pathname === '/api/iam/users/alice/keys' && request.method === 'GET') {
+      return json(200, {
+        keys: [
+          {
+            ...existingKey,
+            hasPolicy: true,
+            policySummary: 'Key policy: arn:aws:s3:::photos/uploads/*',
+          },
+        ],
+      })
+    }
+    return route(request)
+  })
+  expect(await screen.findByText('Key policy: arn:aws:s3:::photos/uploads/*')).toBeTruthy()
+  expect(screen.getByText(/Limits this key only/)).toBeTruthy()
+  expect(screen.queryByText(/This user has no policies/)).toBeNull()
+})
+
+test('deleting an access key asks for confirmation', async () => {
+  const userEvents = userEvent.setup()
+  let deleted = false
+  const { screen } = renderUser((request) => {
+    const url = new URL(request.url)
+    if (url.pathname.startsWith('/api/iam/users/alice/keys/') && request.method === 'DELETE') {
+      deleted = true
+      return json(200, { ok: true })
+    }
+    return route(request)
+  })
+  await userEvents.click(await screen.findByRole('button', { name: 'Delete' }))
+  expect(deleted).toBe(false)
+  const dialog = within(await screen.findByRole('dialog', { name: 'Delete access key?' }))
+  await userEvents.click(dialog.getByRole('button', { name: 'Delete key' }))
+  await waitFor(() => expect(deleted).toBe(true))
+})
+
 test('granting a scope is a separate action from creating a key', async () => {
   const userEvents = userEvent.setup()
   const posts: { path: string; body: unknown }[] = []

@@ -59,7 +59,7 @@ describe('summarizeFilter', () => {
   })
 
   test('joins prefix, tags and sizes', () => {
-    expect(summarizeFilter(full)).toBe('Prefix "logs/" · Tag env=dev · Larger than 1 KB · Smaller than 1 MB')
+    expect(summarizeFilter(full)).toBe('Prefix "logs/" · Tag env=dev · Larger than 1 KiB · Smaller than 1 MiB')
   })
 })
 

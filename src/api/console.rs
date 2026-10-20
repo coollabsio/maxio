@@ -267,6 +267,61 @@ pub async fn login(
     (resp_headers, Json(session_response(&identity))).into_response()
 }
 
+#[derive(Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
+pub struct CapabilityParams {
+    /// When set, `putObject` and `deleteObject` are evaluated under this prefix.
+    bucket: Option<String>,
+    prefix: Option<String>,
+}
+
+#[derive(Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct Capabilities {
+    create_bucket: bool,
+    delete_bucket: bool,
+    put_object: bool,
+    delete_object: bool,
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/auth/capabilities",
+    operation_id = "getCapabilities",
+    tag = "auth",
+    params(CapabilityParams),
+    responses((status = 200, body = Capabilities))
+)]
+pub async fn capabilities(
+    State(state): State<AppState>,
+    authn: Option<axum::extract::Extension<crate::iam::Authenticated>>,
+    Query(params): Query<CapabilityParams>,
+) -> Response {
+    let Some(axum::extract::Extension(authn)) = authn else {
+        return error(StatusCode::UNAUTHORIZED, "Not authenticated");
+    };
+    match crate::iam::console_capabilities(
+        &state.config,
+        &authn.principal,
+        params.bucket.as_deref(),
+        params.prefix.as_deref(),
+    )
+    .await
+    {
+        Ok(caps) => (
+            StatusCode::OK,
+            Json(Capabilities {
+                create_bucket: caps.create_bucket,
+                delete_bucket: caps.delete_bucket,
+                put_object: caps.put_object,
+                delete_object: caps.delete_object,
+            }),
+        )
+            .into_response(),
+        Err(err) => internal(err),
+    }
+}
+
 #[utoipa::path(
     get,
     path = "/api/auth/check",
@@ -421,11 +476,16 @@ pub struct BucketSummary {
     public_list: bool,
     /// Number of bucket tags.
     tag_count: u32,
+    /// Caller may call DeleteBucket on this bucket.
+    can_delete: bool,
 }
 
 #[derive(Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
 pub struct BucketListResponse {
     buckets: Vec<BucketSummary>,
+    /// Caller may create a bucket.
+    create_bucket: bool,
 }
 
 #[utoipa::path(
@@ -457,9 +517,27 @@ pub async fn list_buckets(
                     Err(err) => return internal(err),
                 }
             }
-            let buckets = visible
-                .into_iter()
-                .map(|b| BucketSummary {
+            let create_bucket =
+                match crate::iam::console_capabilities(&state.config, &authn.principal, None, None)
+                    .await
+                {
+                    Ok(caps) => caps.create_bucket,
+                    Err(err) => return internal(err),
+                };
+            let mut buckets = Vec::with_capacity(visible.len());
+            for b in visible {
+                let can_delete = match crate::iam::console_capabilities(
+                    &state.config,
+                    &authn.principal,
+                    Some(&b.name),
+                    None,
+                )
+                .await
+                {
+                    Ok(caps) => caps.delete_bucket,
+                    Err(err) => return internal(err),
+                };
+                buckets.push(BucketSummary {
                     name: b.name,
                     created_at: b.created_at,
                     versioning: b.versioning,
@@ -467,9 +545,17 @@ pub async fn list_buckets(
                     public_read: b.public_read,
                     public_list: b.public_list,
                     tag_count: b.tags.as_ref().map_or(0, |t| t.len() as u32),
-                })
-                .collect();
-            (StatusCode::OK, Json(BucketListResponse { buckets })).into_response()
+                    can_delete,
+                });
+            }
+            (
+                StatusCode::OK,
+                Json(BucketListResponse {
+                    buckets,
+                    create_bucket,
+                }),
+            )
+                .into_response()
         }
         Err(e) => internal(e),
     }
@@ -1995,6 +2081,7 @@ pub fn console_router(state: AppState) -> Router<AppState> {
 
     let protected_limited = Router::new()
         .route("/auth/logout", post(logout))
+        .route("/auth/capabilities", get(capabilities))
         .route("/buckets", get(list_buckets))
         .route("/buckets", post(create_bucket))
         .route("/buckets/{bucket}", delete(delete_bucket_api))

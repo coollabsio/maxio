@@ -291,7 +291,7 @@ impl IamStore {
                 .map_err(|e| IamError::Internal(e.to_string()))?,
         );
         let path = Path::new(data_dir).join("iam.json");
-        let memory = load_and_tighten(&path, &keyring).await?;
+        let memory = load_memory(&path, &keyring).await?;
         let store = Arc::new(Self {
             path,
             keyring,
@@ -1057,83 +1057,6 @@ fn seed_builtins(policies: &mut Vec<ManagedRecord>) {
     }
 }
 
-async fn load_and_tighten(path: &Path, keyring: &Keyring) -> Result<Memory, IamError> {
-    let mut memory = load_memory(path, keyring).await?;
-    let notes = tighten_memory(&mut memory);
-    if notes.is_empty() {
-        return Ok(memory);
-    }
-    persist(path, keyring, &memory).await?;
-    tracing::warn!(
-        "Rewrote IAM policies that used a prefix without a directory slash (bucket/uploads* also allowed uploads-private and uploadsX): {}",
-        notes.join("; ")
-    );
-    Ok(memory)
-}
-
-/// One-time rewrite of `bucket/prefix*` policies saved before directory scopes.
-///
-/// Returns a line per change. An empty list means `iam.json` was already tight
-/// or absent. The caller logs the lines at startup.
-pub async fn rewrite_loose_prefix_policies(
-    data_dir: &str,
-    keyring: &Keyring,
-) -> Result<Vec<String>, String> {
-    let path = Path::new(data_dir).join("iam.json");
-    if !path.exists() {
-        return Ok(Vec::new());
-    }
-    let mut memory = load_memory(&path, keyring)
-        .await
-        .map_err(|err| format!("Refusing to start: {err}"))?;
-    let notes = tighten_memory(&mut memory);
-    if notes.is_empty() {
-        return Ok(notes);
-    }
-    persist(&path, keyring, &memory).await.map_err(|err| {
-        format!(
-            "Refusing to start: could not save rewritten IAM prefix policies in {}: {err}",
-            path.display()
-        )
-    })?;
-    Ok(notes)
-}
-
-fn tighten_memory(mem: &mut Memory) -> Vec<String> {
-    let mut notes = Vec::new();
-    for user in &mut mem.users {
-        for inline in &mut user.inline_policies {
-            for note in policy::tighten_loose_scope_prefixes(&mut inline.document) {
-                notes.push(format!(
-                    "user {} inline policy {}: {note}",
-                    user.name, inline.name
-                ));
-            }
-        }
-    }
-    for key in &mut mem.keys {
-        let Some(document) = &mut key.policy else {
-            continue;
-        };
-        let owner = match &key.user_name {
-            Some(name) => format!("user {name} access key {}", key.access_key_id),
-            None => format!("service key {} ({})", key.access_key_id, key.label),
-        };
-        for note in policy::tighten_loose_scope_prefixes(document) {
-            notes.push(format!("{owner}: {note}"));
-        }
-    }
-    for managed in &mut mem.policies {
-        if managed.builtin {
-            continue;
-        }
-        for note in policy::tighten_loose_scope_prefixes(&mut managed.document) {
-            notes.push(format!("managed policy {}: {note}", managed.name));
-        }
-    }
-    notes
-}
-
 async fn load_memory(path: &Path, keyring: &Keyring) -> Result<Memory, IamError> {
     let text = match tokio::fs::read_to_string(path).await {
         Ok(text) => text,
@@ -1414,65 +1337,68 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn loose_prefix_policies_are_rewritten_once() {
+    async fn wildcard_policy_is_unchanged_across_restarts() {
         let (dir, store) = fresh().await;
         store.create_user("alice").await.unwrap();
-        let loose = policy::parse_policy_str(
+        let document = policy::parse_policy_str(
             r#"{"Version":"2012-10-17","Statement":[
-                {"Effect":"Allow","Action":"s3:ListBucket","Resource":"arn:aws:s3:::photos",
-                 "Condition":{"StringLike":{"s3:prefix":["uploads*"]}}},
-                {"Effect":"Allow","Action":"s3:GetObject","Resource":"arn:aws:s3:::photos/uploads*"}
+                {"Effect":"Allow","Action":"s3:GetObject","Resource":[
+                    "arn:aws:s3:::iam-photos/2026-*",
+                    "arn:aws:s3:::iam-photos/uploads*"
+                ]}
             ]}"#,
         )
         .unwrap();
+        let original = document.to_canonical_json().unwrap();
         store
-            .put_inline_policy("alice", "old-scope", loose.clone())
+            .put_inline_policy("alice", "wild", document)
             .await
             .unwrap();
-        let on_key = store.create_access_key("alice", Some(loose)).await.unwrap();
-        let path = dir.path().to_str().unwrap();
-        let keyring = Keyring::load(path, None).await.unwrap();
-        let notes = rewrite_loose_prefix_policies(path, &keyring).await.unwrap();
+        let path = dir.path().to_str().unwrap().to_string();
+        let disk_before = tokio::fs::read(dir.path().join("iam.json")).await.unwrap();
         assert!(
-            notes
-                .iter()
-                .any(|n| n.contains("user alice inline policy old-scope")),
-            "{notes:?}"
+            std::str::from_utf8(&disk_before)
+                .unwrap()
+                .contains("2026-*")
         );
         assert!(
-            notes.iter().any(|n| n.contains(&on_key.info.access_key_id)),
-            "{notes:?}"
+            std::str::from_utf8(&disk_before)
+                .unwrap()
+                .contains("uploads*")
         );
-        let memory = load_memory(&dir.path().join("iam.json"), &keyring)
-            .await
-            .unwrap();
-        let inline = memory
-            .users
-            .iter()
-            .find(|u| u.name == "alice")
-            .unwrap()
-            .inline_policies
-            .iter()
-            .find(|p| p.name == "old-scope")
-            .unwrap();
-        let json = inline.document.to_canonical_json().unwrap();
-        assert!(json.contains("arn:aws:s3:::photos/uploads/*"), "{json}");
         assert!(
-            !json.replace("uploads/*", "").contains("uploads*"),
-            "{json}"
+            !std::str::from_utf8(&disk_before)
+                .unwrap()
+                .contains("uploads/*")
         );
-        let key = memory
-            .keys
-            .iter()
-            .find(|k| k.access_key_id == on_key.info.access_key_id)
-            .unwrap();
-        let key_json = key.policy.as_ref().unwrap().to_canonical_json().unwrap();
-        assert!(
-            !key_json.replace("uploads/*", "").contains("uploads*"),
-            "{key_json}"
-        );
-        let again = rewrite_loose_prefix_policies(path, &keyring).await.unwrap();
-        assert!(again.is_empty(), "{again:?}");
+
+        for _ in 0..2 {
+            assert!(
+                stores().lock().await.remove(&path).is_some(),
+                "store cache key {path}"
+            );
+            let reopened = IamStore::open(&path, None).await.unwrap();
+            let loaded = reopened.get_inline_policy("alice", "wild").await.unwrap();
+            assert_eq!(loaded.to_canonical_json().unwrap(), original);
+            let disk = tokio::fs::read(dir.path().join("iam.json")).await.unwrap();
+            assert_eq!(disk, disk_before);
+            let allow = |key: &str| {
+                assert_eq!(
+                    policy::evaluate(
+                        std::slice::from_ref(&loaded),
+                        &policy::EvalContext {
+                            action: "s3:GetObject",
+                            resource: &policy::object_arn("iam-photos", key),
+                            prefix: None,
+                        },
+                    ),
+                    policy::EffectDecision::Allow,
+                    "{key}"
+                );
+            };
+            allow("2026-01.csv");
+            allow("uploadsY.txt");
+        }
     }
 
     #[tokio::test]

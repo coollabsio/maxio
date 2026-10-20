@@ -235,7 +235,12 @@ async fn main() -> anyhow::Result<()> {
         config.master_key_file.as_deref(),
     )
     .await?;
-    iam::secrets::refuse_missing_keyring(&config.data_dir, master_key_b64.is_some()).await?;
+    iam::secrets::refuse_missing_keyring(
+        &config.data_dir,
+        master_key_b64.is_some(),
+        config.allow_missing_master_key,
+    )
+    .await?;
     let keyring = Arc::new(if config.allow_missing_master_key {
         storage::keys::Keyring::load_with(
             &config.data_dir,
@@ -250,16 +255,16 @@ async fn main() -> anyhow::Result<()> {
     });
     iam::store::ensure_secrets_readable(&config.data_dir, &keyring)
         .await
-        .map_err(anyhow::Error::msg)?;
-    let rewritten = iam::store::rewrite_loose_prefix_policies(&config.data_dir, &keyring)
-        .await
-        .map_err(anyhow::Error::msg)?;
-    if !rewritten.is_empty() {
-        tracing::warn!(
-            "Rewrote IAM policies that used a prefix without a directory slash (bucket/uploads* also allowed uploads-private and uploadsX): {}",
-            rewritten.join("; ")
-        );
-    }
+        .map_err(|err| {
+            if config.allow_missing_master_key {
+                anyhow::Error::msg(format!(
+                    "{err}\n\n{}",
+                    iam::secrets::allow_missing_does_not_cover_iam(&config.data_dir)
+                ))
+            } else {
+                anyhow::Error::msg(err)
+            }
+        })?;
     match (&config.master_key, &config.master_key_file) {
         (_, Some(path)) => {
             tracing::info!(

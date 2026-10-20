@@ -204,7 +204,7 @@ mc cp file.txt maxio/my-bucket/
 
 The root access key (`MAXIO_ACCESS_KEY` / `MAXIO_SECRET_KEY`) is the administrator. Additional callers are IAM users or standalone service keys. Policies are AWS-style JSON: `Effect`, wildcard actions such as `s3:Get*`, and resource ARNs such as `arn:aws:s3:::bucket` and `arn:aws:s3:::bucket/prefix/*`. An explicit `Deny` wins. Built-in policies are `readonly`, `readwrite`, `writeonly`, and `admin`.
 
-A prefix in the console is a directory. `uploads` and `uploads/` both allow `bucket/uploads/file` and do not allow `bucket/uploads-private` or `bucket/uploadsX`. Policies saved by the first IAM build used `bucket/uploads*` (no slash). On startup MaxIO rewrites those resource ARNs and `s3:prefix` values to the directory form and logs each one.
+A prefix in the console scope picker is a directory. `uploads` and `uploads/` both allow `bucket/uploads/file` and do not allow `bucket/uploads-private` or `bucket/uploadsX`, because that picker writes `prefix/*`. A policy written with AWS wildcard syntax is stored as given: `prefix*` matches any key that starts with that text, including `uploadsY.txt` and `2026-01.csv`.
 
 Create a user and a key with the AWS CLI (the key secret is printed once):
 

@@ -139,13 +139,6 @@ impl Statements {
             Self::Many(v) => v.iter().collect(),
         }
     }
-
-    fn iter_mut(&mut self) -> Vec<&mut Statement> {
-        match self {
-            Self::One(s) => vec![s],
-            Self::Many(v) => v.iter_mut().collect(),
-        }
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -752,128 +745,6 @@ fn normalize_scope_prefix(prefix: &str) -> String {
     prefix
 }
 
-/// Rewrite a directory prefix saved by the first IAM build (`bucket/uploads*`)
-/// into the directory form (`bucket/uploads/*`, list prefix `uploads/` and
-/// `uploads/*`). Returns one note per change. A tight policy is left as it is.
-pub fn tighten_loose_scope_prefixes(doc: &mut PolicyDocument) -> Vec<String> {
-    let original = doc.clone();
-    let notes = tighten_loose_scope_prefixes_in_place(doc);
-    if notes.is_empty() {
-        return notes;
-    }
-    if validate_policy(doc).is_err() {
-        *doc = original;
-        return Vec::new();
-    }
-    notes
-}
-
-fn tighten_loose_scope_prefixes_in_place(doc: &mut PolicyDocument) -> Vec<String> {
-    let mut notes = Vec::new();
-    for stmt in doc.statement.iter_mut() {
-        if let Some(list) = &mut stmt.resource {
-            notes.extend(rewrite_loose_resources(list));
-        }
-        for map in [
-            &mut stmt.condition.string_like,
-            &mut stmt.condition.string_equals,
-        ]
-        .into_iter()
-        .flatten()
-        {
-            notes.extend(rewrite_loose_prefix_conditions(map));
-        }
-    }
-    notes
-}
-
-/// `arn:aws:s3:::bucket/uploads*` (the star is not after a slash).
-fn loose_object_resource(arn: &str) -> Option<(&str, &str)> {
-    let rest = arn.strip_prefix("arn:aws:s3:::")?;
-    let (bucket, key) = rest.split_once('/')?;
-    if bucket.is_empty() || bucket.contains('*') || bucket.contains('?') {
-        return None;
-    }
-    let prefix = key.strip_suffix('*')?;
-    if !is_bare_directory_prefix(prefix) {
-        return None;
-    }
-    Some((bucket, prefix))
-}
-
-/// `uploads*` but not `uploads/*`, `*`, or a value that already ends in `/`.
-fn loose_directory_star(value: &str) -> Option<&str> {
-    let prefix = value.strip_suffix('*')?;
-    if is_bare_directory_prefix(prefix) {
-        Some(prefix)
-    } else {
-        None
-    }
-}
-
-fn is_bare_directory_prefix(prefix: &str) -> bool {
-    !prefix.is_empty() && !prefix.ends_with('/') && !prefix.contains(['*', '?', ':'])
-}
-
-fn rewrite_loose_resources(list: &mut StringOrList) -> Vec<String> {
-    let mut notes = Vec::new();
-    let mut next = Vec::new();
-    for value in list.values() {
-        if let Some((bucket, prefix)) = loose_object_resource(value) {
-            let rewritten = format!("arn:aws:s3:::{bucket}/{prefix}/*");
-            notes.push(format!("resource {value} -> {rewritten}"));
-            push_unique(&mut next, rewritten);
-        } else {
-            push_unique(&mut next, value.to_string());
-        }
-    }
-    if !notes.is_empty() {
-        *list = string_or_list(next);
-    }
-    notes
-}
-
-fn rewrite_loose_prefix_conditions(map: &mut BTreeMap<String, StringOrList>) -> Vec<String> {
-    let mut notes = Vec::new();
-    for (key, list) in map.iter_mut() {
-        if !key.eq_ignore_ascii_case("s3:prefix") {
-            continue;
-        }
-        let mut next = Vec::new();
-        let mut changed = false;
-        for value in list.values() {
-            if let Some(prefix) = loose_directory_star(value) {
-                let dir = format!("{prefix}/");
-                let under = format!("{prefix}/*");
-                notes.push(format!("s3:prefix {value} -> {dir}, {under}"));
-                push_unique(&mut next, dir);
-                push_unique(&mut next, under);
-                changed = true;
-            } else {
-                push_unique(&mut next, value.to_string());
-            }
-        }
-        if changed {
-            *list = string_or_list(next);
-        }
-    }
-    notes
-}
-
-fn push_unique(out: &mut Vec<String>, value: String) {
-    if !out.iter().any(|existing| existing == &value) {
-        out.push(value);
-    }
-}
-
-fn string_or_list(values: Vec<String>) -> StringOrList {
-    if values.len() == 1 {
-        StringOrList::One(values.into_iter().next().unwrap_or_default())
-    } else {
-        StringOrList::Many(values)
-    }
-}
-
 fn stmt(
     effect: &str,
     actions: &[&str],
@@ -1316,65 +1187,32 @@ mod tests {
     }
 
     #[test]
-    fn loose_prefix_star_is_rewritten_to_a_directory() {
-        let mut policy = doc(r#"{"Version":"2012-10-17","Statement":[
-                {"Effect":"Allow","Action":"s3:ListBucket","Resource":"arn:aws:s3:::photos",
-                 "Condition":{"StringLike":{"s3:prefix":"uploads*"}}},
-                {"Effect":"Allow","Action":["s3:GetObject","s3:PutObject"],
-                 "Resource":"arn:aws:s3:::photos/uploads*"}
-            ]}"#);
-        let notes = tighten_loose_scope_prefixes(&mut policy);
-        assert!(notes.iter().any(|n| n.contains("uploads*")));
-        let json = policy.to_canonical_json().unwrap();
-        let without_tight = json.replace("uploads/*", "");
-        assert!(
-            !without_tight.contains("uploads*"),
-            "loose prefix remains in {json}"
+    fn aws_star_matches_any_suffix() {
+        let policy = doc(
+            r#"{"Version":"2012-10-17","Statement":{"Effect":"Allow","Action":"s3:GetObject","Resource":["arn:aws:s3:::iam-photos/2026-*","arn:aws:s3:::iam-photos/uploads*"]}}"#,
         );
-        assert!(json.contains("arn:aws:s3:::photos/uploads/*"), "{json}");
-        let allow = |action: &str, key: &str| {
+        let allow = |key: &str| {
             assert_eq!(
                 evaluate(
                     std::slice::from_ref(&policy),
-                    &ctx(action, &object_arn("photos", key), None)
+                    &ctx("s3:GetObject", &object_arn("iam-photos", key), None)
                 ),
                 EffectDecision::Allow,
-                "{action} {key}"
+                "{key}"
             );
         };
-        let deny = |action: &str, key: &str| {
-            assert_eq!(
-                evaluate(
-                    std::slice::from_ref(&policy),
-                    &ctx(action, &object_arn("photos", key), None)
-                ),
-                EffectDecision::ImplicitDeny,
-                "{action} {key}"
-            );
-        };
-        allow("s3:GetObject", "uploads/x.txt");
-        deny("s3:GetObject", "uploads-private/x.txt");
-        deny("s3:PutObject", "uploadsX.txt");
+        allow("2026-01.csv");
+        allow("uploadsY.txt");
         assert_eq!(
-            evaluate(
-                std::slice::from_ref(&policy),
-                &ctx("s3:ListBucket", "arn:aws:s3:::photos", Some("uploads/"))
-            ),
-            EffectDecision::Allow
+            policy
+                .to_canonical_json()
+                .unwrap()
+                .matches("2026-*")
+                .count(),
+            1
         );
-        assert_eq!(
-            evaluate(
-                std::slice::from_ref(&policy),
-                &ctx(
-                    "s3:ListBucket",
-                    "arn:aws:s3:::photos",
-                    Some("uploads-private/")
-                )
-            ),
-            EffectDecision::ImplicitDeny
-        );
-        let again = tighten_loose_scope_prefixes(&mut policy);
-        assert!(again.is_empty());
+        assert!(policy.to_canonical_json().unwrap().contains("uploads*"));
+        assert!(!policy.to_canonical_json().unwrap().contains("uploads/*"));
     }
 
     #[test]

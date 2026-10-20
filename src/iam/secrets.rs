@@ -52,9 +52,19 @@ pub async fn sealed_master_key_ids(data_dir: &str) -> anyhow::Result<Vec<String>
 /// Call this before [`crate::storage::keys::Keyring::load`]. That load creates
 /// a fresh keyring when the file is missing; doing so here would make every
 /// existing access key permanently unverifiable.
+/// Why `--allow-missing-master-key` cannot stand in for a missing IAM key.
+pub fn allow_missing_does_not_cover_iam(data_dir: &str) -> String {
+    format!(
+        "--allow-missing-master-key does not apply to IAM secrets. That flag can leave encrypted objects unreadable. It does not replace the key that seals access-key secrets in iam.json, and a new key would make those access keys permanently unverifiable.\n\
+         Recovery, with the server stopped: restore the original key with --master-key (MAXIO_MASTER_KEY) or --master-key-file (MAXIO_MASTER_KEY_FILE), or merge the backup keyring:\n\
+         maxio keyring merge --data-dir {data_dir} --from <backup-of-.maxio-keys.json>"
+    )
+}
+
 pub async fn refuse_missing_keyring(
     data_dir: &str,
     master_key_provided: bool,
+    allow_missing_master_key: bool,
 ) -> anyhow::Result<()> {
     let ids = sealed_master_key_ids(data_dir).await?;
     if ids.is_empty() || master_key_provided {
@@ -64,6 +74,11 @@ pub async fn refuse_missing_keyring(
     match tokio::fs::metadata(&keyring_path).await {
         Ok(_) => Ok(()),
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            let flag_note = if allow_missing_master_key {
+                format!("\n{}\n", allow_missing_does_not_cover_iam(data_dir))
+            } else {
+                String::new()
+            };
             anyhow::bail!(
                 "IAM access-key secrets are sealed and the SSE-S3 master key is missing.\n\
                  \n\
@@ -73,6 +88,7 @@ pub async fn refuse_missing_keyring(
                  \n\
                  Refusing to generate a new master key. Those secrets cannot be recovered without the original key, so a new keyring would make the access keys permanently unverifiable.\n\
                  Restore {keyring_path} from the same backup as iam.json, or pass that key with --master-key (MAXIO_MASTER_KEY) or --master-key-file (MAXIO_MASTER_KEY_FILE).\n\
+                 {flag_note}\
                  Back up .maxio-keys.json and iam.json together.",
                 ids.join(", ")
             )
@@ -93,7 +109,9 @@ mod tests {
         tokio::fs::write(dir.path().join("iam.json"), iam)
             .await
             .unwrap();
-        let err = refuse_missing_keyring(path, false).await.unwrap_err();
+        let err = refuse_missing_keyring(path, false, false)
+            .await
+            .unwrap_err();
         let message = err.to_string();
         assert!(message.contains("iam.json"), "{message}");
         assert!(message.contains("master key"), "{message}");
@@ -106,8 +124,29 @@ mod tests {
     #[tokio::test]
     async fn absent_iam_file_does_not_block_startup() {
         let dir = tempfile::tempdir().unwrap();
-        refuse_missing_keyring(dir.path().to_str().unwrap(), false)
+        refuse_missing_keyring(dir.path().to_str().unwrap(), false, false)
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn allow_missing_master_key_does_not_cover_iam_secrets() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_str().unwrap();
+        let iam = r#"{"version":1,"keys":[{"secret":{"keyId":"aabbccddeeff0011","nonce":"AA","ciphertext":"AA"}}]}"#;
+        tokio::fs::write(dir.path().join("iam.json"), iam)
+            .await
+            .unwrap();
+        let err = refuse_missing_keyring(path, false, true).await.unwrap_err();
+        let message = err.to_string();
+        assert!(
+            message.contains("does not apply to IAM secrets"),
+            "{message}"
+        );
+        assert!(message.contains("--allow-missing-master-key"), "{message}");
+        assert!(message.contains("--master-key-file"), "{message}");
+        assert!(message.contains("keyring merge"), "{message}");
+        assert!(message.contains("server stopped"), "{message}");
+        assert!(!dir.path().join(".maxio-keys.json").exists());
     }
 }

@@ -201,7 +201,7 @@ jobs:
           merge-multiple: true
 
       - name: Checksums
-        run: sha256sum *.tar.gz | tee SHA256SUMS
+        run: sha256sum ./*.tar.gz | tee SHA256SUMS
 
       - uses: actions/upload-artifact@v4
         with:
@@ -389,7 +389,7 @@ jobs:
           merge-multiple: true
 
       - name: Checksums
-        run: sha256sum *.tar.gz | tee SHA256SUMS
+        run: sha256sum ./*.tar.gz | tee SHA256SUMS
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2

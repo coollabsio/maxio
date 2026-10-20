@@ -23,6 +23,7 @@ mod error;
 mod openapi;
 mod server;
 mod storage;
+mod vhost;
 mod xml;
 
 use clap::Parser;
@@ -142,6 +143,8 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let config = cli.config;
+    let virtual_domains =
+        vhost::parse_domains(&config.domain).map_err(|err| anyhow::anyhow!(err))?;
 
     if config.access_key == "maxioadmin"
         && config.secret_key == "maxioadmin"
@@ -241,6 +244,14 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!("Secret Key: [REDACTED]");
     tracing::info!("Data dir:   {}", config.data_dir);
     tracing::info!("Region:     {}", config.region);
+    if virtual_domains.is_empty() {
+        tracing::info!("Addressing: path-style");
+    } else {
+        tracing::info!(
+            "Addressing: path-style and virtual-hosted-style ({})",
+            virtual_domains.join(", ")
+        );
+    }
     if config.erasure_coding {
         tracing::info!(
             "Erasure coding: enabled (chunk size: {}MB)",

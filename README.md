@@ -10,7 +10,7 @@ S3-compatible object storage server — single-binary replacement for MinIO.
 
 MaxIO is a lightweight S3-compatible object storage server written in Rust. One binary, one data directory, no database. Buckets are directories and objects are files, so a backup is a copy of the data dir.
 
-- Works with `mc`, AWS CLI, and any S3 SDK (AWS Signature V4, presigned URLs)
+- Works with `mc`, AWS CLI, and any S3 SDK (AWS Signature V4, presigned URLs, path-style and virtual-hosted-style)
 - Built-in web console at `/ui/`
 - Multipart upload, versioning, tagging, CORS, range and conditional requests, checksums
 - Server-side encryption (SSE-S3, SSE-C) and optional erasure coding
@@ -78,8 +78,71 @@ printf 'Open http://localhost:9000/ui/ and sign in with %s / %s\n' \
 | `MAXIO_PARITY_SHARDS` | `0` | Parity shards per object |
 | `MAXIO_MASTER_KEY` | _(auto)_ | Base64 32-byte SSE-S3 master key. If unset, stored in `<data-dir>/.maxio-keys.json` — back this file up |
 | `MAXIO_MAX_CONSOLE_BODY_BYTES` | `1048576` | Max body size for console JSON routes |
+| `MAXIO_DOMAIN` | _(none)_ | Comma-separated base domains for virtual-hosted-style (`<bucket>.<domain>`). Alias: `MINIO_DOMAIN`. Unset keeps every host on path-style |
 
-Each variable also has a CLI flag (for example `--port`). Run `maxio --help` for the full list.
+Each variable also has a CLI flag (for example `--port`, `--domain`). Run `maxio --help` for the full list.
+
+## Virtual-hosted-style addressing
+
+Path-style (`http://s3.example.com/bucket/key`) works with no extra configuration. Many SDKs and tools default to virtual-hosted-style (`http://bucket.s3.example.com/key`). Enable that by naming the base domain:
+
+```bash
+maxio --domain s3.example.com --data-dir ./data --port 9000
+# or several domains:
+# MAXIO_DOMAIN=s3.example.com,s3.example.org
+```
+
+A request whose `Host` is `<bucket>.<domain>` (a port is ignored, and the host is matched case-insensitively) is served from that bucket. The bare domain, an IP address, and any other host stay on path-style, so the web console (`/ui/`), `/api/`, `/healthz`, and `/minio/health/*` on the service host are unchanged. Bucket names follow the S3 rules (lowercase letters, digits, dots, and hyphens). A dotted name such as `my.bucket` is the host `my.bucket.s3.example.com`.
+
+When more than one domain is configured, the longest match wins. `album.s3.example.com` is bucket `album` under `s3.example.com`, and the host `s3.example.com` itself stays the service host.
+
+### DNS
+
+Point the base name and a wildcard at the server:
+
+```text
+s3.example.com.      A     203.0.113.10
+*.s3.example.com.    A     203.0.113.10
+```
+
+For a local process, `--domain localhost` is enough on resolvers that answer `*.localhost` with `127.0.0.1` (common on macOS and systemd-resolved). If `bucket.localhost` does not resolve, add the names you use to `/etc/hosts`, or run a wildcard resolver.
+
+### TLS
+
+Terminate TLS in front of MaxIO. A certificate for `*.s3.example.com` covers a single extra label (`photos.s3.example.com`). Add the apex `s3.example.com` to the same certificate so the console, health checks, and path-style clients can use HTTPS on the base name. A dotted bucket adds another label (`my.bucket.s3.example.com`); list each dotted name you serve on the certificate, or use path-style for those buckets.
+
+### Reverse proxy
+
+Preserve the client `Host` so SigV4 still sees the host that was signed:
+
+```nginx
+proxy_set_header Host $http_host;
+proxy_set_header X-Forwarded-Proto $scheme;
+proxy_set_header X-Forwarded-Host $http_host;
+```
+
+`$http_host` includes a non-default port. Overwrite `X-Forwarded-Host`; do not append a client-supplied value.
+
+If the proxy replaces `Host` with the upstream address, set `X-Forwarded-Host` to the original `Host`. MaxIO uses that value for virtual-host routing and for the signed `host` header only when `Host` itself is not already a configured domain or `<bucket>.<domain>`. A request to the bare domain keeps path-style even if a client sends `X-Forwarded-Host`.
+
+### Clients
+
+```bash
+# AWS CLI. Put this in the config file used by AWS_CONFIG_FILE.
+# [default]
+# region = us-east-1
+# s3 =
+#     addressing_style = virtual
+aws --endpoint-url http://s3.example.com:9000 s3 cp file.txt s3://my-bucket/file.txt
+
+# mc bucket lookup over DNS (virtual-hosted-style)
+mc alias set maxio http://s3.example.com:9000 "$MAXIO_ACCESS_KEY" "$MAXIO_SECRET_KEY" --api S3v4 --path off
+mc cp file.txt maxio/my-bucket/file.txt
+```
+
+Path-style clients keep working against the same server: leave `addressing_style` unset (or `path`) and point `mc` at the base URL without `--path off`.
+
+AWS CLI and `mc` send dotted bucket names as path-style even when virtual addressing is selected. MaxIO accepts that, and it also accepts a dotted name as `<dotted-name>.<domain>` when a client addresses it that way.
 
 ## Usage
 

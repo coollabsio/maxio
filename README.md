@@ -206,11 +206,15 @@ Object bytes, sidecars, multipart parts, version files, and bucket configuration
 
 On startup MaxIO deletes those temp files, restores or drops stranded erasure-coded publish backups, and removes multipart uploads whose metadata never landed. Uploads that have readable metadata are kept so a client can finish them. An hourly sweep aborts uploads that have been idle for 7 days and deletes temp files older than a day (a live upload is younger than that).
 
-Back up the data directory and, when SSE-S3 is in use, `<data-dir>/.maxio-keys.json`. The keyring is not recoverable.
+Back up the data directory and the SSE-S3 master key. That key is `<data-dir>/.maxio-keys.json` unless you set `MAXIO_MASTER_KEY` or `MAXIO_MASTER_KEY_FILE`, which stay outside the data directory. Losing the key makes SSE-S3 objects unrecoverable.
+
+The server holds an exclusive lock on `<data-dir>/.maxio.lock` until it exits. The lock is released on shutdown and when the process crashes, so a restart is not blocked.
 
 ### `maxio check`
 
-Stop the server, then scan the data directory:
+Stop the server before `--repair`. A read-only scan can run while the server is up and warns that the result can race with in-flight writes. `--repair` and `keyring merge` refuse to run while the server holds the data-directory lock.
+
+If SSE-S3 uses an external master key, pass it the same way the server does (`--master-key`, `--master-key-file`, `MAXIO_MASTER_KEY`, or `MAXIO_MASTER_KEY_FILE`). A matching key is not a finding. With no key supplied, check prints a note and still exits 0. A missing or wrong key is an error, and `--repair` cannot invent the key.
 
 ```bash
 maxio check --data-dir ./data

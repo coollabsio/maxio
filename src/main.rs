@@ -82,9 +82,20 @@ enum Commands {
         #[arg(long, env = "MAXIO_DATA_DIR", default_value = "./data")]
         data_dir: String,
 
-        /// Rewrite or remove inconsistencies that can be fixed safely
+        /// Rewrite or remove inconsistencies that can be fixed safely.
+        /// Refuses to run while a maxio server holds the data directory lock.
         #[arg(long)]
         repair: bool,
+
+        /// SSE-S3 master key (base64-encoded 32 bytes). Same as the server flag.
+        /// When omitted, MAXIO_MASTER_KEY from the environment is used.
+        #[arg(long)]
+        master_key: Option<String>,
+
+        /// File containing the SSE-S3 master key. Same as the server flag.
+        /// When omitted, MAXIO_MASTER_KEY_FILE from the environment is used.
+        #[arg(long)]
+        master_key_file: Option<std::path::PathBuf>,
     },
 
     /// Write the web console OpenAPI document (used to generate the UI API client)
@@ -160,8 +171,15 @@ async fn main() -> anyhow::Result<()> {
         Some(Commands::Check {
             ref data_dir,
             repair,
+            ref master_key,
+            ref master_key_file,
         }) => {
-            return run_check(data_dir, repair).await;
+            let inline = master_key.as_deref().or(cli.config.master_key.as_deref());
+            let file = master_key_file
+                .as_deref()
+                .or(cli.config.master_key_file.as_deref());
+            let resolved = storage::keys::resolve_master_key(inline, file).await?;
+            return run_check(data_dir, repair, resolved.as_deref()).await;
         }
         Some(Commands::Openapi { ref output }) => {
             let json = openapi::openapi_json();
@@ -200,6 +218,9 @@ async fn main() -> anyhow::Result<()> {
     }
 
     tokio::fs::create_dir_all(&config.data_dir).await?;
+    // Held until this process exits, including after a graceful shutdown.
+    // A crash closes the fd and the OS drops the flock, so restart is not blocked.
+    let _data_lock = storage::lock::acquire_exclusive(std::path::Path::new(&config.data_dir))?;
 
     // SSE-S3 master key. A missing keyring file bootstraps a new key only when
     // the data directory has no encrypted objects. See storage::keys.
@@ -352,10 +373,26 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn run_check(data_dir: &str, repair: bool) -> anyhow::Result<()> {
-    let report = storage::check::check(std::path::Path::new(data_dir), repair).await?;
+async fn run_check(
+    data_dir: &str,
+    repair: bool,
+    master_key_b64: Option<&str>,
+) -> anyhow::Result<()> {
+    let report =
+        storage::check::check_with(std::path::Path::new(data_dir), repair, master_key_b64).await?;
     report.print();
     if report.unresolved() > 0 {
+        let key_only = report.issues.iter().all(|issue| {
+            issue.advisory
+                || issue.repaired
+                || issue.kind == storage::check::IssueKind::KeyringMissing
+        });
+        if key_only {
+            anyhow::bail!(
+                "{} unresolved issue(s). A missing or mismatched SSE-S3 master key cannot be cleared with --repair; pass the original key with --master-key, --master-key-file, MAXIO_MASTER_KEY, or MAXIO_MASTER_KEY_FILE.",
+                report.unresolved()
+            );
+        }
         anyhow::bail!(
             "{} unresolved issue(s); rerun with --repair for the cases MaxIO can fix safely",
             report.unresolved()
@@ -433,6 +470,7 @@ async fn run_keyring_rotate(data_dir: &str) -> anyhow::Result<()> {
 }
 
 async fn run_keyring_merge(data_dir: &str, from: &std::path::Path) -> anyhow::Result<()> {
+    let _lock = storage::lock::acquire_exclusive(std::path::Path::new(data_dir))?;
     let result = storage::keys::merge_keyring(data_dir, from).await?;
     println!("✓ keyring merged into {data_dir}/.maxio-keys.json");
     if result.added_ids.is_empty() {

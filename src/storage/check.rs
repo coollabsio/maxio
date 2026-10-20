@@ -2296,20 +2296,34 @@ mod master_key_tests {
             r#"{{"version":1,"users":[],"keys":[{{"secret":{{"keyId":"{}","nonce":"AA","ciphertext":"AA"}}}}],"policies":[]}}"#,
             kr.active_id()
         );
-        std::fs::write(tmp.path().join("iam.json"), iam).unwrap();
-        let report = check(tmp.path(), false).await.unwrap();
+        std::fs::write(tmp.path().join("iam.json"), &iam).unwrap();
+        let report = check(tmp.path(), true).await.unwrap();
         assert!(
-            report
-                .issues
-                .iter()
-                .all(|issue| !issue.path.contains("iam.json") && !issue.detail.contains("iam.json")),
+            report.issues.iter().all(|issue| {
+                !issue.path.contains("iam.json")
+                    && !issue.detail.contains("iam.json")
+                    && issue.kind != IssueKind::LegacyReservedKey
+            }),
             "{:?}",
             report
                 .issues
                 .iter()
-                .map(|issue| (issue.path.clone(), issue.detail.clone()))
+                .map(|issue| (
+                    issue.kind.as_str(),
+                    issue.path.clone(),
+                    issue.detail.clone()
+                ))
                 .collect::<Vec<_>>()
         );
         assert_eq!(report.unresolved(), 0);
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("iam.json")).unwrap(),
+            iam
+        );
+        assert!(!tmp.path().join(".maxio-quarantine").exists());
+        let legacy =
+            crate::storage::filesystem::find_legacy_reserved_keys(&tmp.path().join("buckets"))
+                .await;
+        assert!(legacy.is_empty());
     }
 }

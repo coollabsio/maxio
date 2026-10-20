@@ -147,6 +147,14 @@ pub(crate) fn key_contains_reserved_segment(key: &str) -> bool {
     reserved_segment_in(key).is_some()
 }
 
+/// Error text for a key that uses an internal path segment. `None` when the
+/// key is a normal object name. Callers reject this before authorization so
+/// the response is `400 InvalidArgument` for every principal.
+pub(crate) fn reserved_key_message(key: &str) -> Option<String> {
+    reserved_segment_in(key)
+        .map(|name| format!("Key segment '{name}' collides with an internal storage name"))
+}
+
 fn reserved_segment_in(key: &str) -> Option<String> {
     Path::new(key)
         .components()

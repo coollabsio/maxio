@@ -59,7 +59,7 @@ pub async fn s3_authz_middleware(
         let bytes = axum::body::to_bytes(body, DELETE_BODY_MAX)
             .await
             .map_err(|_| S3Error::malformed_xml())?;
-        let requirement = delete_objects_requirement(&path, &bytes);
+        let requirement = delete_objects_requirement(&path, &bytes)?;
         (requirement, Body::from(bytes))
     } else {
         (required(&method, &path, &query, &parts.headers)?, body)
@@ -108,31 +108,37 @@ fn is_delete_objects(method: &str, path: &str, query: &str) -> bool {
     segments.len() == 1 && query_map(query).contains_key("delete")
 }
 
-fn delete_objects_requirement(path: &str, body: &[u8]) -> Requirement {
+fn delete_objects_requirement(path: &str, body: &[u8]) -> Result<Requirement, S3Error> {
     let bucket = decode_path(path).into_iter().next().unwrap_or_default();
     let Ok(text) = std::str::from_utf8(body) else {
-        return Requirement::Allow;
+        return Ok(Requirement::Allow);
     };
     let Ok((targets, _)) = parse_delete_request(text) else {
-        return Requirement::Allow;
+        return Ok(Requirement::Allow);
     };
-    let checks = targets
-        .into_iter()
-        .map(|target| {
-            let action = if target.version_id.is_some() {
-                "s3:DeleteObjectVersion"
-            } else {
-                "s3:DeleteObject"
-            };
-            Check {
-                action: action.to_string(),
-                resource: iam::policy::object_arn(&bucket, &target.key),
-                prefix: None,
-                bucket: Some(bucket.clone()),
-            }
-        })
-        .collect();
-    Requirement::Checks(checks)
+    let mut checks = Vec::new();
+    for target in targets {
+        reject_reserved_object_key(&target.key)?;
+        let action = if target.version_id.is_some() {
+            "s3:DeleteObjectVersion"
+        } else {
+            "s3:DeleteObject"
+        };
+        checks.push(Check {
+            action: action.to_string(),
+            resource: iam::policy::object_arn(&bucket, &target.key),
+            prefix: None,
+            bucket: Some(bucket.clone()),
+        });
+    }
+    Ok(Requirement::Checks(checks))
+}
+
+fn reject_reserved_object_key(key: &str) -> Result<(), S3Error> {
+    if let Some(message) = crate::storage::filesystem::reserved_key_message(key) {
+        return Err(S3Error::invalid_argument(&message));
+    }
+    Ok(())
 }
 
 fn required(
@@ -258,6 +264,7 @@ fn object_checks(
     q: &HashMap<String, String>,
     headers: &HeaderMap,
 ) -> Result<Vec<Check>, S3Error> {
+    reject_reserved_object_key(key)?;
     let resource = iam::policy::object_arn(bucket, key);
     let version = q.contains_key("versionId");
     let mut checks = Vec::new();
@@ -343,6 +350,7 @@ fn copy_source_checks(headers: &HeaderMap) -> Result<Vec<Check>, S3Error> {
         return Ok(Vec::new());
     }
     let source = parse_copy_source(headers)?;
+    reject_reserved_object_key(&source.key)?;
     let action = if source.version_id.is_some() {
         "s3:GetObjectVersion"
     } else {
@@ -614,6 +622,9 @@ pub async fn authorize_s3(
     key: Option<&str>,
     prefix: Option<&str>,
 ) -> Result<(), S3Error> {
+    if let Some(key) = key {
+        reject_reserved_object_key(key)?;
+    }
     let resource = match key {
         Some(key) => iam::policy::object_arn(bucket, key),
         None => iam::policy::bucket_arn(bucket),
@@ -647,6 +658,32 @@ mod tests {
             Requirement::IamApi => vec!["iam-api".into()],
             Requirement::Allow => vec!["allow".into()],
         }
+    }
+
+    #[test]
+    fn reserved_object_key_is_rejected_before_authorization() {
+        let err = required(
+            &http::Method::PUT,
+            "/pics/.maxio.object",
+            "",
+            &HeaderMap::new(),
+        )
+        .err()
+        .expect("reserved key");
+        assert_eq!(err.code.status_code(), http::StatusCode::BAD_REQUEST);
+        assert!(
+            err.message
+                .contains("collides with an internal storage name")
+        );
+        let err = required(
+            &http::Method::PUT,
+            "/pics/docs/.maxio-tmp-crash",
+            "",
+            &HeaderMap::new(),
+        )
+        .err()
+        .expect("reserved key");
+        assert_eq!(err.code.status_code(), http::StatusCode::BAD_REQUEST);
     }
 
     #[test]
@@ -731,7 +768,7 @@ mod tests {
     #[test]
     fn delete_objects_checks_each_key() {
         let xml = r#"<Delete><Object><Key>a.txt</Key></Object><Object><Key>b.txt</Key><VersionId>v1</VersionId></Object></Delete>"#;
-        let requirement = delete_objects_requirement("/pics", xml.as_bytes());
+        let requirement = delete_objects_requirement("/pics", xml.as_bytes()).unwrap();
         let Requirement::Checks(checks) = requirement else {
             panic!("expected checks");
         };
@@ -743,7 +780,7 @@ mod tests {
 
     #[test]
     fn malformed_delete_is_left_to_the_handler() {
-        let requirement = delete_objects_requirement("/pics", b"not-xml");
+        let requirement = delete_objects_requirement("/pics", b"not-xml").unwrap();
         assert!(matches!(requirement, Requirement::Allow));
     }
 }

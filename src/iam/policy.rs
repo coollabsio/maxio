@@ -1187,6 +1187,23 @@ mod tests {
     }
 
     #[test]
+    fn prefix_star_matches_children_not_the_key_itself() {
+        let policy = doc(
+            r#"{"Version":"2012-10-17","Statement":{"Effect":"Allow","Action":"s3:PutObject","Resource":"arn:aws:s3:::bucket/a/*"}}"#,
+        );
+        let decision = |key: &str| {
+            evaluate(
+                std::slice::from_ref(&policy),
+                &ctx("s3:PutObject", &object_arn("bucket", key), None),
+            )
+        };
+        assert_eq!(decision("a/b"), EffectDecision::Allow);
+        assert_eq!(decision("a/b/c"), EffectDecision::Allow);
+        assert_eq!(decision("a"), EffectDecision::ImplicitDeny);
+        assert_eq!(decision("ab"), EffectDecision::ImplicitDeny);
+    }
+
+    #[test]
     fn aws_star_matches_any_suffix() {
         let policy = doc(
             r#"{"Version":"2012-10-17","Statement":{"Effect":"Allow","Action":"s3:GetObject","Resource":["arn:aws:s3:::iam-photos/2026-*","arn:aws:s3:::iam-photos/uploads*"]}}"#,

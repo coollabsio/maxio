@@ -2687,6 +2687,51 @@ fi
 $AWS s3 rm "s3://$COMPAT_BUCKET" --recursive > /dev/null 2>&1 || true
 assert "delete compat bucket" $AWS s3api delete-bucket --bucket "$COMPAT_BUCKET"
 
+# IAM prefix policy on a key that is also a prefix, and reserved names.
+# `bucket/a/*` allows a/b and does not allow the object key a.
+# A reserved name is InvalidArgument before authorization, including for a
+# caller whose policy does not cover that key.
+export AWS_ACCESS_KEY_ID="$MAXIO_TEST_ACCESS_KEY"
+export AWS_SECRET_ACCESS_KEY="$MAXIO_TEST_SECRET_KEY"
+IAM_PFX_BUCKET="iam-pfx-$$"
+IAM_PFX_USER="pfx$$"
+echo "child" > "$TMPDIR/iam-pfx-child.txt"
+echo "self" > "$TMPDIR/iam-pfx-self.txt"
+assert "iam prefix-key bucket" $AWS s3 mb "s3://$IAM_PFX_BUCKET"
+assert "iam prefix-key root writes a" $AWS s3api put-object --bucket "$IAM_PFX_BUCKET" --key a --body "$TMPDIR/iam-pfx-self.txt"
+assert "iam prefix-key create-user" $AWS iam create-user --user-name "$IAM_PFX_USER"
+cat > "$TMPDIR/iam-pfx-policy.json" <<EOF
+{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["s3:PutObject","s3:GetObject","s3:DeleteObject"],"Resource":"arn:aws:s3:::$IAM_PFX_BUCKET/a/*"}]}
+EOF
+assert "iam prefix-key put-user-policy" $AWS iam put-user-policy --user-name "$IAM_PFX_USER" \
+    --policy-name children --policy-document "file://$TMPDIR/iam-pfx-policy.json"
+IAM_PFX_JSON=$($AWS iam create-access-key --user-name "$IAM_PFX_USER" --output json)
+IAM_PFX_KEY=$(printf '%s' "$IAM_PFX_JSON" | python3 -c 'import json,sys; print(json.load(sys.stdin)["AccessKey"]["AccessKeyId"])')
+IAM_PFX_SECRET=$(printf '%s' "$IAM_PFX_JSON" | python3 -c 'import json,sys; print(json.load(sys.stdin)["AccessKey"]["SecretAccessKey"])')
+export AWS_ACCESS_KEY_ID="$IAM_PFX_KEY"
+export AWS_SECRET_ACCESS_KEY="$IAM_PFX_SECRET"
+assert "iam prefix-key writes a/b" $AWS s3api put-object --bucket "$IAM_PFX_BUCKET" --key a/b --body "$TMPDIR/iam-pfx-child.txt"
+IAM_PFX_SELF=$($AWS s3api put-object --bucket "$IAM_PFX_BUCKET" --key a --body "$TMPDIR/iam-pfx-self.txt" 2>&1 || true)
+assert_eq "iam prefix-key denies object a" "true" \
+    "$(printf '%s' "$IAM_PFX_SELF" | grep -q AccessDenied && echo true || echo false)"
+IAM_PFX_RESERVED=$($AWS s3api put-object --bucket "$IAM_PFX_BUCKET" --key .maxio.object --body "$TMPDIR/iam-pfx-self.txt" 2>&1 || true)
+assert_eq "iam reserved name is InvalidArgument" "true" \
+    "$(printf '%s' "$IAM_PFX_RESERVED" | grep -q InvalidArgument && echo true || echo false)"
+assert_eq "iam reserved name is not AccessDenied" "false" \
+    "$(printf '%s' "$IAM_PFX_RESERVED" | grep -q AccessDenied && echo true || echo false)"
+IAM_PFX_TMP=$($AWS s3api put-object --bucket "$IAM_PFX_BUCKET" --key 'docs/.maxio-tmp-crash' --body "$TMPDIR/iam-pfx-self.txt" 2>&1 || true)
+assert_eq "iam reserved temp name is InvalidArgument" "true" \
+    "$(printf '%s' "$IAM_PFX_TMP" | grep -q InvalidArgument && echo true || echo false)"
+export AWS_ACCESS_KEY_ID="$MAXIO_TEST_ACCESS_KEY"
+export AWS_SECRET_ACCESS_KEY="$MAXIO_TEST_SECRET_KEY"
+assert "iam prefix-key object a unchanged" $AWS s3api get-object --bucket "$IAM_PFX_BUCKET" --key a "$TMPDIR/iam-pfx-a-down.txt"
+assert_eq "iam prefix-key object a body" "self" "$(cat "$TMPDIR/iam-pfx-a-down.txt")"
+assert "iam prefix-key delete-access-key" $AWS iam delete-access-key --user-name "$IAM_PFX_USER" --access-key-id "$IAM_PFX_KEY"
+assert "iam prefix-key delete-user-policy" $AWS iam delete-user-policy --user-name "$IAM_PFX_USER" --policy-name children
+assert "iam prefix-key delete-user" $AWS iam delete-user --user-name "$IAM_PFX_USER"
+$AWS s3 rm "s3://$IAM_PFX_BUCKET" --recursive >/dev/null 2>&1 || true
+assert "iam prefix-key delete bucket" $AWS s3 rb "s3://$IAM_PFX_BUCKET"
+
 # --- Summary ---
 echo ""
 echo "=== Results: $PASS passed, $FAIL failed ==="

@@ -71,6 +71,21 @@ enum Commands {
     #[command(subcommand)]
     Keyring(KeyringCmd),
 
+    /// Scan the data directory for crash leftovers and inconsistent objects.
+    ///
+    /// Reports orphaned data, sidecar mismatches, stale temp files, and
+    /// multipart debris. `--repair` fixes the cases that can be made
+    /// consistent from the bytes already on disk. Stop the server first.
+    Check {
+        /// Data directory to scan
+        #[arg(long, env = "MAXIO_DATA_DIR", default_value = "./data")]
+        data_dir: String,
+
+        /// Rewrite or remove inconsistencies that can be fixed safely
+        #[arg(long)]
+        repair: bool,
+    },
+
     /// Write the web console OpenAPI document (used to generate the UI API client)
     Openapi {
         /// Output file; prints to stdout when omitted
@@ -119,6 +134,12 @@ async fn main() -> anyhow::Result<()> {
         }
         Some(Commands::Keyring(KeyringCmd::List { ref data_dir })) => {
             return run_keyring_list(data_dir).await;
+        }
+        Some(Commands::Check {
+            ref data_dir,
+            repair,
+        }) => {
+            return run_check(data_dir, repair).await;
         }
         Some(Commands::Openapi { ref output }) => {
             let json = openapi::openapi_json();
@@ -270,6 +291,18 @@ async fn main() -> anyhow::Result<()> {
     .with_graceful_shutdown(shutdown_signal())
     .await?;
 
+    Ok(())
+}
+
+async fn run_check(data_dir: &str, repair: bool) -> anyhow::Result<()> {
+    let report = storage::check::check(std::path::Path::new(data_dir), repair).await?;
+    report.print();
+    if report.unresolved() > 0 {
+        anyhow::bail!(
+            "{} unresolved issue(s); rerun with --repair for the cases MaxIO can fix safely",
+            report.unresolved()
+        );
+    }
     Ok(())
 }
 

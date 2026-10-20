@@ -1,3 +1,4 @@
+pub mod check;
 pub mod chunk_reader;
 pub mod crypto;
 pub mod filesystem;

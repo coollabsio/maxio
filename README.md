@@ -90,6 +90,35 @@ mc mb maxio/my-bucket
 mc cp file.txt maxio/my-bucket/
 ```
 
+## Durability
+
+Object bytes, sidecars, multipart parts, version files, and bucket configuration are published with a temp file, `fsync`, rename, and a directory `fsync`. A crash during a write leaves the previous object in place, or a temp file that is not part of the bucket listing.
+
+On startup MaxIO deletes those temp files, restores or drops stranded erasure-coded publish backups, and removes multipart uploads whose metadata never landed. Uploads that have readable metadata are kept so a client can finish them. An hourly sweep aborts uploads that have been idle for 7 days and deletes temp files older than a day (a live upload is younger than that).
+
+Back up the data directory and, when SSE-S3 is in use, `<data-dir>/.maxio-keys.json`. The keyring is not recoverable.
+
+### `maxio check`
+
+Stop the server, then scan the data directory:
+
+```bash
+maxio check --data-dir ./data
+maxio check --data-dir ./data --repair
+```
+
+The report lists stale temp files, stranded backups, object bytes without a sidecar, sidecars without bytes, plain-object size / etag / checksum mismatches, multipart debris, and erasure-coded chunks that do not match their manifest. Exit status is 1 when anything is still unresolved.
+
+`--repair` fixes the cases that are determined by the bytes already on disk:
+
+- delete temp files and finished publish backups; restore a backup when the live object is missing
+- recreate a sidecar for plain object bytes that have none (etag and size taken from the file)
+- delete a sidecar whose bytes are gone, and delete a multipart upload that has no readable metadata
+- rewrite a plain object's size, etag, and checksum so they match the file
+- rebuild a missing or corrupt data chunk when parity shards can reconstruct it
+
+It does not invent bucket configuration, rewrite encrypted sidecars (those are MAC-protected), or choose between a plain file and an erasure-coded directory for the same key. Those are reported and left unchanged.
+
 ## Benchmarks
 
 MaxIO vs MinIO on a Hetzner CCX13 (`./tests/bench-remote.sh`, MaxIO >= 0.3.2):

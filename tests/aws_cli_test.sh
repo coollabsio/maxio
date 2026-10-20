@@ -1722,6 +1722,110 @@ EOF
     mc alias rm "$MC_ALIAS" > /dev/null 2>&1 || true
 fi
 
+# Crash safety: operations across a restart, plus `maxio check --repair`.
+# Uses its own server so the caller-owned process is left alone.
+ROBUST_BIN="${MAXIO_BIN:-}"
+if [ -z "$ROBUST_BIN" ]; then
+    if [ -x ./target/debug/maxio ]; then
+        ROBUST_BIN=./target/debug/maxio
+    elif [ -x ./target/release/maxio ]; then
+        ROBUST_BIN=./target/release/maxio
+    fi
+fi
+if [ -z "$ROBUST_BIN" ]; then
+    echo "SKIP: maxio binary not found (set MAXIO_BIN) — restart and check cases"
+else
+    ROBUST_DATA=$(mktemp -d)
+    ROBUST_PORT=$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1]); s.close()')
+    ROBUST_BUCKET="restart-bucket"
+    ROBUST_EP="http://127.0.0.1:$ROBUST_PORT"
+    ROBUST_AWS="aws --endpoint-url $ROBUST_EP"
+    start_robust() {
+        RUST_LOG=warn "$ROBUST_BIN" --data-dir "$ROBUST_DATA" --port "$ROBUST_PORT" \
+            --address 127.0.0.1 --allow-insecure-dev >"$ROBUST_DATA/server.log" 2>&1 &
+        ROBUST_PID=$!
+        for _ in $(seq 1 50); do
+            if curl -sf "$ROBUST_EP/healthz" >/dev/null 2>&1; then
+                return 0
+            fi
+            sleep 0.1
+        done
+        echo "robustness server failed to start; log:"
+        cat "$ROBUST_DATA/server.log" || true
+        return 1
+    }
+    stop_robust() {
+        if [ -n "${ROBUST_PID:-}" ] && kill -0 "$ROBUST_PID" 2>/dev/null; then
+            kill -TERM "$ROBUST_PID" 2>/dev/null || true
+            for _ in $(seq 1 50); do
+                kill -0 "$ROBUST_PID" 2>/dev/null || break
+                sleep 0.1
+            done
+            kill -KILL "$ROBUST_PID" 2>/dev/null || true
+            wait "$ROBUST_PID" 2>/dev/null || true
+        fi
+        ROBUST_PID=""
+    }
+    start_robust
+    assert "robustness create bucket" $ROBUST_AWS s3 mb "s3://$ROBUST_BUCKET"
+    echo "across-restart" > "$TMPDIR/restart.txt"
+    assert "robustness put" $ROBUST_AWS s3 cp "$TMPDIR/restart.txt" "s3://$ROBUST_BUCKET/restart.txt"
+    dd if=/dev/urandom of="$TMPDIR/mp-a.bin" bs=1024 count=5120 status=none
+    echo tail >> "$TMPDIR/mp-b.bin"
+    MP_ID=$($ROBUST_AWS s3api create-multipart-upload --bucket "$ROBUST_BUCKET" --key "multi.bin" --query UploadId --output text)
+    MP_E1=$($ROBUST_AWS s3api upload-part --bucket "$ROBUST_BUCKET" --key "multi.bin" --part-number 1 --body "$TMPDIR/mp-a.bin" --upload-id "$MP_ID" --query ETag --output text)
+    MP_E2=$($ROBUST_AWS s3api upload-part --bucket "$ROBUST_BUCKET" --key "multi.bin" --part-number 2 --body "$TMPDIR/mp-b.bin" --upload-id "$MP_ID" --query ETag --output text)
+    cat > "$TMPDIR/mp-complete.json" <<EOF
+{
+  "Parts": [
+    {"ETag": $MP_E1, "PartNumber": 1},
+    {"ETag": $MP_E2, "PartNumber": 2}
+  ]
+}
+EOF
+    assert "robustness complete multipart" $ROBUST_AWS s3api complete-multipart-upload \
+        --bucket "$ROBUST_BUCKET" --key "multi.bin" --upload-id "$MP_ID" \
+        --multipart-upload "file://$TMPDIR/mp-complete.json"
+    MC_ROBUST="robust$$"
+    mc alias set "$MC_ROBUST" "$ROBUST_EP" maxioadmin maxioadmin >/dev/null
+    echo "mc-restart" > "$TMPDIR/mc-restart.txt"
+    assert "robustness mc cp" mc cp "$TMPDIR/mc-restart.txt" "$MC_ROBUST/$ROBUST_BUCKET/mc-restart.txt"
+
+    stop_robust
+    start_robust
+    assert "robustness get after restart" $ROBUST_AWS s3 cp "s3://$ROBUST_BUCKET/restart.txt" "$TMPDIR/restart-down.txt"
+    assert_eq "robustness body after restart" "across-restart" "$(cat "$TMPDIR/restart-down.txt")"
+    assert "robustness multipart get after restart" $ROBUST_AWS s3 cp "s3://$ROBUST_BUCKET/multi.bin" "$TMPDIR/multi-down.bin"
+    assert_eq "robustness multipart size after restart" \
+        "$(($(wc -c < "$TMPDIR/mp-a.bin") + $(wc -c < "$TMPDIR/mp-b.bin")))" \
+        "$(wc -c < "$TMPDIR/multi-down.bin" | tr -d ' ')"
+    assert_eq "robustness mc body after restart" "mc-restart" \
+        "$(mc cat "$MC_ROBUST/$ROBUST_BUCKET/mc-restart.txt")"
+
+    stop_robust
+    echo partial > "$ROBUST_DATA/buckets/$ROBUST_BUCKET/.maxio-tmp-crash"
+    printf '%s\n' '{"key":"missing.txt","size":1,"etag":"\"x\"","content_type":"text/plain","last_modified":"2020-01-01T00:00:00.000Z"}' \
+        > "$ROBUST_DATA/buckets/$ROBUST_BUCKET/missing.txt.meta.json"
+    set +e
+    "$ROBUST_BIN" check --data-dir "$ROBUST_DATA" >"$TMPDIR/check-out.txt" 2>"$TMPDIR/check-err.txt"
+    CHECK_RC=$?
+    set -e
+    assert_eq "maxio check reports damage" "1" "$CHECK_RC"
+    assert_eq "maxio check mentions temp" "true" \
+        "$(grep -q 'stale-temp' "$TMPDIR/check-out.txt" && echo true || echo false)"
+    assert "maxio check --repair" "$ROBUST_BIN" check --data-dir "$ROBUST_DATA" --repair
+    assert "maxio check clean after repair" "$ROBUST_BIN" check --data-dir "$ROBUST_DATA"
+    assert_eq "repaired temp removed" "false" \
+        "$([ -f "$ROBUST_DATA/buckets/$ROBUST_BUCKET/.maxio-tmp-crash" ] && echo true || echo false)"
+
+    start_robust
+    assert "get still works after check --repair" $ROBUST_AWS s3 cp "s3://$ROBUST_BUCKET/restart.txt" "$TMPDIR/restart-down2.txt"
+    assert_eq "body intact after repair" "across-restart" "$(cat "$TMPDIR/restart-down2.txt")"
+    stop_robust
+    mc alias rm "$MC_ROBUST" >/dev/null 2>&1 || true
+    rm -rf "$ROBUST_DATA"
+fi
+
 # --- Summary ---
 echo ""
 echo "=== Results: $PASS passed, $FAIL failed ==="

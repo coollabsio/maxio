@@ -1225,10 +1225,11 @@ fn parse_copy_source_range(
 
 async fn upload_part_copy(
     State(state): State<AppState>,
-    Path((bucket, _key)): Path<(String, String)>,
+    Path((bucket, key)): Path<(String, String)>,
     Query(params): Query<HashMap<String, String>>,
     headers: HeaderMap,
 ) -> Result<Response<Body>, S3Error> {
+    crate::storage::filesystem::reject_writable_key(&key).map_err(|e| map_put_error(e, &key))?;
     let src = parse_copy_source(&headers)?;
 
     let upload_id = params
@@ -1905,7 +1906,10 @@ pub async fn delete_object(
         .storage
         .delete_object(&bucket, &key)
         .await
-        .map_err(S3Error::internal)?;
+        .map_err(|e| match e {
+            StorageError::InvalidKey(msg) => S3Error::invalid_argument(&msg),
+            other => S3Error::internal(other),
+        })?;
 
     let mut builder = Response::builder().status(StatusCode::NO_CONTENT);
     if let Some(vid) = &result.version_id {

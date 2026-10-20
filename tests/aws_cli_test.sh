@@ -31,7 +31,7 @@ unset AWS_CONFIG_FILE AWS_PROFILE AWS_DEFAULT_PROFILE
 
 AWS="aws --endpoint-url $ENDPOINT"
 
-VHOST_MARK="# maxio-awscli-vhost"
+VHOST_MARK="# maxio-awscli-vhost-$$-$PORT"
 cleanup() {
     if [ -n "${KEY_PID:-}" ] && kill -0 "$KEY_PID" 2>/dev/null; then
         kill "$KEY_PID" 2>/dev/null || true

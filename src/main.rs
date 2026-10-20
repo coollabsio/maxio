@@ -77,7 +77,9 @@ enum Commands {
     ///
     /// Reports orphaned data, sidecar mismatches, stale temp files, promote
     /// directories, and multipart debris. `--repair` fixes the cases that can
-    /// be made consistent from the bytes already on disk. Stop the server first.
+    /// be made consistent from the bytes already on disk. Bytes with no
+    /// sidecar are moved to `.maxio-quarantine/` instead of being adopted.
+    /// Stop the server first.
     Check {
         /// Data directory to scan
         #[arg(long, env = "MAXIO_DATA_DIR", default_value = "./data")]

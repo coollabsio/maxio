@@ -122,7 +122,8 @@ fn validate_key(key: &str) -> Result<(), StorageError> {
 }
 
 /// Reject key path segments that collide with internal on-disk names
-/// (sidecars, bucket metadata, internal dirs, EC dirs, temp files).
+/// (sidecars, bucket metadata, internal dirs, EC dirs, temp files, the
+/// inline payload, and key-promotion directories and markers).
 fn is_reserved_segment(name: &str) -> bool {
     name.ends_with(".meta.json")
         || name.ends_with(".ec")
@@ -130,8 +131,31 @@ fn is_reserved_segment(name: &str) -> bool {
         || name == ".uploads"
         || name == ".versions"
         || name == ".folder"
+        || name == ".maxio.object"
+        || name == ".maxio-quarantine"
         || name.starts_with(".maxio-tmp-")
         || name.starts_with(".maxio-bak-")
+        || name.starts_with(".maxio-promote-")
+}
+
+fn key_contains_reserved_segment(key: &str) -> bool {
+    Path::new(key).components().any(|component| {
+        matches!(component, Component::Normal(seg) if is_reserved_segment(&seg.to_string_lossy()))
+    })
+}
+
+/// Reads of an internal name are `NoSuchKey`. The bytes, if any, belong to
+/// MaxIO's layout (for example `p/.maxio.object` is the payload of key `p`).
+fn validate_readable_key(key: &str) -> Result<(), StorageError> {
+    if key_contains_reserved_segment(key) {
+        return Err(StorageError::NotFound(key.to_string()));
+    }
+    validate_key(key)
+}
+
+/// Writes of an internal name are `InvalidArgument`.
+pub(crate) fn reject_writable_key(key: &str) -> Result<(), StorageError> {
+    validate_key(key)
 }
 
 /// Version ids are joined into filesystem paths, so accept only "null" or
@@ -2842,7 +2866,7 @@ impl FilesystemStorage {
         customer_key: Option<[u8; 32]>,
     ) -> Result<(ByteStream, ObjectMeta), StorageError> {
         validate_bucket_name(bucket)?;
-        validate_key(key)?;
+        validate_readable_key(key)?;
         // Hold the key lock across the sidecar read + data-file open so the
         // meta and the opened fd always describe the same object generation.
         // The lock is released when this method returns; streaming continues
@@ -2926,7 +2950,7 @@ impl FilesystemStorage {
         customer_key: Option<[u8; 32]>,
     ) -> Result<(ByteStream, ObjectMeta), StorageError> {
         validate_bucket_name(bucket)?;
-        validate_key(key)?;
+        validate_readable_key(key)?;
         // Hold the key lock across the sidecar read + data-file open so the
         // meta and the opened fd always describe the same object generation.
         // The lock is released when this method returns; streaming continues
@@ -2951,7 +2975,7 @@ impl FilesystemStorage {
 
     pub async fn head_object(&self, bucket: &str, key: &str) -> Result<ObjectMeta, StorageError> {
         validate_bucket_name(bucket)?;
-        validate_key(key)?;
+        validate_readable_key(key)?;
         let meta = self.read_object_meta(bucket, key).await?;
         Ok(meta)
     }
@@ -2961,7 +2985,7 @@ impl FilesystemStorage {
         bucket: &str,
         key: &str,
     ) -> Result<std::collections::HashMap<String, String>, StorageError> {
-        validate_key(key)?;
+        validate_readable_key(key)?;
         let meta = self.read_object_meta(bucket, key).await?;
         Ok(meta.tags.unwrap_or_default())
     }
@@ -3235,6 +3259,7 @@ impl FilesystemStorage {
         }
 
         let upload_meta = self.read_upload_meta(bucket, upload_id).await?;
+        validate_key(&upload_meta.key)?;
         let (cipher_opt, nonce_prefix) = if let Some(ref spec) = upload_meta.encryption_spec {
             let dek = self.resolve_upload_dek(spec, customer_key)?;
             // Fresh random prefix PER UploadPart attempt: all parts share the
@@ -3405,6 +3430,7 @@ impl FilesystemStorage {
             }
             Err(e) => return Err(e),
         };
+        validate_key(&upload_meta.key)?;
         let mut selected = Vec::with_capacity(parts.len());
         for (idx, (part_number, requested_etag)) in parts.iter().enumerate() {
             let meta = self.read_part_meta(bucket, upload_id, *part_number).await?;
@@ -4173,9 +4199,17 @@ impl FilesystemStorage {
 
                 if name == PROMOTE_TARGET_FILE || name == PROMOTE_READY_FILE {
                     // Markers left inside a published key directory after a
-                    // crash between the rename and the marker cleanup. The
-                    // in-progress copies live inside `.maxio-promote-*`, which
-                    // this sweep does not recurse into.
+                    // crash between the rename and the marker cleanup. A
+                    // sibling sidecar means this name is an object written
+                    // before the segment was reserved; leave those bytes.
+                    // The in-progress copies live inside `.maxio-promote-*`,
+                    // which this sweep does not recurse into.
+                    if fs::try_exists(dir.join(format!("{name}.meta.json")))
+                        .await
+                        .unwrap_or(false)
+                    {
+                        continue;
+                    }
                     if !Self::is_stale(&path, backup_max_age).await {
                         continue;
                     }
@@ -4667,7 +4701,7 @@ impl FilesystemStorage {
         key: &str,
     ) -> Result<Vec<ObjectMeta>, StorageError> {
         validate_bucket_name(bucket)?;
-        validate_key(key)?;
+        validate_readable_key(key)?;
         let mut out = Vec::new();
         match self.read_object_meta(bucket, key).await {
             Ok(m) if m.version_id.is_none() => out.push(m),
@@ -5257,7 +5291,7 @@ impl FilesystemStorage {
         customer_key: Option<[u8; 32]>,
     ) -> Result<(ByteStream, ObjectMeta), StorageError> {
         validate_bucket_name(bucket)?;
-        validate_key(key)?;
+        validate_readable_key(key)?;
         validate_version_id(version_id)?;
         if version_id == "null"
             && !fs::try_exists(self.version_meta_path(bucket, key, "null")).await?
@@ -5786,7 +5820,7 @@ impl FilesystemStorage {
         version_id: &str,
     ) -> Result<ObjectMeta, StorageError> {
         validate_bucket_name(bucket)?;
-        validate_key(key)?;
+        validate_readable_key(key)?;
         validate_version_id(version_id)?;
         if version_id == "null"
             && !fs::try_exists(self.version_meta_path(bucket, key, "null")).await?
@@ -5822,7 +5856,7 @@ impl FilesystemStorage {
         key: &str,
     ) -> Result<Option<String>, StorageError> {
         validate_bucket_name(bucket)?;
-        validate_key(key)?;
+        validate_readable_key(key)?;
         match self.read_object_meta(bucket, key).await {
             Ok(m) if !m.is_delete_marker => return Ok(None),
             Ok(_) | Err(StorageError::NotFound(_)) => {}
@@ -5864,7 +5898,7 @@ impl FilesystemStorage {
         customer_key: Option<[u8; 32]>,
     ) -> Result<(ByteStream, ObjectMeta), StorageError> {
         validate_bucket_name(bucket)?;
-        validate_key(key)?;
+        validate_readable_key(key)?;
         validate_version_id(version_id)?;
         if version_id == "null"
             && !fs::try_exists(self.version_meta_path(bucket, key, "null")).await?

@@ -12525,6 +12525,146 @@ async fn test_key_and_child_prefix_coexist() {
 }
 
 #[tokio::test]
+async fn test_internal_key_segments_are_rejected() {
+    let (base, _tmp) = start_server().await;
+    let bucket = "reserved-keys";
+    s3_request("PUT", &format!("{base}/{bucket}"), vec![]).await;
+
+    let parent = b"sse-parent-bytes".to_vec();
+    let put = s3_request_with_headers(
+        "PUT",
+        &format!("{base}/{bucket}/p"),
+        parent.clone(),
+        vec![("x-amz-server-side-encryption", "AES256")],
+    )
+    .await;
+    assert_eq!(put.status(), 200, "{}", put.text().await.unwrap());
+    assert_eq!(
+        s3_request("PUT", &format!("{base}/{bucket}/p/q"), b"child".to_vec())
+            .await
+            .status(),
+        200
+    );
+
+    let overwrite = s3_request(
+        "PUT",
+        &format!("{base}/{bucket}/p/.maxio.object"),
+        b"clobber".to_vec(),
+    )
+    .await;
+    assert_eq!(overwrite.status(), 400);
+    let overwrite_xml = overwrite.text().await.unwrap();
+    assert!(overwrite_xml.contains("InvalidArgument"), "{overwrite_xml}");
+
+    let head = s3_request("HEAD", &format!("{base}/{bucket}/p"), vec![]).await;
+    assert_eq!(head.status(), 200);
+    let expect_len = parent.len().to_string();
+    assert_eq!(
+        head.headers()
+            .get("content-length")
+            .and_then(|v| v.to_str().ok()),
+        Some(expect_len.as_str())
+    );
+    assert_eq!(
+        head.headers()
+            .get("x-amz-server-side-encryption")
+            .and_then(|v| v.to_str().ok()),
+        Some("AES256")
+    );
+    let got = s3_request("GET", &format!("{base}/{bucket}/p"), vec![]).await;
+    assert_eq!(got.status(), 200);
+    assert_eq!(got.bytes().await.unwrap().as_ref(), parent.as_slice());
+
+    let hidden = s3_request("GET", &format!("{base}/{bucket}/p/.maxio.object"), vec![]).await;
+    assert_eq!(hidden.status(), 404);
+    let hidden_xml = hidden.text().await.unwrap();
+    assert!(hidden_xml.contains("NoSuchKey"), "{hidden_xml}");
+
+    let deleted = s3_request(
+        "DELETE",
+        &format!("{base}/{bucket}/p/.maxio.object"),
+        vec![],
+    )
+    .await;
+    assert_eq!(deleted.status(), 400);
+    assert!(deleted.text().await.unwrap().contains("InvalidArgument"));
+    let still = s3_request("GET", &format!("{base}/{bucket}/p"), vec![]).await;
+    assert_eq!(still.bytes().await.unwrap().as_ref(), parent.as_slice());
+
+    let copy_source = format!("/{bucket}/p/q");
+    let copied = s3_request_with_headers(
+        "PUT",
+        &format!("{base}/{bucket}/p/.maxio.object"),
+        vec![],
+        vec![("x-amz-copy-source", copy_source.as_str())],
+    )
+    .await;
+    assert_eq!(copied.status(), 400);
+    assert!(copied.text().await.unwrap().contains("InvalidArgument"));
+    let after_copy = s3_request("GET", &format!("{base}/{bucket}/p"), vec![]).await;
+    assert_eq!(
+        after_copy.bytes().await.unwrap().as_ref(),
+        parent.as_slice()
+    );
+
+    let names = [
+        ".maxio.object",
+        ".maxio-promote-abc/file.txt",
+        "docs/.maxio-promote-ready",
+        "docs/.maxio-promote-target",
+        "docs/.maxio-tmp-crash",
+        "docs/.maxio-bak-old",
+        ".folder",
+        "nested/.uploads",
+    ];
+    for name in names {
+        let url = format!("{base}/{bucket}/{name}");
+        let put = s3_request("PUT", &url, b"nope".to_vec()).await;
+        let put_status = put.status();
+        let put_xml = put.text().await.unwrap();
+        assert_eq!(put_status, 400, "{name}: {put_xml}");
+        assert!(put_xml.contains("InvalidArgument"), "{name}: {put_xml}");
+        let get = s3_request("GET", &url, vec![]).await;
+        let get_status = get.status();
+        let get_xml = get.text().await.unwrap();
+        assert_eq!(get_status, 404, "{name}: {get_xml}");
+        assert!(get_xml.contains("NoSuchKey"), "{name}: {get_xml}");
+        let create = s3_request("POST", &format!("{url}?uploads="), vec![]).await;
+        let create_status = create.status();
+        let create_xml = create.text().await.unwrap();
+        assert_eq!(create_status, 400, "multipart create {name}: {create_xml}");
+        assert!(
+            create_xml.contains("InvalidArgument"),
+            "multipart create {name}: {create_xml}"
+        );
+        let complete = s3_request(
+            "POST",
+            &format!("{url}?uploadId=00000000-0000-0000-0000-000000000000"),
+            b"<CompleteMultipartUpload></CompleteMultipartUpload>".to_vec(),
+        )
+        .await;
+        let complete_status = complete.status();
+        let complete_xml = complete.text().await.unwrap();
+        assert_eq!(
+            complete_status, 400,
+            "multipart complete {name}: {complete_xml}"
+        );
+        assert!(
+            complete_xml.contains("InvalidArgument"),
+            "multipart complete {name}: {complete_xml}"
+        );
+    }
+
+    let parent_after = s3_request("GET", &format!("{base}/{bucket}/p"), vec![]).await;
+    assert_eq!(
+        parent_after.bytes().await.unwrap().as_ref(),
+        parent.as_slice()
+    );
+    let child = s3_request("GET", &format!("{base}/{bucket}/p/q"), vec![]).await;
+    assert_eq!(child.bytes().await.unwrap().as_ref(), b"child");
+}
+
+#[tokio::test]
 async fn test_get_part_number_on_single_object() {
     let (base, _tmp) = start_server().await;
     c_setup(&base, "onepart", false).await;

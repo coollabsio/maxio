@@ -216,7 +216,7 @@ A crash during the promotion parks the bytes in `.maxio-promote-<id>/.maxio.obje
 
 Object keys cannot use those internal names as a path segment (`.maxio.object`, `.maxio-promote-*`, `.maxio-tmp-*`, `.maxio-bak-*`, `.maxio-quarantine`, and the other layout names). Matching is ASCII case-insensitive, so `p/.MAXIO.OBJECT` is rejected too. A write returns `400 InvalidArgument`. A read returns `NoSuchKey`. That stops a client from overwriting `p`'s bytes by putting `p/.maxio.object`.
 
-Objects created by an older build may already use those names. Startup and `maxio check --repair` leave them in place, including their sidecars. `maxio check` lists each one (`legacy-reserved-key`) and says how to remove it. `DELETE` and `DeleteObjects` remove an existing object with a reserved name. A bucket can be deleted after those objects are gone. See [UPGRADE.md](UPGRADE.md).
+Objects created by a pre-1.0 build may already use those names. MaxIO refuses to start when it finds one, and `maxio check` reports it as `legacy-reserved-key` without modifying the files. Rename or delete the keys with the previous version (`aws s3 mv`), then start this version. See [UPGRADE.md](UPGRADE.md).
 
 Back up the data directory and the SSE-S3 master key. That key is `<data-dir>/.maxio-keys.json` unless you set `MAXIO_MASTER_KEY` or `MAXIO_MASTER_KEY_FILE`, which stay outside the data directory. Losing the key makes SSE-S3 objects unrecoverable.
 

@@ -16,9 +16,9 @@
 
 use super::chunk_reader::repair_chunk_file;
 use super::filesystem::{
-    INLINE_OBJECT_PAYLOAD, PROMOTE_READY_FILE, PROMOTE_TARGET_FILE, is_exact_promote_leftover,
+    INLINE_OBJECT_PAYLOAD, PROMOTE_READY_FILE, PROMOTE_TARGET_FILE, find_legacy_reserved_keys,
     is_legacy_container, is_promote_dir_name, key_contains_reserved_segment, list_promotes,
-    recover_promotes_in, write_file_atomic,
+    promote_dir_has_meta, recover_promotes_in, write_file_atomic,
 };
 use super::{
     BucketMeta, ChecksumAlgorithm, ChecksumHasher, ChunkKind, ChunkManifest, EncryptionMode,
@@ -79,9 +79,9 @@ impl IssueKind {
     }
 }
 
-fn legacy_key_detail(key: &str) -> String {
+fn legacy_key_detail(bucket: &str, key: &str) -> String {
     format!(
-        "key {key} uses a name this version reserves for internal files. Listings skip it and GET returns NoSuchKey. DELETE removes it. New writes of this name are rejected. Copy the file out by hand if you still need the bytes."
+        "{bucket}/{key} uses a name reserved by this version of MaxIO. Start the previous MaxIO version on this data directory and rename or delete these keys (for example `aws s3 mv`), then start this version. check does not modify this object."
     )
 }
 
@@ -209,6 +209,14 @@ pub async fn check_with(
     let mut report = CheckReport::default();
     let mut saw_sse_s3 = false;
     let buckets_dir = data_dir.join("buckets");
+    for legacy in find_legacy_reserved_keys(&buckets_dir).await {
+        report.push(
+            IssueKind::LegacyReservedKey,
+            &buckets_dir.join(&legacy.bucket).join(&legacy.key),
+            legacy_key_detail(&legacy.bucket, &legacy.key),
+            false,
+        );
+    }
     if tokio::fs::try_exists(&buckets_dir).await? {
         let mut buckets = tokio::fs::read_dir(&buckets_dir).await?;
         while let Some(entry) = buckets.next_entry().await? {
@@ -376,13 +384,9 @@ async fn scan_bucket(
             } else {
                 format!("{prefix}{stem}")
             };
+            // Reported by the legacy-key scan. Do not repair, quarantine, or
+            // delete the sidecar.
             if key_contains_reserved_segment(&key_for_reserve) {
-                report.push(
-                    IssueKind::LegacyReservedKey,
-                    path,
-                    legacy_key_detail(&key_for_reserve),
-                    false,
-                );
                 continue;
             }
             let (key, data_path) = if stem == ".folder" {
@@ -448,7 +452,11 @@ async fn scan_bucket(
                 // reserves. Descend so `check` can list them. An exact
                 // promote leftover is not one of those objects.
                 if is_promote_dir_name(name) {
-                    if !is_exact_promote_leftover(path).await {
+                    // Leftovers with no sidecar are handled by promote
+                    // recovery. Descend only when the directory holds a real
+                    // object sidecar so those bytes are not treated as an
+                    // inline payload.
+                    if promote_dir_has_meta(path).await {
                         stack.push((path.clone(), format!("{prefix}{name}/")));
                     }
                 } else if is_legacy_container(name) {
@@ -515,12 +523,6 @@ async fn check_meta_pair(
     let repair = flags.repair;
     let keep_sidecar = flags.keep_sidecar;
     if key_contains_reserved_segment(key) {
-        report.push(
-            IssueKind::LegacyReservedKey,
-            meta_path,
-            legacy_key_detail(key),
-            false,
-        );
         return Ok(());
     }
     // Resolve `p/.maxio.object` before any decision to delete `p.meta.json`.
@@ -1026,40 +1028,6 @@ async fn repair_backup(
     report.push(IssueKind::StaleBackup, backup, detail, repaired);
 }
 
-async fn note_legacy_promote_dirs(dir: &Path, guard: &mut SidecarGuard, report: &mut CheckReport) {
-    let mut listed = match tokio::fs::read_dir(dir).await {
-        Ok(listed) => listed,
-        Err(_) => return,
-    };
-    while let Ok(Some(entry)) = listed.next_entry().await {
-        let name = entry.file_name().to_string_lossy().to_string();
-        if !is_promote_dir_name(&name) {
-            continue;
-        }
-        if !entry
-            .file_type()
-            .await
-            .map(|ft| ft.is_dir())
-            .unwrap_or(false)
-        {
-            continue;
-        }
-        let path = entry.path();
-        if is_exact_promote_leftover(&path).await {
-            continue;
-        }
-        // Bytes in this directory may belong to a sidecar in `dir`. Do not
-        // delete that sidecar while the directory remains.
-        guard.protect_unmatched = true;
-        report.push(
-            IssueKind::LegacyReservedKey,
-            &path,
-            legacy_key_detail(&name),
-            false,
-        );
-    }
-}
-
 async fn settle_promotes(dir: &Path, repair: bool, report: &mut CheckReport) -> SidecarGuard {
     let mut guard = SidecarGuard {
         targets: std::collections::HashSet::new(),
@@ -1082,25 +1050,28 @@ async fn settle_promotes(dir: &Path, repair: bool, report: &mut CheckReport) -> 
                 outcome.resolved,
             );
         }
-        note_legacy_promote_dirs(dir, &mut guard, report).await;
         return guard;
     }
     for (path, target) in list_promotes(dir).await {
-        match &target {
-            Some(name) => {
-                guard.targets.insert(name.clone());
-            }
-            None => guard.protect_unmatched = true,
+        if let Some(name) = &target {
+            guard.targets.insert(name.clone());
+        }
+        let has_payload = tokio::fs::metadata(path.join(INLINE_OBJECT_PAYLOAD))
+            .await
+            .map(|meta| meta.is_file())
+            .unwrap_or(false);
+        if target.is_none() && has_payload {
+            guard.protect_unmatched = true;
         }
         let detail = match &target {
             Some(name) => format!("promote directory still holds object bytes for {name}"),
-            None => {
+            None if has_payload => {
                 "promote directory still holds object bytes and has no target marker".to_string()
             }
+            None => "empty promote directory".to_string(),
         };
         report.push(IssueKind::PromoteLeftover, &path, detail, false);
     }
-    note_legacy_promote_dirs(dir, &mut guard, report).await;
     guard
 }
 
@@ -1610,8 +1581,6 @@ mod tests {
         Unlinked,
         /// Original unlinked and `p/` already exists (payload must go inline).
         DestDirectory,
-        /// Pre-marker builds: renamed `p` into `.maxio-promote-*/.maxio.object`.
-        LegacyUnmarked,
     }
 
     impl PromoteCrash {
@@ -1622,7 +1591,6 @@ mod tests {
                 Self::ReadyOriginalRemains => "ready",
                 Self::Unlinked => "unlinked",
                 Self::DestDirectory => "dest-dir",
-                Self::LegacyUnmarked => "legacy",
             }
         }
     }
@@ -1657,10 +1625,6 @@ mod tests {
                 if matches!(step, PromoteCrash::DestDirectory) {
                     std::fs::create_dir(&src).unwrap();
                 }
-            }
-            PromoteCrash::LegacyUnmarked => {
-                std::fs::write(&payload, &bytes).unwrap();
-                std::fs::remove_file(&src).unwrap();
             }
         }
     }
@@ -1859,47 +1823,88 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unmarked_promote_dir_is_not_deleted() {
+    async fn empty_and_duplicate_promote_dirs_are_removed() {
         let tmp = tempfile::tempdir().unwrap();
         let storage = storage_at(tmp.path()).await;
         storage.create_bucket(&bucket_meta("bkt")).await.unwrap();
         put_p(&storage, b"keep-me", true).await;
         let bucket = tmp.path().join("buckets/bkt");
-        arrange_promote_crash(&bucket, PromoteCrash::LegacyUnmarked);
         let meta_before = std::fs::read(bucket.join("p.meta.json")).unwrap();
-        let payload = bucket.join(".maxio-promote-legacy/.maxio.object");
-        let payload_before = std::fs::read(&payload).unwrap();
-        drop(storage);
+        let bytes_before = std::fs::read(bucket.join("p")).unwrap();
+        let empty = bucket.join(".maxio-promote-empty");
+        std::fs::create_dir(&empty).unwrap();
+        let dup = bucket.join(".maxio-promote-dup");
+        std::fs::create_dir(&dup).unwrap();
+        std::fs::write(dup.join(".maxio-promote-target"), b"p").unwrap();
+        std::fs::write(dup.join(".maxio.object"), &bytes_before).unwrap();
 
-        let storage = storage_at(tmp.path()).await;
-        assert_eq!(std::fs::read(&payload).unwrap(), payload_before);
+        let reported = check(tmp.path(), false).await.unwrap();
+        assert!(
+            reported
+                .issues
+                .iter()
+                .any(|issue| issue.kind == IssueKind::PromoteLeftover
+                    && issue.detail.contains("empty")),
+            "{:?}",
+            reported.issues
+        );
+        assert!(empty.exists() && dup.exists());
         assert_eq!(
             std::fs::read(bucket.join("p.meta.json")).unwrap(),
             meta_before
         );
 
         let repaired = check(tmp.path(), true).await.unwrap();
-        assert_eq!(std::fs::read(&payload).unwrap(), payload_before);
+        assert_eq!(repaired.unresolved(), 0, "{:?}", repaired.issues);
+        assert!(!empty.exists(), "repair should remove an empty promote dir");
+        assert!(!dup.exists(), "repair should drop a duplicate payload");
+        assert_eq!(std::fs::read(bucket.join("p")).unwrap(), bytes_before);
         assert_eq!(
             std::fs::read(bucket.join("p.meta.json")).unwrap(),
-            meta_before,
-            "repair must not drop the wrapped key: {:?}",
-            repaired.issues
+            meta_before
         );
-        assert!(
-            repaired
-                .issues
-                .iter()
-                .any(|issue| issue.kind == IssueKind::PromoteLeftover
-                    || issue.detail.contains("promote")),
-            "{:?}",
-            repaired.issues
+
+        std::fs::create_dir(&empty).unwrap();
+        std::fs::create_dir(&dup).unwrap();
+        std::fs::write(dup.join(".maxio-promote-target"), b"p").unwrap();
+        std::fs::write(dup.join(".maxio.object"), &bytes_before).unwrap();
+        drop(storage);
+        let storage = storage_at(tmp.path()).await;
+        assert!(!empty.exists());
+        assert!(!dup.exists());
+        assert_eq!(std::fs::read(bucket.join("p")).unwrap(), bytes_before);
+        assert_eq!(
+            std::fs::read(bucket.join("p.meta.json")).unwrap(),
+            meta_before
         );
-        let _ = storage;
+        assert_eq!(read_key(&storage, "p").await, b"keep-me");
+    }
+
+    fn tree_bytes(root: &std::path::Path) -> Vec<(String, Vec<u8>)> {
+        let mut out = Vec::new();
+        fn walk(root: &std::path::Path, dir: &std::path::Path, out: &mut Vec<(String, Vec<u8>)>) {
+            for entry in std::fs::read_dir(dir).unwrap() {
+                let entry = entry.unwrap();
+                let path = entry.path();
+                if path.is_dir() {
+                    walk(root, &path, out);
+                } else {
+                    let rel = path
+                        .strip_prefix(root)
+                        .unwrap()
+                        .to_string_lossy()
+                        .to_string();
+                    out.push((rel, std::fs::read(&path).unwrap()));
+                }
+            }
+        }
+        walk(root, root, &mut out);
+        out.sort();
+        out
     }
 
     #[tokio::test]
-    async fn legacy_reserved_keys_survive_upgrade_and_can_be_deleted() {
+    async fn legacy_reserved_keys_refuse_startup_and_repair_leaves_them() {
         let tmp = tempfile::tempdir().unwrap();
         let storage = storage_at(tmp.path()).await;
         storage.create_bucket(&bucket_meta("bkt")).await.unwrap();
@@ -1914,12 +1919,24 @@ mod tests {
                 "s1",
                 b"sse-photo".as_slice(),
                 true,
+                ".maxio-promote-photos/sse.jpg",
+            ),
+            (
+                "s2",
+                b"plain-nested".as_slice(),
+                false,
                 "y/.maxio-promote-bar/file.txt",
             ),
-            ("s2", b"plain-inline".as_slice(), false, "a/.maxio.object"),
-            ("s3", b"sse-inline".as_slice(), true, "b/.maxio.object"),
-            ("s4", b"plain-quar".as_slice(), false, ".maxio-quarantine/f"),
-            ("s5", b"sse-quar".as_slice(), true, ".maxio-quarantine/g"),
+            (
+                "s3",
+                b"sse-nested".as_slice(),
+                true,
+                "y/.maxio-promote-bar/sse.txt",
+            ),
+            ("s4", b"plain-inline".as_slice(), false, "a/.maxio.object"),
+            ("s5", b"sse-inline".as_slice(), true, "b/.maxio.object"),
+            ("s6", b"plain-quar".as_slice(), false, ".maxio-quarantine/f"),
+            ("s7", b"sse-quar".as_slice(), true, ".maxio-quarantine/g"),
         ];
         for (src, body, sse, _dest) in specs {
             storage
@@ -1935,14 +1952,12 @@ mod tests {
                 .unwrap();
         }
         let bucket = tmp.path().join("buckets/bkt");
-        let mut planted = Vec::new();
         for (src, _body, sse, dest) in specs {
             let src_data = bucket.join(src);
             let src_meta = bucket.join(format!("{src}.meta.json"));
             let dest_data = bucket.join(dest);
             let dest_meta = bucket.join(format!("{dest}.meta.json"));
             std::fs::create_dir_all(dest_data.parent().unwrap()).unwrap();
-            let bytes = std::fs::read(&src_data).unwrap();
             std::fs::rename(&src_data, &dest_data).unwrap();
             let mut meta: serde_json::Value =
                 serde_json::from_str(&std::fs::read_to_string(&src_meta).unwrap()).unwrap();
@@ -1954,81 +1969,72 @@ mod tests {
                 let text = String::from_utf8_lossy(&meta_bytes);
                 assert!(text.contains("wrapped_dek"), "{dest}: {text}");
             }
-            planted.push((dest, bytes, meta_bytes));
         }
         drop(storage);
+        let buckets = tmp.path().join("buckets");
+        let before = tree_bytes(&buckets);
 
-        let storage = storage_at(tmp.path()).await;
-        for (dest, bytes, meta_bytes) in &planted {
-            assert_eq!(
-                std::fs::read(bucket.join(dest)).unwrap(),
-                *bytes,
-                "startup deleted {dest}"
-            );
-            assert_eq!(
-                std::fs::read(bucket.join(format!("{dest}.meta.json"))).unwrap(),
-                *meta_bytes,
-                "startup deleted meta for {dest}"
+        let keyring = Arc::new(
+            Keyring::load(tmp.path().to_str().unwrap(), None)
+                .await
+                .unwrap(),
+        );
+        let started =
+            FilesystemStorage::new(tmp.path().to_str().unwrap(), false, 1024 * 1024, 0, keyring)
+                .await;
+        let err = match started {
+            Err(err) => err,
+            Ok(_) => panic!("legacy reserved keys must refuse startup"),
+        };
+        let message = err.to_string();
+        assert!(
+            message.contains("previous MaxIO version") && message.contains("aws s3 mv"),
+            "{message}"
+        );
+        for (_src, _body, _sse, dest) in specs {
+            assert!(
+                message.contains(&format!("bkt/{dest}")),
+                "startup error missing {dest}: {message}"
             );
         }
+        assert_eq!(
+            tree_bytes(&buckets),
+            before,
+            "startup must not modify the data dir"
+        );
 
         let reported = check(tmp.path(), false).await.unwrap();
-        for (dest, _, _) in &planted {
+        for (_src, _body, _sse, dest) in specs {
             assert!(
                 reported.issues.iter().any(|issue| {
-                    issue.kind == IssueKind::LegacyReservedKey && issue.detail.contains(*dest)
+                    issue.kind == IssueKind::LegacyReservedKey
+                        && !issue.repaired
+                        && issue.detail.contains(dest)
+                        && issue.detail.contains("aws s3 mv")
                 }),
                 "check did not report {dest}: {:?}",
                 reported.issues
             );
         }
-
         let repaired = check(tmp.path(), true).await.unwrap();
-        for (dest, bytes, meta_bytes) in &planted {
-            assert_eq!(
-                std::fs::read(bucket.join(dest)).unwrap(),
-                *bytes,
-                "repair deleted {dest}: {:?}",
-                repaired.issues
-            );
-            assert_eq!(
-                std::fs::read(bucket.join(format!("{dest}.meta.json"))).unwrap(),
-                *meta_bytes,
-                "repair deleted meta for {dest}"
-            );
-        }
         assert!(
-            !repaired
-                .issues
-                .iter()
-                .any(|issue| issue.kind == IssueKind::OrphanMetadata && issue.repaired),
+            repaired.unresolved() >= specs.len(),
             "{:?}",
             repaired.issues
         );
-
-        let rejected = storage
-            .put_object(
-                "bkt",
-                "p/.MAXIO.OBJECT",
-                "text/plain",
-                Box::pin(&b"no"[..]),
-                None,
-                None,
-            )
-            .await;
-        match rejected {
-            Err(crate::storage::StorageError::InvalidKey(_)) => {}
-            Err(err) => panic!("reserved name must be rejected, got {err}"),
-            Ok(_) => panic!("reserved name must be rejected"),
-        }
-
-        for (dest, _, _) in &planted {
-            storage.delete_object("bkt", dest).await.unwrap();
-            assert!(!bucket.join(dest).exists(), "DELETE left {dest}");
-            assert!(!bucket.join(format!("{dest}.meta.json")).exists());
-        }
-        assert!(storage.delete_bucket("bkt").await.unwrap());
-        assert!(!bucket.exists());
+        assert_eq!(
+            tree_bytes(&buckets),
+            before,
+            "repair must not modify legacy keys"
+        );
+        assert!(
+            repaired
+                .issues
+                .iter()
+                .any(|issue| issue.kind == IssueKind::LegacyReservedKey && !issue.repaired),
+            "{:?}",
+            repaired.issues
+        );
     }
 }
 

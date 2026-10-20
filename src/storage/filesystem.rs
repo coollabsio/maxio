@@ -418,6 +418,13 @@ impl FilesystemStorage {
             max_part_size: u64::MAX,
             max_multipart_object_size: u64::MAX,
         };
+        // An older build allowed object keys this version reserves. Serving
+        // them in place collides with the on-disk layout, so refuse before
+        // any cleanup rewrites the directory.
+        let legacy = find_legacy_reserved_keys(&storage.buckets_dir).await;
+        if !legacy.is_empty() {
+            return Err(anyhow::anyhow!(format_legacy_reserved_error(&legacy)));
+        }
         // Nothing is in flight during construction, so crash leftovers (temp
         // files, stranded EC backups, half-finished key promotions, upload
         // dirs with no readable metadata) are safe to clear immediately. The
@@ -1723,6 +1730,12 @@ pub(crate) struct PromoteOutcome {
 
 /// Restore or discard promote directories directly inside `dir`.
 ///
+/// A `.maxio-promote-*` directory that contains no `*.meta.json` is MaxIO's
+/// own crash leftover: empty directories are removed, a payload whose
+/// original key is still present is removed as a duplicate, and a payload
+/// whose original is missing is restored. A directory that contains a
+/// sidecar is a legacy user key and is not touched.
+///
 /// `max_age` of `None` handles every directory (startup, `check --repair`).
 /// `Some(secs)` skips a directory newer than that, so the hourly sweep cannot
 /// race a promote that is still running.
@@ -1744,50 +1757,249 @@ pub(crate) async fn recover_promotes_in(dir: &Path, max_age: Option<u64>) -> Vec
         if !FilesystemStorage::is_stale(&path, max_age).await {
             continue;
         }
-        // A directory an older build used as a real key prefix
-        // (`.maxio-promote-photos/img.jpg`) is not a crash leftover.
-        // Startup must not delete it.
-        if is_exact_promote_leftover(&path).await {
-            promotes.push(path);
+        if promote_dir_has_meta(&path).await {
+            continue;
         }
+        promotes.push(path);
     }
 
     let mut outcomes = Vec::new();
     for promote in promotes {
-        if let Some(target) = read_promote_target(&promote).await {
-            outcomes.push(recover_marked_promote(dir, &promote, &target).await);
-        }
+        outcomes.push(cleanup_promote_leftover(dir, &promote).await);
     }
     outcomes
 }
 
-/// True only for a promote directory this build created: a valid target
-/// marker, and nothing except that marker, the ready marker, and
-/// `.maxio.object`. Any sidecar, subdirectory, or other file means the
-/// directory is user data from before the name was reserved.
-pub(crate) async fn is_exact_promote_leftover(promote: &Path) -> bool {
-    let mut listed = match fs::read_dir(promote).await {
-        Ok(rd) => rd,
-        Err(_) => return false,
-    };
-    let mut saw_target = false;
-    while let Ok(Some(entry)) = listed.next_entry().await {
-        let name = entry.file_name().to_string_lossy().to_string();
-        if matches!(entry.file_type().await, Ok(ft) if ft.is_dir()) {
-            return false;
-        }
-        if name == PROMOTE_TARGET_FILE {
-            saw_target = true;
-        } else if name == PROMOTE_READY_FILE || name == INLINE_OBJECT_PAYLOAD {
-            // allowed
-        } else {
-            return false;
+/// True when `promote` contains an object sidecar anywhere inside it.
+pub(crate) async fn promote_dir_has_meta(promote: &Path) -> bool {
+    let mut stack = vec![promote.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let mut listed = match fs::read_dir(&dir).await {
+            Ok(rd) => rd,
+            Err(_) => continue,
+        };
+        while let Ok(Some(entry)) = listed.next_entry().await {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name.ends_with(".meta.json") {
+                return true;
+            }
+            if matches!(entry.file_type().await, Ok(ft) if ft.is_dir()) {
+                stack.push(entry.path());
+            }
         }
     }
-    saw_target && read_promote_target(promote).await.is_some()
+    false
 }
 
-/// Promote directories in `dir` and the target name recorded in each, if any.
+/// How many legacy keys to name in a startup error or check report.
+pub(crate) const LEGACY_KEY_LIST_LIMIT: usize = 32;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct LegacyReservedKey {
+    pub bucket: String,
+    pub key: String,
+}
+
+/// Object keys from a pre-1.0 data directory that use a reserved path
+/// segment. Detected by a real object sidecar (`*.meta.json`), not by
+/// MaxIO crash leftovers (those have no sidecar).
+pub(crate) async fn find_legacy_reserved_keys(buckets_dir: &Path) -> Vec<LegacyReservedKey> {
+    let mut found = Vec::new();
+    let mut buckets = match fs::read_dir(buckets_dir).await {
+        Ok(rd) => rd,
+        Err(_) => return found,
+    };
+    while let Ok(Some(bucket_entry)) = buckets.next_entry().await {
+        if !matches!(bucket_entry.file_type().await, Ok(ft) if ft.is_dir()) {
+            continue;
+        }
+        let bucket = bucket_entry.file_name().to_string_lossy().to_string();
+        let mut stack = vec![(bucket_entry.path(), String::new())];
+        while let Some((dir, rel)) = stack.pop() {
+            let mut listed = match fs::read_dir(&dir).await {
+                Ok(rd) => rd,
+                Err(_) => continue,
+            };
+            while let Ok(Some(entry)) = listed.next_entry().await {
+                let name = entry.file_name().to_string_lossy().to_string();
+                let is_dir = matches!(entry.file_type().await, Ok(ft) if ft.is_dir());
+                if is_dir {
+                    let child_rel = if rel.is_empty() {
+                        name.clone()
+                    } else {
+                        format!("{rel}/{name}")
+                    };
+                    stack.push((entry.path(), child_rel));
+                    continue;
+                }
+                if let Some(key) = object_key_for_sidecar(&rel, &name) {
+                    if key_contains_reserved_segment(&key) {
+                        found.push(LegacyReservedKey {
+                            bucket: bucket.clone(),
+                            key,
+                        });
+                    }
+                }
+            }
+        }
+    }
+    found.sort_by(|a, b| (&a.bucket, &a.key).cmp(&(&b.bucket, &b.key)));
+    found.dedup();
+    found
+}
+
+pub(crate) fn format_legacy_reserved_error(keys: &[LegacyReservedKey]) -> String {
+    let mut msg = String::from(
+        "refusing to start: this data directory contains object keys that use names reserved by this version of MaxIO.\n\
+         Start the previous MaxIO version on this data directory and rename or delete these keys (for example `aws s3 mv`), then start this version.",
+    );
+    let shown = keys.len().min(LEGACY_KEY_LIST_LIMIT);
+    for key in keys.iter().take(shown) {
+        msg.push_str(&format!("\n  {}/{}", key.bucket, key.key));
+    }
+    if keys.len() > shown {
+        msg.push_str(&format!("\n  and {} more", keys.len() - shown));
+    }
+    msg
+}
+
+/// Map a sidecar file back to an object key. Upload metadata (`.meta.json`
+/// inside an upload id directory) and version files are not object keys;
+/// the object key is reconstructed for version sidecars.
+fn object_key_for_sidecar(rel_dir: &str, filename: &str) -> Option<String> {
+    if filename == ".meta.json" || !filename.ends_with(".meta.json") {
+        return None;
+    }
+    let stem = filename.strip_suffix(".meta.json")?;
+    if stem.is_empty() {
+        return None;
+    }
+    let parts: Vec<&str> = rel_dir.split('/').filter(|s| !s.is_empty()).collect();
+    if let Some(idx) = parts
+        .iter()
+        .rposition(|part| part.eq_ignore_ascii_case(".versions"))
+    {
+        let object_name = parts.get(idx + 1)?;
+        let mut key_parts: Vec<&str> = parts[..idx].to_vec();
+        key_parts.push(object_name);
+        return Some(key_parts.join("/"));
+    }
+    if let Some(idx) = parts
+        .iter()
+        .rposition(|part| part.eq_ignore_ascii_case(".uploads"))
+    {
+        // `bucket/.uploads/{uploadId}/N.meta.json` is part metadata.
+        // `bucket/.uploads/name.meta.json` would be a legacy object key.
+        if idx + 1 != parts.len() {
+            return None;
+        }
+    }
+    if stem == ".folder" {
+        if parts.is_empty() {
+            return None;
+        }
+        return Some(format!("{}/", parts.join("/")));
+    }
+    if parts.is_empty() {
+        Some(stem.to_string())
+    } else {
+        Some(format!("{}/{stem}", parts.join("/")))
+    }
+}
+
+async fn cleanup_promote_leftover(parent: &Path, promote: &Path) -> PromoteOutcome {
+    let mut has_payload = false;
+    let mut only_promote_files = true;
+    let mut listed = match fs::read_dir(promote).await {
+        Ok(rd) => rd,
+        Err(e) => {
+            return promote_outcome(
+                promote,
+                None,
+                false,
+                format!("cannot read promote directory: {e}"),
+            );
+        }
+    };
+    while let Ok(Some(entry)) = listed.next_entry().await {
+        let name = entry.file_name().to_string_lossy().to_string();
+        let is_dir = matches!(entry.file_type().await, Ok(ft) if ft.is_dir());
+        if name == INLINE_OBJECT_PAYLOAD && !is_dir {
+            has_payload = true;
+            continue;
+        }
+        if !is_dir
+            && (name == PROMOTE_TARGET_FILE
+                || name == PROMOTE_READY_FILE
+                || name.starts_with(".maxio-tmp-"))
+        {
+            continue;
+        }
+        only_promote_files = false;
+    }
+    if !only_promote_files {
+        // No sidecar (the caller checked) but the shape is not one this
+        // build writes. Leave it rather than delete an unknown tree.
+        return promote_outcome(
+            promote,
+            None,
+            false,
+            "promote directory has unexpected contents and no sidecar; left untouched",
+        );
+    }
+    if !has_payload {
+        let removed = fs::remove_dir_all(promote).await.is_ok();
+        let _ = sync_dir(parent).await;
+        return promote_outcome(promote, None, removed, "removed empty promote directory");
+    }
+    if let Some(target) = read_promote_target(promote).await {
+        let dest = parent.join(&target);
+        let original_file = fs::metadata(&dest)
+            .await
+            .map(|meta| meta.is_file())
+            .unwrap_or(false);
+        let inline_present = fs::metadata(dest.join(INLINE_OBJECT_PAYLOAD))
+            .await
+            .map(|meta| meta.is_file())
+            .unwrap_or(false);
+        if original_file || inline_present {
+            let removed = fs::remove_dir_all(promote).await.is_ok();
+            let _ = sync_dir(parent).await;
+            return promote_outcome(
+                promote,
+                Some(target),
+                removed,
+                "removed duplicate promote payload; original object is intact",
+            );
+        }
+        return recover_marked_promote(parent, promote, &target).await;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if std::fs::metadata(promote.join(INLINE_OBJECT_PAYLOAD))
+            .map(|meta| meta.nlink() > 1)
+            .unwrap_or(false)
+        {
+            let removed = fs::remove_dir_all(promote).await.is_ok();
+            let _ = sync_dir(parent).await;
+            return promote_outcome(
+                promote,
+                None,
+                removed,
+                "removed hard-linked duplicate promote payload",
+            );
+        }
+    }
+    promote_outcome(
+        promote,
+        None,
+        false,
+        "promote payload has no target marker and is the only copy; left untouched",
+    )
+}
+
+/// Promote directories in `dir` that are MaxIO leftovers (no object sidecar).
 /// Does not change the disk.
 pub(crate) async fn list_promotes(dir: &Path) -> Vec<(PathBuf, Option<String>)> {
     let mut listed = match fs::read_dir(dir).await {
@@ -1804,7 +2016,7 @@ pub(crate) async fn list_promotes(dir: &Path) -> Vec<(PathBuf, Option<String>)> 
             continue;
         }
         let path = entry.path();
-        if !is_exact_promote_leftover(&path).await {
+        if promote_dir_has_meta(&path).await {
             continue;
         }
         let target = read_promote_target(&path).await;
@@ -3041,47 +3253,11 @@ impl FilesystemStorage {
         key: &str,
     ) -> Result<DeleteResult, StorageError> {
         validate_bucket_name(bucket)?;
-        if let Some(done) = self.legacy_delete_guard(bucket, key).await? {
-            return Ok(done);
-        }
+        validate_key(key)?;
 
         let _bucket_guard = self.bucket_read(bucket).await;
         let _key_guard = self.key_lock(bucket, key).await;
         self.delete_object_locked(bucket, key).await
-    }
-
-    /// Reserved names cannot be created, but objects written by an older
-    /// build may still use them. DELETE removes those when they have their
-    /// own sidecar. It does not remove `p/.maxio.object` when that file is
-    /// the inline payload of key `p` (no sidecar of its own).
-    async fn legacy_delete_guard(
-        &self,
-        bucket: &str,
-        key: &str,
-    ) -> Result<Option<DeleteResult>, StorageError> {
-        validate_key_shape(key)?;
-        if !key_contains_reserved_segment(key) {
-            return Ok(None);
-        }
-        let meta_path = self.meta_path(bucket, key);
-        if fs::try_exists(&meta_path).await? {
-            return Ok(None);
-        }
-        let obj_path = self.object_path(bucket, key);
-        if fs::metadata(&obj_path)
-            .await
-            .map(|meta| meta.is_file())
-            .unwrap_or(false)
-        {
-            let segment = reserved_segment_in(key).unwrap_or_else(|| key.to_string());
-            return Err(StorageError::InvalidKey(format!(
-                "Key segment '{segment}' collides with an internal storage name"
-            )));
-        }
-        Ok(Some(DeleteResult {
-            version_id: None,
-            is_delete_marker: false,
-        }))
     }
 
     /// Lifecycle expiration of the current version: delete `key` exactly like
@@ -3098,9 +3274,7 @@ impl FilesystemStorage {
         last_modified: &str,
     ) -> Result<Option<DeleteResult>, StorageError> {
         validate_bucket_name(bucket)?;
-        if let Some(done) = self.legacy_delete_guard(bucket, key).await? {
-            return Ok(Some(done));
-        }
+        validate_key(key)?;
         let _bucket_guard = self.bucket_read(bucket).await;
         let _key_guard = self.key_lock(bucket, key).await;
         match self.read_object_meta(bucket, key).await {
@@ -5404,7 +5578,7 @@ impl FilesystemStorage {
         version_id: &str,
     ) -> Result<ObjectMeta, StorageError> {
         validate_bucket_name(bucket)?;
-        validate_key_shape(key)?;
+        validate_key(key)?;
         validate_version_id(version_id)?;
         let _bucket_guard = self.bucket_read(bucket).await;
         let _key_guard = self.key_lock(bucket, key).await;

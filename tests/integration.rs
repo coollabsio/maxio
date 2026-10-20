@@ -12588,6 +12588,13 @@ async fn test_internal_key_segments_are_rejected() {
     .await;
     assert_eq!(deleted.status(), 400);
     assert!(deleted.text().await.unwrap().contains("InvalidArgument"));
+    for extra in ["p/.maxio.object/", "p/.maxio.object/sub"] {
+        let deleted = s3_request("DELETE", &format!("{base}/{bucket}/{extra}"), vec![]).await;
+        let status = deleted.status();
+        let xml = deleted.text().await.unwrap();
+        assert_eq!(status, 400, "{extra}: {xml}");
+        assert!(xml.contains("InvalidArgument"), "{extra}: {xml}");
+    }
     let still = s3_request("GET", &format!("{base}/{bucket}/p"), vec![]).await;
     assert_eq!(still.bytes().await.unwrap().as_ref(), parent.as_slice());
 

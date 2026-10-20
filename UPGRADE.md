@@ -13,20 +13,24 @@ This version reserves path segments that MaxIO uses on disk:
 
 The match is ASCII case-insensitive (`p/.MAXIO.OBJECT` is the same as `p/.maxio.object`).
 
-New writes of those names return `400 InvalidArgument` (PUT, copy, multipart create, upload part, and complete). GET and HEAD return `NoSuchKey`. Listings skip them.
+New writes of those names return `400 InvalidArgument` (PUT, copy, delete, multipart create, upload part, and complete). GET and HEAD return `NoSuchKey`.
 
-An older build accepted these names as ordinary keys. A data directory from that build can still contain them, for example:
+A data directory written by a pre-1.0 build can still contain real objects whose keys use those names, for example:
 
 - `.maxio-promote-photos/img.jpg`
 - `y/.maxio-promote-bar/file.txt`
-- `a/.maxio.object` with sidecar `a/.maxio.object.meta.json` (this is not the inline payload of key `a`)
+- `a/.maxio.object` (sidecar `a/.maxio.object.meta.json`)
 - `.maxio-quarantine/f`
 
-Startup does not delete those objects. A `.maxio-promote-*` directory is treated as a crash leftover only when it contains a valid target marker and nothing except that marker, the ready marker, and `.maxio.object`. Anything else is left untouched.
+MaxIO will not start if any such object is present. Startup prints the bucket and key (up to 32 names) and stops without changing the data directory. `maxio check` reports each one as `legacy-reserved-key` and does not modify it, including with `--repair`.
 
-`maxio check` reports each legacy key as `legacy-reserved-key`. `--repair` does not delete the bytes or the sidecar. The sidecar holds the wrapped SSE-S3 data key, so deleting it would make the object unrecoverable.
+Start the previous MaxIO version on this data directory and rename or delete the keys, then start this version:
 
-`DELETE` and `DeleteObjects` remove an existing legacy object. After they are gone, the bucket can be deleted. Copy the files out of the data directory first if you still need the bytes. GET will not return them.
+```bash
+aws s3 mv s3://bucket/a/.maxio.object s3://bucket/a-object --endpoint-url http://127.0.0.1:9000
+```
+
+A `.maxio-promote-*` directory with no `*.meta.json` sidecar is this version's own crash leftover, not one of those objects. Startup removes an empty directory, removes a duplicate payload when the original object is still there, and restores a payload when the original is missing.
 
 ## Key and prefix layout
 

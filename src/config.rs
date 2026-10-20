@@ -55,10 +55,23 @@ pub struct Config {
     #[arg(long, env = "MAXIO_REGION", default_value_t = default_region())]
     pub region: String,
 
-    /// Master key for SSE-S3 encryption (base64-encoded 32 bytes).
-    /// When set, takes precedence over the keyring file for new writes.
+    /// SSE-S3 master key (base64-encoded 32 bytes).
+    /// Active key for new writes. Not copied into the data directory.
+    /// Mutually exclusive with `--master-key-file`.
     #[arg(long, env = "MAXIO_MASTER_KEY")]
     pub master_key: Option<String>,
+
+    /// File containing the SSE-S3 master key (base64-encoded 32 bytes, or 32 raw bytes).
+    /// Keeps the key outside the data directory. Not copied into the data directory.
+    /// Mutually exclusive with `--master-key`.
+    #[arg(long, env = "MAXIO_MASTER_KEY_FILE")]
+    pub master_key_file: Option<std::path::PathBuf>,
+
+    /// Start even when SSE-S3 objects exist and their master key is missing.
+    /// Those objects stay unreadable. Does not overwrite an unreadable or corrupt keyring file.
+    /// Required on every start until the original keys are restored.
+    #[arg(long, env = "MAXIO_ALLOW_MISSING_MASTER_KEY", default_value = "false")]
+    pub allow_missing_master_key: bool,
 
     /// Allow the built-in maxioadmin credentials and omit Secure on console cookies for every host.
     /// For local development only. A production server should set its own access key and secret key.

@@ -40,6 +40,8 @@ async fn start_server() -> (String, TempDir) {
         secret_key: SECRET_KEY.to_string(),
         region: REGION.to_string(),
         master_key: None,
+        master_key_file: None,
+        allow_missing_master_key: false,
         allow_insecure_dev: true,
         secure_cookies: false,
         erasure_coding: false,
@@ -97,6 +99,8 @@ async fn start_server_with_keys(
         secret_key: secret_key.to_string(),
         region: REGION.to_string(),
         master_key: None,
+        master_key_file: None,
+        allow_missing_master_key: false,
         allow_insecure_dev,
         secure_cookies,
         erasure_coding: false,
@@ -242,6 +246,8 @@ async fn start_server_with_default_buckets(default_buckets: &str) -> (String, Te
         secret_key: SECRET_KEY.to_string(),
         region: REGION.to_string(),
         master_key: None,
+        master_key_file: None,
+        allow_missing_master_key: false,
         allow_insecure_dev: true,
         secure_cookies: false,
         erasure_coding: false,
@@ -319,6 +325,8 @@ async fn test_default_buckets_skip_existing() {
         secret_key: SECRET_KEY.to_string(),
         region: REGION.to_string(),
         master_key: None,
+        master_key_file: None,
+        allow_missing_master_key: false,
         allow_insecure_dev: true,
         secure_cookies: false,
         erasure_coding: false,
@@ -362,7 +370,11 @@ async fn test_default_buckets_skips_invalid_names() {
 
     for bucket in ["INVALID", "b..a", "a.-b", "a-.b", "192.168.0.1"] {
         let resp = s3_request("HEAD", &format!("{}/{}", base_url, bucket), vec![]).await;
-        assert_eq!(resp.status(), 404, "{bucket} should be skipped");
+        assert_eq!(
+            resp.status(),
+            400,
+            "{bucket} should be skipped and rejected as InvalidBucketName"
+        );
     }
 
     let resp = s3_request("HEAD", &format!("{}/valid", base_url), vec![]).await;
@@ -934,7 +946,7 @@ async fn test_create_bucket() {
 async fn test_create_bucket_rejects_canonical_invalid_names() {
     let (base_url, _tmp) = start_server().await;
 
-    for bucket in ["a.-b", "a-.b", "192.168.0.1"] {
+    for bucket in ["c", "ab", "a.-b", "a-.b", "192.168.0.1"] {
         let resp = s3_request("PUT", &format!("{}/{}", base_url, bucket), vec![]).await;
         assert_eq!(resp.status(), 400, "{bucket} should be rejected");
         let body = resp.text().await.unwrap();
@@ -942,6 +954,24 @@ async fn test_create_bucket_rejects_canonical_invalid_names() {
             body.contains("<Code>InvalidBucketName</Code>"),
             "{bucket} should return InvalidBucketName, got {body}"
         );
+    }
+
+    for (method, path) in [
+        ("GET", "/c"),
+        ("HEAD", "/c"),
+        ("DELETE", "/c"),
+        ("PUT", "/c/object.txt"),
+        ("GET", "/c/object.txt"),
+    ] {
+        let resp = s3_request(method, &format!("{base_url}{path}"), vec![]).await;
+        assert_eq!(resp.status(), 400, "{method} {path} should be 400");
+        if method != "HEAD" {
+            let body = resp.text().await.unwrap();
+            assert!(
+                body.contains("<Code>InvalidBucketName</Code>"),
+                "{method} {path} should return InvalidBucketName, got {body}"
+            );
+        }
     }
 }
 
@@ -3166,6 +3196,8 @@ async fn start_server_ec() -> (String, TempDir) {
         secret_key: SECRET_KEY.to_string(),
         region: REGION.to_string(),
         master_key: None,
+        master_key_file: None,
+        allow_missing_master_key: false,
         allow_insecure_dev: true,
         secure_cookies: false,
         erasure_coding: true,
@@ -3689,6 +3721,8 @@ async fn start_server_parity(parity_shards: u32) -> (String, TempDir) {
         secret_key: SECRET_KEY.to_string(),
         region: REGION.to_string(),
         master_key: None,
+        master_key_file: None,
+        allow_missing_master_key: false,
         allow_insecure_dev: true,
         secure_cookies: false,
         erasure_coding: true,
@@ -4999,6 +5033,152 @@ async fn test_keyring_rotate_preserves_old_objects() {
         Some(result.new_active_id.as_str())
     );
     assert_eq!(r2.total_keys, 3);
+}
+
+/// A restart must not mint a new master key over SSE-S3 objects, and the same
+/// key supplied from outside the data directory must still decrypt them.
+#[tokio::test]
+async fn test_missing_master_key_refuses_restart_external_key_recovers() {
+    use maxio::storage::keys::{Keyring, LoadOptions};
+
+    let (base_url, tmp) = start_server().await;
+    s3_request("PUT", &format!("{base_url}/key-safety"), vec![]).await;
+    let plaintext = b"sse-s3 survives a restart".to_vec();
+    let put = s3_request_with_headers(
+        "PUT",
+        &format!("{base_url}/key-safety/secret.txt"),
+        plaintext.clone(),
+        vec![("x-amz-server-side-encryption", "AES256")],
+    )
+    .await;
+    assert_eq!(put.status(), 200);
+
+    let get = s3_request("GET", &format!("{base_url}/key-safety/secret.txt"), vec![]).await;
+    assert_eq!(get.status(), 200);
+    assert_eq!(get.bytes().await.unwrap().as_ref(), plaintext.as_slice());
+
+    let keyring_path = tmp.path().join(".maxio-keys.json");
+    let saved_keyring = std::fs::read(&keyring_path).unwrap();
+    let meta_path = tmp.path().join("buckets/key-safety/secret.txt.meta.json");
+    let meta: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&meta_path).unwrap()).unwrap();
+    let key_id = meta["encryption"]["key_id"].as_str().unwrap().to_string();
+    let wrapped = base64::engine::general_purpose::STANDARD
+        .decode(meta["encryption"]["wrapped_dek"].as_str().unwrap())
+        .unwrap();
+    let nonce_bytes = base64::engine::general_purpose::STANDARD
+        .decode(meta["encryption"]["wrap_nonce"].as_str().unwrap())
+        .unwrap();
+    let mut nonce = [0u8; 12];
+    nonce.copy_from_slice(&nonce_bytes);
+
+    let copy = TempDir::new().unwrap();
+    copy_path(tmp.path(), copy.path());
+    let copy_dir = copy.path().to_str().unwrap().to_string();
+    std::fs::remove_file(copy.path().join(".maxio-keys.json")).unwrap();
+
+    let missing = Keyring::load(&copy_dir, None)
+        .await
+        .err()
+        .expect("missing keyring must refuse to start");
+    assert!(
+        missing
+            .to_string()
+            .contains("Refusing to generate a new master key"),
+        "unexpected error: {missing}"
+    );
+    assert!(
+        !copy.path().join(".maxio-keys.json").exists(),
+        "refused startup must not create a replacement key"
+    );
+
+    let saved: serde_json::Value = serde_json::from_slice(&saved_keyring).unwrap();
+    let b64 = saved["keys"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|k| k["active"].as_bool() == Some(true))
+        .unwrap()["key_b64"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let wrong = base64::engine::general_purpose::STANDARD.encode([0x11u8; 32]);
+    let wrong_err = Keyring::load(&copy_dir, Some(&wrong))
+        .await
+        .err()
+        .expect("wrong external key must refuse to start");
+    assert!(
+        wrong_err.to_string().contains(&key_id),
+        "unexpected error: {wrong_err}"
+    );
+
+    let recovered = Keyring::load(&copy_dir, Some(&b64)).await.unwrap();
+    assert_eq!(recovered.active_id(), key_id);
+    let dek = recovered
+        .unwrap_dek(&key_id, &wrapped, &nonce)
+        .expect("external key must unwrap the DEK");
+    assert_eq!(dek.len(), 32);
+    assert!(!copy.path().join(".maxio-keys.json").exists());
+
+    // Dropping the check file as well as the keyring still refuses, because
+    // the object sidecar names the key id.
+    let bare = TempDir::new().unwrap();
+    copy_path(tmp.path(), bare.path());
+    std::fs::remove_file(bare.path().join(".maxio-keys.json")).unwrap();
+    std::fs::remove_file(bare.path().join(".maxio-key-check.json")).unwrap();
+    let scanned = Keyring::load(bare.path().to_str().unwrap(), None)
+        .await
+        .err()
+        .expect("scanning SSE-S3 metadata must refuse to bootstrap");
+    assert!(
+        scanned.to_string().contains(&key_id),
+        "unexpected error: {scanned}"
+    );
+    assert!(!bare.path().join(".maxio-keys.json").exists());
+
+    let abandoned = Keyring::load_with(
+        bare.path().to_str().unwrap(),
+        LoadOptions {
+            master_key_b64: None,
+            allow_missing_master_key: true,
+        },
+    )
+    .await
+    .unwrap();
+    assert_ne!(abandoned.active_id(), key_id);
+    assert!(
+        abandoned
+            .unwrap_dek(&key_id, &wrapped, &nonce)
+            .unwrap_err()
+            .to_string()
+            .contains("not found in keyring")
+    );
+
+    // The live server still has the original key in memory.
+    let get_again = s3_request("GET", &format!("{base_url}/key-safety/secret.txt"), vec![]).await;
+    assert_eq!(get_again.status(), 200);
+    assert_eq!(
+        get_again.bytes().await.unwrap().as_ref(),
+        plaintext.as_slice()
+    );
+}
+
+fn copy_path(src: &std::path::Path, dst: &std::path::Path) {
+    std::fs::create_dir_all(dst).unwrap();
+    for entry in std::fs::read_dir(src).unwrap() {
+        let entry = entry.unwrap();
+        let to = dst.join(entry.file_name());
+        let ft = entry.file_type().unwrap();
+        if ft.is_symlink() {
+            continue;
+        }
+        if ft.is_dir() {
+            copy_path(&entry.path(), &to);
+        } else if ft.is_file() {
+            std::fs::copy(entry.path(), &to).unwrap();
+        }
+    }
 }
 
 /// Invalid SSE algorithm is rejected.
@@ -6402,6 +6582,8 @@ async fn start_server_ec_parity(chunk_size: u64, parity_shards: u32) -> (String,
         secret_key: SECRET_KEY.to_string(),
         region: REGION.to_string(),
         master_key: None,
+        master_key_file: None,
+        allow_missing_master_key: false,
         allow_insecure_dev: true,
         secure_cookies: false,
         erasure_coding: true,

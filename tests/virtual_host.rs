@@ -45,6 +45,8 @@ async fn start(domain: &str) -> Running {
         secret_key: SECRET_KEY.to_string(),
         region: REGION.to_string(),
         master_key: None,
+        master_key_file: None,
+        allow_missing_master_key: false,
         allow_insecure_dev: true,
         secure_cookies: false,
         erasure_coding: false,

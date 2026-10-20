@@ -3,8 +3,11 @@ set -euo pipefail
 
 # Integration tests using the AWS CLI and MinIO mc against a running maxio server.
 # Usage: ./tests/aws_cli_test.sh [port] [data_dir]
-# Expects maxio to be running on localhost:${PORT:-9000} with the default
-# maxioadmin/maxioadmin credentials (start it with --allow-insecure-dev).
+# Expects maxio to be running on localhost:${PORT:-9000}.
+# Credentials default to maxioadmin/maxioadmin (start that server with
+# --allow-insecure-dev). Override them to match a server that uses its own keys:
+#   MAXIO_TEST_ACCESS_KEY=... MAXIO_TEST_SECRET_KEY=... ./tests/aws_cli_test.sh
+# Sections that start their own server use the same variables.
 # Virtual-hosted-style cases also require --domain localhost (or MAXIO_DOMAIN=localhost).
 # Requires aws (AWS CLI v2), mc, python3, curl, and permission to add *.localhost
 # names to /etc/hosts (those names do not resolve on every OS).
@@ -17,8 +20,10 @@ TMPDIR=$(mktemp -d)
 PASS=0
 FAIL=0
 
-export AWS_ACCESS_KEY_ID=maxioadmin
-export AWS_SECRET_ACCESS_KEY=maxioadmin
+MAXIO_TEST_ACCESS_KEY="${MAXIO_TEST_ACCESS_KEY:-maxioadmin}"
+MAXIO_TEST_SECRET_KEY="${MAXIO_TEST_SECRET_KEY:-maxioadmin}"
+export AWS_ACCESS_KEY_ID="$MAXIO_TEST_ACCESS_KEY"
+export AWS_SECRET_ACCESS_KEY="$MAXIO_TEST_SECRET_KEY"
 export AWS_DEFAULT_REGION=us-east-1
 # A developer AWS config can switch the transfer client off the CRT path that
 # sends streaming trailer checksums. These tests must not inherit that.
@@ -28,6 +33,16 @@ AWS="aws --endpoint-url $ENDPOINT"
 
 VHOST_MARK="# maxio-awscli-vhost"
 cleanup() {
+    if [ -n "${KEY_PID:-}" ] && kill -0 "$KEY_PID" 2>/dev/null; then
+        kill "$KEY_PID" 2>/dev/null || true
+        wait "$KEY_PID" 2>/dev/null || true
+    fi
+    if [ -n "${KEY_MC_ALIAS:-}" ]; then
+        mc alias rm "$KEY_MC_ALIAS" >/dev/null 2>&1 || true
+    fi
+    if [ -n "${KEY_DATA:-}" ]; then
+        rm -rf "$KEY_DATA"
+    fi
     if grep -q "$VHOST_MARK" /etc/hosts 2>/dev/null; then
         local filtered
         filtered=$(grep -v "$VHOST_MARK" /etc/hosts || true)
@@ -1747,6 +1762,253 @@ EOF
     mc alias rm "$MC_ALIAS" > /dev/null 2>&1 || true
 fi
 
+# --- SSE-S3 master key safety ---
+# Own data dir and process so a missing key can fail startup. The caller-owned
+# server above is left running.
+echo ""
+echo "--- SSE-S3 master key safety ---"
+
+if [ -z "${MAXIO_BIN:-}" ] || [ ! -x "${MAXIO_BIN}" ]; then
+    red "SKIP: SSE-S3 key safety tests (maxio binary not found)"
+elif ! command -v mc >/dev/null 2>&1; then
+    red "FAIL: mc is required for SSE-S3 key safety tests"
+    FAIL=$((FAIL + 1))
+else
+    KEY_DATA=$(mktemp -d)
+    KEY_LOG="$KEY_DATA/server.log"
+    KEY_PID=""
+    KEY_PORT=$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1]); s.close()')
+    KEY_ENDPOINT="http://127.0.0.1:$KEY_PORT"
+    KEY_AWS=(aws --endpoint-url "$KEY_ENDPOINT")
+    KEY_MC_ALIAS="maxio-key-$$"
+    KEY_BUCKET="keysafety-$$"
+    # Outside the data directory. The server must not copy this into KEY_DATA.
+    KEY_EXT=$(mktemp)
+
+    start_key_server() {
+        : >"$KEY_LOG"
+        local -a cred_args=(
+            --access-key "$MAXIO_TEST_ACCESS_KEY"
+            --secret-key "$MAXIO_TEST_SECRET_KEY"
+        )
+        if [ "$MAXIO_TEST_ACCESS_KEY" = "maxioadmin" ] && [ "$MAXIO_TEST_SECRET_KEY" = "maxioadmin" ]; then
+            cred_args+=(--allow-insecure-dev)
+        fi
+        "$MAXIO_BIN" --data-dir "$KEY_DATA" --port "$KEY_PORT" --address 127.0.0.1 \
+            "${cred_args[@]}" "$@" >"$KEY_LOG" 2>&1 &
+        KEY_PID=$!
+        local attempt
+        for attempt in $(seq 1 50); do
+            if curl -sf "$KEY_ENDPOINT/healthz" >/dev/null 2>&1; then
+                return 0
+            fi
+            if ! kill -0 "$KEY_PID" 2>/dev/null; then
+                return 1
+            fi
+            sleep 0.1
+        done
+        return 1
+    }
+
+    stop_key_server() {
+        if [ -n "${KEY_PID:-}" ] && kill -0 "$KEY_PID" 2>/dev/null; then
+            kill "$KEY_PID" 2>/dev/null || true
+            wait "$KEY_PID" 2>/dev/null || true
+        fi
+        KEY_PID=""
+    }
+
+    KEY_READY=0
+    if start_key_server; then
+        green "PASS: key-safety server started"
+        PASS=$((PASS + 1))
+        KEY_READY=1
+    else
+        red "FAIL: key-safety server did not start"
+        red "----- server log -----"
+        cat "$KEY_LOG" >&2 || true
+        FAIL=$((FAIL + 1))
+        stop_key_server
+    fi
+
+    if [ "$KEY_READY" -eq 1 ]; then
+    echo "key-safety" > "$TMPDIR/key-safety.txt"
+    "${KEY_AWS[@]}" s3 mb "s3://$KEY_BUCKET" >/dev/null
+    PUT_OUT=$("${KEY_AWS[@]}" s3api put-object --bucket "$KEY_BUCKET" --key secret.txt \
+        --body "$TMPDIR/key-safety.txt" --server-side-encryption AES256)
+    assert_eq "aws SSE-S3 put echoes AES256" "AES256" \
+        "$(echo "$PUT_OUT" | grep -o '"ServerSideEncryption": "[^"]*"' | cut -d'"' -f4)"
+    "${KEY_AWS[@]}" s3api get-object --bucket "$KEY_BUCKET" --key secret.txt \
+        "$TMPDIR/key-safety-get.txt" >/dev/null
+    assert_eq "aws SSE-S3 get round-trip" "key-safety" "$(cat "$TMPDIR/key-safety-get.txt")"
+
+    mc alias set "$KEY_MC_ALIAS" "$KEY_ENDPOINT" "$AWS_ACCESS_KEY_ID" "$AWS_SECRET_ACCESS_KEY" >/dev/null
+    echo "from-mc" > "$TMPDIR/mc-sse.txt"
+    if mc cp --help 2>&1 | grep -q -- '--enc-s3'; then
+        # --enc-s3 takes alias/prefix, not a boolean. SSE-S3 reads do not need it.
+        mc cp --enc-s3 "$KEY_MC_ALIAS/$KEY_BUCKET" \
+            "$TMPDIR/mc-sse.txt" "$KEY_MC_ALIAS/$KEY_BUCKET/mc-sse.txt" >/dev/null
+    elif mc cp --help 2>&1 | grep -q -- '--encrypt'; then
+        mc cp --encrypt SSE-S3 "$TMPDIR/mc-sse.txt" "$KEY_MC_ALIAS/$KEY_BUCKET/mc-sse.txt" >/dev/null
+    else
+        # Bucket-default SSE-S3, then a normal copy.
+        mc encrypt set sse-s3 "$KEY_MC_ALIAS/$KEY_BUCKET" >/dev/null
+        mc cp "$TMPDIR/mc-sse.txt" "$KEY_MC_ALIAS/$KEY_BUCKET/mc-sse.txt" >/dev/null
+    fi
+    MC_BODY=$(mc cat "$KEY_MC_ALIAS/$KEY_BUCKET/mc-sse.txt")
+    assert_eq "mc SSE-S3 get round-trip" "from-mc" "$MC_BODY"
+    if grep -q '"mode": "sse_s3"' "$KEY_DATA/buckets/$KEY_BUCKET/mc-sse.txt.meta.json"; then
+        green "PASS: mc upload stored sse_s3 metadata"
+        PASS=$((PASS + 1))
+    else
+        red "FAIL: mc upload metadata is not sse_s3"
+        FAIL=$((FAIL + 1))
+    fi
+
+    # Restart with the key file still present.
+    stop_key_server
+    if start_key_server; then
+        green "PASS: restart with key file present"
+        PASS=$((PASS + 1))
+    else
+        red "FAIL: restart with key file present"
+        cat "$KEY_LOG" >&2 || true
+        FAIL=$((FAIL + 1))
+    fi
+    "${KEY_AWS[@]}" s3api get-object --bucket "$KEY_BUCKET" --key secret.txt \
+        "$TMPDIR/key-safety-restart.txt" >/dev/null
+    assert_eq "aws get after restart with key" "key-safety" "$(cat "$TMPDIR/key-safety-restart.txt")"
+    assert_eq "mc cat after restart with key" "from-mc" "$(mc cat "$KEY_MC_ALIAS/$KEY_BUCKET/mc-sse.txt")"
+
+    # Loose permissions warn, but the server still starts.
+    chmod 644 "$KEY_DATA/.maxio-keys.json"
+    stop_key_server
+    if start_key_server; then
+        green "PASS: restart with group-readable key file"
+        PASS=$((PASS + 1))
+    else
+        red "FAIL: restart with group-readable key file"
+        FAIL=$((FAIL + 1))
+    fi
+    if grep -q "expected 0600" "$KEY_LOG"; then
+        green "PASS: loose key file permissions are warned"
+        PASS=$((PASS + 1))
+    else
+        red "FAIL: expected a permissions warning in the server log"
+        FAIL=$((FAIL + 1))
+    fi
+    chmod 600 "$KEY_DATA/.maxio-keys.json"
+
+    # External key, kept outside the data dir. Extract the active key the
+    # server just generated — it is not a committed secret.
+    python3 - "$KEY_DATA/.maxio-keys.json" "$KEY_EXT" <<'PY'
+import json, sys
+doc = json.load(open(sys.argv[1]))
+active = next(k["key_b64"] for k in doc["keys"] if k.get("active"))
+open(sys.argv[2], "w").write(active + "\n")
+PY
+    chmod 600 "$KEY_EXT"
+    if grep -F -q "$(tr -d '\n' < "$KEY_EXT")" "$KEY_DATA/.maxio-key-check.json"; then
+        red "FAIL: key check file contains key material"
+        FAIL=$((FAIL + 1))
+    else
+        green "PASS: key check file does not contain the master key"
+        PASS=$((PASS + 1))
+    fi
+
+    SAVED_KEYRING=$(mktemp)
+    cp "$KEY_DATA/.maxio-keys.json" "$SAVED_KEYRING"
+    stop_key_server
+    rm -f "$KEY_DATA/.maxio-keys.json"
+
+    START_MISSING=0
+    start_key_server || START_MISSING=$?
+    if [ "$START_MISSING" -ne 0 ]; then
+        green "PASS: restart with key file missing refuses to start"
+        PASS=$((PASS + 1))
+    else
+        red "FAIL: restart with key file missing started"
+        FAIL=$((FAIL + 1))
+        stop_key_server
+    fi
+    if grep -q "Refusing to generate a new master key" "$KEY_LOG"; then
+        green "PASS: missing-key error names the refusal"
+        PASS=$((PASS + 1))
+    else
+        red "FAIL: missing-key log did not refuse to generate a key"
+        cat "$KEY_LOG" >&2 || true
+        FAIL=$((FAIL + 1))
+    fi
+    assert_file_not_exists "missing key did not write a replacement keyring" \
+        "$KEY_DATA/.maxio-keys.json"
+
+    WRONG_KEY=$(mktemp)
+    openssl rand -base64 32 > "$WRONG_KEY"
+    chmod 600 "$WRONG_KEY"
+    START_WRONG=0
+    start_key_server --master-key-file "$WRONG_KEY" || START_WRONG=$?
+    if [ "$START_WRONG" -ne 0 ]; then
+        green "PASS: wrong external master key refuses to start"
+        PASS=$((PASS + 1))
+        if grep -Eq "not in the loaded keyring|does not match the check value|master key mismatch" "$KEY_LOG"; then
+            green "PASS: wrong-key error names the mismatch"
+            PASS=$((PASS + 1))
+        else
+            red "FAIL: wrong-key log did not describe the mismatch"
+            cat "$KEY_LOG" >&2 || true
+            FAIL=$((FAIL + 1))
+        fi
+    else
+        red "FAIL: wrong external master key started"
+        FAIL=$((FAIL + 1))
+        stop_key_server
+    fi
+    rm -f "$WRONG_KEY"
+    assert_file_not_exists "wrong external key was not copied into the data dir" \
+        "$KEY_DATA/.maxio-keys.json"
+
+    if start_key_server --master-key-file "$KEY_EXT"; then
+        green "PASS: restart with external master key file"
+        PASS=$((PASS + 1))
+    else
+        red "FAIL: restart with external master key file"
+        cat "$KEY_LOG" >&2 || true
+        FAIL=$((FAIL + 1))
+    fi
+    assert_file_not_exists "external key was not copied into the data dir" \
+        "$KEY_DATA/.maxio-keys.json"
+    "${KEY_AWS[@]}" s3api get-object --bucket "$KEY_BUCKET" --key secret.txt \
+        "$TMPDIR/key-safety-ext.txt" >/dev/null
+    assert_eq "aws get with external master key" "key-safety" "$(cat "$TMPDIR/key-safety-ext.txt")"
+    assert_eq "mc cat with external master key" "from-mc" "$(mc cat "$KEY_MC_ALIAS/$KEY_BUCKET/mc-sse.txt")"
+
+    # Restoring the on-disk keyring also works, with no external key.
+    stop_key_server
+    cp "$SAVED_KEYRING" "$KEY_DATA/.maxio-keys.json"
+    chmod 600 "$KEY_DATA/.maxio-keys.json"
+    rm -f "$SAVED_KEYRING"
+    if start_key_server; then
+        green "PASS: restart after restoring the keyring file"
+        PASS=$((PASS + 1))
+    else
+        red "FAIL: restart after restoring the keyring file"
+        cat "$KEY_LOG" >&2 || true
+        FAIL=$((FAIL + 1))
+    fi
+    "${KEY_AWS[@]}" s3api get-object --bucket "$KEY_BUCKET" --key secret.txt \
+        "$TMPDIR/key-safety-restored.txt" >/dev/null
+    assert_eq "aws get after keyring restore" "key-safety" "$(cat "$TMPDIR/key-safety-restored.txt")"
+
+    stop_key_server
+    rm -f "$KEY_EXT"
+    mc alias rm "$KEY_MC_ALIAS" >/dev/null 2>&1 || true
+    KEY_MC_ALIAS=""
+    rm -rf "$KEY_DATA"
+    KEY_DATA=""
+    fi
+    rm -f "$KEY_EXT"
+fi
+
 # --- Virtual-hosted-style (aws addressing_style=virtual, mc --path off) ---
 # Requires the server to be started with --domain localhost. Bucket hosts are
 # pinned in /etc/hosts because *.localhost does not resolve on every OS.
@@ -1859,7 +2121,7 @@ EOF
     assert_eq "path-style body matches virtual put" "virtual-body" "$(cat "$TMPDIR/vpath.txt")"
 
     MC_VHOST="maxiov$$"
-    assert "mc virtual alias" mc alias set "$MC_VHOST" "$ENDPOINT" "$AWS_ACCESS_KEY_ID" "$AWS_SECRET_ACCESS_KEY" \
+    assert "mc virtual alias" mc alias set "$MC_VHOST" "$ENDPOINT" "$MAXIO_TEST_ACCESS_KEY" "$MAXIO_TEST_SECRET_KEY" \
         --api S3v4 --path off
     echo "from-mc" > "$TMPDIR/vmc.txt"
     assert "mc virtual cp" mc cp "$TMPDIR/vmc.txt" "${MC_VHOST}/${VBUCKET}/mc.txt"

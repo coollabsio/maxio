@@ -443,6 +443,13 @@ impl tokio::io::AsyncRead for Md5VerifyingReader {
     }
 }
 
+fn bucket_name_from_storage_msg(msg: &str) -> &str {
+    msg.split_once(':')
+        .map(|(_, name)| name.trim())
+        .filter(|name| !name.is_empty())
+        .unwrap_or(msg)
+}
+
 /// True when a storage error was produced by a Content-MD5 mismatch.
 pub(crate) fn is_content_md5_mismatch(err: &StorageError) -> bool {
     matches!(err, StorageError::Io(io)
@@ -455,6 +462,9 @@ fn map_put_error(e: StorageError, key: &str) -> S3Error {
         return S3Error::bad_digest();
     }
     match e {
+        StorageError::InvalidKey(msg) if msg.starts_with("invalid bucket name") => {
+            S3Error::invalid_bucket_name(bucket_name_from_storage_msg(&msg))
+        }
         StorageError::InvalidKey(msg) => S3Error::invalid_argument(&msg),
         StorageError::ChecksumMismatch(_) => S3Error::bad_checksum("x-amz-checksum"),
         StorageError::EncryptionError(msg) => S3Error::invalid_argument(&msg),
@@ -470,6 +480,9 @@ fn map_read_error(e: StorageError, key: &str, version_id: Option<&str>) -> S3Err
     match e {
         StorageError::VersionNotFound(v) => S3Error::no_such_version(version_id.unwrap_or(&v)),
         StorageError::NotFound(_) => S3Error::no_such_key(key),
+        StorageError::InvalidKey(msg) if msg.starts_with("invalid bucket name") => {
+            S3Error::invalid_bucket_name(bucket_name_from_storage_msg(&msg))
+        }
         StorageError::InvalidKey(msg) => S3Error::invalid_argument(&msg),
         StorageError::DecryptionError(msg) => S3Error::invalid_argument(&msg),
         StorageError::IntegrityError(msg) => S3Error::invalid_argument(&msg),
@@ -948,7 +961,7 @@ pub async fn put_object(
     match state.storage.head_bucket(&bucket).await {
         Ok(true) => {}
         Ok(false) => return Err(S3Error::no_such_bucket(&bucket)),
-        Err(e) => return Err(S3Error::internal(e)),
+        Err(e) => return Err(S3Error::from_bucket_storage(e, &bucket)),
     }
 
     let content_type = headers
@@ -975,7 +988,7 @@ pub async fn put_object(
         match state.storage.get_bucket_encryption(&bucket).await {
             Ok(Some(cfg)) => encryption = Some(encryption_from_bucket_default(&cfg)),
             Ok(None) => {}
-            Err(e) => return Err(S3Error::internal(e)),
+            Err(e) => return Err(S3Error::from_bucket_storage(e, &bucket)),
         }
     }
     let applied_mode = encryption.as_ref().map(|e| e.mode.clone());
@@ -1231,7 +1244,7 @@ async fn copy_object(
     match state.storage.head_bucket(&bucket).await {
         Ok(true) => {}
         Ok(false) => return Err(S3Error::no_such_bucket(&bucket)),
-        Err(e) => return Err(S3Error::internal(e)),
+        Err(e) => return Err(S3Error::from_bucket_storage(e, &bucket)),
     }
 
     let directive = headers
@@ -1717,7 +1730,7 @@ pub async fn delete_object(
     match state.storage.head_bucket(&bucket).await {
         Ok(true) => {}
         Ok(false) => return Err(S3Error::no_such_bucket(&bucket)),
-        Err(e) => return Err(S3Error::internal(e)),
+        Err(e) => return Err(S3Error::from_bucket_storage(e, &bucket)),
     }
 
     // Permanent version deletion
@@ -1872,7 +1885,7 @@ pub async fn delete_objects(
     match state.storage.head_bucket(&bucket).await {
         Ok(true) => {}
         Ok(false) => return Err(S3Error::no_such_bucket(&bucket)),
-        Err(e) => return Err(S3Error::internal(e)),
+        Err(e) => return Err(S3Error::from_bucket_storage(e, &bucket)),
     }
 
     let bytes = axum::body::to_bytes(body, DELETE_BODY_MAX)

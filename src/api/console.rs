@@ -2094,6 +2094,8 @@ mod tests {
             secret_key: "test-credential".into(),
             region: "us-east-1".into(),
             master_key: None,
+            master_key_file: None,
+            allow_missing_master_key: false,
             allow_insecure_dev,
             secure_cookies,
             erasure_coding: false,

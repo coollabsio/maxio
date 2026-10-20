@@ -44,7 +44,7 @@ Images are on [GHCR](https://ghcr.io/coollabsio/maxio) and Docker Hub (`coollabs
 
 ### Build from source
 
-Install [Rust](https://rustup.rs) (the version in `rust-toolchain.toml`) and [bun](https://bun.sh) **1.4.2**. `cargo build` runs bun to compile the web console and embed it in the binary.
+Install [Rust](https://rustup.rs) **1.89** or newer (`rust-version` in `Cargo.toml`; `rust-toolchain.toml` pins the toolchain used in this repo) and [bun](https://bun.sh) **1.4.2**. `cargo build` runs bun to compile the web console and embed it in the binary.
 
 ```bash
 curl -fsSL https://bun.sh/install | bash -s "bun-v1.4.2"
@@ -150,7 +150,7 @@ AWS CLI and `mc` send dotted bucket names as path-style even when virtual addres
 
 SSE-S3 objects are encrypted with a per-object data key. That data key is wrapped by a 32-byte master key. Losing every copy of the master key makes those objects unrecoverable. MaxIO does not escrow it.
 
-On first start, when `<data-dir>/.maxio-keys.json` does not exist and the data directory has no SSE-S3 objects and no key check file, MaxIO generates a master key and writes it to that file (mode `0600` on Unix, created atomically and fsynced). Back this file up **outside** the data directory. `<data-dir>/.maxio-key-check.json` stays with the data. It stores a check value per key id and no key material. Do not delete it to "fix" a startup error.
+On first start, when `<data-dir>/.maxio-keys.json` does not exist and the data directory has no SSE-S3 objects and no key check file, MaxIO generates a master key and writes it to that file (mode `0600` on Unix, created atomically and fsynced). Back this file up **outside** the data directory. `<data-dir>/.maxio-key-check.json` stays with the data. It stores a check value per key id, whether that key lives in `.maxio-keys.json` (`on-disk`) or was supplied from outside (`external`), and no key material. Do not delete it to "fix" a startup error.
 
 If the key file is missing, MaxIO refuses to start when encrypted object metadata is present, and also when the key check file records key ids even if every object has been deleted. The error names which of those it found. A loaded key that does not match a check value also refuses to start. An unreadable or corrupt key file is never overwritten.
 
@@ -214,7 +214,7 @@ The server holds an exclusive lock on `<data-dir>/.maxio.lock` until it exits. T
 
 Stop the server before `--repair`. A read-only scan can run while the server is up and warns that the result can race with in-flight writes. `--repair` and `keyring merge` refuse to run while the server holds the data-directory lock.
 
-If SSE-S3 uses an external master key, pass it the same way the server does (`--master-key`, `--master-key-file`, `MAXIO_MASTER_KEY`, or `MAXIO_MASTER_KEY_FILE`). A matching key is not a finding. With no key supplied, check prints a note and still exits 0. A missing or wrong key is an error, and `--repair` cannot invent the key.
+If SSE-S3 uses an external master key, pass it the same way the server does (`--master-key`, `--master-key-file`, `MAXIO_MASTER_KEY`, or `MAXIO_MASTER_KEY_FILE`). A matching key is not a finding. When the check file says the key is external, or when that file was written before it recorded a source, passing no key prints a note and still exits 0. When the check file says the key was on disk and `.maxio-keys.json` is missing, check exits 1: that key cannot be recovered. A wrong key is an error, and `--repair` cannot invent the key.
 
 ```bash
 maxio check --data-dir ./data

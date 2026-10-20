@@ -162,7 +162,10 @@ pub async fn check_with(
         );
     }
     let _repair_lock = if repair {
-        Some(super::lock::acquire_exclusive(data_dir)?)
+        Some(super::lock::acquire_exclusive(
+            data_dir,
+            super::lock::LockReason::Repair,
+        )?)
     } else {
         None
     };
@@ -1031,6 +1034,11 @@ mod master_key_tests {
         )
         .unwrap();
         assert!(!tmp.path().join(".maxio-keys.json").exists());
+        let check = std::fs::read_to_string(tmp.path().join(".maxio-key-check.json")).unwrap();
+        assert!(
+            check.contains("\"source\": \"external\""),
+            "external key must be recorded in the check file: {check}"
+        );
         (tmp, b64)
     }
 
@@ -1128,9 +1136,85 @@ mod master_key_tests {
     }
 
     #[tokio::test]
+    async fn deleted_on_disk_keyring_is_an_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().to_str().unwrap();
+        Keyring::load(dir, None).await.unwrap();
+        let check_json = std::fs::read_to_string(tmp.path().join(".maxio-key-check.json")).unwrap();
+        assert!(
+            check_json.contains("\"source\": \"on-disk\""),
+            "on-disk keyring must be recorded in the check file: {check_json}"
+        );
+        let keyring_json: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(tmp.path().join(".maxio-keys.json")).unwrap(),
+        )
+        .unwrap();
+        let saved = keyring_json["keys"][0]["key_b64"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        std::fs::remove_file(tmp.path().join(".maxio-keys.json")).unwrap();
+        let report = check(tmp.path(), false).await.unwrap();
+        assert!(report.unresolved() >= 1, "{:?}", report.issues);
+        let issues = keyring_issues(&report);
+        assert!(
+            issues.iter().any(|issue| {
+                issue.kind == IssueKind::KeyringMissing
+                    && !issue.advisory
+                    && issue.detail.contains("cannot be recovered")
+                    && issue.detail.contains(".maxio-keys.json")
+            }),
+            "{:?}",
+            report.issues
+        );
+        assert!(
+            !issues
+                .iter()
+                .any(|issue| issue.kind == IssueKind::KeyringUnverified),
+            "{:?}",
+            report.issues
+        );
+
+        let resolved = resolve_master_key(Some(&saved), None)
+            .await
+            .unwrap()
+            .unwrap();
+        let with_key = check_with(tmp.path(), false, Some(&resolved))
+            .await
+            .unwrap();
+        assert!(
+            keyring_issues(&with_key).is_empty(),
+            "the original key still verifies after the file is gone: {:?}",
+            with_key.issues
+        );
+        assert_eq!(with_key.unresolved(), 0);
+    }
+
+    #[tokio::test]
+    async fn legacy_check_file_without_source_stays_a_note() {
+        let key = [3u8; 32];
+        let (tmp, _) = external_dir(&key).await;
+        let path = tmp.path().join(".maxio-key-check.json");
+        let mut value: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        value.as_object_mut().unwrap().remove("source");
+        std::fs::write(&path, serde_json::to_string_pretty(&value).unwrap()).unwrap();
+        let report = check(tmp.path(), false).await.unwrap();
+        assert_eq!(report.unresolved(), 0, "{:?}", report.issues);
+        let notes = keyring_issues(&report);
+        assert_eq!(notes.len(), 1);
+        assert_eq!(notes[0].kind, IssueKind::KeyringUnverified);
+        assert!(notes[0].advisory);
+    }
+
+    #[tokio::test]
     async fn repair_refuses_while_the_data_dir_lock_is_held() {
         let tmp = tempfile::tempdir().unwrap();
-        let _lock = crate::storage::lock::acquire_exclusive(tmp.path()).unwrap();
+        let _lock = crate::storage::lock::acquire_exclusive(
+            tmp.path(),
+            crate::storage::lock::LockReason::Serve,
+        )
+        .unwrap();
         let err = check(tmp.path(), true).await.unwrap_err();
         assert!(err.to_string().contains(".maxio.lock"), "{err}");
         let report = check(tmp.path(), false).await.unwrap();

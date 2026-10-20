@@ -221,7 +221,10 @@ async fn main() -> anyhow::Result<()> {
     tokio::fs::create_dir_all(&config.data_dir).await?;
     // Held until this process exits, including after a graceful shutdown.
     // A crash closes the fd and the OS drops the flock, so restart is not blocked.
-    let _data_lock = storage::lock::acquire_exclusive(std::path::Path::new(&config.data_dir))?;
+    let _data_lock = storage::lock::acquire_exclusive(
+        std::path::Path::new(&config.data_dir),
+        storage::lock::LockReason::Serve,
+    )?;
 
     // SSE-S3 master key. A missing keyring file bootstraps a new key only when
     // the data directory has no encrypted objects. See storage::keys.
@@ -509,7 +512,10 @@ async fn run_keyring_rotate(data_dir: &str) -> anyhow::Result<()> {
 }
 
 async fn run_keyring_merge(data_dir: &str, from: &std::path::Path) -> anyhow::Result<()> {
-    let _lock = storage::lock::acquire_exclusive(std::path::Path::new(data_dir))?;
+    let _lock = storage::lock::acquire_exclusive(
+        std::path::Path::new(data_dir),
+        storage::lock::LockReason::MergeKeyring,
+    )?;
     let result = storage::keys::merge_keyring(data_dir, from).await?;
     println!("✓ keyring merged into {data_dir}/.maxio-keys.json");
     if result.added_ids.is_empty() {

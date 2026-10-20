@@ -12,8 +12,11 @@
 //!    (or `{data_dir}/.maxio-key-check.json`) say a key is required.
 //!
 //! `.maxio-key-check.json` stores an HMAC of a fixed label under each master
-//! key. It has no key material. It lives with the data so a replaced key file
-//! fails at startup instead of serving ciphertext as if it were plaintext.
+//! key, plus whether that key lives in `.maxio-keys.json` (`on-disk`) or was
+//! supplied from outside (`external`). It has no key material. It lives with
+//! the data so a replaced key file fails at startup instead of serving
+//! ciphertext as if it were plaintext. Files written before `source` existed
+//! stay valid; `check` treats those as it did before the field.
 //!
 //! Losing every copy of the master key makes SSE-S3 objects unrecoverable.
 
@@ -98,13 +101,18 @@ impl Keyring {
     pub async fn load_with(data_dir: &str, opts: LoadOptions<'_>) -> anyhow::Result<Self> {
         let file_path = keyring_path(data_dir);
         let mut keys: HashMap<String, [u8; 32]> = HashMap::new();
+        // `external` only when no keyring file is involved. A file that is
+        // merged in still holds keys, so losing it later must stay an error.
+        let mut key_source = KeySource::OnDisk;
 
         let active_id = if let Some(mk) = opts.master_key_b64 {
             let key_bytes = decode_master_key(mk)?;
             let id = key_id_from_bytes(&key_bytes);
             keys.insert(id.clone(), key_bytes);
             match read_keyring_file(&file_path).await? {
-                KeyringFileState::Missing => {}
+                KeyringFileState::Missing => {
+                    key_source = KeySource::External;
+                }
                 KeyringFileState::Parsed(kr) => {
                     warn_if_perms_open(Path::new(&file_path), "SSE-S3 keyring file").await;
                     ingest_keyring_entries(&mut keys, &kr)?;
@@ -145,7 +153,7 @@ impl Keyring {
             }
         };
 
-        reconcile_key_check(data_dir, &keys, opts.allow_missing_master_key).await?;
+        reconcile_key_check(data_dir, &keys, opts.allow_missing_master_key, key_source).await?;
         Ok(Self { keys, active_id })
     }
 
@@ -266,7 +274,7 @@ pub async fn rotate(data_dir: &str) -> anyhow::Result<RotateResult> {
             }
             // Confirm the current keys match the data-directory check before
             // replacing the file. A failure here leaves the keyring untouched.
-            reconcile_key_check(data_dir, &existing, false).await?;
+            reconcile_key_check(data_dir, &existing, false, KeySource::OnDisk).await?;
             (kr, true)
         }
         KeyringFileState::Missing => {
@@ -328,7 +336,7 @@ pub async fn rotate(data_dir: &str) -> anyhow::Result<RotateResult> {
 
     let mut updated = HashMap::new();
     ingest_keyring_entries(&mut updated, &kr)?;
-    reconcile_key_check(data_dir, &updated, false).await?;
+    reconcile_key_check(data_dir, &updated, false, KeySource::OnDisk).await?;
 
     Ok(RotateResult {
         new_active_id: new_id,
@@ -435,7 +443,7 @@ pub async fn merge_keyring(data_dir: &str, from_path: &Path) -> anyhow::Result<M
     let json = serde_json::to_string_pretty(&dest)?;
     write_private_file_atomic(&dest_path, &json, "SSE-S3 keyring").await?;
 
-    if let Err(err) = reconcile_key_check(data_dir, &known, false).await {
+    if let Err(err) = reconcile_key_check(data_dir, &known, false, KeySource::OnDisk).await {
         return Err(anyhow::anyhow!(
             "{err}\n\nThe merged keyring was written to {dest_path} (added {}). Restart after the missing keys are merged in.",
             if added_ids.is_empty() {
@@ -699,9 +707,9 @@ pub async fn assess_master_key(
         keys.insert(key_id_from_bytes(&raw), raw);
     }
 
-    let check_entries = match read_check_file(&check_path(data_dir)).await? {
-        CheckRead::Missing => Vec::new(),
-        CheckRead::Parsed(file) => file.keys,
+    let (check_entries, check_source) = match read_check_file(&check_path(data_dir)).await? {
+        CheckRead::Missing => (Vec::new(), None),
+        CheckRead::Parsed(file) => (file.keys, file.source),
     };
     let scan = scan_sse_s3(data_dir).await?;
 
@@ -718,6 +726,13 @@ pub async fn assess_master_key(
     }
 
     if keys.is_empty() {
+        if check_source == Some(KeySource::OnDisk) && !keyring_present {
+            return Ok(MasterKeyAssessment::Unrecoverable {
+                detail: "the on-disk SSE-S3 keyring (.maxio-keys.json) is missing. .maxio-key-check.json records that this data directory stored its master key there. Plaintext cannot be recovered without that file or the original key.".into(),
+            });
+        }
+        // No `source` field: files written before the field existed. Those stay
+        // a note, which is what check did when any check file had no keyring.
         if !check_entries.is_empty() && !keyring_present && supplied_b64.is_none() {
             return Ok(MasterKeyAssessment::ExternalKeyUnverified {
                 ids: required.into_iter().collect(),
@@ -752,6 +767,11 @@ pub async fn assess_master_key(
         return Ok(MasterKeyAssessment::Satisfied);
     }
     if supplied_b64.is_none() && !keyring_present && !check_entries.is_empty() {
+        if check_source == Some(KeySource::OnDisk) {
+            return Ok(MasterKeyAssessment::Unrecoverable {
+                detail: "the on-disk SSE-S3 keyring (.maxio-keys.json) is missing. .maxio-key-check.json records that this data directory stored its master key there. Plaintext cannot be recovered without that file or the original key.".into(),
+            });
+        }
         return Ok(MasterKeyAssessment::ExternalKeyUnverified { ids: missing });
     }
     let supplied_ids: Vec<&str> = keys.keys().map(String::as_str).collect();
@@ -788,9 +808,24 @@ async fn read_master_key_file(path: &Path) -> anyhow::Result<String> {
     )
 }
 
+/// Where the master key for this data directory is kept.
+///
+/// Recorded in `.maxio-key-check.json` so `check` can tell a deleted on-disk
+/// keyring from an external key that was never stored there.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+enum KeySource {
+    #[serde(rename = "on-disk")]
+    OnDisk,
+    #[serde(rename = "external")]
+    External,
+}
+
 #[derive(Serialize, Deserialize)]
 struct KeyCheckFile {
     version: u32,
+    /// Absent in files written before this field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    source: Option<KeySource>,
     keys: Vec<KeyCheckEntry>,
 }
 
@@ -950,9 +985,10 @@ async fn reconcile_key_check(
     data_dir: &str,
     keys: &HashMap<String, [u8; 32]>,
     allow_missing: bool,
+    source: KeySource,
 ) -> anyhow::Result<()> {
     let path = check_path(data_dir);
-    let (mut entries, mut dirty) = match read_check_file(&path).await? {
+    let (mut entries, mut dirty, previous_source) = match read_check_file(&path).await? {
         CheckRead::Missing => {
             let scan = scan_sse_s3(data_dir).await?;
             if !scan.unresolved.is_empty() && !allow_missing {
@@ -972,10 +1008,13 @@ async fn reconcile_key_check(
                 .into_iter()
                 .map(|id| KeyCheckEntry { id, check: None })
                 .collect();
-            (entries, true)
+            (entries, true, None)
         }
-        CheckRead::Parsed(file) => (file.keys, false),
+        CheckRead::Parsed(file) => (file.keys, false, file.source),
     };
+    if previous_source != Some(source) {
+        dirty = true;
+    }
 
     let mut missing = Vec::new();
     for entry in &entries {
@@ -1036,6 +1075,7 @@ async fn reconcile_key_check(
     if dirty {
         let file = KeyCheckFile {
             version: KEY_CHECK_VERSION,
+            source: Some(source),
             keys: entries,
         };
         let json = serde_json::to_string_pretty(&file)?;

@@ -2,6 +2,7 @@
 name = "maxio"
 version = "1.0.0"
 edition = "2024"
+rust-version = "1.89"
 description = "S3-compatible object storage server — single-binary replacement for MinIO"
 license = "Apache-2.0"
 repository = "https://github.com/coollabsio/maxio"

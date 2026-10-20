@@ -76,10 +76,45 @@ printf 'Open http://localhost:9000/ui/ and sign in with %s / %s\n' \
 | `MAXIO_ERASURE_CODING` | `false` | Enable erasure coding |
 | `MAXIO_CHUNK_SIZE` | `10485760` | Erasure coding chunk size in bytes |
 | `MAXIO_PARITY_SHARDS` | `0` | Parity shards per object |
-| `MAXIO_MASTER_KEY` | _(auto)_ | Base64 32-byte SSE-S3 master key. If unset, stored in `<data-dir>/.maxio-keys.json` — back this file up |
+| `MAXIO_MASTER_KEY` | _(auto)_ | Base64 32-byte SSE-S3 master key. Not written into the data directory. See [SSE-S3 master keys](#sse-s3-master-keys) |
+| `MAXIO_MASTER_KEY_FILE` | _(none)_ | File containing that key (base64, or 32 raw bytes), kept outside the data directory |
+| `MAXIO_ALLOW_MISSING_MASTER_KEY` | `false` | Start even if SSE-S3 objects exist and their master key is missing. Those objects stay unreadable. Pass it on every start until the key is restored |
 | `MAXIO_MAX_CONSOLE_BODY_BYTES` | `1048576` | Max body size for console JSON routes |
 
 Each variable also has a CLI flag (for example `--port`). Run `maxio --help` for the full list.
+
+## SSE-S3 master keys
+
+SSE-S3 objects are encrypted with a per-object data key. That data key is wrapped by a 32-byte master key. Losing every copy of the master key makes those objects unrecoverable. MaxIO does not escrow it.
+
+On first start, when `<data-dir>/.maxio-keys.json` does not exist and the data directory has no SSE-S3 objects, MaxIO generates a master key and writes it to that file (mode `0600` on Unix, created atomically and fsynced). Back this file up **outside** the data directory. `<data-dir>/.maxio-key-check.json` stays with the data. It stores a check value per key id and no key material. Do not delete it to "fix" a startup error.
+
+If the key file is missing or the loaded key does not match the check value, and encrypted objects are present, MaxIO refuses to start and does not generate a replacement key. An unreadable or corrupt key file is never overwritten.
+
+```bash
+# Generate a key outside the data directory. The shell variable is local to this command.
+umask 077
+openssl rand -base64 32 > /secure/maxio-master.key
+
+# Use it on every start. It is not copied into the data directory.
+export MAXIO_MASTER_KEY_FILE=/secure/maxio-master.key
+# equivalent: export MAXIO_MASTER_KEY="$(cat /secure/maxio-master.key)"
+./maxio --data-dir /var/lib/maxio --master-key-file /secure/maxio-master.key
+```
+
+Set only one of `MAXIO_MASTER_KEY` and `MAXIO_MASTER_KEY_FILE`. The value is standard base64 that decodes to 32 bytes (a trailing newline is fine), or a file of exactly 32 raw bytes. When an external key is set, keys already in `.maxio-keys.json` are still used to read older objects.
+
+### Backup and restore
+
+1. Back up `.maxio-keys.json` (and any external key file) whenever you back up the data directory, including after `maxio keyring rotate`.
+2. On the new host, put the key file back at `<data-dir>/.maxio-keys.json` **or** pass the same `--master-key` / `--master-key-file`, then start.
+3. Copy `.maxio-key-check.json` with the data directory. It is not a substitute for the key.
+
+`maxio keyring list --data-dir <dir>` prints key ids only. `maxio keyring rotate --data-dir <dir>` adds a new active key and keeps the previous ones so existing objects still decrypt. Restart after rotating. Rotate refuses to create a new keyring when encrypted objects exist and the key file is missing.
+
+If the key file's mode is looser than `0600`, startup logs a warning and continues. Restrict it with `chmod 600`.
+
+`--allow-missing-master-key` starts anyway when the key is absent. Objects encrypted with the missing key stay unreadable, and the flag is required on every later start until the original key is restored. It does not override an unreadable key file or a check value that does not match the key you did load.
 
 ## Usage
 

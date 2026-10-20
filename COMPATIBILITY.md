@@ -86,7 +86,7 @@ Status: ✅ supported · 🟡 partial · ❌ not supported
 
 | Feature | Status | Notes |
 |---|---|---|
-| SSE-S3 | ✅ | Local keyring, rotatable master key |
+| SSE-S3 | ✅ | Local keyring or external master key. Startup refuses a missing or wrong key when encrypted objects exist |
 | SSE-C | ✅ | |
 | SSE-KMS | ❌ | Rejected with `InvalidEncryptionAlgorithm` |
 

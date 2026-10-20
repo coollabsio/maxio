@@ -156,21 +156,47 @@ async fn main() -> anyhow::Result<()> {
 
     tokio::fs::create_dir_all(&config.data_dir).await?;
 
-    // Build the SSE-S3 keyring (bootstrap a random master key on first run).
-    let keyring = Arc::new(
-        storage::keys::Keyring::load(&config.data_dir, config.master_key.as_deref()).await?,
-    );
-    if config.master_key.is_none() {
-        tracing::info!(
-            "SSE-S3 keyring: active key id {} (file {}/.maxio-keys.json — BACK THIS UP)",
-            keyring.active_id(),
-            config.data_dir
-        );
+    // SSE-S3 master key. A missing keyring file bootstraps a new key only when
+    // the data directory has no encrypted objects. See storage::keys.
+    let master_key_b64 = storage::keys::resolve_master_key(
+        config.master_key.as_deref(),
+        config.master_key_file.as_deref(),
+    )
+    .await?;
+    let keyring = Arc::new(if config.allow_missing_master_key {
+        storage::keys::Keyring::load_with(
+            &config.data_dir,
+            storage::keys::LoadOptions {
+                master_key_b64: master_key_b64.as_deref(),
+                allow_missing_master_key: true,
+            },
+        )
+        .await?
     } else {
-        tracing::info!(
-            "SSE-S3 keyring: active key id {} (from MAXIO_MASTER_KEY)",
-            keyring.active_id()
-        );
+        storage::keys::Keyring::load(&config.data_dir, master_key_b64.as_deref()).await?
+    });
+    match (&config.master_key, &config.master_key_file) {
+        (_, Some(path)) => {
+            tracing::info!(
+                "SSE-S3 keyring: active key id {} (from master key file {}; not written into the data directory)",
+                keyring.active_id(),
+                path.display()
+            );
+        }
+        (Some(_), None) => {
+            tracing::info!(
+                "SSE-S3 keyring: active key id {} (from MAXIO_MASTER_KEY; not written into the data directory)",
+                keyring.active_id()
+            );
+        }
+        (None, None) => {
+            tracing::info!(
+                "SSE-S3 keyring: active key id {} (file {}/.maxio-keys.json — BACK THIS UP; {}/.maxio-key-check.json stays with the data and has no key material)",
+                keyring.active_id(),
+                config.data_dir,
+                config.data_dir
+            );
+        }
     }
 
     let storage = storage::filesystem::FilesystemStorage::new(

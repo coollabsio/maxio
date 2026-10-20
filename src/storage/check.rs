@@ -16,7 +16,8 @@
 
 use super::chunk_reader::repair_chunk_file;
 use super::filesystem::{
-    INLINE_OBJECT_PAYLOAD, PROMOTE_READY_FILE, PROMOTE_TARGET_FILE, list_promotes,
+    INLINE_OBJECT_PAYLOAD, PROMOTE_READY_FILE, PROMOTE_TARGET_FILE, is_exact_promote_leftover,
+    is_legacy_container, is_promote_dir_name, key_contains_reserved_segment, list_promotes,
     recover_promotes_in, write_file_atomic,
 };
 use super::{
@@ -49,6 +50,8 @@ pub enum IssueKind {
     KeyringUnverified,
     /// `.maxio-promote-*` still holds object bytes from a key promotion.
     PromoteLeftover,
+    /// Object written by an older build under a name this version reserves.
+    LegacyReservedKey,
 }
 
 impl IssueKind {
@@ -71,8 +74,15 @@ impl IssueKind {
             Self::KeyringMissing => "keyring-missing",
             Self::KeyringUnverified => "keyring-unverified",
             Self::PromoteLeftover => "promote-leftover",
+            Self::LegacyReservedKey => "legacy-reserved-key",
         }
     }
+}
+
+fn legacy_key_detail(key: &str) -> String {
+    format!(
+        "key {key} uses a name this version reserves for internal files. Listings skip it and GET returns NoSuchKey. DELETE removes it. New writes of this name are rejected. Copy the file out by hand if you still need the bytes."
+    )
 }
 
 /// Sidecars that must survive this scan because a promote directory may be
@@ -361,6 +371,20 @@ async fn scan_bucket(
             if stem.is_empty() {
                 continue;
             }
+            let key_for_reserve = if stem == ".folder" {
+                prefix.clone()
+            } else {
+                format!("{prefix}{stem}")
+            };
+            if key_contains_reserved_segment(&key_for_reserve) {
+                report.push(
+                    IssueKind::LegacyReservedKey,
+                    path,
+                    legacy_key_detail(&key_for_reserve),
+                    false,
+                );
+                continue;
+            }
             let (key, data_path) = if stem == ".folder" {
                 (prefix.clone(), dir.join(".folder"))
             } else {
@@ -416,12 +440,32 @@ async fn scan_bucket(
             if !*is_dir {
                 continue;
             }
-            if name.starts_with('.') || name.ends_with(".ec") {
+            if name.ends_with(".ec") {
+                continue;
+            }
+            if name.starts_with('.') {
+                // Older builds stored real objects under names this version
+                // reserves. Descend so `check` can list them. An exact
+                // promote leftover is not one of those objects.
+                if is_promote_dir_name(name) {
+                    if !is_exact_promote_leftover(path).await {
+                        stack.push((path.clone(), format!("{prefix}{name}/")));
+                    }
+                } else if is_legacy_container(name) {
+                    stack.push((path.clone(), format!("{prefix}{name}/")));
+                }
                 continue;
             }
             // Payload of a key that is also a prefix. Without a sidecar the
             // bytes may be ciphertext, so repair quarantines the file and
-            // does not invent a plaintext object.
+            // does not invent a plaintext object. `name/.maxio.object.meta.json`
+            // is a legacy object whose key ends in `.maxio.object`, not the
+            // inline payload of `name`.
+            let legacy_inline = path.join(format!("{INLINE_OBJECT_PAYLOAD}.meta.json"));
+            if tokio::fs::try_exists(&legacy_inline).await.unwrap_or(false) {
+                stack.push((path.clone(), format!("{prefix}{name}/")));
+                continue;
+            }
             let inline = path.join(INLINE_OBJECT_PAYLOAD);
             if tokio::fs::metadata(&inline)
                 .await
@@ -470,6 +514,15 @@ async fn check_meta_pair(
 ) -> anyhow::Result<()> {
     let repair = flags.repair;
     let keep_sidecar = flags.keep_sidecar;
+    if key_contains_reserved_segment(key) {
+        report.push(
+            IssueKind::LegacyReservedKey,
+            meta_path,
+            legacy_key_detail(key),
+            false,
+        );
+        return Ok(());
+    }
     // Resolve `p/.maxio.object` before any decision to delete `p.meta.json`.
     // A directory at `p` is not the payload; opening it is EISDIR, and the
     // bytes (including SSE-S3 ciphertext) live in the inline file.
@@ -973,6 +1026,40 @@ async fn repair_backup(
     report.push(IssueKind::StaleBackup, backup, detail, repaired);
 }
 
+async fn note_legacy_promote_dirs(dir: &Path, guard: &mut SidecarGuard, report: &mut CheckReport) {
+    let mut listed = match tokio::fs::read_dir(dir).await {
+        Ok(listed) => listed,
+        Err(_) => return,
+    };
+    while let Ok(Some(entry)) = listed.next_entry().await {
+        let name = entry.file_name().to_string_lossy().to_string();
+        if !is_promote_dir_name(&name) {
+            continue;
+        }
+        if !entry
+            .file_type()
+            .await
+            .map(|ft| ft.is_dir())
+            .unwrap_or(false)
+        {
+            continue;
+        }
+        let path = entry.path();
+        if is_exact_promote_leftover(&path).await {
+            continue;
+        }
+        // Bytes in this directory may belong to a sidecar in `dir`. Do not
+        // delete that sidecar while the directory remains.
+        guard.protect_unmatched = true;
+        report.push(
+            IssueKind::LegacyReservedKey,
+            &path,
+            legacy_key_detail(&name),
+            false,
+        );
+    }
+}
+
 async fn settle_promotes(dir: &Path, repair: bool, report: &mut CheckReport) -> SidecarGuard {
     let mut guard = SidecarGuard {
         targets: std::collections::HashSet::new(),
@@ -995,6 +1082,7 @@ async fn settle_promotes(dir: &Path, repair: bool, report: &mut CheckReport) -> 
                 outcome.resolved,
             );
         }
+        note_legacy_promote_dirs(dir, &mut guard, report).await;
         return guard;
     }
     for (path, target) in list_promotes(dir).await {
@@ -1012,6 +1100,7 @@ async fn settle_promotes(dir: &Path, repair: bool, report: &mut CheckReport) -> 
         };
         report.push(IssueKind::PromoteLeftover, &path, detail, false);
     }
+    note_legacy_promote_dirs(dir, &mut guard, report).await;
     guard
 }
 
@@ -1138,6 +1227,16 @@ async fn quarantine_file(
         }
     }
     tokio::fs::rename(src, &dest).await?;
+    // A sidecar is the wrapped SSE-S3 key. Move it with the bytes. Never
+    // leave it behind for a later pass to delete.
+    let mut sidecar_name = src.as_os_str().to_os_string();
+    sidecar_name.push(".meta.json");
+    let sidecar = std::path::PathBuf::from(sidecar_name);
+    if tokio::fs::try_exists(&sidecar).await? {
+        let mut side_dest = dest.as_os_str().to_os_string();
+        side_dest.push(".meta.json");
+        tokio::fs::rename(&sidecar, std::path::PathBuf::from(side_dest)).await?;
+    }
     Ok(dest)
 }
 
@@ -1624,7 +1723,6 @@ mod tests {
                 PromoteCrash::ReadyOriginalRemains,
                 PromoteCrash::Unlinked,
                 PromoteCrash::DestDirectory,
-                PromoteCrash::LegacyUnmarked,
             ] {
                 // `check` must report the leftover and must not delete the
                 // sidecar. `--repair` then makes GET return the same bytes.
@@ -1758,6 +1856,179 @@ mod tests {
             std::fs::read(bucket.join("p.meta.json")).unwrap(),
             meta_before
         );
+    }
+
+    #[tokio::test]
+    async fn unmarked_promote_dir_is_not_deleted() {
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = storage_at(tmp.path()).await;
+        storage.create_bucket(&bucket_meta("bkt")).await.unwrap();
+        put_p(&storage, b"keep-me", true).await;
+        let bucket = tmp.path().join("buckets/bkt");
+        arrange_promote_crash(&bucket, PromoteCrash::LegacyUnmarked);
+        let meta_before = std::fs::read(bucket.join("p.meta.json")).unwrap();
+        let payload = bucket.join(".maxio-promote-legacy/.maxio.object");
+        let payload_before = std::fs::read(&payload).unwrap();
+        drop(storage);
+
+        let storage = storage_at(tmp.path()).await;
+        assert_eq!(std::fs::read(&payload).unwrap(), payload_before);
+        assert_eq!(
+            std::fs::read(bucket.join("p.meta.json")).unwrap(),
+            meta_before
+        );
+
+        let repaired = check(tmp.path(), true).await.unwrap();
+        assert_eq!(std::fs::read(&payload).unwrap(), payload_before);
+        assert_eq!(
+            std::fs::read(bucket.join("p.meta.json")).unwrap(),
+            meta_before,
+            "repair must not drop the wrapped key: {:?}",
+            repaired.issues
+        );
+        assert!(
+            repaired
+                .issues
+                .iter()
+                .any(|issue| issue.kind == IssueKind::PromoteLeftover
+                    || issue.detail.contains("promote")),
+            "{:?}",
+            repaired.issues
+        );
+        let _ = storage;
+    }
+
+    #[tokio::test]
+    async fn legacy_reserved_keys_survive_upgrade_and_can_be_deleted() {
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = storage_at(tmp.path()).await;
+        storage.create_bucket(&bucket_meta("bkt")).await.unwrap();
+        let specs = [
+            (
+                "s0",
+                b"plain-photo".as_slice(),
+                false,
+                ".maxio-promote-photos/img.jpg",
+            ),
+            (
+                "s1",
+                b"sse-photo".as_slice(),
+                true,
+                "y/.maxio-promote-bar/file.txt",
+            ),
+            ("s2", b"plain-inline".as_slice(), false, "a/.maxio.object"),
+            ("s3", b"sse-inline".as_slice(), true, "b/.maxio.object"),
+            ("s4", b"plain-quar".as_slice(), false, ".maxio-quarantine/f"),
+            ("s5", b"sse-quar".as_slice(), true, ".maxio-quarantine/g"),
+        ];
+        for (src, body, sse, _dest) in specs {
+            storage
+                .put_object(
+                    "bkt",
+                    src,
+                    "text/plain",
+                    Box::pin(body),
+                    None,
+                    sse.then(crate::storage::EncryptionRequest::sse_s3),
+                )
+                .await
+                .unwrap();
+        }
+        let bucket = tmp.path().join("buckets/bkt");
+        let mut planted = Vec::new();
+        for (src, _body, sse, dest) in specs {
+            let src_data = bucket.join(src);
+            let src_meta = bucket.join(format!("{src}.meta.json"));
+            let dest_data = bucket.join(dest);
+            let dest_meta = bucket.join(format!("{dest}.meta.json"));
+            std::fs::create_dir_all(dest_data.parent().unwrap()).unwrap();
+            let bytes = std::fs::read(&src_data).unwrap();
+            std::fs::rename(&src_data, &dest_data).unwrap();
+            let mut meta: serde_json::Value =
+                serde_json::from_str(&std::fs::read_to_string(&src_meta).unwrap()).unwrap();
+            meta["key"] = serde_json::Value::String(dest.to_string());
+            let meta_bytes = serde_json::to_vec_pretty(&meta).unwrap();
+            std::fs::write(&dest_meta, &meta_bytes).unwrap();
+            std::fs::remove_file(&src_meta).unwrap();
+            if sse {
+                let text = String::from_utf8_lossy(&meta_bytes);
+                assert!(text.contains("wrapped_dek"), "{dest}: {text}");
+            }
+            planted.push((dest, bytes, meta_bytes));
+        }
+        drop(storage);
+
+        let storage = storage_at(tmp.path()).await;
+        for (dest, bytes, meta_bytes) in &planted {
+            assert_eq!(
+                std::fs::read(bucket.join(dest)).unwrap(),
+                *bytes,
+                "startup deleted {dest}"
+            );
+            assert_eq!(
+                std::fs::read(bucket.join(format!("{dest}.meta.json"))).unwrap(),
+                *meta_bytes,
+                "startup deleted meta for {dest}"
+            );
+        }
+
+        let reported = check(tmp.path(), false).await.unwrap();
+        for (dest, _, _) in &planted {
+            assert!(
+                reported.issues.iter().any(|issue| {
+                    issue.kind == IssueKind::LegacyReservedKey && issue.detail.contains(*dest)
+                }),
+                "check did not report {dest}: {:?}",
+                reported.issues
+            );
+        }
+
+        let repaired = check(tmp.path(), true).await.unwrap();
+        for (dest, bytes, meta_bytes) in &planted {
+            assert_eq!(
+                std::fs::read(bucket.join(dest)).unwrap(),
+                *bytes,
+                "repair deleted {dest}: {:?}",
+                repaired.issues
+            );
+            assert_eq!(
+                std::fs::read(bucket.join(format!("{dest}.meta.json"))).unwrap(),
+                *meta_bytes,
+                "repair deleted meta for {dest}"
+            );
+        }
+        assert!(
+            !repaired
+                .issues
+                .iter()
+                .any(|issue| issue.kind == IssueKind::OrphanMetadata && issue.repaired),
+            "{:?}",
+            repaired.issues
+        );
+
+        let rejected = storage
+            .put_object(
+                "bkt",
+                "p/.MAXIO.OBJECT",
+                "text/plain",
+                Box::pin(&b"no"[..]),
+                None,
+                None,
+            )
+            .await;
+        match rejected {
+            Err(crate::storage::StorageError::InvalidKey(_)) => {}
+            Err(err) => panic!("reserved name must be rejected, got {err}"),
+            Ok(_) => panic!("reserved name must be rejected"),
+        }
+
+        for (dest, _, _) in &planted {
+            storage.delete_object("bkt", dest).await.unwrap();
+            assert!(!bucket.join(dest).exists(), "DELETE left {dest}");
+            assert!(!bucket.join(format!("{dest}.meta.json")).exists());
+        }
+        assert!(storage.delete_bucket("bkt").await.unwrap());
+        assert!(!bucket.exists());
     }
 }
 

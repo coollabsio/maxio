@@ -84,7 +84,7 @@ fn shard_index(parts: &[&str], shards: usize) -> usize {
 }
 
 /// Validate that an object key does not contain path traversal components.
-fn validate_key(key: &str) -> Result<(), StorageError> {
+fn validate_key_shape(key: &str) -> Result<(), StorageError> {
     if key.is_empty() {
         return Err(StorageError::InvalidKey("Key must not be empty".into()));
     }
@@ -106,17 +106,18 @@ fn validate_key(key: &str) -> Result<(), StorageError> {
                     "Key must not be an absolute path".into(),
                 ));
             }
-            Component::Normal(seg) => {
-                let name = seg.to_string_lossy();
-                if is_reserved_segment(&name) {
-                    return Err(StorageError::InvalidKey(format!(
-                        "Key segment '{}' collides with an internal storage name",
-                        name
-                    )));
-                }
-            }
             _ => {}
         }
+    }
+    Ok(())
+}
+
+fn validate_key(key: &str) -> Result<(), StorageError> {
+    validate_key_shape(key)?;
+    if let Some(name) = reserved_segment_in(key) {
+        return Err(StorageError::InvalidKey(format!(
+            "Key segment '{name}' collides with an internal storage name"
+        )));
     }
     Ok(())
 }
@@ -124,7 +125,11 @@ fn validate_key(key: &str) -> Result<(), StorageError> {
 /// Reject key path segments that collide with internal on-disk names
 /// (sidecars, bucket metadata, internal dirs, EC dirs, temp files, the
 /// inline payload, and key-promotion directories and markers).
-fn is_reserved_segment(name: &str) -> bool {
+///
+/// Comparison is ASCII case-insensitive so `p/.MAXIO.OBJECT` is rejected on
+/// case-insensitive filesystems as well as on Linux.
+pub(crate) fn is_reserved_segment(name: &str) -> bool {
+    let name = name.to_ascii_lowercase();
     name.ends_with(".meta.json")
         || name.ends_with(".ec")
         || name == ".bucket.json"
@@ -138,10 +143,42 @@ fn is_reserved_segment(name: &str) -> bool {
         || name.starts_with(".maxio-promote-")
 }
 
-fn key_contains_reserved_segment(key: &str) -> bool {
-    Path::new(key).components().any(|component| {
-        matches!(component, Component::Normal(seg) if is_reserved_segment(&seg.to_string_lossy()))
-    })
+pub(crate) fn key_contains_reserved_segment(key: &str) -> bool {
+    reserved_segment_in(key).is_some()
+}
+
+fn reserved_segment_in(key: &str) -> Option<String> {
+    Path::new(key)
+        .components()
+        .find_map(|component| match component {
+            Component::Normal(seg) => {
+                let name = seg.to_string_lossy();
+                if is_reserved_segment(&name) {
+                    Some(name.into_owned())
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        })
+}
+
+pub(crate) fn is_promote_dir_name(name: &str) -> bool {
+    name.to_ascii_lowercase().starts_with(".maxio-promote-")
+}
+
+/// A directory MaxIO may descend into while looking for objects whose keys
+/// used a name this version now reserves. Upload and version stores have
+/// their own scanners.
+pub(crate) fn is_legacy_container(name: &str) -> bool {
+    if !is_reserved_segment(name) || is_promote_dir_name(name) {
+        return false;
+    }
+    let name = name.to_ascii_lowercase();
+    !matches!(name.as_str(), ".uploads" | ".versions" | ".folder")
+        && !name.starts_with(".maxio-tmp-")
+        && !name.starts_with(".maxio-bak-")
+        && !name.ends_with(".ec")
 }
 
 /// Reads of an internal name are `NoSuchKey`. The bytes, if any, belong to
@@ -1697,7 +1734,7 @@ pub(crate) async fn recover_promotes_in(dir: &Path, max_age: Option<u64>) -> Vec
     let mut promotes = Vec::new();
     while let Ok(Some(entry)) = listed.next_entry().await {
         let name = entry.file_name().to_string_lossy().to_string();
-        if !name.starts_with(PROMOTE_DIR_PREFIX) {
+        if !is_promote_dir_name(&name) {
             continue;
         }
         if !matches!(entry.file_type().await, Ok(ft) if ft.is_dir()) {
@@ -1707,26 +1744,47 @@ pub(crate) async fn recover_promotes_in(dir: &Path, max_age: Option<u64>) -> Vec
         if !FilesystemStorage::is_stale(&path, max_age).await {
             continue;
         }
-        promotes.push(path);
+        // A directory an older build used as a real key prefix
+        // (`.maxio-promote-photos/img.jpg`) is not a crash leftover.
+        // Startup must not delete it.
+        if is_exact_promote_leftover(&path).await {
+            promotes.push(path);
+        }
     }
 
     let mut outcomes = Vec::new();
-    let mut unmarked = Vec::new();
     for promote in promotes {
-        match read_promote_target(&promote).await {
-            Some(target) => outcomes.push(recover_marked_promote(dir, &promote, &target).await),
-            None => unmarked.push(promote),
+        if let Some(target) = read_promote_target(&promote).await {
+            outcomes.push(recover_marked_promote(dir, &promote, &target).await);
         }
     }
-    if !unmarked.is_empty() {
-        let blocked: std::collections::HashSet<String> = outcomes
-            .iter()
-            .filter(|outcome| !outcome.resolved)
-            .filter_map(|outcome| outcome.target.clone())
-            .collect();
-        outcomes.extend(recover_unmarked_promotes(dir, unmarked, &blocked).await);
-    }
     outcomes
+}
+
+/// True only for a promote directory this build created: a valid target
+/// marker, and nothing except that marker, the ready marker, and
+/// `.maxio.object`. Any sidecar, subdirectory, or other file means the
+/// directory is user data from before the name was reserved.
+pub(crate) async fn is_exact_promote_leftover(promote: &Path) -> bool {
+    let mut listed = match fs::read_dir(promote).await {
+        Ok(rd) => rd,
+        Err(_) => return false,
+    };
+    let mut saw_target = false;
+    while let Ok(Some(entry)) = listed.next_entry().await {
+        let name = entry.file_name().to_string_lossy().to_string();
+        if matches!(entry.file_type().await, Ok(ft) if ft.is_dir()) {
+            return false;
+        }
+        if name == PROMOTE_TARGET_FILE {
+            saw_target = true;
+        } else if name == PROMOTE_READY_FILE || name == INLINE_OBJECT_PAYLOAD {
+            // allowed
+        } else {
+            return false;
+        }
+    }
+    saw_target && read_promote_target(promote).await.is_some()
 }
 
 /// Promote directories in `dir` and the target name recorded in each, if any.
@@ -1739,13 +1797,16 @@ pub(crate) async fn list_promotes(dir: &Path) -> Vec<(PathBuf, Option<String>)> 
     let mut found = Vec::new();
     while let Ok(Some(entry)) = listed.next_entry().await {
         let name = entry.file_name().to_string_lossy().to_string();
-        if !name.starts_with(PROMOTE_DIR_PREFIX) {
+        if !is_promote_dir_name(&name) {
             continue;
         }
         if !matches!(entry.file_type().await, Ok(ft) if ft.is_dir()) {
             continue;
         }
         let path = entry.path();
+        if !is_exact_promote_leftover(&path).await {
+            continue;
+        }
         let target = read_promote_target(&path).await;
         found.push((path, target));
     }
@@ -1912,102 +1973,6 @@ async fn install_promote_payload(dir: &Path, promote: &Path, target: &str) -> Pr
             format!("cannot stat promote destination {target}: {e}"),
         ),
     }
-}
-
-async fn recover_unmarked_promotes(
-    dir: &Path,
-    unmarked: Vec<PathBuf>,
-    blocked: &std::collections::HashSet<String>,
-) -> Vec<PromoteOutcome> {
-    let mut outcomes = Vec::new();
-    let mut with_payload = Vec::new();
-    for promote in unmarked {
-        let payload = promote.join(INLINE_OBJECT_PAYLOAD);
-        if fs::metadata(&payload)
-            .await
-            .map(|m| m.is_file())
-            .unwrap_or(false)
-        {
-            with_payload.push(promote);
-        } else {
-            let removed = fs::remove_dir_all(&promote).await.is_ok();
-            let _ = sync_dir(dir).await;
-            outcomes.push(promote_outcome(
-                &promote,
-                None,
-                removed,
-                "empty promote directory removed",
-            ));
-        }
-    }
-    if with_payload.is_empty() {
-        return outcomes;
-    }
-
-    // Older builds renamed `p` to `.maxio-promote-<uuid>/.maxio.object` with
-    // no marker. The payload is the original file. When exactly one sidecar
-    // in this directory is missing its bytes, that key is the destination.
-    let candidates = missing_payload_stems(dir, blocked).await;
-    if with_payload.len() == 1 && candidates.len() == 1 {
-        outcomes.push(install_promote_payload(dir, &with_payload[0], &candidates[0]).await);
-        return outcomes;
-    }
-    for promote in with_payload {
-        outcomes.push(promote_outcome(
-            &promote,
-            None,
-            false,
-            "promote directory has object bytes but no target marker; left in place so the sidecar is not deleted",
-        ));
-    }
-    outcomes
-}
-
-/// Stems of `*.meta.json` in `dir` whose object bytes are neither the file
-/// nor `<stem>/.maxio.object`.
-async fn missing_payload_stems(
-    dir: &Path,
-    blocked: &std::collections::HashSet<String>,
-) -> Vec<String> {
-    let mut listed = match fs::read_dir(dir).await {
-        Ok(rd) => rd,
-        Err(_) => return Vec::new(),
-    };
-    let mut stems = Vec::new();
-    while let Ok(Some(entry)) = listed.next_entry().await {
-        let name = entry.file_name().to_string_lossy().to_string();
-        if entry
-            .file_type()
-            .await
-            .map(|ft| ft.is_dir())
-            .unwrap_or(true)
-        {
-            continue;
-        }
-        let Some(stem) = name.strip_suffix(".meta.json") else {
-            continue;
-        };
-        if !valid_promote_target(stem) || blocked.contains(stem) {
-            continue;
-        }
-        let dest = dir.join(stem);
-        let dest_meta = fs::metadata(&dest).await;
-        let missing = match dest_meta {
-            Ok(meta) if meta.is_file() => false,
-            Ok(meta) if meta.is_dir() => !fs::metadata(dest.join(INLINE_OBJECT_PAYLOAD))
-                .await
-                .map(|m| m.is_file())
-                .unwrap_or(false),
-            Ok(_) => true,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => true,
-            Err(_) => false,
-        };
-        if missing {
-            stems.push(stem.to_string());
-        }
-    }
-    stems.sort();
-    stems
 }
 
 /// Remove a plain object payload. A directory that also holds child keys is
@@ -3076,11 +3041,47 @@ impl FilesystemStorage {
         key: &str,
     ) -> Result<DeleteResult, StorageError> {
         validate_bucket_name(bucket)?;
-        validate_key(key)?;
+        if let Some(done) = self.legacy_delete_guard(bucket, key).await? {
+            return Ok(done);
+        }
 
         let _bucket_guard = self.bucket_read(bucket).await;
         let _key_guard = self.key_lock(bucket, key).await;
         self.delete_object_locked(bucket, key).await
+    }
+
+    /// Reserved names cannot be created, but objects written by an older
+    /// build may still use them. DELETE removes those when they have their
+    /// own sidecar. It does not remove `p/.maxio.object` when that file is
+    /// the inline payload of key `p` (no sidecar of its own).
+    async fn legacy_delete_guard(
+        &self,
+        bucket: &str,
+        key: &str,
+    ) -> Result<Option<DeleteResult>, StorageError> {
+        validate_key_shape(key)?;
+        if !key_contains_reserved_segment(key) {
+            return Ok(None);
+        }
+        let meta_path = self.meta_path(bucket, key);
+        if fs::try_exists(&meta_path).await? {
+            return Ok(None);
+        }
+        let obj_path = self.object_path(bucket, key);
+        if fs::metadata(&obj_path)
+            .await
+            .map(|meta| meta.is_file())
+            .unwrap_or(false)
+        {
+            let segment = reserved_segment_in(key).unwrap_or_else(|| key.to_string());
+            return Err(StorageError::InvalidKey(format!(
+                "Key segment '{segment}' collides with an internal storage name"
+            )));
+        }
+        Ok(Some(DeleteResult {
+            version_id: None,
+            is_delete_marker: false,
+        }))
     }
 
     /// Lifecycle expiration of the current version: delete `key` exactly like
@@ -3097,7 +3098,9 @@ impl FilesystemStorage {
         last_modified: &str,
     ) -> Result<Option<DeleteResult>, StorageError> {
         validate_bucket_name(bucket)?;
-        validate_key(key)?;
+        if let Some(done) = self.legacy_delete_guard(bucket, key).await? {
+            return Ok(Some(done));
+        }
         let _bucket_guard = self.bucket_read(bucket).await;
         let _key_guard = self.key_lock(bucket, key).await;
         match self.read_object_meta(bucket, key).await {
@@ -4197,7 +4200,8 @@ impl FilesystemStorage {
                     continue;
                 }
 
-                if name == PROMOTE_TARGET_FILE || name == PROMOTE_READY_FILE {
+                let marker_name = name.to_ascii_lowercase();
+                if marker_name == PROMOTE_TARGET_FILE || marker_name == PROMOTE_READY_FILE {
                     // Markers left inside a published key directory after a
                     // crash between the rename and the marker cleanup. A
                     // sibling sidecar means this name is an object written
@@ -4224,7 +4228,7 @@ impl FilesystemStorage {
                     continue;
                 }
 
-                if is_dir && name.starts_with(PROMOTE_DIR_PREFIX) {
+                if is_dir && is_promote_dir_name(&name) {
                     continue;
                 }
 
@@ -5400,7 +5404,7 @@ impl FilesystemStorage {
         version_id: &str,
     ) -> Result<ObjectMeta, StorageError> {
         validate_bucket_name(bucket)?;
-        validate_key(key)?;
+        validate_key_shape(key)?;
         validate_version_id(version_id)?;
         let _bucket_guard = self.bucket_read(bucket).await;
         let _key_guard = self.key_lock(bucket, key).await;

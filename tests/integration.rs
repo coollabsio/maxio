@@ -12612,6 +12612,8 @@ async fn test_internal_key_segments_are_rejected() {
         ".maxio-promote-abc/file.txt",
         "docs/.maxio-promote-ready",
         "docs/.maxio-promote-target",
+        "p/.MAXIO.OBJECT",
+        "docs/.Maxio-Promote-ready",
         "docs/.maxio-tmp-crash",
         "docs/.maxio-bak-old",
         ".folder",

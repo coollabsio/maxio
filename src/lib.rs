@@ -25,4 +25,5 @@ pub mod openapi;
 pub mod serve;
 pub mod server;
 pub mod storage;
+mod vhost;
 pub mod xml;

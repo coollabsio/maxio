@@ -28,7 +28,7 @@ async fn shutdown_drains_the_inflight_request_and_stops_accepting() {
     let addr = listener.local_addr().unwrap();
     let (started_tx, started_rx) = oneshot::channel::<()>();
     let started = Arc::new(tokio::sync::Mutex::new(Some(started_tx)));
-    let app = Router::new().route(
+    let router = Router::new().route(
         "/slow",
         get(move || {
             let started = started.clone();
@@ -41,6 +41,9 @@ async fn shutdown_drains_the_inflight_request_and_stops_accepting() {
             }
         }),
     );
+    // Virtual-host rewrite runs before routing. `localhost` is a base domain,
+    // so this path-style `/slow` request is not rewritten.
+    let app = maxio::server::AppService::new(router, vec!["localhost".to_string()]);
     let (tx, rx) = watch::channel(false);
     let server = tokio::spawn(async move {
         maxio::serve::serve(

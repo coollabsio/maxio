@@ -10,7 +10,7 @@ S3-compatible object storage server — single-binary replacement for MinIO.
 
 MaxIO is a lightweight S3-compatible object storage server written in Rust. One binary, one data directory, no database. Buckets are directories and objects are files, so a backup is a copy of the data dir.
 
-- Works with `mc`, AWS CLI, and any S3 SDK (AWS Signature V4, presigned URLs)
+- Works with `mc`, AWS CLI, and any S3 SDK (AWS Signature V4, presigned URLs, path-style and virtual-hosted-style)
 - Built-in web console at `/ui/`
 - Multipart upload, versioning, tagging, CORS, range and conditional requests, checksums
 - Server-side encryption (SSE-S3, SSE-C) and optional erasure coding
@@ -76,10 +76,120 @@ printf 'Open http://localhost:9000/ui/ and sign in with %s / %s\n' \
 | `MAXIO_ERASURE_CODING` | `false` | Enable erasure coding |
 | `MAXIO_CHUNK_SIZE` | `10485760` | Erasure coding chunk size in bytes |
 | `MAXIO_PARITY_SHARDS` | `0` | Parity shards per object |
-| `MAXIO_MASTER_KEY` | _(auto)_ | Base64 32-byte SSE-S3 master key. If unset, stored in `<data-dir>/.maxio-keys.json` — back this file up |
+| `MAXIO_MASTER_KEY` | _(auto)_ | Base64 32-byte SSE-S3 master key. Not written into the data directory. See [SSE-S3 master keys](#sse-s3-master-keys) |
+| `MAXIO_MASTER_KEY_FILE` | _(none)_ | File containing that key (base64, or 32 raw bytes), kept outside the data directory |
+| `MAXIO_ALLOW_MISSING_MASTER_KEY` | `false` | Start even if SSE-S3 objects exist and their master key is missing. Those objects stay unreadable. Pass it on every start until the key is restored |
 | `MAXIO_MAX_CONSOLE_BODY_BYTES` | `1048576` | Max body size for console JSON routes |
+| `MAXIO_DOMAIN` | _(none)_ | Comma-separated base domains for virtual-hosted-style (`<bucket>.<domain>`). Alias: `MINIO_DOMAIN`. Unset keeps every host on path-style |
 
-Each variable also has a CLI flag (for example `--port`). Run `maxio --help` for the full list.
+Each variable also has a CLI flag (for example `--port`, `--domain`). Run `maxio --help` for the full list.
+
+## Virtual-hosted-style addressing
+
+Path-style (`http://s3.example.com/bucket/key`) works with no extra configuration. Many SDKs and tools default to virtual-hosted-style (`http://bucket.s3.example.com/key`). Enable that by naming the base domain:
+
+```bash
+maxio --domain s3.example.com --data-dir ./data --port 9000
+# or several domains:
+# MAXIO_DOMAIN=s3.example.com,s3.example.org
+```
+
+A request whose `Host` is `<bucket>.<domain>` (a port is ignored, and the host is matched case-insensitively) is served from that bucket. The bare domain, an IP address, and any other host stay on path-style, so the web console (`/ui/`), `/api/`, `/healthz`, and `/minio/health/*` on the service host are unchanged. Bucket names follow the S3 rules (lowercase letters, digits, dots, and hyphens). A dotted name such as `my.bucket` is the host `my.bucket.s3.example.com`.
+
+When more than one domain is configured, the longest match wins. `album.s3.example.com` is bucket `album` under `s3.example.com`, and the host `s3.example.com` itself stays the service host.
+
+### DNS
+
+Point the base name and a wildcard at the server:
+
+```text
+s3.example.com.      A     203.0.113.10
+*.s3.example.com.    A     203.0.113.10
+```
+
+For a local process, `--domain localhost` is enough on resolvers that answer `*.localhost` with `127.0.0.1` (common on macOS and systemd-resolved). If `bucket.localhost` does not resolve, add the names you use to `/etc/hosts`, or run a wildcard resolver.
+
+### TLS
+
+Terminate TLS in front of MaxIO. A certificate for `*.s3.example.com` covers a single extra label (`photos.s3.example.com`). Add the apex `s3.example.com` to the same certificate so the console, health checks, and path-style clients can use HTTPS on the base name. A dotted bucket adds another label (`my.bucket.s3.example.com`); list each dotted name you serve on the certificate, or use path-style for those buckets.
+
+### Reverse proxy
+
+Preserve the client `Host` so SigV4 still sees the host that was signed:
+
+```nginx
+proxy_set_header Host $http_host;
+proxy_set_header X-Forwarded-Proto $scheme;
+proxy_set_header X-Forwarded-Host $http_host;
+```
+
+`$http_host` includes a non-default port. Overwrite `X-Forwarded-Host`; do not append a client-supplied value.
+
+If the proxy replaces `Host` with the upstream address, set `X-Forwarded-Host` to the original `Host`. MaxIO uses that value for virtual-host routing and for the signed `host` header only when `Host` itself is not already a configured domain or `<bucket>.<domain>`. A request to the bare domain keeps path-style even if a client sends `X-Forwarded-Host`.
+
+### Clients
+
+```bash
+# AWS CLI. Put this in the config file used by AWS_CONFIG_FILE.
+# [default]
+# region = us-east-1
+# s3 =
+#     addressing_style = virtual
+aws --endpoint-url http://s3.example.com:9000 s3 cp file.txt s3://my-bucket/file.txt
+
+# mc bucket lookup over DNS (virtual-hosted-style)
+mc alias set maxio http://s3.example.com:9000 "$MAXIO_ACCESS_KEY" "$MAXIO_SECRET_KEY" --api S3v4 --path off
+mc cp file.txt maxio/my-bucket/file.txt
+```
+
+Path-style clients keep working against the same server: leave `addressing_style` unset (or `path`) and point `mc` at the base URL without `--path off`.
+
+AWS CLI and `mc` send dotted bucket names as path-style even when virtual addressing is selected. MaxIO accepts that, and it also accepts a dotted name as `<dotted-name>.<domain>` when a client addresses it that way.
+
+## SSE-S3 master keys
+
+SSE-S3 objects are encrypted with a per-object data key. That data key is wrapped by a 32-byte master key. Losing every copy of the master key makes those objects unrecoverable. MaxIO does not escrow it.
+
+On first start, when `<data-dir>/.maxio-keys.json` does not exist and the data directory has no SSE-S3 objects and no key check file, MaxIO generates a master key and writes it to that file (mode `0600` on Unix, created atomically and fsynced). Back this file up **outside** the data directory. `<data-dir>/.maxio-key-check.json` stays with the data. It stores a check value per key id and no key material. Do not delete it to "fix" a startup error.
+
+If the key file is missing, MaxIO refuses to start when encrypted object metadata is present, and also when the key check file records key ids even if every object has been deleted. The error names which of those it found. A loaded key that does not match a check value also refuses to start. An unreadable or corrupt key file is never overwritten.
+
+```bash
+# Generate a key outside the data directory. The shell variable is local to this command.
+umask 077
+openssl rand -base64 32 > /secure/maxio-master.key
+
+# Use it on every start. It is not copied into the data directory.
+export MAXIO_MASTER_KEY_FILE=/secure/maxio-master.key
+# equivalent: export MAXIO_MASTER_KEY="$(cat /secure/maxio-master.key)"
+./maxio --data-dir /var/lib/maxio --master-key-file /secure/maxio-master.key
+```
+
+Set only one of `MAXIO_MASTER_KEY` and `MAXIO_MASTER_KEY_FILE`. The value is standard base64 that decodes to 32 bytes (a trailing newline is fine), or a file of exactly 32 raw bytes. When an external key is set, keys already in `.maxio-keys.json` are still used to read older objects.
+
+### Backup and restore
+
+1. Back up `.maxio-keys.json` (and any external key file) whenever you back up the data directory, including after `maxio keyring rotate`.
+2. On the new host, put the key file back at `<data-dir>/.maxio-keys.json` **or** pass the same `--master-key` / `--master-key-file`, then start.
+3. Copy `.maxio-key-check.json` with the data directory. It is not a substitute for the key.
+
+`maxio keyring list --data-dir <dir>` prints key ids only. `maxio keyring rotate --data-dir <dir>` adds a new active key and keeps the previous ones so existing objects still decrypt. Restart after rotating. Rotate refuses to create a new keyring when encrypted objects exist and the key file is missing.
+
+If the key file's mode is looser than `0600`, startup logs a warning and continues. Restrict it with `chmod 600`.
+
+`--allow-missing-master-key` starts anyway when the key is absent. Objects encrypted with the missing key stay unreadable, and the flag is required on every later start until the original key is restored. It does not override an unreadable key file or a check value that does not match the key you did load. The flag writes a new `.maxio-keys.json`. Objects created after that use the new key, and the check file still names the original key ids.
+
+### Recovering both keys
+
+Do not copy the original `.maxio-keys.json` over the new file. That drops the new key, and the next start fails with `data directory requires key ids [...]`.
+
+Merge the backup into the current keyring. Keys already on disk stay, including the new active key. Restart after the merge. Both sets of objects decrypt.
+
+```bash
+maxio keyring merge --data-dir /var/lib/maxio --from /backup/.maxio-keys.json
+```
+
+If the backup was already copied over the new file, put that new file back the same way (`--from` the saved copy of the new keyring). Without a copy of the new key, objects written after `--allow-missing-master-key` cannot be decrypted. `maxio keyring list` prints ids only.
 
 ## Usage
 

@@ -311,6 +311,14 @@ pub(super) fn map_storage_err(err: StorageError) -> S3Error {
         {
             S3Error::invalid_part(&msg)
         }
+        StorageError::InvalidKey(msg) if msg.starts_with("invalid bucket name") => {
+            let name = msg
+                .split_once(':')
+                .map(|(_, name)| name.trim())
+                .filter(|name| !name.is_empty())
+                .unwrap_or(msg.as_str());
+            S3Error::invalid_bucket_name(name)
+        }
         StorageError::InvalidKey(msg) => S3Error::invalid_argument(&msg),
         StorageError::EncryptionError(msg) => S3Error::invalid_argument(&msg),
         StorageError::DecryptionError(msg) => S3Error::invalid_argument(&msg),

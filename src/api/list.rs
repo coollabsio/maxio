@@ -23,7 +23,7 @@ pub async fn handle_bucket_get(
     match state.storage.head_bucket(&bucket).await {
         Ok(true) => {}
         Ok(false) => return Err(S3Error::no_such_bucket(&bucket)),
-        Err(e) => return Err(S3Error::internal(e)),
+        Err(e) => return Err(S3Error::from_bucket_storage(e, &bucket)),
     }
 
     match bucket::bucket_subresource(&params) {

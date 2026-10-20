@@ -10,10 +10,11 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use axum::Router;
 use axum::body::Body;
 use axum::extract::Request;
 use axum::extract::connect_info::IntoMakeServiceWithConnectInfo;
+
+use crate::server::AppService;
 use futures::FutureExt;
 use hyper::body::Incoming;
 use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
@@ -45,10 +46,11 @@ const HYPER_MIN_HEADER_BUF: usize = 8192;
 
 pub async fn serve(
     listener: TcpListener,
-    app: Router,
+    app: impl Into<AppService>,
     opts: ServeOptions,
     mut shutdown: watch::Receiver<bool>,
 ) -> io::Result<ShutdownOutcome> {
+    let app = app.into();
     let mut make_service = app.into_make_service_with_connect_info::<SocketAddr>();
     let (signal_tx, _signal_rx) = watch::channel(());
     let slots = if opts.max_connections == 0 {
@@ -128,7 +130,7 @@ fn is_connection_error(err: &io::Error) -> bool {
 }
 
 async fn handle_connection(
-    make_service: &mut IntoMakeServiceWithConnectInfo<Router, SocketAddr>,
+    make_service: &mut IntoMakeServiceWithConnectInfo<AppService, SocketAddr>,
     signal_tx: &watch::Sender<()>,
     opts: &ServeOptions,
     tasks: &mut JoinSet<()>,

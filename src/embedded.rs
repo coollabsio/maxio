@@ -51,7 +51,7 @@ pub async fn ui_handler(uri: Uri) -> Response {
 /// Vite puts content-hashed files in `assets/`; everything else keeps its name between builds.
 fn cache_control(path: &str) -> &'static str {
     if path.ends_with(".html") {
-        "no-store, must-revalidate"
+        "no-store"
     } else if path.starts_with("assets/") {
         "public, max-age=31536000, immutable"
     } else {
@@ -69,7 +69,7 @@ mod tests {
             cache_control("assets/index-Buc3FXVi.js"),
             "public, max-age=31536000, immutable"
         );
-        assert_eq!(cache_control("index.html"), "no-store, must-revalidate");
+        assert_eq!(cache_control("index.html"), "no-store");
         // Icons and the manifest keep their names across builds: revalidate them.
         for path in ["manifest.webmanifest", "icon-512.png", "logo.svg"] {
             assert_eq!(cache_control(path), "no-cache", "{path}");

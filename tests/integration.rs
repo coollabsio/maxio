@@ -53,11 +53,14 @@ async fn start_server() -> (String, TempDir) {
         ..Config::default()
     };
 
+    let revoked_sessions = Arc::new(
+        maxio::api::console::RevokedSessions::open(std::path::Path::new(&config.data_dir)).await,
+    );
     let state = AppState {
         storage: Arc::new(storage),
         config: Arc::new(config),
         login_rate_limiter: Arc::new(maxio::api::console::LoginRateLimiter::new()),
-        revoked_sessions: Arc::new(maxio::api::console::RevokedSessions::new()),
+        revoked_sessions,
     };
 
     let app = server::build_router(state);
@@ -113,11 +116,14 @@ async fn start_server_with_keys(
         ..Config::default()
     };
 
+    let revoked_sessions = Arc::new(
+        maxio::api::console::RevokedSessions::open(std::path::Path::new(&config.data_dir)).await,
+    );
     let state = AppState {
         storage: Arc::new(storage),
         config: Arc::new(config),
         login_rate_limiter: Arc::new(maxio::api::console::LoginRateLimiter::new()),
-        revoked_sessions: Arc::new(maxio::api::console::RevokedSessions::new()),
+        revoked_sessions,
     };
 
     let app = server::build_router(state);
@@ -169,11 +175,14 @@ async fn start_server_with_size_limits(max_object: u64, max_part: u64) -> (Strin
         ..Config::default()
     };
 
+    let revoked_sessions = Arc::new(
+        maxio::api::console::RevokedSessions::open(std::path::Path::new(&config.data_dir)).await,
+    );
     let state = AppState {
         storage: Arc::new(storage),
         config: Arc::new(config),
         login_rate_limiter: Arc::new(maxio::api::console::LoginRateLimiter::new()),
-        revoked_sessions: Arc::new(maxio::api::console::RevokedSessions::new()),
+        revoked_sessions,
     };
 
     let app = server::build_router(state);
@@ -317,11 +326,14 @@ async fn start_server_with_default_buckets(default_buckets: &str) -> (String, Te
         ..Config::default()
     };
 
+    let revoked_sessions = Arc::new(
+        maxio::api::console::RevokedSessions::open(std::path::Path::new(&config.data_dir)).await,
+    );
     let state = AppState {
         storage: Arc::new(storage),
         config: Arc::new(config),
         login_rate_limiter: Arc::new(maxio::api::console::LoginRateLimiter::new()),
-        revoked_sessions: Arc::new(maxio::api::console::RevokedSessions::new()),
+        revoked_sessions,
     };
 
     let app = server::build_router(state);
@@ -396,11 +408,14 @@ async fn test_default_buckets_skip_existing() {
         max_console_body_bytes: 1024 * 1024,
         ..Config::default()
     };
+    let revoked_sessions = Arc::new(
+        maxio::api::console::RevokedSessions::open(std::path::Path::new(&config.data_dir)).await,
+    );
     let state = AppState {
         storage: Arc::new(storage),
         config: Arc::new(config),
         login_rate_limiter: Arc::new(maxio::api::console::LoginRateLimiter::new()),
-        revoked_sessions: Arc::new(maxio::api::console::RevokedSessions::new()),
+        revoked_sessions,
     };
     let app = server::build_router(state);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -918,6 +933,142 @@ async fn logout_rejects_the_old_session_cookie() {
         .await
         .unwrap();
     assert_eq!(check.status(), 401);
+    let cache = logout
+        .headers()
+        .get("cache-control")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    assert!(cache.contains("no-store"), "{cache}");
+}
+
+#[tokio::test]
+async fn logout_stays_revoked_after_restart_and_sessions_are_distinct() {
+    let tmp = TempDir::new().unwrap();
+    let data_dir = tmp.path().to_str().unwrap();
+    let first = spawn_console(data_dir).await;
+    let login = |base: &str| {
+        let base = base.to_string();
+        async move {
+            client()
+                .post(format!("{base}/maxio/api/auth/login"))
+                .json(&serde_json::json!({
+                    "accessKey": ACCESS_KEY,
+                    "secretKey": SECRET_KEY
+                }))
+                .send()
+                .await
+                .unwrap()
+        }
+    };
+    let a = login(&first).await;
+    let b = login(&first).await;
+    assert_eq!(a.status(), 200);
+    assert_eq!(b.status(), 200);
+    let cookie_of = |resp: reqwest::Response| {
+        resp.headers()
+            .get("set-cookie")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string()
+    };
+    let cookie_a = cookie_of(a);
+    let cookie_b = cookie_of(b);
+    assert_ne!(cookie_a, cookie_b, "two logins must not share a cookie");
+    let session_a = cookie_a
+        .strip_prefix("maxio_session=")
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap()
+        .to_string();
+    let session_b = cookie_b
+        .strip_prefix("maxio_session=")
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap()
+        .to_string();
+    let logout = client()
+        .post(format!("{first}/maxio/api/auth/logout"))
+        .header("cookie", format!("maxio_session={session_a}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(logout.status(), 200);
+    let still = client()
+        .get(format!("{first}/maxio/api/version"))
+        .header("cookie", format!("maxio_session={session_b}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(still.status(), 200, "the other session stays signed in");
+    let mode = std::fs::metadata(tmp.path().join(".maxio-revoked-sessions.json"))
+        .unwrap()
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(mode, 0o600, "revocation file must be owner-only");
+
+    let second = spawn_console(data_dir).await;
+    let after = client()
+        .get(format!("{second}/maxio/api/version"))
+        .header("cookie", format!("maxio_session={session_a}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(after.status(), 401, "revocation survives a restart");
+    let other = client()
+        .get(format!("{second}/maxio/api/version"))
+        .header("cookie", format!("maxio_session={session_b}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(other.status(), 200, "the live session survives a restart");
+}
+
+async fn spawn_console(data_dir: &str) -> String {
+    let keyring = Arc::new(Keyring::load(data_dir, None).await.unwrap());
+    let storage = FilesystemStorage::new(data_dir, false, 10 * 1024 * 1024, 0, keyring)
+        .await
+        .unwrap();
+    let config = Config {
+        port: 0,
+        address: "127.0.0.1".to_string(),
+        data_dir: data_dir.to_string(),
+        access_key: ACCESS_KEY.to_string(),
+        secret_key: SECRET_KEY.to_string(),
+        region: REGION.to_string(),
+        master_key: None,
+        allow_insecure_dev: true,
+        secure_cookies: false,
+        erasure_coding: false,
+        chunk_size: 10 * 1024 * 1024,
+        parity_shards: 0,
+        default_buckets: String::new(),
+        max_console_body_bytes: 1024 * 1024,
+        ..Config::default()
+    };
+    let state = AppState {
+        storage: Arc::new(storage),
+        config: Arc::new(config),
+        login_rate_limiter: Arc::new(maxio::api::console::LoginRateLimiter::new()),
+        revoked_sessions: Arc::new(
+            maxio::api::console::RevokedSessions::open(std::path::Path::new(data_dir)).await,
+        ),
+    };
+    let app = server::build_router(state);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base_url = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move {
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await
+        .unwrap();
+    });
+    base_url
 }
 
 #[tokio::test]
@@ -1105,20 +1256,64 @@ async fn bucket_ui_is_reserved_and_browser_get_is_the_console() {
         "{presigned_body}"
     );
 
-    let versioning = client()
-        .get(format!("{root}?versioning"))
-        .send()
-        .await
-        .unwrap();
-    let versioning_status = versioning.status();
-    let versioning_body = versioning.text().await.unwrap();
-    assert_eq!(versioning_status, 403, "{versioning_body}");
-    assert!(versioning_body.contains("<Code>"), "{versioning_body}");
-
     let browser = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .build()
         .unwrap();
+    for path in [
+        "/ui/buckets/photos?prefix=2026%2F",
+        "/ui/buckets/photos/settings?prefix=2026%2F",
+        "/ui?versioning",
+    ] {
+        let page = browser
+            .get(format!("{base_url}{path}"))
+            .send()
+            .await
+            .unwrap();
+        let status = page.status().as_u16();
+        let location = page
+            .headers()
+            .get("location")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+        let cache = page
+            .headers()
+            .get("cache-control")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+        let body = page.text().await.unwrap();
+        if status == 308 {
+            assert!(
+                location.starts_with("/ui/"),
+                "{path} redirected to {location}"
+            );
+            assert!(!body.contains("<Code>"), "{path}: {body}");
+            continue;
+        }
+        assert!(
+            status == 200 || status == 503,
+            "{path} returned {status}: {body}"
+        );
+        assert!(!body.contains("<Code>"), "{path}: {body}");
+        assert!(!body.contains("Missing Authorization"), "{path}: {body}");
+        if status == 200 {
+            assert!(
+                cache.contains("no-store"),
+                "{path} html cache-control is {cache}"
+            );
+            assert!(
+                body.contains("/ui/favicon-32.png"),
+                "favicon must live under /ui/: {body}"
+            );
+            assert!(
+                !body.contains("href=\"/favicon"),
+                "root favicon path must not be claimed: {body}"
+            );
+        }
+    }
+
     let page = browser.get(format!("{root}/")).send().await.unwrap();
     let page_status = page.status().as_u16();
     let page_body = page.text().await.unwrap();
@@ -1283,10 +1478,7 @@ async fn test_ui_deep_link_uses_spa_fallback() {
             .unwrap()
             .contains("text/html")
     );
-    assert_eq!(
-        resp.headers().get("cache-control").unwrap(),
-        "no-store, must-revalidate"
-    );
+    assert_eq!(resp.headers().get("cache-control").unwrap(), "no-store");
     let body = resp.text().await.unwrap();
     assert!(body.contains("MaxIO"));
 }
@@ -3670,11 +3862,14 @@ async fn start_server_ec() -> (String, TempDir) {
         ..Config::default()
     };
 
+    let revoked_sessions = Arc::new(
+        maxio::api::console::RevokedSessions::open(std::path::Path::new(&config.data_dir)).await,
+    );
     let state = AppState {
         storage: Arc::new(storage),
         config: Arc::new(config),
         login_rate_limiter: Arc::new(maxio::api::console::LoginRateLimiter::new()),
-        revoked_sessions: Arc::new(maxio::api::console::RevokedSessions::new()),
+        revoked_sessions,
     };
 
     let app = server::build_router(state);
@@ -4196,11 +4391,14 @@ async fn start_server_parity(parity_shards: u32) -> (String, TempDir) {
         ..Config::default()
     };
 
+    let revoked_sessions = Arc::new(
+        maxio::api::console::RevokedSessions::open(std::path::Path::new(&config.data_dir)).await,
+    );
     let state = AppState {
         storage: Arc::new(storage),
         config: Arc::new(config),
         login_rate_limiter: Arc::new(maxio::api::console::LoginRateLimiter::new()),
-        revoked_sessions: Arc::new(maxio::api::console::RevokedSessions::new()),
+        revoked_sessions,
     };
 
     let app = server::build_router(state);
@@ -7064,11 +7262,14 @@ async fn start_server_ec_parity(chunk_size: u64, parity_shards: u32) -> (String,
         ..Config::default()
     };
 
+    let revoked_sessions = Arc::new(
+        maxio::api::console::RevokedSessions::open(std::path::Path::new(&config.data_dir)).await,
+    );
     let state = AppState {
         storage: Arc::new(storage),
         config: Arc::new(config),
         login_rate_limiter: Arc::new(maxio::api::console::LoginRateLimiter::new()),
-        revoked_sessions: Arc::new(maxio::api::console::RevokedSessions::new()),
+        revoked_sessions,
     };
 
     let app = server::build_router(state);

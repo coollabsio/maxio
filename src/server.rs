@@ -164,11 +164,11 @@ pub fn build_router(state: AppState) -> AppService {
     AppService { router, domains }
 }
 
-/// Serve the console only for an unauthenticated browser GET/HEAD of `/ui`.
+/// Serve the console for an unauthenticated browser GET/HEAD of `/ui`.
 ///
-/// Signed, presigned, and virtual-hosted requests keep going to S3, so bucket
-/// `ui` works. An anonymous path-style GET/HEAD of `/ui` without an S3 query
-/// is the console, which is the remaining clash.
+/// Bucket `ui` is reserved, so a query string is still the SPA. Only a SigV4
+/// `Authorization` header or `X-Amz-*` presign query is S3 (and then fails
+/// `InvalidBucketName`).
 async fn console_ui_middleware(
     request: Request,
     next: axum::middleware::Next,
@@ -217,7 +217,14 @@ fn is_browser_console_request(request: &Request) -> bool {
     {
         return false;
     }
-    !crate::api::bucket::query_selects_s3(request.uri().query().unwrap_or(""))
+    !query_has_presign(request.uri().query().unwrap_or(""))
+}
+
+fn query_has_presign(query: &str) -> bool {
+    query.split('&').any(|pair| {
+        let key = pair.split('=').next().unwrap_or(pair);
+        key.len() >= 6 && key[..6].eq_ignore_ascii_case("x-amz-")
+    })
 }
 
 /// `/ui` -> `/ui/` (keeps the query), so the console has one canonical base URL.
@@ -289,7 +296,15 @@ mod tests {
         assert!(is_browser_console_request(&request("HEAD", "/ui/")));
         assert!(is_browser_console_request(&request(
             "GET",
-            "/ui/buckets/photos?next=x"
+            "/ui/buckets/photos?prefix=2026%2F"
+        )));
+        assert!(is_browser_console_request(&request(
+            "GET",
+            "/ui?versioning"
+        )));
+        assert!(is_browser_console_request(&request(
+            "GET",
+            "/ui/?list-type=2&prefix=photos"
         )));
         assert!(is_browser_console_request(&request(
             "GET",
@@ -316,14 +331,6 @@ mod tests {
         assert!(!is_browser_console_request(&request(
             "GET",
             "/ui/note.txt?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Signature=ab"
-        )));
-        assert!(!is_browser_console_request(&request(
-            "GET",
-            "/ui?versioning"
-        )));
-        assert!(!is_browser_console_request(&request(
-            "GET",
-            "/ui/?list-type=2&prefix=photos"
         )));
         assert!(!is_browser_console_request(&request("PUT", "/ui/note.txt")));
         assert!(!is_browser_console_request(&request(

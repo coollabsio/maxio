@@ -7,7 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-- The console bundle no longer contains the release version. The badge shows `GET /maxio/api/version` only after login. Logout invalidates that session on the server.
+- The console bundle no longer contains the release version. The badge shows `GET /maxio/api/version` only after login. Logout writes the revoked session to the data directory, so it stays revoked across a restart. Each login gets its own session id.
+- A checksum that does not match the payload is quarantined by `check --repair` instead of being adopted. `--accept-current-checksums` records the payload checksum.
+- Unauthenticated `GET`/`HEAD` under `/ui` is the console even when the query string looks like S3. The console favicon is served from `/ui/`. Console HTML and API responses are `Cache-Control: no-store`.
 - `/readyz` and `/minio/health/*` are gone. `/maxio/health/live` and `/maxio/health/ready` are the only health URLs. `readyz` is an ordinary bucket.
 - A data directory the process cannot write, including the lock file, names uid 999, `chown`, and `--user`.
 - `keyring rotate` and `keyring merge` take the data-directory lock before writing, and refuse while a server holds it.

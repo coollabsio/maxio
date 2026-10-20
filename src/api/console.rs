@@ -1,4 +1,4 @@
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap};
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -25,35 +25,132 @@ type HmacSha256 = Hmac<Sha256>;
 
 const COOKIE_NAME: &str = "maxio_session";
 
-/// Cookies that logout has already accepted. A stateless HMAC cookie stays
-/// valid until this set rejects it.
-#[derive(Clone, Default)]
+/// Sessions logout has already accepted. The set is written to the data
+/// directory so a restart does not make a revoked cookie valid again.
+#[derive(Clone)]
 pub struct RevokedSessions {
-    tokens: Arc<Mutex<HashSet<String>>>,
+    path: Option<std::path::PathBuf>,
+    /// jti → unix expiry. Expired entries are dropped on load and on revoke.
+    entries: Arc<Mutex<HashMap<String, i64>>>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct RevocationFile {
+    entries: Vec<RevocationEntry>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct RevocationEntry {
+    jti: String,
+    expires_at: i64,
 }
 
 impl RevokedSessions {
+    #[allow(dead_code)]
     pub fn new() -> Self {
-        Self::default()
-    }
-
-    pub fn revoke(&self, token: &str) {
-        match self.tokens.lock() {
-            Ok(mut guard) => {
-                guard.insert(token.to_string());
-            }
-            Err(poisoned) => {
-                poisoned.into_inner().insert(token.to_string());
-            }
+        Self {
+            path: None,
+            entries: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
-    pub fn contains(&self, token: &str) -> bool {
-        match self.tokens.lock() {
-            Ok(guard) => guard.contains(token),
-            Err(poisoned) => poisoned.into_inner().contains(token),
+    /// Load `{data_dir}/.maxio-revoked-sessions.json`, dropping expired rows.
+    pub async fn open(data_dir: &std::path::Path) -> Self {
+        let path = data_dir.join(".maxio-revoked-sessions.json");
+        let now = chrono::Utc::now().timestamp();
+        let mut map = read_revocations(&path).await;
+        let before = map.len();
+        map.retain(|_, exp| *exp > now);
+        let store = Self {
+            path: Some(path),
+            entries: Arc::new(Mutex::new(map)),
+        };
+        if store.len() != before {
+            store.persist().await;
+        }
+        store
+    }
+
+    fn len(&self) -> usize {
+        self.entries.lock().map(|g| g.len()).unwrap_or(0)
+    }
+
+    pub async fn revoke(&self, jti: &str, expires_at: i64) {
+        let now = chrono::Utc::now().timestamp();
+        {
+            let mut guard = match self.entries.lock() {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            guard.retain(|_, exp| *exp > now);
+            guard.insert(jti.to_string(), expires_at);
+        }
+        self.persist().await;
+    }
+
+    pub fn contains(&self, jti: &str) -> bool {
+        let now = chrono::Utc::now().timestamp();
+        let guard = match self.entries.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        guard.get(jti).is_some_and(|exp| *exp > now)
+    }
+
+    async fn persist(&self) {
+        let Some(path) = &self.path else {
+            return;
+        };
+        let entries: Vec<RevocationEntry> = {
+            let guard = match self.entries.lock() {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            guard
+                .iter()
+                .map(|(jti, expires_at)| RevocationEntry {
+                    jti: jti.clone(),
+                    expires_at: *expires_at,
+                })
+                .collect()
+        };
+        let Ok(body) = serde_json::to_vec_pretty(&RevocationFile { entries }) else {
+            return;
+        };
+        let tmp = path.with_extension("json.tmp");
+        if let Some(parent) = path.parent() {
+            let _ = tokio::fs::create_dir_all(parent).await;
+        }
+        let mut opts = tokio::fs::OpenOptions::new();
+        opts.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        {
+            opts.mode(0o600);
+        }
+        if opts.open(&tmp).await.is_ok() {
+            if tokio::fs::write(&tmp, &body).await.is_ok() {
+                let _ = tokio::fs::rename(&tmp, path).await;
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+                }
+            }
         }
     }
+}
+
+async fn read_revocations(path: &std::path::Path) -> HashMap<String, i64> {
+    let Ok(raw) = tokio::fs::read_to_string(path).await else {
+        return HashMap::new();
+    };
+    let Ok(file) = serde_json::from_str::<RevocationFile>(&raw) else {
+        return HashMap::new();
+    };
+    file.entries
+        .into_iter()
+        .map(|entry| (entry.jti, entry.expires_at))
+        .collect()
 }
 const TOKEN_MAX_AGE_SECS: i64 = 7 * 24 * 60 * 60; // 7 days
 
@@ -205,8 +302,10 @@ async fn console_auth_middleware(
     let Some(token) = extract_cookie(request.headers()) else {
         return error(StatusCode::UNAUTHORIZED, "Not authenticated");
     };
-    if state.revoked_sessions.contains(&token) {
-        return error(StatusCode::UNAUTHORIZED, "Not authenticated");
+    if let Some(parsed) = crate::iam::session::parse_token(&token) {
+        if state.revoked_sessions.contains(parsed.revocation_id()) {
+            return error(StatusCode::UNAUTHORIZED, "Not authenticated");
+        }
     }
     let identity = match crate::iam::console_from_token(&state.config, &token).await {
         Ok(identity) => identity,
@@ -393,8 +492,10 @@ pub async fn check(State(state): State<AppState>, headers: HeaderMap) -> Respons
     let Some(token) = extract_cookie(&headers) else {
         return error(StatusCode::UNAUTHORIZED, "Not authenticated");
     };
-    if state.revoked_sessions.contains(&token) {
-        return error(StatusCode::UNAUTHORIZED, "Not authenticated");
+    if let Some(parsed) = crate::iam::session::parse_token(&token) {
+        if state.revoked_sessions.contains(parsed.revocation_id()) {
+            return error(StatusCode::UNAUTHORIZED, "Not authenticated");
+        }
     }
     match crate::iam::console_from_token(&state.config, &token).await {
         Ok(identity) => (StatusCode::OK, Json(session_response(&identity))).into_response(),
@@ -411,7 +512,15 @@ pub async fn check(State(state): State<AppState>, headers: HeaderMap) -> Respons
 )]
 pub async fn logout(State(state): State<AppState>, headers: HeaderMap) -> Response {
     if let Some(token) = extract_cookie(&headers) {
-        state.revoked_sessions.revoke(&token);
+        if let Some(parsed) = crate::iam::session::parse_token(&token) {
+            let expires_at = parsed
+                .issued_at
+                .saturating_add(crate::iam::session::TOKEN_MAX_AGE_SECS);
+            state
+                .revoked_sessions
+                .revoke(parsed.revocation_id(), expires_at)
+                .await;
+        }
     }
     let cookie = make_cookie("", 0, console_cookie_secure(&state.config, &headers));
     let mut resp_headers = HeaderMap::new();
@@ -2225,7 +2334,18 @@ pub fn console_router(state: AppState) -> Router<AppState> {
             console_auth_middleware,
         ));
 
-    public.merge(protected)
+    public
+        .merge(protected)
+        .layer(axum::middleware::from_fn(console_no_store))
+}
+
+async fn console_no_store(request: Request, next: Next) -> Response {
+    let mut response = next.run(request).await;
+    response.headers_mut().insert(
+        axum::http::header::CACHE_CONTROL,
+        axum::http::HeaderValue::from_static("no-store"),
+    );
+    response
 }
 
 #[cfg(test)]

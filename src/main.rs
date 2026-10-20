@@ -100,6 +100,11 @@ enum Commands {
         /// When omitted, MAXIO_MASTER_KEY_FILE from the environment is used.
         #[arg(long)]
         master_key_file: Option<std::path::PathBuf>,
+
+        /// With `--repair`, write a mismatched checksum to match the payload.
+        /// Without this flag a checksum mismatch is quarantined, not adopted.
+        #[arg(long)]
+        accept_current_checksums: bool,
     },
 
     /// Write the web console OpenAPI document (used to generate the UI API client)
@@ -177,6 +182,7 @@ async fn main() -> anyhow::Result<()> {
             repair,
             ref master_key,
             ref master_key_file,
+            accept_current_checksums,
         }) => {
             // Read-only check must not stamp a marker. --repair writes it
             // only after the data-directory lock is held (see check_with).
@@ -187,7 +193,13 @@ async fn main() -> anyhow::Result<()> {
                 .as_deref()
                 .or(cli.config.master_key_file.as_deref());
             let resolved = storage::keys::resolve_master_key(inline, file).await?;
-            return run_check(data_dir, repair, resolved.as_deref()).await;
+            return run_check(
+                data_dir,
+                repair,
+                accept_current_checksums,
+                resolved.as_deref(),
+            )
+            .await;
         }
         Some(Commands::Openapi { ref output }) => {
             let json = openapi::openapi_json();
@@ -317,7 +329,9 @@ async fn main() -> anyhow::Result<()> {
         storage: Arc::new(storage),
         config: Arc::new(config.clone()),
         login_rate_limiter: Arc::new(api::console::LoginRateLimiter::new()),
-        revoked_sessions: Arc::new(api::console::RevokedSessions::new()),
+        revoked_sessions: Arc::new(
+            api::console::RevokedSessions::open(std::path::Path::new(&config.data_dir)).await,
+        ),
     };
 
     // Background housekeeping: abort stale multipart uploads (>7 days),
@@ -447,10 +461,16 @@ async fn main() -> anyhow::Result<()> {
 async fn run_check(
     data_dir: &str,
     repair: bool,
+    accept_current_checksums: bool,
     master_key_b64: Option<&str>,
 ) -> anyhow::Result<()> {
-    let report =
-        storage::check::check_with(std::path::Path::new(data_dir), repair, master_key_b64).await?;
+    let report = storage::check::check_with_opts(
+        std::path::Path::new(data_dir),
+        repair,
+        master_key_b64,
+        accept_current_checksums,
+    )
+    .await?;
     report.print();
     if report.unresolved() > 0 {
         anyhow::bail!(report.failure_message(repair));

@@ -288,7 +288,7 @@ The report lists stale temp files, stranded backups, promote directories and lef
 - restore object bytes stranded in a `.maxio-promote-*` directory (back to the key, or into `<key>/.maxio.object` if that directory exists) and remove the directory. Remove `.maxio-promote-target` and `.maxio-promote-ready` files left inside a published key directory
 - move object bytes that have no sidecar to `<data-dir>/.maxio-quarantine/<bucket>/<path>` and say so in the report. Those bytes are not given a new sidecar: they may be SSE-S3 ciphertext, and serving them as a plain object would return the ciphertext with no encryption headers. Copy a quarantined file back by hand if you know which object it belongs to
 - delete a sidecar whose bytes are gone, and delete a multipart upload that has no readable metadata. A sidecar is kept when a promote directory for that key still exists
-- rewrite a plain object's size, etag, and checksum so they match the file
+- rewrite a plain object's size and etag so they match the file. A checksum that does not match the payload is not rewritten: `--repair` moves that object (plain, SSE-S3, or `<key>/.maxio.object`) to `<data-dir>/.maxio-quarantine/` and leaves the bytes there. `--accept-current-checksums` with `--repair` records the payload's current checksum instead
 - rebuild a missing or corrupt data chunk when parity shards can reconstruct it
 
 It does not invent bucket configuration, rewrite encrypted sidecars (those are MAC-protected), or choose between a plain file and an erasure-coded directory for the same key. Those are reported and left unchanged.

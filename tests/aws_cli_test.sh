@@ -230,9 +230,20 @@ if { [ "$UI_PAGE" = "200" ] || [ "$UI_PAGE" = "503" ]; } \
     UI_PAGE_OK=true
 fi
 assert_eq "unsigned GET /ui/ is the console" "true" "$UI_PAGE_OK"
-UI_SUB=$(curl -sS "$ENDPOINT/ui?versioning" || true)
-assert_eq "unsigned GET /ui?versioning is S3" "true" \
-    "$(printf '%s' "$UI_SUB" | grep -q '<Code>' && echo true || echo false)"
+UI_DEEP=$(curl -sS -o "$TMPDIR/ui-deep" -w '%{http_code}' "$ENDPOINT/ui/buckets/photos?prefix=2026%2F" || true)
+UI_DEEP_OK=false
+if { [ "$UI_DEEP" = "200" ] || [ "$UI_DEEP" = "503" ]; } \
+    && ! grep -q '<Code>' "$TMPDIR/ui-deep" \
+    && ! grep -q 'Missing Authorization' "$TMPDIR/ui-deep"; then
+    UI_DEEP_OK=true
+fi
+assert_eq "unsigned GET /ui/buckets/photos?prefix= is the console" "true" "$UI_DEEP_OK"
+if [ "$UI_PAGE" = "200" ]; then
+    assert_eq "console html references the favicon under /ui/" "true" \
+        "$(grep -q '/ui/favicon-32.png' "$TMPDIR/ui-page" && ! grep -q 'href="/favicon' "$TMPDIR/ui-page" && echo true || echo false)"
+    assert_eq "console html is not cached" "true" \
+        "$(curl -sS -D - -o /dev/null "$ENDPOINT/ui/" | grep -qi 'cache-control: no-store' && echo true || echo false)"
+fi
 for PROBE_BUCKET in version healthz api readyz; do
     echo "probe-$PROBE_BUCKET" > "$TMPDIR/probe.txt"
     assert "create bucket $PROBE_BUCKET" $AWS s3 mb "s3://$PROBE_BUCKET"

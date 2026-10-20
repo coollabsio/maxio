@@ -7,6 +7,7 @@
 
 use base64::Engine;
 use hmac::{Hmac, Mac};
+use rand::RngExt;
 use sha2::Sha256;
 
 use signature_time::constant_time_eq;
@@ -20,15 +21,27 @@ pub const TOKEN_MAX_AGE_SECS: i64 = 7 * 24 * 60 * 60;
 pub struct ParsedToken {
     pub access_key_id: Option<String>,
     pub issued_at: i64,
+    /// Random per-login id. Absent on tokens issued before sessions were unique.
+    pub nonce: Option<String>,
     signature: String,
     pub legacy_root: bool,
 }
 
+impl ParsedToken {
+    /// Stable id stored when the session is revoked. Unique per login.
+    pub fn revocation_id(&self) -> &str {
+        self.nonce.as_deref().unwrap_or(self.signature.as_str())
+    }
+}
+
 pub fn issue_token(access_key_id: &str, secret: &str, issued_at: i64) -> String {
+    let mut raw = [0u8; 16];
+    rand::rng().fill(&mut raw);
+    let nonce = hex::encode(raw);
     let issued_hex = format!("{issued_at:x}");
-    let sig = sign(secret, &format!("v1:{access_key_id}:{issued_hex}"));
+    let sig = sign(secret, &format!("v2:{access_key_id}:{issued_hex}:{nonce}"));
     let id = B64.encode(access_key_id.as_bytes());
-    format!("{id}.{issued_hex}.{sig}")
+    format!("{id}.{issued_hex}.{nonce}.{sig}")
 }
 
 pub fn parse_token(token: &str) -> Option<ParsedToken> {
@@ -39,8 +52,24 @@ pub fn parse_token(token: &str) -> Option<ParsedToken> {
             Some(ParsedToken {
                 access_key_id: None,
                 issued_at,
+                nonce: None,
                 signature: (*signature).to_string(),
                 legacy_root: true,
+            })
+        }
+        [id_b64, issued_hex, nonce, signature] => {
+            let id = B64.decode(id_b64).ok()?;
+            let access_key_id = String::from_utf8(id).ok()?;
+            if access_key_id.is_empty() || nonce.is_empty() || nonce.contains('.') {
+                return None;
+            }
+            let issued_at = i64::from_str_radix(issued_hex, 16).ok()?;
+            Some(ParsedToken {
+                access_key_id: Some(access_key_id),
+                issued_at,
+                nonce: Some((*nonce).to_string()),
+                signature: (*signature).to_string(),
+                legacy_root: false,
             })
         }
         [id_b64, issued_hex, signature] => {
@@ -53,6 +82,7 @@ pub fn parse_token(token: &str) -> Option<ParsedToken> {
             Some(ParsedToken {
                 access_key_id: Some(access_key_id),
                 issued_at,
+                nonce: None,
                 signature: (*signature).to_string(),
                 legacy_root: false,
             })
@@ -69,6 +99,8 @@ pub fn token_signature_ok(token: &ParsedToken, access_key_id: &str, secret: &str
     let issued_hex = format!("{:x}", token.issued_at);
     let message = if token.legacy_root {
         format!("{access_key_id}:{issued_hex}")
+    } else if let Some(nonce) = &token.nonce {
+        format!("v2:{access_key_id}:{issued_hex}:{nonce}")
     } else {
         format!("v1:{access_key_id}:{issued_hex}")
     };
@@ -111,6 +143,19 @@ mod tests {
             "mxsk_secret"
         ));
         assert!(!token_signature_ok(&parsed, "MXIAEXAMPLEKEY0001", "other"));
+        assert!(parsed.nonce.is_some());
+    }
+
+    #[test]
+    fn two_tokens_in_the_same_second_are_different_sessions() {
+        let a = issue_token("maxioadmin", "secret", 1_700_000_000);
+        let b = issue_token("maxioadmin", "secret", 1_700_000_000);
+        assert_ne!(a, b);
+        let pa = parse_token(&a).unwrap();
+        let pb = parse_token(&b).unwrap();
+        assert_ne!(pa.revocation_id(), pb.revocation_id());
+        assert!(token_signature_ok(&pa, "maxioadmin", "secret"));
+        assert!(token_signature_ok(&pb, "maxioadmin", "secret"));
     }
 
     #[test]

@@ -254,7 +254,7 @@ fn build_frame_aad(bucket: &str, key: &str, version_id: Option<&str>, chunk_inde
 
 /// Build an `AadBuilder` closure for object frames. Captures the identifiers so
 /// the frame writer/reader can produce per-chunk AAD on demand.
-fn object_aad_builder(bucket: &str, key: &str, version_id: Option<&str>) -> AadBuilder {
+pub(crate) fn object_aad_builder(bucket: &str, key: &str, version_id: Option<&str>) -> AadBuilder {
     let bucket = bucket.to_string();
     let key = key.to_string();
     let version_id = version_id.map(|v| v.to_string());

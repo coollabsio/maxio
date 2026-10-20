@@ -41,11 +41,14 @@ async fn start_server() -> (String, TempDir) {
         max_console_body_bytes: 1024 * 1024,
         ..Config::default()
     };
+    let revoked_sessions = Arc::new(
+        maxio::api::console::RevokedSessions::open(std::path::Path::new(&config.data_dir)).await,
+    );
     let state = AppState {
         storage: Arc::new(storage),
         config: Arc::new(config),
         login_rate_limiter: Arc::new(maxio::api::console::LoginRateLimiter::new()),
-        revoked_sessions: Arc::new(maxio::api::console::RevokedSessions::new()),
+        revoked_sessions,
     };
     let app = server::build_router(state);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

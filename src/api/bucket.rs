@@ -613,6 +613,7 @@ pub fn bucket_subresource(params: &HashMap<String, String>) -> Option<&'static s
 }
 
 /// Listing and object query names that are not bucket subresources.
+#[cfg_attr(not(test), allow(dead_code))]
 const S3_LIST_AND_OBJECT_PARAMS: &[&str] = &[
     "attributes",
     "continuation-token",
@@ -642,6 +643,7 @@ const S3_LIST_AND_OBJECT_PARAMS: &[&str] = &[
 ];
 
 /// True when the query string selects an S3 operation (subresource, list, or presign).
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn query_selects_s3(query: &str) -> bool {
     query.split('&').any(|pair| {
         if pair.is_empty() {
@@ -655,6 +657,7 @@ pub(crate) fn query_selects_s3(query: &str) -> bool {
     })
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn s3_query_name(name: &str) -> bool {
     let lower = name.to_ascii_lowercase();
     if lower.starts_with("x-amz-") || lower.starts_with("response-") {
@@ -1198,4 +1201,16 @@ async fn get_bucket_tagging(state: AppState, bucket: String) -> Result<Response<
     };
     let xml = to_xml(&tagging).map_err(S3Error::internal)?;
     Ok(xml_response(xml))
+}
+
+#[cfg(test)]
+mod query_tests {
+    use super::query_selects_s3;
+
+    #[test]
+    fn s3_query_names_are_recognized() {
+        assert!(query_selects_s3("prefix=a"));
+        assert!(query_selects_s3("X-Amz-Signature=ab"));
+        assert!(!query_selects_s3("next=x"));
+    }
 }

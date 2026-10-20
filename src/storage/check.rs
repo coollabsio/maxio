@@ -7,7 +7,10 @@
 //! erasure-coded chunks that parity can rebuild. Object bytes with no
 //! sidecar are quarantined under `<data-dir>/.maxio-quarantine/` rather than
 //! adopted: those bytes may be SSE-S3 ciphertext, and a plaintext sidecar
-//! would serve them without encryption headers. A sidecar is never deleted
+//! would serve them without encryption headers. A checksum that does not match
+//! the payload is the same kind of finding: `--repair` moves the object into
+//! `.maxio-quarantine/` and does not rewrite the checksum. `--accept-current-checksums`
+//! with `--repair` records the payload's checksum instead. A sidecar is never deleted
 //! while a promote directory for that key still holds the bytes (the sidecar
 //! is where an SSE-S3 wrapped data key lives).
 //!
@@ -24,9 +27,11 @@ use super::{
     BucketMeta, ChecksumAlgorithm, ChecksumHasher, ChunkKind, ChunkManifest, EncryptionMode,
     MultipartUploadMeta, ObjectMeta, PartMeta,
 };
+use base64::Engine;
 use md5::{Digest, Md5};
 use sha2::Sha256;
 use std::path::Path;
+use std::sync::Arc;
 use tokio::io::AsyncReadExt;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -240,6 +245,16 @@ pub async fn check_with(
     repair: bool,
     master_key_b64: Option<&str>,
 ) -> anyhow::Result<CheckReport> {
+    check_with_opts(data_dir, repair, master_key_b64, false).await
+}
+
+/// `accept_current_checksums` records a mismatched payload's checksum instead of quarantining it.
+pub async fn check_with_opts(
+    data_dir: &Path,
+    repair: bool,
+    master_key_b64: Option<&str>,
+    accept_current_checksums: bool,
+) -> anyhow::Result<CheckReport> {
     if !tokio::fs::try_exists(data_dir).await? {
         anyhow::bail!("data directory does not exist: {}", data_dir.display());
     }
@@ -270,6 +285,16 @@ pub async fn check_with(
     }
     let mut report = CheckReport::default();
     let mut saw_sse_s3 = false;
+    let keyring = if master_key_b64.is_some()
+        || tokio::fs::try_exists(data_dir.join(".maxio-keys.json")).await?
+    {
+        super::keys::Keyring::load(data_dir.to_str().unwrap_or("."), master_key_b64)
+            .await
+            .ok()
+            .map(Arc::new)
+    } else {
+        None
+    };
     let buckets_dir = data_dir.join("buckets");
     for name in super::filesystem::reserved_buckets_present(&buckets_dir).await {
         report.push(
@@ -299,6 +324,8 @@ pub async fn check_with(
                     &bucket,
                     data_dir,
                     repair,
+                    accept_current_checksums,
+                    keyring.as_ref(),
                     &mut report,
                     &mut saw_sse_s3,
                 )
@@ -346,6 +373,8 @@ async fn scan_bucket(
     bucket: &str,
     data_dir: &Path,
     repair: bool,
+    accept_current_checksums: bool,
+    keyring: Option<&Arc<super::keys::Keyring>>,
     report: &mut CheckReport,
     saw_sse_s3: &mut bool,
 ) -> anyhow::Result<()> {
@@ -409,7 +438,16 @@ async fn scan_bucket(
         }
         if let Some((_, path, _)) = entries.iter().find(|(n, _, d)| n == ".versions" && *d) {
             scan_versions(
-                path, bucket_dir, bucket, data_dir, &prefix, repair, report, saw_sse_s3,
+                path,
+                bucket_dir,
+                bucket,
+                data_dir,
+                &prefix,
+                repair,
+                accept_current_checksums,
+                keyring,
+                report,
+                saw_sse_s3,
             )
             .await?;
         }
@@ -475,10 +513,15 @@ async fn scan_bucket(
                 &data_path,
                 &ec_path,
                 &key,
+                bucket_dir,
+                bucket,
+                data_dir,
                 PairFlags {
                     repair,
                     keep_sidecar: guard.keeps(stem),
+                    accept_current_checksums,
                 },
+                keyring,
                 report,
                 saw_sse_s3,
             )
@@ -581,6 +624,7 @@ async fn scan_bucket(
 struct PairFlags {
     repair: bool,
     keep_sidecar: bool,
+    accept_current_checksums: bool,
 }
 
 async fn check_meta_pair(
@@ -588,7 +632,11 @@ async fn check_meta_pair(
     data_path: &Path,
     ec_path: &Path,
     key: &str,
+    bucket_dir: &Path,
+    bucket: &str,
+    data_dir: &Path,
     flags: PairFlags,
+    keyring: Option<&Arc<super::keys::Keyring>>,
     report: &mut CheckReport,
     saw_sse_s3: &mut bool,
 ) -> anyhow::Result<()> {
@@ -727,56 +775,98 @@ async fn check_meta_pair(
     }
 
     report.objects_seen += 1;
-    if encrypted {
-        return Ok(());
-    }
-
-    let file_len = tokio::fs::metadata(data_path).await?.len();
     let mut dirty = false;
-    if file_len != meta.size {
-        let repaired = repair;
-        report.push(
-            IssueKind::SizeMismatch,
-            data_path,
-            format!("sidecar size is {}, file is {file_len} bytes", meta.size),
-            repaired,
-        );
-        if repair {
-            meta.size = file_len;
-            meta.etag = file_md5_quoted(data_path).await?;
-            meta.part_sizes = None;
-            dirty = true;
-        }
-    } else if !meta.etag.trim_matches('"').contains('-') {
-        let etag = file_md5_quoted(data_path).await?;
-        if etag != meta.etag {
+    // Ciphertext length and MD5 are not the plaintext size and etag.
+    if !encrypted {
+        let file_len = tokio::fs::metadata(data_path).await?.len();
+        if file_len != meta.size {
             let repaired = repair;
             report.push(
-                IssueKind::EtagMismatch,
+                IssueKind::SizeMismatch,
                 data_path,
-                format!("sidecar etag is {}, file hashes to {etag}", meta.etag),
+                format!("sidecar size is {}, file is {file_len} bytes", meta.size),
                 repaired,
             );
             if repair {
-                meta.etag = etag;
+                meta.size = file_len;
+                meta.etag = file_md5_quoted(data_path).await?;
+                meta.part_sizes = None;
                 dirty = true;
+            }
+        } else if !meta.etag.trim_matches('"').contains('-') {
+            let etag = file_md5_quoted(data_path).await?;
+            if etag != meta.etag {
+                let repaired = repair;
+                report.push(
+                    IssueKind::EtagMismatch,
+                    data_path,
+                    format!("sidecar etag is {}, file hashes to {etag}", meta.etag),
+                    repaired,
+                );
+                if repair {
+                    meta.etag = etag;
+                    dirty = true;
+                }
             }
         }
     }
 
     if let (Some(algo), Some(expected)) = (meta.checksum_algorithm, meta.checksum_value.clone()) {
-        let actual = file_checksum(data_path, algo).await?;
-        if actual != expected {
-            let repaired = repair;
-            report.push(
-                IssueKind::ChecksumMismatch,
-                data_path,
-                format!("sidecar checksum is {expected}, file is {actual}"),
-                repaired,
-            );
-            if repair {
+        match payload_checksum(data_path, &meta, algo, bucket, key, keyring).await {
+            Ok(actual) if actual == expected => {}
+            Ok(actual) if repair && flags.accept_current_checksums => {
+                report.push(
+                    IssueKind::ChecksumMismatch,
+                    data_path,
+                    format!(
+                        "sidecar checksum is {expected}, payload is {actual}. Recorded the payload checksum because --accept-current-checksums was set."
+                    ),
+                    true,
+                );
                 meta.checksum_value = Some(actual);
                 dirty = true;
+            }
+            outcome => {
+                let why = match outcome {
+                    Ok(actual) => format!("sidecar checksum is {expected}, payload is {actual}"),
+                    Err(err) => format!(
+                        "sidecar checksum is {expected}, payload could not be verified: {err}"
+                    ),
+                };
+                if repair && !flags.accept_current_checksums {
+                    match quarantine_payload(data_dir, bucket, bucket_dir, data_path, meta_path)
+                        .await
+                    {
+                        Ok(dest) => {
+                            report.push(
+                                IssueKind::ChecksumMismatch,
+                                data_path,
+                                format!(
+                                    "{why}. Quarantined at {} without deleting the bytes and without adopting the payload checksum.",
+                                    dest.display()
+                                ),
+                                true,
+                            );
+                        }
+                        Err(err) => {
+                            report.push(
+                                IssueKind::ChecksumMismatch,
+                                data_path,
+                                format!("{why}. Quarantine failed: {err}. The object was left in place and the checksum was not rewritten."),
+                                false,
+                            );
+                        }
+                    }
+                    return Ok(());
+                }
+                report.push(
+                    IssueKind::ChecksumMismatch,
+                    data_path,
+                    format!(
+                        "{why}. The checksum was not rewritten. --repair moves the object under .maxio-quarantine. --accept-current-checksums with --repair records the payload checksum instead."
+                    ),
+                    false,
+                );
             }
         }
     }
@@ -991,6 +1081,8 @@ async fn scan_versions(
     data_dir: &Path,
     prefix: &str,
     repair: bool,
+    accept_current_checksums: bool,
+    keyring: Option<&Arc<super::keys::Keyring>>,
     report: &mut CheckReport,
     saw_sse_s3: &mut bool,
 ) -> anyhow::Result<()> {
@@ -1028,10 +1120,15 @@ async fn scan_versions(
                 &dir.join(format!("{stem}.data")),
                 &dir.join(format!("{stem}.ec")),
                 &key,
+                bucket_dir,
+                bucket,
+                data_dir,
                 PairFlags {
                     repair,
                     keep_sidecar: false,
+                    accept_current_checksums,
                 },
+                keyring,
                 report,
                 saw_sse_s3,
             )
@@ -2199,6 +2296,220 @@ mod tests {
             repaired.issues
         );
     }
+
+    #[tokio::test]
+    async fn checksum_mismatch_is_quarantined_not_adopted() {
+        let tmp = tempfile::tempdir().unwrap();
+        let keyring = Arc::new(
+            crate::storage::keys::Keyring::load(tmp.path().to_str().unwrap(), None)
+                .await
+                .unwrap(),
+        );
+        let storage =
+            FilesystemStorage::new(tmp.path().to_str().unwrap(), false, 1024 * 1024, 0, keyring)
+                .await
+                .unwrap();
+        storage.create_bucket(&bucket_meta("bkt")).await.unwrap();
+        let checksum = Some((crate::storage::ChecksumAlgorithm::CRC32, None));
+        let put = |key: &'static str, body: &'static [u8], sse: bool| {
+            let storage = &storage;
+            let checksum = checksum.clone();
+            async move {
+                storage
+                    .put_object(
+                        "bkt",
+                        key,
+                        "text/plain",
+                        Box::pin(body),
+                        checksum,
+                        sse.then(crate::storage::EncryptionRequest::sse_s3),
+                    )
+                    .await
+                    .unwrap();
+            }
+        };
+        put("plain.txt", b"plain-bytes", false).await;
+        put("secret.txt", b"secret-bytes", true).await;
+        put("dir", b"inline-bytes", false).await;
+        put("dir/child.txt", b"child", false).await;
+
+        let bucket = tmp.path().join("buckets/bkt");
+        let flip = |path: &std::path::Path| {
+            let mut bytes = std::fs::read(path).unwrap();
+            bytes[0] ^= 0xff;
+            std::fs::write(path, bytes).unwrap();
+        };
+        flip(&bucket.join("plain.txt"));
+        flip(&bucket.join("secret.txt"));
+        flip(&bucket.join("dir/.maxio.object"));
+        let plain_sum = std::fs::read_to_string(bucket.join("plain.txt.meta.json")).unwrap();
+        assert!(plain_sum.contains("checksum_value"));
+
+        let reported = check(tmp.path(), false).await.unwrap();
+        let mismatches: Vec<_> = reported
+            .issues
+            .iter()
+            .filter(|issue| issue.kind == IssueKind::ChecksumMismatch)
+            .collect();
+        assert!(
+            mismatches.len() >= 3,
+            "expected plain, sse, and inline mismatches: {:?}",
+            reported.issues
+        );
+        assert!(mismatches.iter().all(|issue| !issue.repaired));
+        assert!(bucket.join("plain.txt").is_file());
+        assert_eq!(
+            std::fs::read_to_string(bucket.join("plain.txt.meta.json")).unwrap(),
+            plain_sum,
+            "a read-only check must not rewrite the checksum"
+        );
+
+        let repaired = check(tmp.path(), true).await.unwrap();
+        assert!(
+            repaired
+                .issues
+                .iter()
+                .any(|issue| issue.kind == IssueKind::ChecksumMismatch
+                    && issue.repaired
+                    && issue.detail.contains("Quarantined")),
+            "{:?}",
+            repaired.issues
+        );
+        assert!(!bucket.join("plain.txt").exists());
+        assert!(!bucket.join("secret.txt").exists());
+        assert!(!bucket.join("dir/.maxio.object").exists());
+        assert!(
+            bucket.join("dir/child.txt").is_file(),
+            "untampered child stays"
+        );
+        let quarantine = tmp.path().join(".maxio-quarantine/bkt");
+        assert!(quarantine.join("plain.txt").is_file());
+        assert!(quarantine.join("secret.txt").is_file());
+        assert!(quarantine.join("dir/.maxio.object").is_file());
+        let kept = std::fs::read_to_string(quarantine.join("plain.txt.meta.json")).unwrap();
+        assert_eq!(kept, plain_sum);
+        assert!(!kept.contains("adopt"), "{kept}");
+    }
+}
+
+async fn payload_checksum(
+    data_path: &Path,
+    meta: &ObjectMeta,
+    algo: ChecksumAlgorithm,
+    bucket: &str,
+    key: &str,
+    keyring: Option<&Arc<super::keys::Keyring>>,
+) -> Result<String, String> {
+    if let Some(enc) = &meta.encryption {
+        if enc.mode != EncryptionMode::SseS3 {
+            return Err(
+                "SSE-C payload cannot be checked without the customer key; it was left in place"
+                    .into(),
+            );
+        }
+        let Some(keyring) = keyring else {
+            return Err("SSE-S3 master key is not loaded; the payload was left in place".into());
+        };
+        return checksum_sse_s3(data_path, meta, enc, algo, bucket, key, keyring).await;
+    }
+    file_checksum(data_path, algo)
+        .await
+        .map_err(|err| err.to_string())
+}
+
+async fn checksum_sse_s3(
+    data_path: &Path,
+    meta: &ObjectMeta,
+    enc: &super::EncryptionMeta,
+    algo: ChecksumAlgorithm,
+    bucket: &str,
+    key: &str,
+    keyring: &super::keys::Keyring,
+) -> Result<String, String> {
+    let b64 = base64::engine::general_purpose::STANDARD;
+    let key_id = enc.key_id.as_deref().ok_or("missing key_id")?;
+    let wrapped = b64
+        .decode(enc.wrapped_dek.as_deref().ok_or("missing wrapped_dek")?)
+        .map_err(|err| err.to_string())?;
+    let nonce_raw = b64
+        .decode(enc.wrap_nonce.as_deref().ok_or("missing wrap_nonce")?)
+        .map_err(|err| err.to_string())?;
+    if nonce_raw.len() != 12 {
+        return Err("wrap_nonce must be 12 bytes".into());
+    }
+    let mut nonce = [0u8; 12];
+    nonce.copy_from_slice(&nonce_raw);
+    let dek = keyring
+        .unwrap_dek(key_id, &wrapped, &nonce)
+        .map_err(|err| err.to_string())?;
+    let file = tokio::fs::File::open(data_path)
+        .await
+        .map_err(|err| err.to_string())?;
+    let aad = super::filesystem::object_aad_builder(bucket, key, meta.version_id.as_deref());
+    let mut dec = super::crypto::FrameDecryptor::new(
+        Box::pin(file),
+        &dek,
+        meta.size,
+        enc.chunk_size.max(1) as usize,
+        aad,
+    );
+    let mut hasher = ChecksumHasher::new(algo);
+    let mut buf = vec![0u8; 64 * 1024];
+    loop {
+        let n = dec
+            .read(&mut buf)
+            .await
+            .map_err(|err| format!("authentication failed ({err})"))?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok(hasher.finalize_base64())
+}
+
+async fn quarantine_payload(
+    data_dir: &Path,
+    bucket: &str,
+    bucket_dir: &Path,
+    data_path: &Path,
+    meta_path: &Path,
+) -> anyhow::Result<std::path::PathBuf> {
+    let rel = data_path.strip_prefix(bucket_dir).unwrap_or(data_path);
+    let mut dest = data_dir.join(".maxio-quarantine").join(bucket).join(rel);
+    if let Some(parent) = dest.parent() {
+        tokio::fs::create_dir_all(parent).await?;
+    }
+    if tokio::fs::try_exists(&dest).await? {
+        let parent = dest
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| data_dir.to_path_buf());
+        let stem = dest
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "object".to_string());
+        for n in 1..1000 {
+            let candidate = parent.join(format!("{stem}.{n}"));
+            if !tokio::fs::try_exists(&candidate).await? {
+                dest = candidate;
+                break;
+            }
+        }
+    }
+    tokio::fs::rename(data_path, &dest).await?;
+    if tokio::fs::try_exists(meta_path).await? {
+        let meta_rel = meta_path.strip_prefix(bucket_dir).unwrap_or(meta_path);
+        let meta_dest = data_dir
+            .join(".maxio-quarantine")
+            .join(bucket)
+            .join(meta_rel);
+        if let Some(parent) = meta_dest.parent() {
+            tokio::fs::create_dir_all(parent).await?;
+        }
+        tokio::fs::rename(meta_path, &meta_dest).await?;
+    }
+    Ok(dest)
 }
 
 async fn file_checksum(path: &Path, algo: ChecksumAlgorithm) -> anyhow::Result<String> {

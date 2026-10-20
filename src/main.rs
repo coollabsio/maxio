@@ -21,16 +21,18 @@ mod config;
 mod embedded;
 mod error;
 mod iam;
+mod limits;
 mod openapi;
+mod serve;
 mod server;
 mod storage;
+mod vhost;
 mod xml;
 
 use clap::Parser;
 use clap::Subcommand;
 use config::Config;
 use http::Uri;
-use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -72,6 +74,32 @@ enum Commands {
     #[command(subcommand)]
     Keyring(KeyringCmd),
 
+    /// Scan the data directory for crash leftovers and inconsistent objects.
+    ///
+    /// Reports orphaned data, sidecar mismatches, stale temp files, and
+    /// multipart debris. `--repair` fixes the cases that can be made
+    /// consistent from the bytes already on disk. Stop the server first.
+    Check {
+        /// Data directory to scan
+        #[arg(long, env = "MAXIO_DATA_DIR", default_value = "./data")]
+        data_dir: String,
+
+        /// Rewrite or remove inconsistencies that can be fixed safely.
+        /// Refuses to run while a maxio server holds the data directory lock.
+        #[arg(long)]
+        repair: bool,
+
+        /// SSE-S3 master key (base64-encoded 32 bytes). Same as the server flag.
+        /// When omitted, MAXIO_MASTER_KEY from the environment is used.
+        #[arg(long)]
+        master_key: Option<String>,
+
+        /// File containing the SSE-S3 master key. Same as the server flag.
+        /// When omitted, MAXIO_MASTER_KEY_FILE from the environment is used.
+        #[arg(long)]
+        master_key_file: Option<std::path::PathBuf>,
+    },
+
     /// Write the web console OpenAPI document (used to generate the UI API client)
     Openapi {
         /// Output file; prints to stdout when omitted
@@ -97,6 +125,21 @@ enum KeyringCmd {
         #[arg(long, env = "MAXIO_DATA_DIR", default_value = "./data")]
         data_dir: String,
     },
+
+    /// Add every key from another keyring file into this data directory.
+    ///
+    /// Keeps the keys already stored here. The active key does not change when
+    /// this data directory already has one. Use this after
+    /// `--allow-missing-master-key` created a new key and you still have the
+    /// original `.maxio-keys.json`: pass that backup as `--from`. Do not copy
+    /// the backup over the current file; that drops the new key.
+    Merge {
+        #[arg(long, env = "MAXIO_DATA_DIR", default_value = "./data")]
+        data_dir: String,
+        /// Keyring file to merge in. Key material is not printed.
+        #[arg(long)]
+        from: std::path::PathBuf,
+    },
 }
 
 fn default_healthcheck_url() -> String {
@@ -121,6 +164,25 @@ async fn main() -> anyhow::Result<()> {
         Some(Commands::Keyring(KeyringCmd::List { ref data_dir })) => {
             return run_keyring_list(data_dir).await;
         }
+        Some(Commands::Keyring(KeyringCmd::Merge {
+            ref data_dir,
+            ref from,
+        })) => {
+            return run_keyring_merge(data_dir, from).await;
+        }
+        Some(Commands::Check {
+            ref data_dir,
+            repair,
+            ref master_key,
+            ref master_key_file,
+        }) => {
+            let inline = master_key.as_deref().or(cli.config.master_key.as_deref());
+            let file = master_key_file
+                .as_deref()
+                .or(cli.config.master_key_file.as_deref());
+            let resolved = storage::keys::resolve_master_key(inline, file).await?;
+            return run_check(data_dir, repair, resolved.as_deref()).await;
+        }
         Some(Commands::Openapi { ref output }) => {
             let json = openapi::openapi_json();
             match output {
@@ -143,6 +205,8 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let config = cli.config;
+    let virtual_domains =
+        vhost::parse_domains(&config.domain).map_err(|err| anyhow::anyhow!(err))?;
 
     if config.access_key == "maxioadmin"
         && config.secret_key == "maxioadmin"
@@ -156,18 +220,34 @@ async fn main() -> anyhow::Result<()> {
     }
 
     tokio::fs::create_dir_all(&config.data_dir).await?;
+    // Held until this process exits, including after a graceful shutdown.
+    // A crash closes the fd and the OS drops the flock, so restart is not blocked.
+    let _data_lock = storage::lock::acquire_exclusive(
+        std::path::Path::new(&config.data_dir),
+        storage::lock::LockReason::Serve,
+    )?;
 
-    // IAM secrets are sealed with the same master key. Refuse before
-    // Keyring::load can mint a replacement file over a missing keyring.
-    // The SSE-S3 missing-key scan (collect_requirement) must include
-    // iam::secrets::sealed_master_key_ids so a data dir that only has iam.json
-    // is treated like one that has encrypted objects.
-    iam::secrets::refuse_missing_keyring(&config.data_dir, config.master_key.is_some()).await?;
-
-    // Build the SSE-S3 keyring (bootstrap a random master key on first run).
-    let keyring = Arc::new(
-        storage::keys::Keyring::load(&config.data_dir, config.master_key.as_deref()).await?,
-    );
+    // Resolve the external key before any keyring file is created. IAM secrets
+    // use the same key, so a missing keyring must not be replaced while
+    // iam.json still holds sealed secrets.
+    let master_key_b64 = storage::keys::resolve_master_key(
+        config.master_key.as_deref(),
+        config.master_key_file.as_deref(),
+    )
+    .await?;
+    iam::secrets::refuse_missing_keyring(&config.data_dir, master_key_b64.is_some()).await?;
+    let keyring = Arc::new(if config.allow_missing_master_key {
+        storage::keys::Keyring::load_with(
+            &config.data_dir,
+            storage::keys::LoadOptions {
+                master_key_b64: master_key_b64.as_deref(),
+                allow_missing_master_key: true,
+            },
+        )
+        .await?
+    } else {
+        storage::keys::Keyring::load(&config.data_dir, master_key_b64.as_deref()).await?
+    });
     iam::store::ensure_secrets_readable(&config.data_dir, &keyring)
         .await
         .map_err(anyhow::Error::msg)?;
@@ -180,20 +260,31 @@ async fn main() -> anyhow::Result<()> {
             rewritten.join("; ")
         );
     }
-    if config.master_key.is_none() {
-        tracing::info!(
-            "SSE-S3 keyring: active key id {} (file {}/.maxio-keys.json — BACK THIS UP)",
-            keyring.active_id(),
-            config.data_dir
-        );
-    } else {
-        tracing::info!(
-            "SSE-S3 keyring: active key id {} (from MAXIO_MASTER_KEY)",
-            keyring.active_id()
-        );
+    match (&config.master_key, &config.master_key_file) {
+        (_, Some(path)) => {
+            tracing::info!(
+                "SSE-S3 keyring: active key id {} (from master key file {}; not written into the data directory)",
+                keyring.active_id(),
+                path.display()
+            );
+        }
+        (Some(_), None) => {
+            tracing::info!(
+                "SSE-S3 keyring: active key id {} (from MAXIO_MASTER_KEY; not written into the data directory)",
+                keyring.active_id()
+            );
+        }
+        (None, None) => {
+            tracing::info!(
+                "SSE-S3 keyring: active key id {} (file {}/.maxio-keys.json — BACK THIS UP; {}/.maxio-key-check.json stays with the data and has no key material)",
+                keyring.active_id(),
+                config.data_dir,
+                config.data_dir
+            );
+        }
     }
 
-    let storage = storage::filesystem::FilesystemStorage::new(
+    let mut storage = storage::filesystem::FilesystemStorage::new(
         &config.data_dir,
         config.erasure_coding,
         config.chunk_size,
@@ -201,6 +292,11 @@ async fn main() -> anyhow::Result<()> {
         keyring.clone(),
     )
     .await?;
+    storage.set_upload_limits(
+        config.max_object_size,
+        config.max_part_size,
+        config.max_multipart_object_size,
+    );
 
     storage::provision_default_buckets(&storage, &config.default_buckets, &config.region).await;
 
@@ -212,14 +308,25 @@ async fn main() -> anyhow::Result<()> {
 
     // Background housekeeping: abort stale multipart uploads (>7 days),
     // remove leftover temp files from crashed writes, and apply bucket
-    // lifecycle rules. Runs once at startup, then hourly.
+    // lifecycle rules. Runs once at startup, then hourly. Stops when the
+    // process begins draining for shutdown.
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     {
         let storage = state.storage.clone();
+        let mut shutdown_rx = shutdown_rx.clone();
         tokio::spawn(async move {
             let stale_after = chrono::Duration::days(7);
             let mut ticker = tokio::time::interval(Duration::from_secs(3600));
             loop {
-                ticker.tick().await;
+                tokio::select! {
+                    _ = ticker.tick() => {}
+                    changed = shutdown_rx.changed() => {
+                        if changed.is_err() || *shutdown_rx.borrow() {
+                            break;
+                        }
+                        continue;
+                    }
+                }
                 let (uploads, temps) = storage.housekeeping_sweep(stale_after).await;
                 if uploads > 0 || temps > 0 {
                     tracing::info!(
@@ -250,17 +357,30 @@ async fn main() -> anyhow::Result<()> {
 
     let addr = format!("{}:{}", config.address, config.port);
     let listener = tokio::net::TcpListener::bind(&addr).await?;
+    let bound = listener.local_addr()?;
     if config.access_key == "maxioadmin" && config.secret_key == "maxioadmin" {
         tracing::warn!(
             "WARNING: Using default credentials because insecure development mode is enabled."
         );
     }
 
-    tracing::info!("MaxIO v{} listening on {}", env!("CARGO_PKG_VERSION"), addr);
+    tracing::info!(
+        "MaxIO v{} listening on {}",
+        env!("CARGO_PKG_VERSION"),
+        bound
+    );
     tracing::info!("Access Key: {}", config.access_key);
     tracing::info!("Secret Key: [REDACTED]");
     tracing::info!("Data dir:   {}", config.data_dir);
     tracing::info!("Region:     {}", config.region);
+    if virtual_domains.is_empty() {
+        tracing::info!("Addressing: path-style");
+    } else {
+        tracing::info!(
+            "Addressing: path-style and virtual-hosted-style ({})",
+            virtual_domains.join(", ")
+        );
+    }
     if config.erasure_coding {
         tracing::info!(
             "Erasure coding: enabled (chunk size: {}MB)",
@@ -281,15 +401,60 @@ async fn main() -> anyhow::Result<()> {
     } else {
         &config.address
     };
-    tracing::info!("Web UI:     http://{}:{}/ui/", display_host, config.port);
+    tracing::info!("Web UI:     http://{}:{}/ui/", display_host, bound.port());
 
-    axum::serve(
-        listener,
-        app.into_make_service_with_connect_info::<SocketAddr>(),
-    )
-    .with_graceful_shutdown(shutdown_signal())
-    .await?;
+    let serve_opts = serve::ServeOptions {
+        max_header_bytes: config.max_header_bytes,
+        max_connections: config.max_connections,
+        idle_timeout: Duration::from_secs(config.idle_timeout_secs),
+        shutdown_timeout: Duration::from_secs(config.shutdown_timeout_secs),
+    };
+    let shutdown_tx_for_signal = shutdown_tx.clone();
+    tokio::spawn(async move {
+        shutdown_signal().await;
+        let _ = shutdown_tx_for_signal.send(true);
+    });
+    match serve::serve(listener, app, serve_opts, shutdown_rx).await? {
+        serve::ShutdownOutcome::Drained => {
+            tracing::info!("in-flight requests drained; shutdown complete");
+        }
+        serve::ShutdownOutcome::TimedOut => {
+            tracing::warn!(
+                "shutdown timeout of {}s elapsed; aborted remaining connections",
+                config.shutdown_timeout_secs
+            );
+        }
+    }
+    let _ = shutdown_tx.send(true);
 
+    Ok(())
+}
+
+async fn run_check(
+    data_dir: &str,
+    repair: bool,
+    master_key_b64: Option<&str>,
+) -> anyhow::Result<()> {
+    let report =
+        storage::check::check_with(std::path::Path::new(data_dir), repair, master_key_b64).await?;
+    report.print();
+    if report.unresolved() > 0 {
+        let key_only = report.issues.iter().all(|issue| {
+            issue.advisory
+                || issue.repaired
+                || issue.kind == storage::check::IssueKind::KeyringMissing
+        });
+        if key_only {
+            anyhow::bail!(
+                "{} unresolved issue(s). A missing or mismatched SSE-S3 master key cannot be cleared with --repair; pass the original key with --master-key, --master-key-file, MAXIO_MASTER_KEY, or MAXIO_MASTER_KEY_FILE.",
+                report.unresolved()
+            );
+        }
+        anyhow::bail!(
+            "{} unresolved issue(s); rerun with --repair for the cases MaxIO can fix safely",
+            report.unresolved()
+        );
+    }
     Ok(())
 }
 
@@ -358,6 +523,25 @@ async fn run_keyring_rotate(data_dir: &str) -> anyhow::Result<()> {
     println!("  total keys in ring: {}", result.total_keys);
     println!();
     println!("Restart the server to begin encrypting new objects with the new key.");
+    Ok(())
+}
+
+async fn run_keyring_merge(data_dir: &str, from: &std::path::Path) -> anyhow::Result<()> {
+    let _lock = storage::lock::acquire_exclusive(
+        std::path::Path::new(data_dir),
+        storage::lock::LockReason::MergeKeyring,
+    )?;
+    let result = storage::keys::merge_keyring(data_dir, from).await?;
+    println!("✓ keyring merged into {data_dir}/.maxio-keys.json");
+    if result.added_ids.is_empty() {
+        println!("  added:             <none> (already present)");
+    } else {
+        println!("  added:             {}", result.added_ids.join(", "));
+    }
+    println!("  active key id:     {}", result.active_id);
+    println!("  total keys in ring: {}", result.total_keys);
+    println!();
+    println!("Restart the server so it loads the merged keyring.");
     Ok(())
 }
 

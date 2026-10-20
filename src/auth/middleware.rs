@@ -34,6 +34,8 @@ pub async fn auth_middleware(
     let has_auth_header = request.headers().get("authorization").is_some();
 
     // Anonymous public-bucket access: no auth header, safe method, bucket flagged public.
+    // Virtual-hosted requests have already been rewritten to path-style, so this
+    // path is `/{bucket}` or `/{bucket}/{key}`.
     if !has_auth_header
         && is_public_bypass_allowed(&state, &method, request.uri().path(), &query).await
     {
@@ -100,7 +102,9 @@ pub async fn auth_middleware(
         ));
     }
 
-    let path = request.uri().path().to_string();
+    // Virtual-hosted requests are rewritten to `/{bucket}{path}` before routing.
+    // The signature covers the path the client sent, not the rewritten one.
+    let path = signature_path(&request);
 
     tracing::debug!("Verifying signature for {} {} ?{}", method, path, query);
 
@@ -181,6 +185,14 @@ fn take_body_failure(slot: &Option<chunked::FailureSlot>) -> Option<S3Error> {
     let slot = slot.as_ref()?;
     let failure = slot.lock().unwrap_or_else(|p| p.into_inner()).take()?;
     Some(failure.to_s3_error())
+}
+
+fn signature_path(request: &Request) -> String {
+    request
+        .extensions()
+        .get::<crate::vhost::SignedRequestPath>()
+        .map(|path| path.0.clone())
+        .unwrap_or_else(|| request.uri().path().to_string())
 }
 
 fn redact_header_value(name: &str) -> &'static str {
@@ -306,7 +318,7 @@ async fn handle_presigned(
         ));
     }
 
-    let path = request.uri().path().to_string();
+    let path = signature_path(&request);
 
     tracing::debug!(
         "Verifying presigned signature for {} {} ?{}",

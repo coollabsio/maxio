@@ -7,7 +7,10 @@ set -euo pipefail
 # Credentials default to maxioadmin/maxioadmin (start that server with
 # --allow-insecure-dev). Override them to match a server that uses its own keys:
 #   MAXIO_TEST_ACCESS_KEY=... MAXIO_TEST_SECRET_KEY=... ./tests/aws_cli_test.sh
-# Requires aws (AWS CLI v2), mc, python3, and curl.
+# Sections that start their own server use the same variables.
+# Virtual-hosted-style cases also require --domain localhost (or MAXIO_DOMAIN=localhost).
+# Requires aws (AWS CLI v2), mc, python3, curl, and permission to add *.localhost
+# names to /etc/hosts (those names do not resolve on every OS).
 
 PORT="${1:-9000}"
 DATA_DIR="$(cd "${2:-./data}" && pwd)"
@@ -28,10 +31,43 @@ unset AWS_CONFIG_FILE AWS_PROFILE AWS_DEFAULT_PROFILE
 
 AWS="aws --endpoint-url $ENDPOINT"
 
+VHOST_MARK="# maxio-awscli-vhost"
 cleanup() {
+    if [ -n "${KEY_PID:-}" ] && kill -0 "$KEY_PID" 2>/dev/null; then
+        kill "$KEY_PID" 2>/dev/null || true
+        wait "$KEY_PID" 2>/dev/null || true
+    fi
+    if [ -n "${KEY_MC_ALIAS:-}" ]; then
+        mc alias rm "$KEY_MC_ALIAS" >/dev/null 2>&1 || true
+    fi
+    if [ -n "${KEY_DATA:-}" ]; then
+        rm -rf "$KEY_DATA"
+    fi
+    if grep -q "$VHOST_MARK" /etc/hosts 2>/dev/null; then
+        local filtered
+        filtered=$(grep -v "$VHOST_MARK" /etc/hosts || true)
+        if [ -w /etc/hosts ]; then
+            printf '%s\n' "$filtered" > /etc/hosts
+        else
+            printf '%s\n' "$filtered" | sudo tee /etc/hosts >/dev/null
+        fi
+    fi
     rm -rf "$TMPDIR"
 }
 trap cleanup EXIT
+
+pin_vhost() {
+    local name="$1"
+    if grep -qE "[[:space:]]${name}([[:space:]]|$).*${VHOST_MARK}" /etc/hosts 2>/dev/null; then
+        return 0
+    fi
+    local line="127.0.0.1 ${name} ${VHOST_MARK}"
+    if [ -w /etc/hosts ]; then
+        printf '%s\n' "$line" >> /etc/hosts
+    else
+        printf '%s\n' "$line" | sudo tee -a /etc/hosts >/dev/null
+    fi
+}
 
 red()   { printf "\033[31m%s\033[0m\n" "$1"; }
 green() { printf "\033[32m%s\033[0m\n" "$1"; }
@@ -926,6 +962,8 @@ done
 
 if [ -z "$MAXIO_BIN" ]; then
     red "SKIP: keyring rotate tests (./target/debug/maxio and ./target/release/maxio not found)"
+elif [ -n "${MAXIO_MASTER_KEY:-}" ] || [ -n "${MAXIO_MASTER_KEY_FILE:-}" ]; then
+    echo "SKIP: keyring rotate tests (external master key is in use; the on-disk keyring is not the active key)"
 else
     KEYRING_FILE="$DATA_DIR/.maxio-keys.json"
 
@@ -1906,6 +1944,633 @@ done < <(printf '%s' "$NOGRANT_KEYS" | python3 -c 'import json,sys; [print(k["Ac
 assert "nogrant delete-user" $AWS iam delete-user --user-name "$NOGRANT_USER"
 $AWS s3 rm "s3://$NOGRANT_BUCKET" --recursive >/dev/null 2>&1 || true
 assert "nogrant delete bucket" $AWS s3 rb "s3://$NOGRANT_BUCKET"
+
+# Crash safety: operations across a restart, plus `maxio check --repair`.
+# Uses its own server so the caller-owned process is left alone.
+ROBUST_BIN="${MAXIO_BIN:-}"
+if [ -z "$ROBUST_BIN" ]; then
+    if [ -x ./target/debug/maxio ]; then
+        ROBUST_BIN=./target/debug/maxio
+    elif [ -x ./target/release/maxio ]; then
+        ROBUST_BIN=./target/release/maxio
+    fi
+fi
+if [ -z "$ROBUST_BIN" ]; then
+    echo "SKIP: maxio binary not found (set MAXIO_BIN) — restart and check cases"
+else
+    ROBUST_DATA=$(mktemp -d)
+    ROBUST_PORT=$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1]); s.close()')
+    ROBUST_BUCKET="restart-bucket"
+    ROBUST_EP="http://127.0.0.1:$ROBUST_PORT"
+    ROBUST_AWS="aws --endpoint-url $ROBUST_EP"
+    start_robust() {
+        local -a cred_args=(
+            --access-key "$MAXIO_TEST_ACCESS_KEY"
+            --secret-key "$MAXIO_TEST_SECRET_KEY"
+        )
+        if [ "$MAXIO_TEST_ACCESS_KEY" = "maxioadmin" ] && [ "$MAXIO_TEST_SECRET_KEY" = "maxioadmin" ]; then
+            cred_args+=(--allow-insecure-dev)
+        fi
+        RUST_LOG=warn "$ROBUST_BIN" --data-dir "$ROBUST_DATA" --port "$ROBUST_PORT" \
+            --address 127.0.0.1 "${cred_args[@]}" >"$ROBUST_DATA/server.log" 2>&1 &
+        ROBUST_PID=$!
+        for _ in $(seq 1 50); do
+            if curl -sf "$ROBUST_EP/healthz" >/dev/null 2>&1; then
+                return 0
+            fi
+            sleep 0.1
+        done
+        echo "robustness server failed to start; log:"
+        cat "$ROBUST_DATA/server.log" || true
+        return 1
+    }
+    stop_robust() {
+        if [ -n "${ROBUST_PID:-}" ] && kill -0 "$ROBUST_PID" 2>/dev/null; then
+            kill -TERM "$ROBUST_PID" 2>/dev/null || true
+            for _ in $(seq 1 50); do
+                kill -0 "$ROBUST_PID" 2>/dev/null || break
+                sleep 0.1
+            done
+            kill -KILL "$ROBUST_PID" 2>/dev/null || true
+            wait "$ROBUST_PID" 2>/dev/null || true
+        fi
+        ROBUST_PID=""
+    }
+    start_robust
+    assert "robustness create bucket" $ROBUST_AWS s3 mb "s3://$ROBUST_BUCKET"
+    echo "across-restart" > "$TMPDIR/restart.txt"
+    assert "robustness put" $ROBUST_AWS s3 cp "$TMPDIR/restart.txt" "s3://$ROBUST_BUCKET/restart.txt"
+    dd if=/dev/urandom of="$TMPDIR/mp-a.bin" bs=1024 count=5120 status=none
+    echo tail >> "$TMPDIR/mp-b.bin"
+    MP_ID=$($ROBUST_AWS s3api create-multipart-upload --bucket "$ROBUST_BUCKET" --key "multi.bin" --query UploadId --output text)
+    MP_E1=$($ROBUST_AWS s3api upload-part --bucket "$ROBUST_BUCKET" --key "multi.bin" --part-number 1 --body "$TMPDIR/mp-a.bin" --upload-id "$MP_ID" --query ETag --output text)
+    MP_E2=$($ROBUST_AWS s3api upload-part --bucket "$ROBUST_BUCKET" --key "multi.bin" --part-number 2 --body "$TMPDIR/mp-b.bin" --upload-id "$MP_ID" --query ETag --output text)
+    cat > "$TMPDIR/mp-complete.json" <<EOF
+{
+  "Parts": [
+    {"ETag": $MP_E1, "PartNumber": 1},
+    {"ETag": $MP_E2, "PartNumber": 2}
+  ]
+}
+EOF
+    assert "robustness complete multipart" $ROBUST_AWS s3api complete-multipart-upload \
+        --bucket "$ROBUST_BUCKET" --key "multi.bin" --upload-id "$MP_ID" \
+        --multipart-upload "file://$TMPDIR/mp-complete.json"
+    MC_ROBUST="robust$$"
+    mc alias set "$MC_ROBUST" "$ROBUST_EP" "$MAXIO_TEST_ACCESS_KEY" "$MAXIO_TEST_SECRET_KEY" >/dev/null
+    echo "mc-restart" > "$TMPDIR/mc-restart.txt"
+    assert "robustness mc cp" mc cp "$TMPDIR/mc-restart.txt" "$MC_ROBUST/$ROBUST_BUCKET/mc-restart.txt"
+
+    stop_robust
+    start_robust
+    assert "robustness get after restart" $ROBUST_AWS s3 cp "s3://$ROBUST_BUCKET/restart.txt" "$TMPDIR/restart-down.txt"
+    assert_eq "robustness body after restart" "across-restart" "$(cat "$TMPDIR/restart-down.txt")"
+    assert "robustness multipart get after restart" $ROBUST_AWS s3 cp "s3://$ROBUST_BUCKET/multi.bin" "$TMPDIR/multi-down.bin"
+    assert_eq "robustness multipart size after restart" \
+        "$(($(wc -c < "$TMPDIR/mp-a.bin") + $(wc -c < "$TMPDIR/mp-b.bin")))" \
+        "$(wc -c < "$TMPDIR/multi-down.bin" | tr -d ' ')"
+    assert_eq "robustness mc body after restart" "mc-restart" \
+        "$(mc cat "$MC_ROBUST/$ROBUST_BUCKET/mc-restart.txt")"
+
+    stop_robust
+    echo partial > "$ROBUST_DATA/buckets/$ROBUST_BUCKET/.maxio-tmp-crash"
+    printf '%s\n' '{"key":"missing.txt","size":1,"etag":"\"x\"","content_type":"text/plain","last_modified":"2020-01-01T00:00:00.000Z"}' \
+        > "$ROBUST_DATA/buckets/$ROBUST_BUCKET/missing.txt.meta.json"
+    set +e
+    "$ROBUST_BIN" check --data-dir "$ROBUST_DATA" >"$TMPDIR/check-out.txt" 2>"$TMPDIR/check-err.txt"
+    CHECK_RC=$?
+    set -e
+    assert_eq "maxio check reports damage" "1" "$CHECK_RC"
+    assert_eq "maxio check mentions temp" "true" \
+        "$(grep -q 'stale-temp' "$TMPDIR/check-out.txt" && echo true || echo false)"
+    assert "maxio check --repair" "$ROBUST_BIN" check --data-dir "$ROBUST_DATA" --repair
+    assert "maxio check clean after repair" "$ROBUST_BIN" check --data-dir "$ROBUST_DATA"
+    assert_eq "repaired temp removed" "false" \
+        "$([ -f "$ROBUST_DATA/buckets/$ROBUST_BUCKET/.maxio-tmp-crash" ] && echo true || echo false)"
+
+    start_robust
+    assert "get still works after check --repair" $ROBUST_AWS s3 cp "s3://$ROBUST_BUCKET/restart.txt" "$TMPDIR/restart-down2.txt"
+    assert_eq "body intact after repair" "across-restart" "$(cat "$TMPDIR/restart-down2.txt")"
+    stop_robust
+    mc alias rm "$MC_ROBUST" >/dev/null 2>&1 || true
+    rm -rf "$ROBUST_DATA"
+
+    # A tiny object cap must fail a normal PUT with EntityTooLarge.
+    SUB_CREDS=(--access-key "$MAXIO_TEST_ACCESS_KEY" --secret-key "$MAXIO_TEST_SECRET_KEY")
+    if [ "$MAXIO_TEST_ACCESS_KEY" = "maxioadmin" ] && [ "$MAXIO_TEST_SECRET_KEY" = "maxioadmin" ]; then
+        SUB_CREDS+=(--allow-insecure-dev)
+    fi
+    LIMIT_DATA=$(mktemp -d)
+    LIMIT_PORT=$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1]); s.close()')
+    RUST_LOG=warn "$ROBUST_BIN" --data-dir "$LIMIT_DATA" --port "$LIMIT_PORT" \
+        --address 127.0.0.1 "${SUB_CREDS[@]}" --max-object-size 1024 \
+        >"$LIMIT_DATA/server.log" 2>&1 &
+    LIMIT_PID=$!
+    LIMIT_EP="http://127.0.0.1:$LIMIT_PORT"
+    for _ in $(seq 1 50); do
+        curl -sf "$LIMIT_EP/healthz" >/dev/null 2>&1 && break
+        sleep 0.1
+    done
+    dd if=/dev/zero of="$TMPDIR/too-big.bin" bs=1024 count=2 status=none
+    LIMIT_OUT=$(aws --endpoint-url "$LIMIT_EP" s3 cp "$TMPDIR/too-big.bin" s3://limit-bucket/too-big.bin 2>&1 || true)
+    # The bucket does not exist yet; create it, then the size check runs.
+    aws --endpoint-url "$LIMIT_EP" s3 mb s3://limit-bucket >/dev/null
+    LIMIT_OUT=$(aws --endpoint-url "$LIMIT_EP" s3 cp "$TMPDIR/too-big.bin" s3://limit-bucket/too-big.bin 2>&1 || true)
+    assert_eq "put over max object size is EntityTooLarge" "true" \
+        "$(printf '%s' "$LIMIT_OUT" | grep -q EntityTooLarge && echo true || echo false)"
+    echo "ok" > "$TMPDIR/small-ok.txt"
+    assert "put under max object size" aws --endpoint-url "$LIMIT_EP" s3 cp "$TMPDIR/small-ok.txt" s3://limit-bucket/small-ok.txt
+    assert "iam limit create-user" aws --endpoint-url "$LIMIT_EP" iam create-user --user-name limituser
+    cat > "$TMPDIR/limit-iam.json" <<'EOF'
+{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["s3:PutObject","s3:GetObject"],"Resource":"arn:aws:s3:::limit-bucket/*"}]}
+EOF
+    assert "iam limit put-user-policy" aws --endpoint-url "$LIMIT_EP" iam put-user-policy \
+        --user-name limituser --policy-name write --policy-document "file://$TMPDIR/limit-iam.json"
+    LIMIT_KEY_JSON=$(aws --endpoint-url "$LIMIT_EP" iam create-access-key --user-name limituser --output json)
+    LIMIT_IAM_KEY=$(printf '%s' "$LIMIT_KEY_JSON" | python3 -c 'import json,sys; print(json.load(sys.stdin)["AccessKey"]["AccessKeyId"])')
+    LIMIT_IAM_SECRET=$(printf '%s' "$LIMIT_KEY_JSON" | python3 -c 'import json,sys; print(json.load(sys.stdin)["AccessKey"]["SecretAccessKey"])')
+    LIMIT_IAM_OUT=$(AWS_ACCESS_KEY_ID="$LIMIT_IAM_KEY" AWS_SECRET_ACCESS_KEY="$LIMIT_IAM_SECRET" \
+        aws --endpoint-url "$LIMIT_EP" s3 cp "$TMPDIR/too-big.bin" s3://limit-bucket/iam-big.bin 2>&1 || true)
+    assert_eq "iam user put over max object size is EntityTooLarge" "true" \
+        "$(printf '%s' "$LIMIT_IAM_OUT" | grep -q EntityTooLarge && echo true || echo false)"
+    kill -TERM "$LIMIT_PID" 2>/dev/null || true
+    wait "$LIMIT_PID" 2>/dev/null || true
+    rm -rf "$LIMIT_DATA"
+
+    # Parts are capped by --max-part-size, not --max-object-size. A 5 MiB part
+    # must succeed when the single-PUT cap is 1 MiB and the part cap is 6 MiB.
+    PART_DATA=$(mktemp -d)
+    PART_PORT=$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1]); s.close()')
+    RUST_LOG=warn "$ROBUST_BIN" --data-dir "$PART_DATA" --port "$PART_PORT" \
+        --address 127.0.0.1 "${SUB_CREDS[@]}" \
+        --max-object-size $((1024 * 1024)) --max-part-size $((6 * 1024 * 1024)) \
+        >"$PART_DATA/server.log" 2>&1 &
+    PART_PID=$!
+    PART_EP="http://127.0.0.1:$PART_PORT"
+    PART_AWS="aws --endpoint-url $PART_EP"
+    for _ in $(seq 1 50); do
+        curl -sf "$PART_EP/healthz" >/dev/null 2>&1 && break
+        sleep 0.1
+    done
+    assert "part-limit create bucket" $PART_AWS s3 mb s3://part-limit
+    dd if=/dev/zero of="$TMPDIR/over-object.bin" bs=1024 count=2048 status=none
+    PART_PUT=$($PART_AWS s3 cp "$TMPDIR/over-object.bin" s3://part-limit/single.bin 2>&1 || true)
+    assert_eq "single PUT over max-object-size is EntityTooLarge" "true" \
+        "$(printf '%s' "$PART_PUT" | grep -q EntityTooLarge && echo true || echo false)"
+    dd if=/dev/zero of="$TMPDIR/part5.bin" bs=1024 count=5120 status=none
+    dd if=/dev/zero of="$TMPDIR/part2.bin" bs=1024 count=2048 status=none
+    PART_UPLOAD=$($PART_AWS s3api create-multipart-upload --bucket part-limit --key multi.bin --query UploadId --output text)
+    PART_E1=$($PART_AWS s3api upload-part --bucket part-limit --key multi.bin --part-number 1 --body "$TMPDIR/part5.bin" --upload-id "$PART_UPLOAD" --query ETag --output text)
+    PART_E2=$($PART_AWS s3api upload-part --bucket part-limit --key multi.bin --part-number 2 --body "$TMPDIR/part2.bin" --upload-id "$PART_UPLOAD" --query ETag --output text)
+    assert_eq "5MiB part accepted under 6MiB part cap" "true" \
+        "$([ -n "$PART_E1" ] && [ "$PART_E1" != "None" ] && echo true || echo false)"
+    cat > "$TMPDIR/part-limit-complete.json" <<EOF
+{
+  "Parts": [
+    {"ETag": $PART_E1, "PartNumber": 1},
+    {"ETag": $PART_E2, "PartNumber": 2}
+  ]
+}
+EOF
+    assert "complete multipart above max-object-size" $PART_AWS s3api complete-multipart-upload \
+        --bucket part-limit --key multi.bin --upload-id "$PART_UPLOAD" \
+        --multipart-upload "file://$TMPDIR/part-limit-complete.json"
+    assert "download multipart above max-object-size" $PART_AWS s3 cp s3://part-limit/multi.bin "$TMPDIR/part-limit-down.bin"
+    assert_eq "multipart above max-object-size size" \
+        "$(($(wc -c < "$TMPDIR/part5.bin") + $(wc -c < "$TMPDIR/part2.bin")))" \
+        "$(wc -c < "$TMPDIR/part-limit-down.bin" | tr -d ' ')"
+    kill -TERM "$PART_PID" 2>/dev/null || true
+    wait "$PART_PID" 2>/dev/null || true
+    rm -rf "$PART_DATA"
+fi
+
+# --- SSE-S3 master key safety ---
+# Own data dir and process so a missing key can fail startup. The caller-owned
+# server above is left running.
+echo ""
+echo "--- SSE-S3 master key safety ---"
+
+# This section creates and deletes its own on-disk keyring. An ambient
+# external key (the caller-owned server's MAXIO_MASTER_KEY) would skip that
+# file and make the missing-key cases pass for the wrong reason.
+unset MAXIO_MASTER_KEY MAXIO_MASTER_KEY_FILE
+
+if [ -z "${MAXIO_BIN:-}" ] || [ ! -x "${MAXIO_BIN}" ]; then
+    red "SKIP: SSE-S3 key safety tests (maxio binary not found)"
+elif ! command -v mc >/dev/null 2>&1; then
+    red "FAIL: mc is required for SSE-S3 key safety tests"
+    FAIL=$((FAIL + 1))
+else
+    KEY_DATA=$(mktemp -d)
+    KEY_LOG="$KEY_DATA/server.log"
+    KEY_PID=""
+    KEY_PORT=$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1]); s.close()')
+    KEY_ENDPOINT="http://127.0.0.1:$KEY_PORT"
+    KEY_AWS=(aws --endpoint-url "$KEY_ENDPOINT")
+    KEY_MC_ALIAS="maxio-key-$$"
+    KEY_BUCKET="keysafety-$$"
+    # Outside the data directory. The server must not copy this into KEY_DATA.
+    KEY_EXT=$(mktemp)
+
+    start_key_server() {
+        : >"$KEY_LOG"
+        local -a cred_args=(
+            --access-key "$MAXIO_TEST_ACCESS_KEY"
+            --secret-key "$MAXIO_TEST_SECRET_KEY"
+        )
+        if [ "$MAXIO_TEST_ACCESS_KEY" = "maxioadmin" ] && [ "$MAXIO_TEST_SECRET_KEY" = "maxioadmin" ]; then
+            cred_args+=(--allow-insecure-dev)
+        fi
+        "$MAXIO_BIN" --data-dir "$KEY_DATA" --port "$KEY_PORT" --address 127.0.0.1 \
+            "${cred_args[@]}" "$@" >"$KEY_LOG" 2>&1 &
+        KEY_PID=$!
+        local attempt
+        for attempt in $(seq 1 50); do
+            if curl -sf "$KEY_ENDPOINT/healthz" >/dev/null 2>&1; then
+                return 0
+            fi
+            if ! kill -0 "$KEY_PID" 2>/dev/null; then
+                return 1
+            fi
+            sleep 0.1
+        done
+        return 1
+    }
+
+    stop_key_server() {
+        if [ -n "${KEY_PID:-}" ] && kill -0 "$KEY_PID" 2>/dev/null; then
+            kill "$KEY_PID" 2>/dev/null || true
+            wait "$KEY_PID" 2>/dev/null || true
+        fi
+        KEY_PID=""
+    }
+
+    KEY_READY=0
+    if start_key_server; then
+        green "PASS: key-safety server started"
+        PASS=$((PASS + 1))
+        KEY_READY=1
+    else
+        red "FAIL: key-safety server did not start"
+        red "----- server log -----"
+        cat "$KEY_LOG" >&2 || true
+        FAIL=$((FAIL + 1))
+        stop_key_server
+    fi
+
+    if [ "$KEY_READY" -eq 1 ]; then
+    echo "key-safety" > "$TMPDIR/key-safety.txt"
+    "${KEY_AWS[@]}" s3 mb "s3://$KEY_BUCKET" >/dev/null
+    PUT_OUT=$("${KEY_AWS[@]}" s3api put-object --bucket "$KEY_BUCKET" --key secret.txt \
+        --body "$TMPDIR/key-safety.txt" --server-side-encryption AES256)
+    assert_eq "aws SSE-S3 put echoes AES256" "AES256" \
+        "$(echo "$PUT_OUT" | grep -o '"ServerSideEncryption": "[^"]*"' | cut -d'"' -f4)"
+    "${KEY_AWS[@]}" s3api get-object --bucket "$KEY_BUCKET" --key secret.txt \
+        "$TMPDIR/key-safety-get.txt" >/dev/null
+    assert_eq "aws SSE-S3 get round-trip" "key-safety" "$(cat "$TMPDIR/key-safety-get.txt")"
+
+    mc alias set "$KEY_MC_ALIAS" "$KEY_ENDPOINT" "$AWS_ACCESS_KEY_ID" "$AWS_SECRET_ACCESS_KEY" >/dev/null
+    echo "from-mc" > "$TMPDIR/mc-sse.txt"
+    if mc cp --help 2>&1 | grep -q -- '--enc-s3'; then
+        # --enc-s3 takes alias/prefix, not a boolean. SSE-S3 reads do not need it.
+        mc cp --enc-s3 "$KEY_MC_ALIAS/$KEY_BUCKET" \
+            "$TMPDIR/mc-sse.txt" "$KEY_MC_ALIAS/$KEY_BUCKET/mc-sse.txt" >/dev/null
+    elif mc cp --help 2>&1 | grep -q -- '--encrypt'; then
+        mc cp --encrypt SSE-S3 "$TMPDIR/mc-sse.txt" "$KEY_MC_ALIAS/$KEY_BUCKET/mc-sse.txt" >/dev/null
+    else
+        # Bucket-default SSE-S3, then a normal copy.
+        mc encrypt set sse-s3 "$KEY_MC_ALIAS/$KEY_BUCKET" >/dev/null
+        mc cp "$TMPDIR/mc-sse.txt" "$KEY_MC_ALIAS/$KEY_BUCKET/mc-sse.txt" >/dev/null
+    fi
+    MC_BODY=$(mc cat "$KEY_MC_ALIAS/$KEY_BUCKET/mc-sse.txt")
+    assert_eq "mc SSE-S3 get round-trip" "from-mc" "$MC_BODY"
+    if grep -q '"mode": "sse_s3"' "$KEY_DATA/buckets/$KEY_BUCKET/mc-sse.txt.meta.json"; then
+        green "PASS: mc upload stored sse_s3 metadata"
+        PASS=$((PASS + 1))
+    else
+        red "FAIL: mc upload metadata is not sse_s3"
+        FAIL=$((FAIL + 1))
+    fi
+
+    # Restart with the key file still present.
+    stop_key_server
+    if start_key_server; then
+        green "PASS: restart with key file present"
+        PASS=$((PASS + 1))
+    else
+        red "FAIL: restart with key file present"
+        cat "$KEY_LOG" >&2 || true
+        FAIL=$((FAIL + 1))
+    fi
+    "${KEY_AWS[@]}" s3api get-object --bucket "$KEY_BUCKET" --key secret.txt \
+        "$TMPDIR/key-safety-restart.txt" >/dev/null
+    assert_eq "aws get after restart with key" "key-safety" "$(cat "$TMPDIR/key-safety-restart.txt")"
+    assert_eq "mc cat after restart with key" "from-mc" "$(mc cat "$KEY_MC_ALIAS/$KEY_BUCKET/mc-sse.txt")"
+
+    # Loose permissions warn, but the server still starts.
+    chmod 644 "$KEY_DATA/.maxio-keys.json"
+    stop_key_server
+    if start_key_server; then
+        green "PASS: restart with group-readable key file"
+        PASS=$((PASS + 1))
+    else
+        red "FAIL: restart with group-readable key file"
+        FAIL=$((FAIL + 1))
+    fi
+    if grep -q "expected 0600" "$KEY_LOG"; then
+        green "PASS: loose key file permissions are warned"
+        PASS=$((PASS + 1))
+    else
+        red "FAIL: expected a permissions warning in the server log"
+        FAIL=$((FAIL + 1))
+    fi
+    chmod 600 "$KEY_DATA/.maxio-keys.json"
+
+    # External key, kept outside the data dir. Extract the active key the
+    # server just generated — it is not a committed secret.
+    python3 - "$KEY_DATA/.maxio-keys.json" "$KEY_EXT" <<'PY'
+import json, sys
+doc = json.load(open(sys.argv[1]))
+active = next(k["key_b64"] for k in doc["keys"] if k.get("active"))
+open(sys.argv[2], "w").write(active + "\n")
+PY
+    chmod 600 "$KEY_EXT"
+    if grep -F -q "$(tr -d '\n' < "$KEY_EXT")" "$KEY_DATA/.maxio-key-check.json"; then
+        red "FAIL: key check file contains key material"
+        FAIL=$((FAIL + 1))
+    else
+        green "PASS: key check file does not contain the master key"
+        PASS=$((PASS + 1))
+    fi
+
+    SAVED_KEYRING=$(mktemp)
+    cp "$KEY_DATA/.maxio-keys.json" "$SAVED_KEYRING"
+    stop_key_server
+    rm -f "$KEY_DATA/.maxio-keys.json"
+
+    START_MISSING=0
+    start_key_server || START_MISSING=$?
+    if [ "$START_MISSING" -ne 0 ]; then
+        green "PASS: restart with key file missing refuses to start"
+        PASS=$((PASS + 1))
+    else
+        red "FAIL: restart with key file missing started"
+        FAIL=$((FAIL + 1))
+        stop_key_server
+    fi
+    if grep -q "Refusing to generate a new master key" "$KEY_LOG"; then
+        green "PASS: missing-key error names the refusal"
+        PASS=$((PASS + 1))
+    else
+        red "FAIL: missing-key log did not refuse to generate a key"
+        cat "$KEY_LOG" >&2 || true
+        FAIL=$((FAIL + 1))
+    fi
+    assert_file_not_exists "missing key did not write a replacement keyring" \
+        "$KEY_DATA/.maxio-keys.json"
+
+    WRONG_KEY=$(mktemp)
+    openssl rand -base64 32 > "$WRONG_KEY"
+    chmod 600 "$WRONG_KEY"
+    START_WRONG=0
+    start_key_server --master-key-file "$WRONG_KEY" || START_WRONG=$?
+    if [ "$START_WRONG" -ne 0 ]; then
+        green "PASS: wrong external master key refuses to start"
+        PASS=$((PASS + 1))
+        if grep -Eq "not in the loaded keyring|does not match the check value|master key mismatch" "$KEY_LOG"; then
+            green "PASS: wrong-key error names the mismatch"
+            PASS=$((PASS + 1))
+        else
+            red "FAIL: wrong-key log did not describe the mismatch"
+            cat "$KEY_LOG" >&2 || true
+            FAIL=$((FAIL + 1))
+        fi
+    else
+        red "FAIL: wrong external master key started"
+        FAIL=$((FAIL + 1))
+        stop_key_server
+    fi
+    rm -f "$WRONG_KEY"
+    assert_file_not_exists "wrong external key was not copied into the data dir" \
+        "$KEY_DATA/.maxio-keys.json"
+
+    if start_key_server --master-key-file "$KEY_EXT"; then
+        green "PASS: restart with external master key file"
+        PASS=$((PASS + 1))
+    else
+        red "FAIL: restart with external master key file"
+        cat "$KEY_LOG" >&2 || true
+        FAIL=$((FAIL + 1))
+    fi
+    assert_file_not_exists "external key was not copied into the data dir" \
+        "$KEY_DATA/.maxio-keys.json"
+    "${KEY_AWS[@]}" s3api get-object --bucket "$KEY_BUCKET" --key secret.txt \
+        "$TMPDIR/key-safety-ext.txt" >/dev/null
+    assert_eq "aws get with external master key" "key-safety" "$(cat "$TMPDIR/key-safety-ext.txt")"
+    assert_eq "mc cat with external master key" "from-mc" "$(mc cat "$KEY_MC_ALIAS/$KEY_BUCKET/mc-sse.txt")"
+
+    # Restoring the on-disk keyring also works, with no external key.
+    stop_key_server
+    cp "$SAVED_KEYRING" "$KEY_DATA/.maxio-keys.json"
+    chmod 600 "$KEY_DATA/.maxio-keys.json"
+    rm -f "$SAVED_KEYRING"
+    if start_key_server; then
+        green "PASS: restart after restoring the keyring file"
+        PASS=$((PASS + 1))
+    else
+        red "FAIL: restart after restoring the keyring file"
+        cat "$KEY_LOG" >&2 || true
+        FAIL=$((FAIL + 1))
+    fi
+    "${KEY_AWS[@]}" s3api get-object --bucket "$KEY_BUCKET" --key secret.txt \
+        "$TMPDIR/key-safety-restored.txt" >/dev/null
+    assert_eq "aws get after keyring restore" "key-safety" "$(cat "$TMPDIR/key-safety-restored.txt")"
+
+    stop_key_server
+    rm -f "$KEY_EXT"
+    mc alias rm "$KEY_MC_ALIAS" >/dev/null 2>&1 || true
+    KEY_MC_ALIAS=""
+    rm -rf "$KEY_DATA"
+    KEY_DATA=""
+    fi
+    rm -f "$KEY_EXT"
+fi
+
+# --- Virtual-hosted-style (aws addressing_style=virtual, mc --path off) ---
+# Requires the server to be started with --domain localhost. Bucket hosts are
+# pinned in /etc/hosts because *.localhost does not resolve on every OS.
+echo ""
+echo "--- Virtual-hosted-style (aws + mc) ---"
+VHOST_PROBE=$(curl -sS -o /dev/null -w '%{http_code}' \
+    -H "Host: hprobe.localhost:${PORT}" "http://127.0.0.1:${PORT}/healthz" || echo "000")
+if [ "$VHOST_PROBE" != "403" ]; then
+    red "FAIL: virtual-hosted-style is off (GET /healthz with Host hprobe.localhost returned ${VHOST_PROBE}, expected 403). Start maxio with --domain localhost."
+    FAIL=$((FAIL + 1))
+else
+    green "PASS: virtual-hosted-style enabled"
+    PASS=$((PASS + 1))
+
+    VBUCKET="vhost-${PORT}-$$"
+    VDOT="dot.vhost-${PORT}-$$"
+    pin_vhost "${VBUCKET}.localhost"
+    pin_vhost "${VDOT}.localhost"
+
+    AWS_VCONF="$TMPDIR/aws-virtual.config"
+    cat > "$AWS_VCONF" <<'EOF'
+[default]
+region = us-east-1
+s3 =
+    addressing_style = virtual
+EOF
+    VAWS=(aws --endpoint-url "http://localhost:${PORT}")
+    vaws() {
+        AWS_CONFIG_FILE="$AWS_VCONF" "${VAWS[@]}" "$@"
+    }
+
+    assert "virtual create bucket" vaws s3 mb "s3://${VBUCKET}"
+    assert "virtual head bucket" vaws s3api head-bucket --bucket "$VBUCKET"
+    echo "virtual-body" > "$TMPDIR/vhost.txt"
+    assert "virtual put object" vaws s3 cp "$TMPDIR/vhost.txt" "s3://${VBUCKET}/folder/obj.txt"
+    assert "virtual get object" vaws s3 cp "s3://${VBUCKET}/folder/obj.txt" "$TMPDIR/vhost-down.txt"
+    assert_eq "virtual object body" "virtual-body" "$(cat "$TMPDIR/vhost-down.txt")"
+    VLIST=$(vaws s3api list-objects-v2 --bucket "$VBUCKET" --prefix folder/ 2>&1)
+    assert_eq "virtual list-objects-v2" "true" "$(echo "$VLIST" | grep -q 'folder/obj.txt' && echo true || echo false)"
+
+    assert "virtual copy-object" vaws s3api copy-object --bucket "$VBUCKET" --key copy.txt \
+        --copy-source "${VBUCKET}/folder/obj.txt"
+    assert "virtual download copy" vaws s3 cp "s3://${VBUCKET}/copy.txt" "$TMPDIR/vhost-copy.txt"
+    assert_eq "virtual copy body" "virtual-body" "$(cat "$TMPDIR/vhost-copy.txt")"
+
+    echo "part-a" > "$TMPDIR/vpart.txt"
+    VUPLOAD=$(vaws s3api create-multipart-upload --bucket "$VBUCKET" --key multi.bin --query UploadId --output text)
+    assert_eq "virtual create multipart" "true" "$([ -n "$VUPLOAD" ] && [ "$VUPLOAD" != "None" ] && echo true || echo false)"
+    VETAG=$(vaws s3api upload-part --bucket "$VBUCKET" --key multi.bin --part-number 1 \
+        --upload-id "$VUPLOAD" --body "$TMPDIR/vpart.txt" --query ETag --output text)
+    assert_eq "virtual upload part" "true" "$([ -n "$VETAG" ] && [ "$VETAG" != "None" ] && echo true || echo false)"
+    cat > "$TMPDIR/vcomplete.json" <<EOF
+{"Parts":[{"ETag":${VETAG},"PartNumber":1}]}
+EOF
+    assert "virtual complete multipart" vaws s3api complete-multipart-upload --bucket "$VBUCKET" \
+        --key multi.bin --upload-id "$VUPLOAD" --multipart-upload "file://$TMPDIR/vcomplete.json"
+    assert "virtual download multipart" vaws s3 cp "s3://${VBUCKET}/multi.bin" "$TMPDIR/vmulti.txt"
+    assert_eq "virtual multipart body" "part-a" "$(cat "$TMPDIR/vmulti.txt")"
+
+    cat > "$TMPDIR/vtagging.json" <<'EOF'
+{"TagSet":[{"Key":"env","Value":"prod"}]}
+EOF
+    assert "virtual put-bucket-tagging" vaws s3api put-bucket-tagging --bucket "$VBUCKET" \
+        --tagging "file://$TMPDIR/vtagging.json"
+    VTAGS=$(vaws s3api get-bucket-tagging --bucket "$VBUCKET" 2>&1)
+    assert_eq "virtual get-bucket-tagging" "true" "$(echo "$VTAGS" | grep -q '"Value": "prod"' && echo true || echo false)"
+
+    cat > "$TMPDIR/vlifecycle.json" <<'EOF'
+{
+  "Rules": [
+    {
+      "ID": "logs",
+      "Filter": {"Prefix": "logs/"},
+      "Status": "Enabled",
+      "Expiration": {"Days": 30}
+    }
+  ]
+}
+EOF
+    assert "virtual put-bucket-lifecycle" vaws s3api put-bucket-lifecycle-configuration \
+        --bucket "$VBUCKET" --lifecycle-configuration "file://$TMPDIR/vlifecycle.json"
+    VLC=$(vaws s3api get-bucket-lifecycle-configuration --bucket "$VBUCKET" 2>&1)
+    assert_eq "virtual lifecycle days" "30" "$(echo "$VLC" | python3 -c 'import json,sys; print(json.load(sys.stdin)["Rules"][0]["Expiration"]["Days"])')"
+
+    cat > "$TMPDIR/vpolicy.json" <<EOF
+{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::${VBUCKET}/*"}]}
+EOF
+    assert "virtual put-bucket-policy" vaws s3api put-bucket-policy --bucket "$VBUCKET" \
+        --policy "file://$TMPDIR/vpolicy.json"
+    VPOLICY=$(vaws s3api get-bucket-policy --bucket "$VBUCKET" --query Policy --output text 2>&1)
+    assert_eq "virtual get-bucket-policy" "true" "$(echo "$VPOLICY" | grep -q 's3:GetObject' && echo true || echo false)"
+
+    VPRESIGN=$(vaws s3 presign "s3://${VBUCKET}/folder/obj.txt" --expires-in 300)
+    assert_eq "virtual presign host" "true" "$(echo "$VPRESIGN" | grep -q "://${VBUCKET}.localhost:" && echo true || echo false)"
+    (unset AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY; curl -fsS "$VPRESIGN" -o "$TMPDIR/vpresign.txt")
+    assert_eq "virtual presigned GET" "virtual-body" "$(cat "$TMPDIR/vpresign.txt")"
+
+    # AWS CLI and mc keep dotted bucket names on path-style even with virtual
+    # addressing selected (a one-label wildcard cert cannot cover them). MaxIO
+    # still has to accept that path-style request, and the Rust tests cover
+    # the virtual host my.bucket.localhost directly.
+    assert "dotted bucket create with virtual addressing enabled" vaws s3 mb "s3://${VDOT}"
+    echo "dotted" > "$TMPDIR/vdot.txt"
+    assert "dotted bucket put with virtual addressing enabled" vaws s3 cp "$TMPDIR/vdot.txt" "s3://${VDOT}/a.txt"
+    assert "dotted bucket get with virtual addressing enabled" vaws s3 cp "s3://${VDOT}/a.txt" "$TMPDIR/vdot-down.txt"
+    assert_eq "dotted bucket body" "dotted" "$(cat "$TMPDIR/vdot-down.txt")"
+
+    # Path-style against the same server still addresses the bucket.
+    assert "path-style read of virtual object" $AWS s3 cp "s3://${VBUCKET}/folder/obj.txt" "$TMPDIR/vpath.txt"
+    assert_eq "path-style body matches virtual put" "virtual-body" "$(cat "$TMPDIR/vpath.txt")"
+
+    MC_VHOST="maxiov$$"
+    assert "mc virtual alias" mc alias set "$MC_VHOST" "$ENDPOINT" "$MAXIO_TEST_ACCESS_KEY" "$MAXIO_TEST_SECRET_KEY" \
+        --api S3v4 --path off
+    echo "from-mc" > "$TMPDIR/vmc.txt"
+    assert "mc virtual cp" mc cp "$TMPDIR/vmc.txt" "${MC_VHOST}/${VBUCKET}/mc.txt"
+    MC_BODY=$(mc cat "${MC_VHOST}/${VBUCKET}/mc.txt" 2>/dev/null || true)
+    assert_eq "mc virtual cat" "from-mc" "$MC_BODY"
+    assert "mc virtual rm" mc rm "${MC_VHOST}/${VBUCKET}/mc.txt"
+    mc alias rm "$MC_VHOST" > /dev/null 2>&1 || true
+
+    # IAM user can read and write the bucket. The access key is narrowed to read
+    # photos/, so a virtual-hosted PUT is denied and a presigned GET still works.
+    VIAM_BUCKET="viam-${PORT}-$$"
+    VIAM_USER="viam$$"
+    pin_vhost "${VIAM_BUCKET}.localhost"
+    echo "viam-body" > "$TMPDIR/viam.txt"
+    assert "viam create bucket" $AWS s3 mb "s3://$VIAM_BUCKET"
+    assert "viam seed object" $AWS s3 cp "$TMPDIR/viam.txt" "s3://$VIAM_BUCKET/photos/a.txt"
+    assert "viam create-user" $AWS iam create-user --user-name "$VIAM_USER"
+    cat > "$TMPDIR/viam-user.json" <<EOF
+{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["s3:GetObject","s3:PutObject","s3:DeleteObject","s3:ListBucket","s3:GetBucketLocation"],"Resource":["arn:aws:s3:::$VIAM_BUCKET","arn:aws:s3:::$VIAM_BUCKET/*"]}]}
+EOF
+    assert "viam put-user-policy" $AWS iam put-user-policy --user-name "$VIAM_USER" \
+        --policy-name broad --policy-document "file://$TMPDIR/viam-user.json"
+    curl -sS -c "$TMPDIR/viam.cookies" -H 'content-type: application/json' \
+        -d "{\"accessKey\":\"$MAXIO_TEST_ACCESS_KEY\",\"secretKey\":\"$MAXIO_TEST_SECRET_KEY\"}" \
+        "$ENDPOINT/api/auth/login" > /dev/null
+    VIAM_STATUS=$(curl -sS -o "$TMPDIR/viam-key.json" -w '%{http_code}' -b "$TMPDIR/viam.cookies" \
+        -H 'content-type: application/json' \
+        -d "{\"buckets\":[\"$VIAM_BUCKET\"],\"prefix\":\"photos/\",\"access\":\"read\"}" \
+        "$ENDPOINT/api/iam/users/$VIAM_USER/keys")
+    assert_eq "viam create narrowed key" "200" "$VIAM_STATUS"
+    VIAM_KEY=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["accessKeyId"])' "$TMPDIR/viam-key.json")
+    VIAM_SECRET=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["secretAccessKey"])' "$TMPDIR/viam-key.json")
+    viamaws() {
+        AWS_CONFIG_FILE="$AWS_VCONF" AWS_ACCESS_KEY_ID="$VIAM_KEY" AWS_SECRET_ACCESS_KEY="$VIAM_SECRET" \
+            aws --endpoint-url "http://localhost:${PORT}" "$@"
+    }
+    assert "viam virtual get" viamaws s3 cp "s3://$VIAM_BUCKET/photos/a.txt" "$TMPDIR/viam-down.txt"
+    assert_eq "viam virtual body" "viam-body" "$(cat "$TMPDIR/viam-down.txt")"
+    assert_fail "viam virtual put denied" viamaws s3 cp "$TMPDIR/viam.txt" "s3://$VIAM_BUCKET/photos/b.txt"
+    VIAM_PRESIGN=$(viamaws s3 presign "s3://$VIAM_BUCKET/photos/a.txt" --expires-in 300)
+    assert_eq "viam presign host" "true" \
+        "$(printf '%s' "$VIAM_PRESIGN" | grep -q "://${VIAM_BUCKET}.localhost:" && echo true || echo false)"
+    (unset AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY; curl -fsS "$VIAM_PRESIGN" -o "$TMPDIR/viam-presign.txt")
+    assert_eq "viam presigned GET" "viam-body" "$(cat "$TMPDIR/viam-presign.txt")"
+    MC_VIAM="viam$$"
+    assert "mc viam alias" mc alias set "$MC_VIAM" "$ENDPOINT" "$VIAM_KEY" "$VIAM_SECRET" --api S3v4 --path off
+    assert_eq "mc viam cat" "viam-body" "$(mc cat "$MC_VIAM/$VIAM_BUCKET/photos/a.txt" 2>/dev/null || true)"
+    assert_fail "mc viam put denied" mc cp "$TMPDIR/viam.txt" "$MC_VIAM/$VIAM_BUCKET/photos/from-mc.txt"
+    mc alias rm "$MC_VIAM" >/dev/null 2>&1 || true
+    VIAM_IDS=$($AWS iam list-access-keys --user-name "$VIAM_USER" --query 'AccessKeyMetadata[].AccessKeyId' --output text)
+    for VIAM_ID in $VIAM_IDS; do
+        $AWS iam delete-access-key --user-name "$VIAM_USER" --access-key-id "$VIAM_ID" >/dev/null
+    done
+    $AWS iam delete-user-policy --user-name "$VIAM_USER" --policy-name broad >/dev/null
+    assert "viam delete-user" $AWS iam delete-user --user-name "$VIAM_USER"
+    $AWS s3 rb "s3://$VIAM_BUCKET" --force >/dev/null 2>&1 || true
+
+    vaws s3 rm "s3://${VBUCKET}" --recursive > /dev/null 2>&1 || true
+    vaws s3 rm "s3://${VDOT}" --recursive > /dev/null 2>&1 || true
+    assert "virtual delete bucket" vaws s3api delete-bucket --bucket "$VBUCKET"
+    assert "virtual delete dotted bucket" vaws s3api delete-bucket --bucket "$VDOT"
+fi
 
 # --- Summary ---
 echo ""

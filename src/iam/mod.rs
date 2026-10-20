@@ -516,6 +516,7 @@ mod tests {
             parity_shards: 0,
             default_buckets: String::new(),
             max_console_body_bytes: 1024,
+            ..Config::default()
         }
     }
 

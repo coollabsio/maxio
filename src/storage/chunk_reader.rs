@@ -265,6 +265,28 @@ fn try_reconstruct_data_chunk(
     Ok(result)
 }
 
+/// Rebuild one data chunk from parity and publish it with fsync + rename.
+pub(crate) fn repair_chunk_file(
+    chunks_dir: &Path,
+    manifest: &ChunkManifest,
+    index: u32,
+) -> io::Result<()> {
+    let data = try_reconstruct_data_chunk(chunks_dir, manifest, index)?;
+    let final_path = chunks_dir.join(format!("{index:06}"));
+    let tmp = chunks_dir.join(format!(".maxio-tmp-repair-{index:06}"));
+    {
+        use std::io::Write;
+        let mut file = std::fs::File::create(&tmp)?;
+        file.write_all(&data)?;
+        file.sync_all()?;
+    }
+    std::fs::rename(&tmp, &final_path)?;
+    if let Some(parent) = final_path.parent() {
+        let _ = std::fs::File::open(parent).and_then(|dir| dir.sync_all());
+    }
+    Ok(())
+}
+
 impl AsyncRead for VerifiedChunkReader {
     fn poll_read(
         self: Pin<&mut Self>,

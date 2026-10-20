@@ -250,7 +250,13 @@ fn stores() -> &'static Mutex<HashMap<String, Arc<IamStore>>> {
 }
 
 pub async fn store_for(config: &Config) -> Result<Arc<IamStore>, IamError> {
-    IamStore::open(&config.data_dir, config.master_key.as_deref()).await
+    let resolved = crate::storage::keys::resolve_master_key(
+        config.master_key.as_deref(),
+        config.master_key_file.as_deref(),
+    )
+    .await
+    .map_err(|err| IamError::Internal(err.to_string()))?;
+    IamStore::open(&config.data_dir, resolved.as_deref()).await
 }
 
 /// Decrypt every sealed secret with `keyring`, or explain why startup must stop.
@@ -1467,5 +1473,37 @@ mod tests {
         );
         let again = rewrite_loose_prefix_policies(path, &keyring).await.unwrap();
         assert!(again.is_empty(), "{again:?}");
+    }
+
+    #[tokio::test]
+    async fn merged_keyring_still_decrypts_iam_secrets() {
+        let (dir, store) = fresh().await;
+        store.create_user("alice").await.unwrap();
+        let created = store.create_access_key("alice", None).await.unwrap();
+        let other = tempfile::tempdir().unwrap();
+        Keyring::load(other.path().to_str().unwrap(), None)
+            .await
+            .unwrap();
+        crate::storage::keys::merge_keyring(
+            dir.path().to_str().unwrap(),
+            &other.path().join(".maxio-keys.json"),
+        )
+        .await
+        .unwrap();
+        let loaded = Keyring::load(dir.path().to_str().unwrap(), None)
+            .await
+            .unwrap();
+        ensure_secrets_readable(dir.path().to_str().unwrap(), &loaded)
+            .await
+            .unwrap();
+        let memory = load_memory(&dir.path().join("iam.json"), &loaded)
+            .await
+            .unwrap();
+        let key = memory
+            .keys
+            .iter()
+            .find(|key| key.access_key_id == created.info.access_key_id)
+            .unwrap();
+        assert_eq!(key.secret, created.secret);
     }
 }

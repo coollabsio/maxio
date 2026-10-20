@@ -2,7 +2,7 @@ use axum::Json;
 use axum::Router;
 use axum::body::Body;
 use axum::extract::{Request, State};
-use axum::http::{HeaderValue, StatusCode, header};
+use axum::http::{HeaderValue, Method, StatusCode, header};
 use axum::middleware::from_fn_with_state;
 use axum::response::IntoResponse;
 use axum::routing::get;
@@ -81,8 +81,8 @@ impl Service<Request<Body>> for AppService {
 
     fn call(&mut self, mut request: Request<Body>) -> Self::Future {
         // `maxio.<domain>` is the reserved service host, not an S3 bucket.
-        if vhost::is_reserved_service_host(&request, &self.domains) {
-            let response = S3Error::invalid_bucket_name("maxio").into_response();
+        if let Some(bucket) = vhost::reserved_service_bucket(&request, &self.domains) {
+            let response = S3Error::invalid_bucket_name(&bucket).into_response();
             return Box::pin(std::future::ready(Ok(response)));
         }
         vhost::apply(&mut request, &self.domains);
@@ -135,20 +135,21 @@ pub fn build_router(state: AppState) -> AppService {
         ));
 
     let mut router = Router::new()
-        .nest("/api", console_router(state.clone()))
+        .nest("/maxio/api", console_router(state.clone()))
         .route("/readyz", get(readyz))
         // Service probes. Unauthenticated, and they do not carry the version.
         // Registered outside the S3 router so SigV4 never runs. `GET /healthz`
-        // and `GET /version` are ordinary bucket paths.
+        // and `GET /version` are ordinary bucket paths. The console API is
+        // only `/maxio/api/*`; `/api/*` is an ordinary bucket path.
         .route("/maxio/health/live", get(health_live))
         .route("/maxio/health/ready", get(health_ready))
         .route("/minio/health/live", get(live))
         .route("/minio/health/ready", get(readyz))
         .route("/minio/health/cluster", get(readyz))
-        .route("/ui", get(redirect_to_ui_root))
-        .route("/ui/", get(ui_handler))
-        .route("/ui/{*path}", get(ui_handler))
+        // `/ui` is not a static route. Browser GET/HEAD is the console; every
+        // other request, including bucket `ui`, falls through to S3.
         .merge(s3_routes)
+        .layer(axum::middleware::from_fn(console_ui_middleware))
         .layer(from_fn_with_state(max_header_bytes, limit_headers));
 
     if !request_timeout.is_zero() {
@@ -165,6 +166,62 @@ pub fn build_router(state: AppState) -> AppService {
         .with_state(state);
 
     AppService { router, domains }
+}
+
+/// Serve the console only for an unauthenticated browser GET/HEAD of `/ui`.
+///
+/// Signed, presigned, and virtual-hosted requests keep going to S3, so bucket
+/// `ui` works. An anonymous path-style GET/HEAD of `/ui` without an S3 query
+/// is the console, which is the remaining clash.
+async fn console_ui_middleware(
+    request: Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    if !is_browser_console_request(&request) {
+        return next.run(request).await;
+    }
+    let head = request.method() == Method::HEAD;
+    let uri = request.uri().clone();
+    let mut response = if uri.path() == "/ui" {
+        redirect_to_ui_root(uri).await.into_response()
+    } else {
+        ui_handler(uri).await
+    };
+    if head {
+        *response.body_mut() = Body::empty();
+    }
+    response
+}
+
+/// True for GET/HEAD `/ui` and `/ui/...` that are not S3.
+fn is_browser_console_request(request: &Request) -> bool {
+    let path = request.uri().path();
+    if path != "/ui" && !path.starts_with("/ui/") {
+        return false;
+    }
+    // Virtual-hosted `ui.<domain>` was rewritten onto this path.
+    if request
+        .extensions()
+        .get::<vhost::SignedRequestPath>()
+        .is_some()
+    {
+        return false;
+    }
+    if request.method() != Method::GET && request.method() != Method::HEAD {
+        return false;
+    }
+    if request.headers().contains_key(header::AUTHORIZATION) {
+        return false;
+    }
+    // Header names are lowercase. A SigV4 header is not a browser page load.
+    if request
+        .headers()
+        .keys()
+        .any(|name| name.as_str().starts_with("x-amz-"))
+    {
+        return false;
+    }
+    !crate::api::bucket::query_selects_s3(request.uri().query().unwrap_or(""))
 }
 
 /// `/ui` -> `/ui/` (keeps the query), so the console has one canonical base URL.
@@ -223,6 +280,75 @@ async fn request_id_middleware(
         }
     }
     response
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::vhost::SignedRequestPath;
+
+    fn request(method: &str, uri: &str) -> Request<Body> {
+        Request::builder()
+            .method(method)
+            .uri(uri)
+            .body(Body::empty())
+            .unwrap()
+    }
+
+    #[test]
+    fn browser_get_and_head_of_ui_are_the_console() {
+        assert!(is_browser_console_request(&request("GET", "/ui")));
+        assert!(is_browser_console_request(&request("HEAD", "/ui/")));
+        assert!(is_browser_console_request(&request(
+            "GET",
+            "/ui/buckets/photos?next=x"
+        )));
+        assert!(is_browser_console_request(&request(
+            "GET",
+            "/ui/assets/index-abc.js"
+        )));
+    }
+
+    #[test]
+    fn signed_presigned_and_s3_queries_are_not_the_console() {
+        let mut signed = request("GET", "/ui/note.txt");
+        signed.headers_mut().insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_static("AWS4-HMAC-SHA256 Credential=a"),
+        );
+        assert!(!is_browser_console_request(&signed));
+
+        let mut amz = request("GET", "/ui/note.txt");
+        amz.headers_mut().insert(
+            "x-amz-content-sha256",
+            HeaderValue::from_static("UNSIGNED-PAYLOAD"),
+        );
+        assert!(!is_browser_console_request(&amz));
+
+        assert!(!is_browser_console_request(&request(
+            "GET",
+            "/ui/note.txt?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Signature=ab"
+        )));
+        assert!(!is_browser_console_request(&request(
+            "GET",
+            "/ui?versioning"
+        )));
+        assert!(!is_browser_console_request(&request(
+            "GET",
+            "/ui/?list-type=2&prefix=photos"
+        )));
+        assert!(!is_browser_console_request(&request("PUT", "/ui/note.txt")));
+        assert!(!is_browser_console_request(&request(
+            "GET",
+            "/maxio/api/version"
+        )));
+
+        let mut virtual_host = request("GET", "/ui/note.txt");
+        virtual_host
+            .extensions_mut()
+            .insert(SignedRequestPath("/note.txt".to_string()));
+        assert!(!is_browser_console_request(&virtual_host));
+    }
 }
 
 async fn security_headers_middleware(

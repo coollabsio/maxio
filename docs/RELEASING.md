@@ -5,7 +5,7 @@ Versions are [semantic versions](https://semver.org/spec/v2.0.0.html). The numbe
 - `ui/package.json` (`version`)
 - `ui/src/version.ts` (`appVersion`)
 
-`just version-check` fails when they differ. `maxio --version` prints it. A signed-in console session can read `GET /api/version`, and the console badge uses that. Unauthenticated health checks are `GET /maxio/health/live` and `/maxio/health/ready`; they report status only.
+`just version-check` fails when they differ. `maxio --version` prints it. A signed-in console session can read `GET /maxio/api/version`, and the console badge uses that. Unauthenticated health checks are `GET /maxio/health/live` and `/maxio/health/ready`; they report status only.
 
 ## Changelog
 

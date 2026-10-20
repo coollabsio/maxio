@@ -391,7 +391,7 @@ pub enum ConsoleGate {
     Defer,
 }
 
-/// Authorize one console API route. `path` may be `/buckets/...` or `/api/buckets/...`.
+/// Authorize one console API route. `path` may be `/buckets/...` or `/maxio/api/buckets/...`.
 pub async fn authorize_console(
     state: &AppState,
     principal: &Principal,
@@ -402,8 +402,10 @@ pub async fn authorize_console(
     if principal.is_root() {
         return Ok(ConsoleGate::Allow);
     }
+    // Nesting strips `/maxio/api` before this runs. Callers that pass the
+    // public path are stripped here. There is no `/api` prefix.
     let path = path
-        .strip_prefix("/api")
+        .strip_prefix("/maxio/api")
         .unwrap_or(path)
         .trim_end_matches('/');
     let q = query_map(query);

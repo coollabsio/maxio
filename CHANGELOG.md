@@ -20,7 +20,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Format 2 is the key-and-prefix layout. A key that is also a prefix is stored at `<key>/.maxio.object`. A build that only understands format 1 refuses a version 2 directory instead of opening that path as a file. Format 3 and newer is refused by this binary
 - React web console with a generated OpenAPI client
 - Bucket lifecycle, bucket tags, anonymous read/list, and streaming trailer checksums
-- `GET /api/version` requires a console session and is what the console badge shows. Unauthenticated callers get 401. `GET` and `HEAD /maxio/health/live` and `/maxio/health/ready` are unauthenticated and report status only, never the version. The bucket name `maxio` is reserved. Buckets named `version` and `healthz` are ordinary buckets
+- The console API is `/maxio/api/*`, including `GET /maxio/api/version`. That route requires a console session and is what the console badge shows. Unauthenticated callers get 401. There is no `/api` alias. `GET` and `HEAD /maxio/health/live` and `/maxio/health/ready` are unauthenticated and report status only, never the version. The bucket names `maxio` and `ui` are reserved (`ui` is also shorter than an S3 bucket name, so it cannot be a working bucket). An existing `buckets/maxio` or `buckets/ui` directory refuses startup. Buckets named `api`, `version`, and `healthz` are ordinary buckets. An unauthenticated browser `GET` or `HEAD` of `/ui` without an S3 query is the console. The session cookie path is `/maxio`
 - Release binaries for Linux (static musl) and macOS, with SHA256 checksums, multi-arch container images, and changelog-backed GitHub Release notes
 
 ### Fixed

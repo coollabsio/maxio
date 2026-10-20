@@ -503,6 +503,15 @@ pub fn is_valid_bucket_name(name: &str) -> bool {
 
 /// Explains why `name` is not a valid S3 bucket name, or `None` when it is valid.
 pub fn bucket_name_error(name: &str) -> Option<&'static str> {
+    // Checked before the length rule so `ui` is reserved, not merely too short.
+    // The console lives at `/ui`, and S3 bucket names are at least 3 characters,
+    // so a working bucket with that name is not possible.
+    if name == "maxio" {
+        return Some("Bucket name maxio is reserved.");
+    }
+    if name == "ui" {
+        return Some("Bucket name ui is reserved.");
+    }
     if name.len() < 3 || name.len() > 63 {
         return Some("Bucket name must be 3-63 characters long.");
     }
@@ -523,10 +532,6 @@ pub fn bucket_name_error(name: &str) -> Option<&'static str> {
 
     if name.contains("..") || name.contains(".-") || name.contains("-.") {
         return Some("Bucket name must not contain two dots in a row or a dot next to a hyphen.");
-    }
-
-    if name == "maxio" {
-        return Some("Bucket name maxio is reserved.");
     }
 
     let parts: Vec<&str> = name.split('.').collect();
@@ -629,6 +634,7 @@ mod validation_tests {
             "a-.b",
             "192.168.0.1",
             "maxio",
+            "ui",
         ] {
             assert!(
                 validate_bucket_name(name).is_err(),
@@ -648,6 +654,8 @@ mod validation_tests {
         assert_eq!(bucket_name_error("prod-logs.2026"), None);
         for (name, expected) in [
             ("ab", "must be 3-63 characters long"),
+            ("maxio", "Bucket name maxio is reserved."),
+            ("ui", "Bucket name ui is reserved."),
             ("My-Bucket", "may only contain lowercase letters"),
             ("-bucket", "must start and end with a letter or number"),
             ("evil..bucket", "must not contain two dots in a row"),

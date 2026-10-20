@@ -15,7 +15,7 @@ export class ApiError extends Error {
   }
 }
 
-/** Dispatched on `window` when a request outside of `/api/auth/` is rejected with 401. */
+/** Dispatched on `window` when a request outside of `/maxio/api/auth/` is rejected with 401. */
 export const UNAUTHORIZED_EVENT = 'maxio:unauthorized'
 
 export function toApiError(payload: unknown, status: number): ApiError {
@@ -28,7 +28,7 @@ export function toApiError(payload: unknown, status: number): ApiError {
 
 // Routes whose trailing `{key}` is a `{*key}` wildcard on the server: the key keeps its `/` separators.
 const OBJECT_KEY_ROUTE =
-  /^(\/api\/buckets\/[^/]+\/(?:objects|upload|download|presign|object-info|object-tags|versions\/[^/]+\/(?:objects|download|restore))\/)(.+)$/
+  /^(\/maxio\/api\/buckets\/[^/]+\/(?:objects|upload|download|presign|object-info|object-tags|versions\/[^/]+\/(?:objects|download|restore))\/)(.+)$/
 
 /**
  * hey-api encodes path params with `encodeURIComponent`, which turns the `/` inside object keys into `%2F`.
@@ -74,7 +74,7 @@ export function configureApiClient(client: Client, options: ApiClientOptions = {
   client.interceptors.error.use((error, response, request) => {
     // Network failures have no response: keep the original error (callers show "Failed to connect").
     if (!response) return error
-    if (response.status === 401 && request && !new URL(request.url).pathname.startsWith('/api/auth/')) {
+    if (response.status === 401 && request && !new URL(request.url).pathname.startsWith('/maxio/api/auth/')) {
       options.onUnauthorized?.()
     }
     return toApiError(error, response.status)

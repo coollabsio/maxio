@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react'
 import { appVersion } from '@/version'
 
-/** Cargo version compiled into the console, replaced by `GET /api/version` when the server answers. */
+/** Cargo version compiled into the console, replaced by `GET /maxio/api/version` when the server answers. */
 export function useAppVersion(): string {
   const [version, setVersion] = useState(appVersion)
 
@@ -9,7 +9,7 @@ export function useAppVersion(): string {
     // Bun unit tests do not set Vite's DEV/PROD flags. Skip the probe there.
     if (!import.meta.env.DEV && !import.meta.env.PROD) return
     const controller = new AbortController()
-    fetch('/api/version', { signal: controller.signal, headers: { accept: 'application/json' } })
+    fetch('/maxio/api/version', { signal: controller.signal, headers: { accept: 'application/json' } })
       .then((response) => (response.ok ? response.json() : null))
       .then((body: { version?: unknown } | null) => {
         if (body && typeof body.version === 'string' && body.version.length > 0) {

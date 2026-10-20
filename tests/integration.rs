@@ -818,7 +818,7 @@ async fn test_healthz_is_public_and_returns_ok() {
 async fn test_version_endpoint_reports_package_version() {
     let (base_url, _tmp) = start_server().await;
     let denied = client()
-        .get(format!("{base_url}/api/version"))
+        .get(format!("{base_url}/maxio/api/version"))
         .send()
         .await
         .unwrap();
@@ -826,7 +826,7 @@ async fn test_version_endpoint_reports_package_version() {
     body_has_no_version(&denied.text().await.unwrap());
 
     let login = client()
-        .post(format!("{base_url}/api/auth/login"))
+        .post(format!("{base_url}/maxio/api/auth/login"))
         .json(&serde_json::json!({
             "accessKey": ACCESS_KEY,
             "secretKey": SECRET_KEY
@@ -835,12 +835,12 @@ async fn test_version_endpoint_reports_package_version() {
         .await
         .unwrap();
     assert_eq!(login.status(), 200, "root login");
-    let session = login
-        .headers()
-        .get("set-cookie")
-        .unwrap()
-        .to_str()
-        .unwrap()
+    let set_cookie = login.headers().get("set-cookie").unwrap().to_str().unwrap();
+    assert!(
+        set_cookie.contains("Path=/maxio"),
+        "session cookie is limited to the console API: {set_cookie}"
+    );
+    let session = set_cookie
         .strip_prefix("maxio_session=")
         .unwrap()
         .split(';')
@@ -848,7 +848,7 @@ async fn test_version_endpoint_reports_package_version() {
         .unwrap()
         .to_string();
     let resp = client()
-        .get(format!("{base_url}/api/version"))
+        .get(format!("{base_url}/maxio/api/version"))
         .header("cookie", format!("maxio_session={session}"))
         .send()
         .await
@@ -936,7 +936,7 @@ async fn probe_names_are_buckets_and_unsigned_healthz_stays_a_probe() {
     body_has_no_version(&live_body);
 
     let denied = client()
-        .get(format!("{base_url}/api/version"))
+        .get(format!("{base_url}/maxio/api/version"))
         .send()
         .await
         .unwrap();
@@ -954,7 +954,23 @@ async fn probe_names_are_buckets_and_unsigned_healthz_stays_a_probe() {
     assert_ne!(old_status, 200, "{old_body}");
     body_has_no_version(&old_body);
 
-    for bucket in ["version", "healthz"] {
+    let old_api = client()
+        .get(format!("{base_url}/api/version"))
+        .send()
+        .await
+        .unwrap();
+    let old_api_status = old_api.status();
+    let old_api_body = old_api.text().await.unwrap();
+    assert_ne!(
+        old_api_status, 401,
+        "old /api/version must not be the console: {old_api_body}"
+    );
+    assert!(
+        !old_api_body.contains("Not authenticated"),
+        "{old_api_body}"
+    );
+
+    for bucket in ["version", "healthz", "api"] {
         let root = format!("{base_url}/{bucket}");
         let created = signed("PUT", &root, b"").await;
         assert_eq!(
@@ -1001,6 +1017,55 @@ async fn probe_names_are_buckets_and_unsigned_healthz_stays_a_probe() {
         let removed = signed("DELETE", &root, b"").await;
         assert_eq!(removed.status(), 204, "{bucket} delete bucket");
     }
+}
+
+/// `ui` is not a bucket: the name is shorter than S3 allows and it is the console path.
+/// Browser GET/HEAD of `/ui` is the console. A signed or query-selected request is S3.
+#[tokio::test]
+async fn bucket_ui_is_reserved_and_browser_get_is_the_console() {
+    let (base_url, _tmp) = start_server().await;
+    let root = format!("{base_url}/ui");
+    let created = signed("PUT", &root, b"").await;
+    let created_status = created.status();
+    let created_body = created.text().await.unwrap();
+    assert_eq!(created_status, 400, "{created_body}");
+    assert!(created_body.contains("InvalidBucketName"), "{created_body}");
+
+    let presigned = client()
+        .get(presign_url(&base_url, "GET", "/ui/note.txt", 300))
+        .send()
+        .await
+        .unwrap();
+    let presigned_status = presigned.status();
+    let presigned_body = presigned.text().await.unwrap();
+    assert_eq!(presigned_status, 400, "{presigned_body}");
+    assert!(
+        presigned_body.contains("InvalidBucketName"),
+        "{presigned_body}"
+    );
+
+    let versioning = client()
+        .get(format!("{root}?versioning"))
+        .send()
+        .await
+        .unwrap();
+    let versioning_status = versioning.status();
+    let versioning_body = versioning.text().await.unwrap();
+    assert_eq!(versioning_status, 403, "{versioning_body}");
+    assert!(versioning_body.contains("<Code>"), "{versioning_body}");
+
+    let browser = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap();
+    let page = browser.get(format!("{root}/")).send().await.unwrap();
+    let page_status = page.status().as_u16();
+    let page_body = page.text().await.unwrap();
+    assert!(
+        page_status == 200 || page_status == 503,
+        "browser /ui/ returned {page_status}: {page_body}"
+    );
+    assert!(!page_body.contains("<Code>"), "{page_body}");
 }
 
 #[tokio::test]
@@ -1050,7 +1115,7 @@ async fn console_login_on_loopback_http_omits_secure_and_authenticates() {
     let (base_url, _tmp) =
         start_server_with_keys("test-access", "test-credential", true, false).await;
     let resp = client()
-        .post(format!("{base_url}/api/auth/login"))
+        .post(format!("{base_url}/maxio/api/auth/login"))
         .json(&serde_json::json!({
             "accessKey": "test-access",
             "secretKey": "test-credential"
@@ -1077,7 +1142,7 @@ async fn console_login_on_loopback_http_omits_secure_and_authenticates() {
         .next()
         .unwrap();
     let check = client()
-        .get(format!("{base_url}/api/auth/check"))
+        .get(format!("{base_url}/maxio/api/auth/check"))
         .header("cookie", format!("maxio_session={session}"))
         .send()
         .await
@@ -1090,7 +1155,7 @@ async fn console_login_marks_cookie_secure_for_https_and_public_hosts() {
     let (base_url, _tmp) =
         start_server_with_keys("test-access", "test-credential", true, false).await;
     let https = client()
-        .post(format!("{base_url}/api/auth/login"))
+        .post(format!("{base_url}/maxio/api/auth/login"))
         .header("x-forwarded-proto", "https")
         .json(&serde_json::json!({
             "accessKey": "test-access",
@@ -1107,7 +1172,7 @@ async fn console_login_marks_cookie_secure_for_https_and_public_hosts() {
     );
 
     let public_host = client()
-        .post(format!("{base_url}/api/auth/login"))
+        .post(format!("{base_url}/maxio/api/auth/login"))
         .header("host", "storage.example.com")
         .json(&serde_json::json!({
             "accessKey": "test-access",
@@ -2940,7 +3005,7 @@ async fn test_presigned_bad_signature() {
 /// Helper: login via console API and return the session cookie value.
 async fn console_login(base_url: &str) -> String {
     let resp = client()
-        .post(&format!("{}/api/auth/login", base_url))
+        .post(&format!("{}/maxio/api/auth/login", base_url))
         .json(&serde_json::json!({"accessKey": ACCESS_KEY, "secretKey": SECRET_KEY}))
         .send()
         .await
@@ -2973,7 +3038,7 @@ async fn test_console_mutation_allows_dev_loopback_origin_via_vite_proxy() {
     let session = console_login(&base_url).await;
 
     let resp = client()
-        .post(format!("{}/api/buckets", base_url))
+        .post(format!("{}/maxio/api/buckets", base_url))
         .header("cookie", format!("maxio_session={}", session))
         .header("origin", "http://127.0.0.1:5173")
         .json(&serde_json::json!({ "name": "dev-origin-bucket" }))
@@ -2990,7 +3055,7 @@ async fn test_console_mutation_rejects_cross_site_origin() {
     let session = console_login(&base_url).await;
 
     let resp = client()
-        .post(format!("{}/api/buckets", base_url))
+        .post(format!("{}/maxio/api/buckets", base_url))
         .header("cookie", format!("maxio_session={}", session))
         .header("origin", "http://evil.example")
         .json(&serde_json::json!({ "name": "evil-origin-bucket" }))
@@ -3008,7 +3073,7 @@ async fn test_console_delete_object_missing_bucket_returns_404() {
 
     let resp = client()
         .delete(&format!(
-            "{}/api/buckets/missing-bucket/objects/file.txt",
+            "{}/maxio/api/buckets/missing-bucket/objects/file.txt",
             base_url
         ))
         .header("cookie", format!("maxio_session={}", session))
@@ -3041,7 +3106,7 @@ async fn test_console_presign_simple_key() {
     // Generate presigned URL via console endpoint
     let resp = client()
         .get(&format!(
-            "{}/api/buckets/cpresign-bucket/presign/test.txt?expires=300",
+            "{}/maxio/api/buckets/cpresign-bucket/presign/test.txt?expires=300",
             base_url
         ))
         .header("Cookie", format!("maxio_session={}", session))
@@ -3084,7 +3149,7 @@ async fn test_console_presign_key_with_spaces() {
     // Request presigned URL for the key with spaces (URL-encoded in the API path)
     let resp = client()
         .get(&format!(
-            "{}/api/buckets/cpresign-space/presign/my%20file.txt?expires=300",
+            "{}/maxio/api/buckets/cpresign-space/presign/my%20file.txt?expires=300",
             base_url
         ))
         .header("Cookie", format!("maxio_session={}", session))
@@ -3124,7 +3189,7 @@ async fn test_console_presign_nested_key() {
 
     let resp = client()
         .get(&format!(
-            "{}/api/buckets/cpresign-nested/presign/folder/sub/file.txt?expires=300",
+            "{}/maxio/api/buckets/cpresign-nested/presign/folder/sub/file.txt?expires=300",
             base_url
         ))
         .header("Cookie", format!("maxio_session={}", session))
@@ -5573,7 +5638,7 @@ async fn test_console_upload_fails_when_bucket_encryption_unreadable() {
     let session = console_login(&base_url).await;
     let resp = client()
         .put(&format!(
-            "{}/api/buckets/console-corrupt/upload/safe.txt",
+            "{}/maxio/api/buckets/console-corrupt/upload/safe.txt",
             base_url
         ))
         .header("cookie", format!("maxio_session={}", session))
@@ -5618,7 +5683,7 @@ async fn test_console_create_folder_fails_when_bucket_encryption_unreadable() {
     let session = console_login(&base_url).await;
     let resp = client()
         .post(&format!(
-            "{}/api/buckets/console-corrupt-folder/folders",
+            "{}/maxio/api/buckets/console-corrupt-folder/folders",
             base_url
         ))
         .header("cookie", format!("maxio_session={}", session))
@@ -5643,7 +5708,7 @@ async fn test_console_create_folder_fails_when_bucket_encryption_unreadable() {
     );
 }
 
-/// Console API GET/PUT /api/buckets/{b}/encryption round-trips bucket default
+/// Console API GET/PUT /maxio/api/buckets/{b}/encryption round-trips bucket default
 /// encryption config. Toggles enable → disable and verifies both the response
 /// body and the on-disk `.bucket.json` state.
 #[tokio::test]
@@ -5654,7 +5719,7 @@ async fn test_console_bucket_encryption_endpoint_roundtrip() {
 
     // Initial GET → disabled
     let resp = client()
-        .get(&format!("{}/api/buckets/cenc-1/encryption", base_url))
+        .get(&format!("{}/maxio/api/buckets/cenc-1/encryption", base_url))
         .header("cookie", format!("maxio_session={}", session))
         .send()
         .await
@@ -5667,7 +5732,7 @@ async fn test_console_bucket_encryption_endpoint_roundtrip() {
 
     // PUT {enabled: true}
     let resp = client()
-        .put(&format!("{}/api/buckets/cenc-1/encryption", base_url))
+        .put(&format!("{}/maxio/api/buckets/cenc-1/encryption", base_url))
         .header("cookie", format!("maxio_session={}", session))
         .json(&serde_json::json!({"enabled": true}))
         .send()
@@ -5679,7 +5744,7 @@ async fn test_console_bucket_encryption_endpoint_roundtrip() {
 
     // GET → enabled + AES256
     let resp = client()
-        .get(&format!("{}/api/buckets/cenc-1/encryption", base_url))
+        .get(&format!("{}/maxio/api/buckets/cenc-1/encryption", base_url))
         .header("cookie", format!("maxio_session={}", session))
         .send()
         .await
@@ -5700,7 +5765,7 @@ async fn test_console_bucket_encryption_endpoint_roundtrip() {
 
     // PUT {enabled: false}
     let resp = client()
-        .put(&format!("{}/api/buckets/cenc-1/encryption", base_url))
+        .put(&format!("{}/maxio/api/buckets/cenc-1/encryption", base_url))
         .header("cookie", format!("maxio_session={}", session))
         .json(&serde_json::json!({"enabled": false}))
         .send()
@@ -5710,7 +5775,7 @@ async fn test_console_bucket_encryption_endpoint_roundtrip() {
 
     // GET → disabled again
     let resp = client()
-        .get(&format!("{}/api/buckets/cenc-1/encryption", base_url))
+        .get(&format!("{}/maxio/api/buckets/cenc-1/encryption", base_url))
         .header("cookie", format!("maxio_session={}", session))
         .send()
         .await
@@ -5727,7 +5792,7 @@ async fn test_console_bucket_encryption_endpoint_roundtrip() {
     );
 }
 
-/// Console API upload (`PUT /api/buckets/{b}/upload/{key}`) honors the
+/// Console API upload (`PUT /maxio/api/buckets/{b}/upload/{key}`) honors the
 /// bucket's default encryption config. Previously the handler passed `None`
 /// to `put_object`, bypassing the bucket default and writing plaintext.
 #[tokio::test]
@@ -5738,7 +5803,10 @@ async fn test_console_upload_honors_bucket_default_encryption() {
 
     // Enable default encryption via console API
     let resp = client()
-        .put(&format!("{}/api/buckets/cenc-up/encryption", base_url))
+        .put(&format!(
+            "{}/maxio/api/buckets/cenc-up/encryption",
+            base_url
+        ))
         .header("cookie", format!("maxio_session={}", session))
         .json(&serde_json::json!({"enabled": true}))
         .send()
@@ -5750,7 +5818,7 @@ async fn test_console_upload_honors_bucket_default_encryption() {
     let marker = b"plaintext-marker-AAAA".to_vec();
     let resp = client()
         .put(&format!(
-            "{}/api/buckets/cenc-up/upload/hello.txt",
+            "{}/maxio/api/buckets/cenc-up/upload/hello.txt",
             base_url
         ))
         .header("cookie", format!("maxio_session={}", session))
@@ -5781,7 +5849,7 @@ async fn test_console_upload_honors_bucket_default_encryption() {
     // Download via console API returns plaintext
     let resp = client()
         .get(&format!(
-            "{}/api/buckets/cenc-up/download/hello.txt",
+            "{}/maxio/api/buckets/cenc-up/download/hello.txt",
             base_url
         ))
         .header("cookie", format!("maxio_session={}", session))
@@ -5793,7 +5861,7 @@ async fn test_console_upload_honors_bucket_default_encryption() {
     assert_eq!(downloaded.as_ref(), marker.as_slice());
 }
 
-/// Console API `POST /api/buckets/{b}/folders` resolves bucket default
+/// Console API `POST /maxio/api/buckets/{b}/folders` resolves bucket default
 /// encryption without crashing when encryption is enabled. Folder markers
 /// are zero-byte objects so no ciphertext assertion is possible; this is a
 /// regression guard for the `create_folder` encryption-lookup fix.
@@ -5805,7 +5873,10 @@ async fn test_console_create_folder_succeeds_with_bucket_default_encryption() {
 
     // Enable default encryption
     let resp = client()
-        .put(&format!("{}/api/buckets/cenc-fold/encryption", base_url))
+        .put(&format!(
+            "{}/maxio/api/buckets/cenc-fold/encryption",
+            base_url
+        ))
         .header("cookie", format!("maxio_session={}", session))
         .json(&serde_json::json!({"enabled": true}))
         .send()
@@ -5815,7 +5886,7 @@ async fn test_console_create_folder_succeeds_with_bucket_default_encryption() {
 
     // Create folder
     let resp = client()
-        .post(&format!("{}/api/buckets/cenc-fold/folders", base_url))
+        .post(&format!("{}/maxio/api/buckets/cenc-fold/folders", base_url))
         .header("cookie", format!("maxio_session={}", session))
         .json(&serde_json::json!({"name": "sub"}))
         .send()
@@ -10716,7 +10787,7 @@ async fn test_version_id_traversal_rejected_console() {
     let cookie = console_login(&base).await;
     let r = client()
         .delete(&format!(
-            "{}/api/buckets/vtravc/versions/..%2F..%2Fvictim/objects/a",
+            "{}/maxio/api/buckets/vtravc/versions/..%2F..%2Fvictim/objects/a",
             base
         ))
         .header("cookie", format!("maxio_session={}", cookie))
@@ -10726,7 +10797,7 @@ async fn test_version_id_traversal_rejected_console() {
     assert_eq!(r.status(), 400);
     let r = client()
         .get(&format!(
-            "{}/api/buckets/vtravc/versions/..%2F..%2Fvictim/download/a",
+            "{}/maxio/api/buckets/vtravc/versions/..%2F..%2Fvictim/download/a",
             base
         ))
         .header("cookie", format!("maxio_session={}", cookie))
@@ -10892,7 +10963,7 @@ async fn test_console_new_endpoints_require_auth() {
         let r = client()
             .request(
                 method.parse().unwrap(),
-                format!("{}/api/buckets/kauth/{}", base, path),
+                format!("{}/maxio/api/buckets/kauth/{}", base, path),
             )
             .json(&serde_json::json!({ "tags": [], "rules": [] }))
             .send()
@@ -10926,7 +10997,7 @@ async fn test_console_object_info_returns_metadata() {
     let (status, info) = console_json(
         "GET",
         &base,
-        "/api/buckets/kinfo/object-info/dir/report.txt",
+        "/maxio/api/buckets/kinfo/object-info/dir/report.txt",
         &session,
         None,
     )
@@ -10964,7 +11035,7 @@ async fn test_console_object_info_returns_metadata() {
     let (status, body) = console_json(
         "GET",
         &base,
-        "/api/buckets/kinfo/object-info/nope.txt",
+        "/maxio/api/buckets/kinfo/object-info/nope.txt",
         &session,
         None,
     )
@@ -10976,7 +11047,7 @@ async fn test_console_object_info_returns_metadata() {
     let (status, _) = console_json(
         "GET",
         &base,
-        "/api/buckets/kinfo-missing/object-info/a",
+        "/maxio/api/buckets/kinfo-missing/object-info/a",
         &session,
         None,
     )
@@ -11002,7 +11073,7 @@ async fn test_console_object_info_encryption_and_versions() {
     let (status, info) = console_json(
         "GET",
         &base,
-        "/api/buckets/kenc/object-info/s3.txt",
+        "/maxio/api/buckets/kenc/object-info/s3.txt",
         &session,
         None,
     )
@@ -11033,7 +11104,7 @@ async fn test_console_object_info_encryption_and_versions() {
     let (status, info) = console_json(
         "GET",
         &base,
-        "/api/buckets/kenc/object-info/c.txt",
+        "/maxio/api/buckets/kenc/object-info/c.txt",
         &session,
         None,
     )
@@ -11051,7 +11122,7 @@ async fn test_console_object_info_encryption_and_versions() {
     let (status, info) = console_json(
         "GET",
         &base,
-        &format!("/api/buckets/kver/object-info/f?versionId={}", v1),
+        &format!("/maxio/api/buckets/kver/object-info/f?versionId={}", v1),
         &session,
         None,
     )
@@ -11062,7 +11133,7 @@ async fn test_console_object_info_encryption_and_versions() {
     let (status, info) = console_json(
         "GET",
         &base,
-        "/api/buckets/kver/object-info/f",
+        "/maxio/api/buckets/kver/object-info/f",
         &session,
         None,
     )
@@ -11074,7 +11145,7 @@ async fn test_console_object_info_encryption_and_versions() {
     let (status, _) = console_json(
         "GET",
         &base,
-        "/api/buckets/kver/object-info/f?versionId=../x",
+        "/maxio/api/buckets/kver/object-info/f?versionId=../x",
         &session,
         None,
     )
@@ -11083,7 +11154,7 @@ async fn test_console_object_info_encryption_and_versions() {
     let (status, _) = console_json(
         "GET",
         &base,
-        "/api/buckets/kver/object-info/f?versionId=123-abc",
+        "/maxio/api/buckets/kver/object-info/f?versionId=123-abc",
         &session,
         None,
     )
@@ -11097,7 +11168,7 @@ async fn test_console_object_tags_roundtrip_and_validation() {
     let session = console_login(&base).await;
     s3_request("PUT", &format!("{}/ktags", base), vec![]).await;
     s3_request("PUT", &format!("{}/ktags/a/b.txt", base), b"x".to_vec()).await;
-    let path = "/api/buckets/ktags/object-tags/a/b.txt";
+    let path = "/maxio/api/buckets/ktags/object-tags/a/b.txt";
 
     let (status, body) = console_json("GET", &base, path, &session, None).await;
     assert_eq!(status, 200, "{}", body);
@@ -11172,7 +11243,7 @@ async fn test_console_object_tags_roundtrip_and_validation() {
     let (status, _) = console_json(
         "GET",
         &base,
-        "/api/buckets/ktags/object-tags/missing",
+        "/maxio/api/buckets/ktags/object-tags/missing",
         &session,
         None,
     )
@@ -11181,7 +11252,7 @@ async fn test_console_object_tags_roundtrip_and_validation() {
     let (status, _) = console_json(
         "PUT",
         &base,
-        "/api/buckets/ktags/object-tags/missing",
+        "/maxio/api/buckets/ktags/object-tags/missing",
         &session,
         Some(serde_json::json!({ "tags": [] })),
     )
@@ -11199,7 +11270,7 @@ async fn test_console_object_tags_on_versions() {
     let v1 = c_header(&r, "x-amz-version-id").unwrap();
     s3_request("PUT", &format!("{}/kvtags/f", base), b"two".to_vec()).await;
 
-    let v1_path = format!("/api/buckets/kvtags/object-tags/f?versionId={}", v1);
+    let v1_path = format!("/maxio/api/buckets/kvtags/object-tags/f?versionId={}", v1);
     let (status, body) = console_json(
         "PUT",
         &base,
@@ -11218,7 +11289,7 @@ async fn test_console_object_tags_on_versions() {
     let (_, body) = console_json(
         "GET",
         &base,
-        "/api/buckets/kvtags/object-tags/f",
+        "/maxio/api/buckets/kvtags/object-tags/f",
         &session,
         None,
     )
@@ -11229,7 +11300,7 @@ async fn test_console_object_tags_on_versions() {
     let (status, _) = console_json(
         "PUT",
         &base,
-        "/api/buckets/kvtags/object-tags/f",
+        "/maxio/api/buckets/kvtags/object-tags/f",
         &session,
         Some(serde_json::json!({ "tags": [{ "key": "cur", "value": "1" }] })),
     )
@@ -11238,7 +11309,7 @@ async fn test_console_object_tags_on_versions() {
     let (_, info) = console_json(
         "GET",
         &base,
-        "/api/buckets/kvtags/object-info/f",
+        "/maxio/api/buckets/kvtags/object-info/f",
         &session,
         None,
     )
@@ -11247,7 +11318,7 @@ async fn test_console_object_tags_on_versions() {
     let (_, body) = console_json(
         "GET",
         &base,
-        &format!("/api/buckets/kvtags/object-tags/f?versionId={}", cur),
+        &format!("/maxio/api/buckets/kvtags/object-tags/f?versionId={}", cur),
         &session,
         None,
     )
@@ -11257,7 +11328,7 @@ async fn test_console_object_tags_on_versions() {
     let (status, _) = console_json(
         "PUT",
         &base,
-        "/api/buckets/kvtags/object-tags/f?versionId=bad/id",
+        "/maxio/api/buckets/kvtags/object-tags/f?versionId=bad/id",
         &session,
         Some(serde_json::json!({ "tags": [] })),
     )
@@ -11270,7 +11341,7 @@ async fn test_console_bucket_tags_roundtrip_and_validation() {
     let (base, _tmp) = start_server().await;
     let session = console_login(&base).await;
     s3_request("PUT", &format!("{}/kbtags", base), vec![]).await;
-    let path = "/api/buckets/kbtags/tags";
+    let path = "/maxio/api/buckets/kbtags/tags";
 
     let (status, body) = console_json("GET", &base, path, &session, None).await;
     assert_eq!(status, 200, "{}", body);
@@ -11304,7 +11375,7 @@ async fn test_console_bucket_tags_roundtrip_and_validation() {
     assert!(xml.contains("<Key>cost-center</Key>"), "{}", xml);
 
     // Bucket list carries tagCount
-    let (_, list) = console_json("GET", &base, "/api/buckets", &session, None).await;
+    let (_, list) = console_json("GET", &base, "/maxio/api/buckets", &session, None).await;
     let b = list["buckets"]
         .as_array()
         .unwrap()
@@ -11354,7 +11425,7 @@ async fn test_console_bucket_tags_roundtrip_and_validation() {
     let (status, _) = console_json(
         "GET",
         &base,
-        "/api/buckets/kbtags-missing/tags",
+        "/maxio/api/buckets/kbtags-missing/tags",
         &session,
         None,
     )
@@ -11368,23 +11439,35 @@ async fn test_console_bucket_policy_view_and_bucket_summary_flags() {
     let session = console_login(&base).await;
     s3_request("PUT", &format!("{}/kpolicy", base), vec![]).await;
 
-    let (status, body) =
-        console_json("GET", &base, "/api/buckets/kpolicy/policy", &session, None).await;
+    let (status, body) = console_json(
+        "GET",
+        &base,
+        "/maxio/api/buckets/kpolicy/policy",
+        &session,
+        None,
+    )
+    .await;
     assert_eq!(status, 200, "{}", body);
     assert!(body["policy"].is_null(), "{}", body);
 
     let (status, _) = console_json(
         "PUT",
         &base,
-        "/api/buckets/kpolicy/public",
+        "/maxio/api/buckets/kpolicy/public",
         &session,
         Some(serde_json::json!({ "read": true, "list": false })),
     )
     .await;
     assert_eq!(status, 200);
 
-    let (status, body) =
-        console_json("GET", &base, "/api/buckets/kpolicy/policy", &session, None).await;
+    let (status, body) = console_json(
+        "GET",
+        &base,
+        "/maxio/api/buckets/kpolicy/policy",
+        &session,
+        None,
+    )
+    .await;
     assert_eq!(status, 200);
     let policy_str = body["policy"].as_str().expect("policy string");
     let s3_policy = s3_request("GET", &format!("{}/kpolicy?policy", base), vec![])
@@ -11397,7 +11480,7 @@ async fn test_console_bucket_policy_view_and_bucket_summary_flags() {
     assert!(policy.to_string().contains("s3:GetObject"));
     assert!(!policy.to_string().contains("s3:ListBucket"));
 
-    let (_, list) = console_json("GET", &base, "/api/buckets", &session, None).await;
+    let (_, list) = console_json("GET", &base, "/maxio/api/buckets", &session, None).await;
     let b = list["buckets"]
         .as_array()
         .unwrap()
@@ -11411,7 +11494,7 @@ async fn test_console_bucket_policy_view_and_bucket_summary_flags() {
     let (status, _) = console_json(
         "GET",
         &base,
-        "/api/buckets/kpolicy-missing/policy",
+        "/maxio/api/buckets/kpolicy-missing/policy",
         &session,
         None,
     )
@@ -11431,8 +11514,14 @@ async fn test_console_list_objects_includes_content_type() {
         vec![("content-type", "text/html")],
     )
     .await;
-    let (status, body) =
-        console_json("GET", &base, "/api/buckets/kctype/objects", &session, None).await;
+    let (status, body) = console_json(
+        "GET",
+        &base,
+        "/maxio/api/buckets/kctype/objects",
+        &session,
+        None,
+    )
+    .await;
     assert_eq!(status, 200);
     assert_eq!(body["files"][0]["contentType"], "text/html");
 }
@@ -11468,7 +11557,10 @@ async fn test_console_restore_version_roundtrip() {
     let (status, body) = console_json(
         "POST",
         &base,
-        &format!("/api/buckets/krestore/versions/{}/restore/docs/f.txt", v1),
+        &format!(
+            "/maxio/api/buckets/krestore/versions/{}/restore/docs/f.txt",
+            v1
+        ),
         &session,
         None,
     )
@@ -11491,7 +11583,7 @@ async fn test_console_restore_version_roundtrip() {
     let (_, info) = console_json(
         "GET",
         &base,
-        "/api/buckets/krestore/object-info/docs/f.txt",
+        "/maxio/api/buckets/krestore/object-info/docs/f.txt",
         &session,
         None,
     )
@@ -11501,7 +11593,7 @@ async fn test_console_restore_version_roundtrip() {
     let (_, versions) = console_json(
         "GET",
         &base,
-        "/api/buckets/krestore/versions?key=docs/f.txt",
+        "/maxio/api/buckets/krestore/versions?key=docs/f.txt",
         &session,
         None,
     )
@@ -11517,7 +11609,7 @@ async fn test_console_restore_version_roundtrip() {
     let (status, _) = console_json(
         "POST",
         &base,
-        "/api/buckets/krestore/versions/not-a-version/restore/docs/f.txt",
+        "/maxio/api/buckets/krestore/versions/not-a-version/restore/docs/f.txt",
         &session,
         None,
     )
@@ -11526,7 +11618,7 @@ async fn test_console_restore_version_roundtrip() {
     let (status, _) = console_json(
         "POST",
         &base,
-        "/api/buckets/krestore/versions/1-abc/restore/docs/f.txt",
+        "/maxio/api/buckets/krestore/versions/1-abc/restore/docs/f.txt",
         &session,
         None,
     )
@@ -11540,7 +11632,7 @@ async fn test_console_restore_version_roundtrip() {
         "POST",
         &base,
         &format!(
-            "/api/buckets/krestore/versions/{}/restore/docs/f.txt",
+            "/maxio/api/buckets/krestore/versions/{}/restore/docs/f.txt",
             marker
         ),
         &session,
@@ -11552,7 +11644,10 @@ async fn test_console_restore_version_roundtrip() {
     let (status, _) = console_json(
         "POST",
         &base,
-        &format!("/api/buckets/krestore/versions/{}/restore/docs/f.txt", v2),
+        &format!(
+            "/maxio/api/buckets/krestore/versions/{}/restore/docs/f.txt",
+            v2
+        ),
         &session,
         None,
     )
@@ -11581,7 +11676,7 @@ async fn test_console_restore_version_encryption() {
     let (status, body) = console_json(
         "POST",
         &base,
-        &format!("/api/buckets/krenc/versions/{}/restore/s3", v1),
+        &format!("/maxio/api/buckets/krenc/versions/{}/restore/s3", v1),
         &session,
         None,
     )
@@ -11613,7 +11708,7 @@ async fn test_console_restore_version_encryption() {
     let (status, body) = console_json(
         "POST",
         &base,
-        &format!("/api/buckets/krenc/versions/{}/restore/c", vc),
+        &format!("/maxio/api/buckets/krenc/versions/{}/restore/c", vc),
         &session,
         None,
     )
@@ -12522,7 +12617,7 @@ async fn test_console_lifecycle_roundtrip() {
     let (base, _tmp) = start_server().await;
     let session = console_login(&base).await;
     s3_request("PUT", &format!("{}/ulc", base), vec![]).await;
-    let path = "/api/buckets/ulc/lifecycle";
+    let path = "/maxio/api/buckets/ulc/lifecycle";
 
     let (status, body) = console_json("GET", &base, path, &session, None).await;
     assert_eq!(status, 200, "{}", body);
@@ -12576,7 +12671,7 @@ async fn test_console_lifecycle_roundtrip() {
     let (status, _) = console_json(
         "GET",
         &base,
-        "/api/buckets/ulc-missing/lifecycle",
+        "/maxio/api/buckets/ulc-missing/lifecycle",
         &session,
         None,
     )
@@ -12589,7 +12684,7 @@ async fn test_console_lifecycle_validation_error() {
     let (base, _tmp) = start_server().await;
     let session = console_login(&base).await;
     s3_request("PUT", &format!("{}/ulcval", base), vec![]).await;
-    let path = "/api/buckets/ulcval/lifecycle";
+    let path = "/maxio/api/buckets/ulcval/lifecycle";
     for rules in [
         // no action
         serde_json::json!([{ "status": "Enabled" }]),
@@ -12623,7 +12718,7 @@ async fn test_console_lifecycle_validation_error() {
     let (status, _) = console_json(
         "PUT",
         &base,
-        "/api/buckets/ulcval-missing/lifecycle",
+        "/maxio/api/buckets/ulcval-missing/lifecycle",
         &session,
         Some(serde_json::json!({ "rules": [] })),
     )
@@ -12636,7 +12731,7 @@ async fn test_console_lifecycle_empty_deletes() {
     let (base, _tmp) = start_server().await;
     let session = console_login(&base).await;
     s3_request("PUT", &format!("{}/ulcdel", base), vec![]).await;
-    let path = "/api/buckets/ulcdel/lifecycle";
+    let path = "/maxio/api/buckets/ulcdel/lifecycle";
     let (status, _) = console_json(
         "PUT",
         &base,

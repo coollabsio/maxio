@@ -112,7 +112,9 @@ maxio --domain s3.example.com --data-dir ./data --port 9000
 # MAXIO_DOMAIN=s3.example.com,s3.example.org
 ```
 
-A request whose `Host` is `<bucket>.<domain>` (a port is ignored, and the host is matched case-insensitively) is served from that bucket. The bare domain, an IP address, and any other host stay on path-style, so the web console (`/ui/`), `/api/`, `/maxio/health/*`, and `/minio/health/*` on the service host are unchanged. The bucket name `maxio` is reserved. Bucket names follow the S3 rules (lowercase letters, digits, dots, and hyphens). A dotted name such as `my.bucket` is the host `my.bucket.s3.example.com`.
+A request whose `Host` is `<bucket>.<domain>` (a port is ignored, and the host is matched case-insensitively) is served from that bucket. The bare domain, an IP address, and any other host stay on path-style, so the web console (`/ui/`), `/maxio/api/`, `/maxio/health/*`, and `/minio/health/*` on the service host are unchanged. The bucket names `maxio` and `ui` are reserved. `api` is an ordinary bucket. Bucket names follow the S3 rules (lowercase letters, digits, dots, and hyphens, 3–63 characters). A dotted name such as `my.bucket` is the host `my.bucket.s3.example.com`. `ui.<domain>` is rejected with `InvalidBucketName`, the same as `maxio.<domain>`.
+
+The console UI stays at `/ui`. An unauthenticated browser `GET` or `HEAD` of `/ui` or `/ui/...` is the console when the request has no `Authorization` header, no `x-amz-*` header, no `X-Amz-*` presign query, and no S3 subresource or listing query. Any other request for that path is handled as S3 and fails because `ui` is not a valid bucket name. A working bucket named `ui` is not possible: S3 names are at least 3 characters, and that path is the console. `CreateBucket` returns `400 InvalidBucketName`. A data directory that already contains `buckets/ui` or `buckets/maxio` refuses to start; `maxio check` reports it and does not delete it. The console API is only `/maxio/api/*`. The session cookie uses `Path=/maxio`.
 
 When more than one domain is configured, the longest match wins. `album.s3.example.com` is bucket `album` under `s3.example.com`, and the host `s3.example.com` itself stays the service host.
 
@@ -233,7 +235,7 @@ aws --endpoint-url http://localhost:9000 iam attach-user-policy \
 aws --endpoint-url http://localhost:9000 iam create-access-key --user-name alice
 ```
 
-A key policy only narrows what that user's policies already allow. Granting access is a separate step: attach a policy, or use **Grant scope to user** in the console (or `PUT /api/iam/users/{name}/inline/{policy}`). **Create access key** (`POST /api/iam/users/{name}/keys`) never adds a policy to the user. The scope is stored on that key only. Omitting `keyOnly` means key-only. Sending `keyOnly: false` is rejected.
+A key policy only narrows what that user's policies already allow. Granting access is a separate step: attach a policy, or use **Grant scope to user** in the console (or `PUT /maxio/api/iam/users/{name}/inline/{policy}`). **Create access key** (`POST /maxio/api/iam/users/{name}/keys`) never adds a policy to the user. The scope is stored on that key only. Omitting `keyOnly` means key-only. Sending `keyOnly: false` is rejected.
 
 The console at `/ui/users` and `/ui/policies` is available to root and to anyone whose policy allows IAM administration. Other IAM users can sign in and see only the buckets their policy allows.
 

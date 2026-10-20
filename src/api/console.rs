@@ -101,7 +101,7 @@ fn make_cookie(value: &str, max_age: i64, secure: bool) -> String {
     let secure_flag = if secure { "; Secure" } else { "" };
 
     format!(
-        "{}={}; Path=/; HttpOnly; SameSite=Strict; Max-Age={}{}",
+        "{}={}; Path=/maxio; HttpOnly; SameSite=Strict; Max-Age={}{}",
         COOKIE_NAME, value, max_age, secure_flag
     )
 }
@@ -206,7 +206,7 @@ pub struct ServerVersion {
 
 #[utoipa::path(
     get,
-    path = "/api/version",
+    path = "/maxio/api/version",
     operation_id = "getServerVersion",
     tag = "meta",
     responses(
@@ -229,7 +229,7 @@ pub struct LoginRequest {
 
 #[utoipa::path(
     post,
-    path = "/api/auth/login",
+    path = "/maxio/api/auth/login",
     operation_id = "login",
     tag = "auth",
     security(()),
@@ -307,7 +307,7 @@ pub struct Capabilities {
 
 #[utoipa::path(
     get,
-    path = "/api/auth/capabilities",
+    path = "/maxio/api/auth/capabilities",
     operation_id = "getCapabilities",
     tag = "auth",
     params(CapabilityParams),
@@ -345,7 +345,7 @@ pub async fn capabilities(
 
 #[utoipa::path(
     get,
-    path = "/api/auth/check",
+    path = "/maxio/api/auth/check",
     operation_id = "checkAuth",
     tag = "auth",
     security(()),
@@ -366,7 +366,7 @@ pub async fn check(State(state): State<AppState>, headers: HeaderMap) -> Respons
 
 #[utoipa::path(
     post,
-    path = "/api/auth/logout",
+    path = "/maxio/api/auth/logout",
     operation_id = "logout",
     tag = "auth",
     responses((status = 200, body = OkResponse))
@@ -511,7 +511,7 @@ pub struct BucketListResponse {
 
 #[utoipa::path(
     get,
-    path = "/api/buckets",
+    path = "/maxio/api/buckets",
     operation_id = "listBuckets",
     tag = "buckets",
     responses(
@@ -589,7 +589,7 @@ pub struct CreateBucketRequest {
 
 #[utoipa::path(
     post,
-    path = "/api/buckets",
+    path = "/maxio/api/buckets",
     operation_id = "createBucket",
     tag = "buckets",
     request_body = CreateBucketRequest,
@@ -648,7 +648,7 @@ pub async fn create_bucket(
 
 #[utoipa::path(
     delete,
-    path = "/api/buckets/{bucket}",
+    path = "/maxio/api/buckets/{bucket}",
     operation_id = "deleteBucket",
     tag = "buckets",
     params(("bucket" = String, Path)),
@@ -710,7 +710,7 @@ pub struct ObjectListResponse {
 
 #[utoipa::path(
     get,
-    path = "/api/buckets/{bucket}/objects",
+    path = "/maxio/api/buckets/{bucket}/objects",
     operation_id = "listObjects",
     tag = "objects",
     params(("bucket" = String, Path), ListObjectsParams),
@@ -786,7 +786,7 @@ pub struct UploadResponse {
 
 #[utoipa::path(
     put,
-    path = "/api/buckets/{bucket}/upload/{key}",
+    path = "/maxio/api/buckets/{bucket}/upload/{key}",
     operation_id = "uploadObject",
     tag = "objects",
     params(
@@ -872,7 +872,7 @@ async fn bucket_default_encryption(
 
 #[utoipa::path(
     delete,
-    path = "/api/buckets/{bucket}/objects/{key}",
+    path = "/maxio/api/buckets/{bucket}/objects/{key}",
     operation_id = "deleteObject",
     tag = "objects",
     params(
@@ -951,7 +951,7 @@ async fn preserve_empty_parent_folder_after_object_delete(
 
 #[utoipa::path(
     get,
-    path = "/api/buckets/{bucket}/download/{key}",
+    path = "/maxio/api/buckets/{bucket}/download/{key}",
     operation_id = "downloadObject",
     tag = "objects",
     params(
@@ -1046,7 +1046,7 @@ async fn signing_credentials(
 
 #[utoipa::path(
     get,
-    path = "/api/buckets/{bucket}/presign/{key}",
+    path = "/maxio/api/buckets/{bucket}/presign/{key}",
     operation_id = "presignObject",
     tag = "objects",
     params(
@@ -1179,7 +1179,7 @@ pub struct CreateFolderRequest {
 
 #[utoipa::path(
     post,
-    path = "/api/buckets/{bucket}/folders",
+    path = "/maxio/api/buckets/{bucket}/folders",
     operation_id = "createFolder",
     tag = "objects",
     params(("bucket" = String, Path)),
@@ -1249,7 +1249,7 @@ pub struct SetEnabledRequest {
 
 #[utoipa::path(
     get,
-    path = "/api/buckets/{bucket}/versioning",
+    path = "/maxio/api/buckets/{bucket}/versioning",
     operation_id = "getVersioning",
     tag = "settings",
     params(("bucket" = String, Path)),
@@ -1264,7 +1264,7 @@ pub async fn get_versioning(State(state): State<AppState>, Path(bucket): Path<St
 
 #[utoipa::path(
     put,
-    path = "/api/buckets/{bucket}/versioning",
+    path = "/maxio/api/buckets/{bucket}/versioning",
     operation_id = "setVersioning",
     tag = "settings",
     params(("bucket" = String, Path)),
@@ -1291,7 +1291,7 @@ pub struct EncryptionResponse {
 
 #[utoipa::path(
     get,
-    path = "/api/buckets/{bucket}/encryption",
+    path = "/maxio/api/buckets/{bucket}/encryption",
     operation_id = "getEncryption",
     tag = "settings",
     params(("bucket" = String, Path)),
@@ -1313,7 +1313,7 @@ pub async fn get_encryption(State(state): State<AppState>, Path(bucket): Path<St
 
 #[utoipa::path(
     put,
-    path = "/api/buckets/{bucket}/encryption",
+    path = "/maxio/api/buckets/{bucket}/encryption",
     operation_id = "setEncryption",
     tag = "settings",
     params(("bucket" = String, Path)),
@@ -1347,7 +1347,7 @@ pub struct PublicAccess {
 
 #[utoipa::path(
     get,
-    path = "/api/buckets/{bucket}/public",
+    path = "/maxio/api/buckets/{bucket}/public",
     operation_id = "getPublicAccess",
     tag = "settings",
     params(("bucket" = String, Path)),
@@ -1362,7 +1362,7 @@ pub async fn get_public(State(state): State<AppState>, Path(bucket): Path<String
 
 #[utoipa::path(
     put,
-    path = "/api/buckets/{bucket}/public",
+    path = "/maxio/api/buckets/{bucket}/public",
     operation_id = "setPublicAccess",
     tag = "settings",
     params(("bucket" = String, Path)),
@@ -1408,7 +1408,7 @@ pub struct VersionListResponse {
 
 #[utoipa::path(
     get,
-    path = "/api/buckets/{bucket}/versions",
+    path = "/maxio/api/buckets/{bucket}/versions",
     operation_id = "listVersions",
     tag = "versions",
     params(("bucket" = String, Path), ListVersionsParams),
@@ -1446,7 +1446,7 @@ pub async fn list_versions(
 
 #[utoipa::path(
     delete,
-    path = "/api/buckets/{bucket}/versions/{versionId}/objects/{key}",
+    path = "/maxio/api/buckets/{bucket}/versions/{versionId}/objects/{key}",
     operation_id = "deleteVersion",
     tag = "versions",
     params(
@@ -1473,7 +1473,7 @@ pub async fn delete_version(
 
 #[utoipa::path(
     get,
-    path = "/api/buckets/{bucket}/versions/{versionId}/download/{key}",
+    path = "/maxio/api/buckets/{bucket}/versions/{versionId}/download/{key}",
     operation_id = "downloadVersion",
     tag = "versions",
     params(
@@ -1693,7 +1693,7 @@ async fn resolve_object_meta(
 
 #[utoipa::path(
     get,
-    path = "/api/buckets/{bucket}/object-info/{key}",
+    path = "/maxio/api/buckets/{bucket}/object-info/{key}",
     operation_id = "getObjectInfo",
     tag = "objects",
     params(
@@ -1745,7 +1745,7 @@ const BUCKET_TAGS_MAX: usize = 50;
 
 #[utoipa::path(
     get,
-    path = "/api/buckets/{bucket}/object-tags/{key}",
+    path = "/maxio/api/buckets/{bucket}/object-tags/{key}",
     operation_id = "getObjectTags",
     tag = "objects",
     params(
@@ -1781,7 +1781,7 @@ pub async fn get_object_tags(
 
 #[utoipa::path(
     put,
-    path = "/api/buckets/{bucket}/object-tags/{key}",
+    path = "/maxio/api/buckets/{bucket}/object-tags/{key}",
     operation_id = "setObjectTags",
     tag = "objects",
     params(
@@ -1832,7 +1832,7 @@ pub async fn set_object_tags(
 
 #[utoipa::path(
     get,
-    path = "/api/buckets/{bucket}/tags",
+    path = "/maxio/api/buckets/{bucket}/tags",
     operation_id = "getBucketTags",
     tag = "settings",
     params(("bucket" = String, Path)),
@@ -1865,7 +1865,7 @@ pub async fn get_bucket_tags(
 
 #[utoipa::path(
     put,
-    path = "/api/buckets/{bucket}/tags",
+    path = "/maxio/api/buckets/{bucket}/tags",
     operation_id = "setBucketTags",
     tag = "settings",
     params(("bucket" = String, Path)),
@@ -1909,7 +1909,7 @@ pub struct BucketPolicyResponse {
 
 #[utoipa::path(
     get,
-    path = "/api/buckets/{bucket}/policy",
+    path = "/maxio/api/buckets/{bucket}/policy",
     operation_id = "getBucketPolicy",
     tag = "settings",
     params(("bucket" = String, Path)),
@@ -1949,7 +1949,7 @@ pub struct RestoreVersionResponse {
 
 #[utoipa::path(
     post,
-    path = "/api/buckets/{bucket}/versions/{versionId}/restore/{key}",
+    path = "/maxio/api/buckets/{bucket}/versions/{versionId}/restore/{key}",
     operation_id = "restoreVersion",
     tag = "versions",
     params(
@@ -2040,7 +2040,7 @@ pub struct LifecycleConfigBody {
 
 #[utoipa::path(
     get,
-    path = "/api/buckets/{bucket}/lifecycle",
+    path = "/maxio/api/buckets/{bucket}/lifecycle",
     operation_id = "getBucketLifecycle",
     tag = "settings",
     params(("bucket" = String, Path)),
@@ -2073,7 +2073,7 @@ pub async fn get_bucket_lifecycle_api(
 
 #[utoipa::path(
     put,
-    path = "/api/buckets/{bucket}/lifecycle",
+    path = "/maxio/api/buckets/{bucket}/lifecycle",
     operation_id = "setBucketLifecycle",
     tag = "settings",
     params(("bucket" = String, Path)),

@@ -433,8 +433,9 @@ impl FilesystemStorage {
         if !legacy.is_empty() {
             return Err(anyhow::anyhow!(format_legacy_reserved_error(&legacy)));
         }
-        if reserved_bucket_present(&storage.buckets_dir).await {
-            return Err(anyhow::anyhow!(reserved_bucket_error()));
+        let reserved = reserved_buckets_present(&storage.buckets_dir).await;
+        if !reserved.is_empty() {
+            return Err(anyhow::anyhow!(reserved_bucket_error(&reserved)));
         }
         // Nothing is in flight during construction, so crash leftovers (temp
         // files, stranded EC backups, half-finished key promotions, upload
@@ -1869,19 +1870,28 @@ pub(crate) async fn find_legacy_reserved_keys(buckets_dir: &Path) -> Vec<LegacyR
     found
 }
 
-/// `buckets/maxio` is a bucket created before this name was reserved.
-pub(crate) async fn reserved_bucket_present(buckets_dir: &Path) -> bool {
-    let path = buckets_dir.join("maxio");
-    match tokio::fs::metadata(&path).await {
-        Ok(meta) => meta.is_dir(),
-        Err(_) => false,
+/// Bucket directories whose names this version reserves (`maxio`, `ui`).
+pub(crate) async fn reserved_buckets_present(buckets_dir: &Path) -> Vec<&'static str> {
+    let mut found = Vec::new();
+    for name in ["maxio", "ui"] {
+        let path = buckets_dir.join(name);
+        if matches!(tokio::fs::metadata(&path).await, Ok(meta) if meta.is_dir()) {
+            found.push(name);
+        }
     }
+    found
 }
 
-pub(crate) fn reserved_bucket_error() -> String {
-    "refusing to start: this data directory contains a bucket named \"maxio\", which this version of MaxIO reserves.\n\
-     Start the previous MaxIO version on this data directory, move the objects out, and remove the bucket (for example `aws s3 rb`), then start this version."
-        .to_string()
+pub(crate) fn reserved_bucket_error(names: &[&str]) -> String {
+    let listed = names
+        .iter()
+        .map(|name| format!("\"{name}\""))
+        .collect::<Vec<_>>()
+        .join(" and ");
+    format!(
+        "refusing to start: this data directory contains a bucket named {listed}, which this version of MaxIO reserves.\n\
+         Start the previous MaxIO version on this data directory, move the objects out, and remove the bucket (for example `aws s3 rb`), then start this version."
+    )
 }
 
 pub(crate) fn format_legacy_reserved_error(keys: &[LegacyReservedKey]) -> String {

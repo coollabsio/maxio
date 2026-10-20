@@ -9,7 +9,7 @@ Losing the keyring makes SSE-S3 objects unreadable. There is no escrow key.
 
 ## Before you upgrade
 
-1. Note the running version: `maxio --version`, or `GET /api/version`.
+1. Note the running version: `maxio --version`, or `GET /maxio/api/version`.
 2. Stop the process and confirm nothing else is writing the data directory.
 3. Copy the whole data directory, including hidden files, to a place that is not the live path.
 
@@ -19,6 +19,8 @@ tar -C /var/lib -czf "/backup/maxio-$(date +%Y%m%d).tar.gz" maxio
 ```
 
 The container equivalent is a copy of the volume while the container is stopped. Keep that copy until the new version has read and written the data you care about.
+
+Bucket names `maxio` and `ui` are reserved. `CreateBucket` returns `400 InvalidBucketName`. If the data directory already has `buckets/maxio` or `buckets/ui`, this version refuses to start. `maxio check` reports `reserved-bucket` and does not delete the directory. Start the previous version, move the objects out, remove the bucket, then start this version. `ui` cannot be a working bucket: S3 names are at least 3 characters, and `/ui` is the console.
 
 ## Upgrade a binary
 

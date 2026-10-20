@@ -144,7 +144,7 @@ async fn call(
 
 async fn console_login(base: &str, access: &str, secret: &str) -> (u16, String, serde_json::Value) {
     let resp = reqwest::Client::new()
-        .post(format!("{base}/api/auth/login"))
+        .post(format!("{base}/maxio/api/auth/login"))
         .json(&serde_json::json!({ "accessKey": access, "secretKey": secret }))
         .send()
         .await
@@ -217,7 +217,7 @@ async fn scoped_key_allows_reads_and_denies_writes() {
 
     let client = reqwest::Client::new();
     let created = client
-        .post(format!("{base}/api/iam/users"))
+        .post(format!("{base}/maxio/api/iam/users"))
         .header("cookie", format!("maxio_session={cookie}"))
         .json(&serde_json::json!({ "name": "alice" }))
         .send()
@@ -229,7 +229,9 @@ async fn scoped_key_allows_reads_and_denies_writes() {
     // that to read access under pics/albums/. Creating a key does not grant the user.
     let user_policy = r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["s3:GetObject","s3:GetObjectVersion","s3:PutObject","s3:DeleteObject","s3:ListBucket","s3:GetBucketLocation"],"Resource":["arn:aws:s3:::pics","arn:aws:s3:::pics/*"]}]}"#;
     let granted = client
-        .put(format!("{base}/api/iam/users/alice/inline/pics-readwrite"))
+        .put(format!(
+            "{base}/maxio/api/iam/users/alice/inline/pics-readwrite"
+        ))
         .header("cookie", format!("maxio_session={cookie}"))
         .json(&serde_json::json!({ "documentJson": user_policy }))
         .send()
@@ -238,7 +240,7 @@ async fn scoped_key_allows_reads_and_denies_writes() {
     assert_eq!(granted.status(), 200, "{}", granted.text().await.unwrap());
 
     let key = client
-        .post(format!("{base}/api/iam/users/alice/keys"))
+        .post(format!("{base}/maxio/api/iam/users/alice/keys"))
         .header("cookie", format!("maxio_session={cookie}"))
         .json(&serde_json::json!({
             "buckets": ["pics"],
@@ -301,7 +303,7 @@ async fn scoped_key_allows_reads_and_denies_writes() {
     assert_eq!(user_session["userName"], "alice");
     assert_eq!(user_session["iamAdmin"], false);
     let buckets = client
-        .get(format!("{base}/api/buckets"))
+        .get(format!("{base}/maxio/api/buckets"))
         .header("cookie", format!("maxio_session={user_cookie}"))
         .send()
         .await
@@ -317,7 +319,9 @@ async fn scoped_key_allows_reads_and_denies_writes() {
     assert_eq!(names, vec!["pics"]);
 
     let download = client
-        .get(format!("{base}/api/buckets/pics/download/albums/a.txt"))
+        .get(format!(
+            "{base}/maxio/api/buckets/pics/download/albums/a.txt"
+        ))
         .header("cookie", format!("maxio_session={user_cookie}"))
         .send()
         .await
@@ -326,7 +330,7 @@ async fn scoped_key_allows_reads_and_denies_writes() {
     assert_eq!(download.text().await.unwrap(), "hello");
 
     let upload = client
-        .put(format!("{base}/api/buckets/pics/upload/albums/b.txt"))
+        .put(format!("{base}/maxio/api/buckets/pics/upload/albums/b.txt"))
         .header("cookie", format!("maxio_session={user_cookie}"))
         .body("nope")
         .send()
@@ -335,7 +339,7 @@ async fn scoped_key_allows_reads_and_denies_writes() {
     assert_eq!(upload.status(), 403);
 
     let users = client
-        .get(format!("{base}/api/iam/users"))
+        .get(format!("{base}/maxio/api/iam/users"))
         .header("cookie", format!("maxio_session={user_cookie}"))
         .send()
         .await
@@ -572,7 +576,7 @@ async fn explicit_deny_beats_public_bucket_policy() {
     let client = reqwest::Client::new();
     assert_eq!(
         client
-            .post(format!("{base}/api/iam/users"))
+            .post(format!("{base}/maxio/api/iam/users"))
             .header("cookie", format!("maxio_session={cookie}"))
             .json(&serde_json::json!({ "name": "carol" }))
             .send()
@@ -583,7 +587,7 @@ async fn explicit_deny_beats_public_bucket_policy() {
     );
     let deny = r#"{"Statement":[{"Effect":"Deny","Action":"s3:GetObject","Resource":"*"}]}"#;
     let key = client
-        .post(format!("{base}/api/iam/users/carol/keys"))
+        .post(format!("{base}/maxio/api/iam/users/carol/keys"))
         .header("cookie", format!("maxio_session={cookie}"))
         .json(&serde_json::json!({ "documentJson": deny, "keyOnly": true }))
         .send()
@@ -647,7 +651,7 @@ async fn create_key_scope_does_not_grant_the_user() {
     let cookie = format!("maxio_session={cookie}");
     assert_eq!(
         client
-            .post(format!("{base}/api/iam/users"))
+            .post(format!("{base}/maxio/api/iam/users"))
             .header("cookie", &cookie)
             .json(&serde_json::json!({ "name": "bob" }))
             .send()
@@ -659,7 +663,7 @@ async fn create_key_scope_does_not_grant_the_user() {
     let read = r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["s3:GetObject","s3:GetObjectVersion"],"Resource":"arn:aws:s3:::photos/*"}]}"#;
     assert_eq!(
         client
-            .put(format!("{base}/api/iam/users/bob/inline/read"))
+            .put(format!("{base}/maxio/api/iam/users/bob/inline/read"))
             .header("cookie", &cookie)
             .json(&serde_json::json!({ "documentJson": read }))
             .send()
@@ -669,7 +673,7 @@ async fn create_key_scope_does_not_grant_the_user() {
         200
     );
     let first = client
-        .post(format!("{base}/api/iam/users/bob/keys"))
+        .post(format!("{base}/maxio/api/iam/users/bob/keys"))
         .header("cookie", &cookie)
         .json(&serde_json::json!({}))
         .send()
@@ -681,7 +685,7 @@ async fn create_key_scope_does_not_grant_the_user() {
     let first_secret = first["secretAccessKey"].as_str().unwrap();
 
     let second = client
-        .post(format!("{base}/api/iam/users/bob/keys"))
+        .post(format!("{base}/maxio/api/iam/users/bob/keys"))
         .header("cookie", &cookie)
         .json(&serde_json::json!({
             "buckets": ["photos"],
@@ -698,7 +702,7 @@ async fn create_key_scope_does_not_grant_the_user() {
     assert!(!second_doc.replace("uploads/*", "").contains("uploads*"));
 
     let user = client
-        .get(format!("{base}/api/iam/users/bob"))
+        .get(format!("{base}/maxio/api/iam/users/bob"))
         .header("cookie", &cookie)
         .send()
         .await
@@ -711,7 +715,7 @@ async fn create_key_scope_does_not_grant_the_user() {
     assert_eq!(inline[0]["name"], "read");
 
     let keys = client
-        .get(format!("{base}/api/iam/users/bob/keys"))
+        .get(format!("{base}/maxio/api/iam/users/bob/keys"))
         .header("cookie", &cookie)
         .send()
         .await
@@ -753,7 +757,7 @@ async fn create_key_scope_does_not_grant_the_user() {
     assert_eq!(widened.status(), 403);
 
     let rejected = client
-        .post(format!("{base}/api/iam/users/bob/keys"))
+        .post(format!("{base}/maxio/api/iam/users/bob/keys"))
         .header("cookie", &cookie)
         .json(&serde_json::json!({
             "buckets": ["finance"],
@@ -766,7 +770,7 @@ async fn create_key_scope_does_not_grant_the_user() {
         .unwrap();
     assert_eq!(rejected.status(), 400, "{}", rejected.text().await.unwrap());
     let user = client
-        .get(format!("{base}/api/iam/users/bob"))
+        .get(format!("{base}/maxio/api/iam/users/bob"))
         .header("cookie", &cookie)
         .send()
         .await

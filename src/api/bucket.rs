@@ -612,6 +612,60 @@ pub fn bucket_subresource(params: &HashMap<String, String>) -> Option<&'static s
         .find(|s| params.contains_key(*s))
 }
 
+/// Listing and object query names that are not bucket subresources.
+const S3_LIST_AND_OBJECT_PARAMS: &[&str] = &[
+    "attributes",
+    "continuation-token",
+    "delimiter",
+    "encoding-type",
+    "fetch-owner",
+    "key-marker",
+    "lambda",
+    "legal-hold",
+    "list-type",
+    "marker",
+    "max-keys",
+    "max-parts",
+    "max-uploads",
+    "part-number-marker",
+    "partNumber",
+    "prefix",
+    "renameObject",
+    "retention",
+    "select-type",
+    "start-after",
+    "upload-id-marker",
+    "uploadId",
+    "version-id-marker",
+    "versionId",
+    "x-id",
+];
+
+/// True when the query string selects an S3 operation (subresource, list, or presign).
+pub(crate) fn query_selects_s3(query: &str) -> bool {
+    query.split('&').any(|pair| {
+        if pair.is_empty() {
+            return false;
+        }
+        let raw = pair.split('=').next().unwrap_or(pair);
+        let name = percent_encoding::percent_decode_str(raw)
+            .decode_utf8_lossy()
+            .into_owned();
+        s3_query_name(&name)
+    })
+}
+
+fn s3_query_name(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    if lower.starts_with("x-amz-") || lower.starts_with("response-") {
+        return true;
+    }
+    BUCKET_SUBRESOURCES
+        .iter()
+        .chain(S3_LIST_AND_OBJECT_PARAMS.iter())
+        .any(|known| name.eq_ignore_ascii_case(known))
+}
+
 fn unsupported_subresource(method: &str, sub: &str) -> S3Error {
     S3Error::not_implemented(&format!(
         "{} on the bucket ?{} subresource is not implemented",

@@ -56,10 +56,10 @@ function renderUser(onRequest: (request: Request) => Response | Promise<Response
 
 function route(request: Request, preview = '{"Version":"2012-10-17","Statement":[]}') {
   const url = new URL(request.url)
-  if (url.pathname === '/api/iam/users/alice' && request.method === 'GET') return json(200, user)
-  if (url.pathname === '/api/iam/users/alice/keys' && request.method === 'GET') return json(200, { keys: [existingKey] })
-  if (url.pathname === '/api/iam/policies' && request.method === 'GET') return json(200, { policies: [] })
-  if (url.pathname === '/api/iam/preview' && request.method === 'POST') return json(200, { documentJson: preview })
+  if (url.pathname === '/maxio/api/iam/users/alice' && request.method === 'GET') return json(200, user)
+  if (url.pathname === '/maxio/api/iam/users/alice/keys' && request.method === 'GET') return json(200, { keys: [existingKey] })
+  if (url.pathname === '/maxio/api/iam/policies' && request.method === 'GET') return json(200, { policies: [] })
+  if (url.pathname === '/maxio/api/iam/preview' && request.method === 'POST') return json(200, { documentJson: preview })
   return json(500, { error: `unexpected ${request.method} ${url.pathname}` })
 }
 
@@ -68,7 +68,7 @@ test('creating a key stores a narrowing policy and does not grant the user', asy
   let created: unknown
   const { screen } = renderUser(async (request) => {
     const url = new URL(request.url)
-    if (url.pathname === '/api/iam/users/alice/keys' && request.method === 'POST') {
+    if (url.pathname === '/maxio/api/iam/users/alice/keys' && request.method === 'POST') {
       created = await request.json()
       return json(200, {
         accessKeyId: 'MXIANEWKEY000000001',
@@ -99,10 +99,10 @@ test('creating a key stores a narrowing policy and does not grant the user', asy
 test('shows a key policy and does not claim the user has no policies', async () => {
   const { screen } = renderUser((request) => {
     const url = new URL(request.url)
-    if (url.pathname === '/api/iam/users/alice' && request.method === 'GET') {
+    if (url.pathname === '/maxio/api/iam/users/alice' && request.method === 'GET') {
       return json(200, { ...user, attachedPolicies: [], inlinePolicies: [] })
     }
-    if (url.pathname === '/api/iam/users/alice/keys' && request.method === 'GET') {
+    if (url.pathname === '/maxio/api/iam/users/alice/keys' && request.method === 'GET') {
       return json(200, {
         keys: [
           {
@@ -123,7 +123,7 @@ test('shows a key policy and does not claim the user has no policies', async () 
 test('a star key policy is described as inheriting the user', async () => {
   const { screen } = renderUser((request) => {
     const url = new URL(request.url)
-    if (url.pathname === '/api/iam/users/alice/keys' && request.method === 'GET') {
+    if (url.pathname === '/maxio/api/iam/users/alice/keys' && request.method === 'GET') {
       return json(200, {
         keys: [{ ...existingKey, hasPolicy: true, policySummary: 'Key policy: *' }],
       })
@@ -139,7 +139,7 @@ test('deleting an access key asks for confirmation', async () => {
   let deleted = false
   const { screen } = renderUser((request) => {
     const url = new URL(request.url)
-    if (url.pathname.startsWith('/api/iam/users/alice/keys/') && request.method === 'DELETE') {
+    if (url.pathname.startsWith('/maxio/api/iam/users/alice/keys/') && request.method === 'DELETE') {
       deleted = true
       return json(200, { ok: true })
     }
@@ -160,7 +160,7 @@ test('granting a scope is a separate action from creating a key', async () => {
     if (request.method === 'POST' || request.method === 'PUT') {
       posts.push({ path: url.pathname, body: await request.json() })
     }
-    if (url.pathname.startsWith('/api/iam/users/alice/inline/') && request.method === 'PUT') {
+    if (url.pathname.startsWith('/maxio/api/iam/users/alice/inline/') && request.method === 'PUT') {
       return json(200, { ok: true })
     }
     return route(request, '{"Version":"2012-10-17","Statement":[{"Effect":"Allow"}]}')
@@ -180,7 +180,7 @@ test('granting a scope is a separate action from creating a key', async () => {
 
   await waitFor(() => expect(posts.some((post) => post.path.includes('/inline/'))).toBe(true))
   const grant = posts.find((post) => post.path.includes('/inline/'))
-  expect(grant?.path).toBe('/api/iam/users/alice/inline/grant-photos-reports-read')
+  expect(grant?.path).toBe('/maxio/api/iam/users/alice/inline/grant-photos-reports-read')
   expect(grant?.body).toMatchObject({ documentJson: expect.stringContaining('Allow') })
   expect(posts.some((post) => post.path.endsWith('/keys'))).toBe(false)
 })

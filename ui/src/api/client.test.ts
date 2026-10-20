@@ -21,21 +21,21 @@ function setup(respond: (request: Request) => Response | Promise<Response>) {
 
 describe('restoreObjectKeySlashes', () => {
   test('restores slashes in the key of object routes only', () => {
-    expect(restoreObjectKeySlashes('/api/buckets/b/objects/a%2Fb%2Fc.txt')).toBe('/api/buckets/b/objects/a/b/c.txt')
-    expect(restoreObjectKeySlashes('/api/buckets/b/upload/a%2Fb%20c')).toBe('/api/buckets/b/upload/a/b%20c')
-    expect(restoreObjectKeySlashes('/api/buckets/b/versions/v%2F1/download/x%2Fy')).toBe(
-      '/api/buckets/b/versions/v%2F1/download/x/y',
+    expect(restoreObjectKeySlashes('/maxio/api/buckets/b/objects/a%2Fb%2Fc.txt')).toBe('/maxio/api/buckets/b/objects/a/b/c.txt')
+    expect(restoreObjectKeySlashes('/maxio/api/buckets/b/upload/a%2Fb%20c')).toBe('/maxio/api/buckets/b/upload/a/b%20c')
+    expect(restoreObjectKeySlashes('/maxio/api/buckets/b/versions/v%2F1/download/x%2Fy')).toBe(
+      '/maxio/api/buckets/b/versions/v%2F1/download/x/y',
     )
-    expect(restoreObjectKeySlashes('/api/buckets/b/versioning')).toBe('/api/buckets/b/versioning')
+    expect(restoreObjectKeySlashes('/maxio/api/buckets/b/versioning')).toBe('/maxio/api/buckets/b/versioning')
   })
 
   test('covers object details, object tags and version restore routes', () => {
-    expect(restoreObjectKeySlashes('/api/buckets/b/object-info/a%2Fb.txt')).toBe('/api/buckets/b/object-info/a/b.txt')
-    expect(restoreObjectKeySlashes('/api/buckets/b/object-tags/a%2Fb.txt')).toBe('/api/buckets/b/object-tags/a/b.txt')
-    expect(restoreObjectKeySlashes('/api/buckets/b/versions/v1/restore/a%2Fb')).toBe(
-      '/api/buckets/b/versions/v1/restore/a/b',
+    expect(restoreObjectKeySlashes('/maxio/api/buckets/b/object-info/a%2Fb.txt')).toBe('/maxio/api/buckets/b/object-info/a/b.txt')
+    expect(restoreObjectKeySlashes('/maxio/api/buckets/b/object-tags/a%2Fb.txt')).toBe('/maxio/api/buckets/b/object-tags/a/b.txt')
+    expect(restoreObjectKeySlashes('/maxio/api/buckets/b/versions/v1/restore/a%2Fb')).toBe(
+      '/maxio/api/buckets/b/versions/v1/restore/a/b',
     )
-    expect(restoreObjectKeySlashes('/api/buckets/b/tags')).toBe('/api/buckets/b/tags')
+    expect(restoreObjectKeySlashes('/maxio/api/buckets/b/tags')).toBe('/maxio/api/buckets/b/tags')
   })
 })
 
@@ -68,14 +68,14 @@ describe('configureApiClient', () => {
     expect(data).toEqual(session)
     expect(requests[0].method).toBe('POST')
     expect(requests[0].credentials).toBe('same-origin')
-    expect(new URL(requests[0].url).pathname).toBe('/api/auth/login')
+    expect(new URL(requests[0].url).pathname).toBe('/maxio/api/auth/login')
     expect(await requests[0].json()).toEqual({ accessKey: 'a', secretKey: 'b' })
   })
 
   test('keeps slashes of object keys while encoding each segment', async () => {
     const { client, requests } = setup(() => json(200, { ok: true }))
     await sdk.deleteObject({ client, path: { bucket: 'media', key: 'photos/my trip/a#1.jpg' }, throwOnError: true })
-    expect(new URL(requests[0].url).pathname).toBe('/api/buckets/media/objects/photos/my%20trip/a%231.jpg')
+    expect(new URL(requests[0].url).pathname).toBe('/maxio/api/buckets/media/objects/photos/my%20trip/a%231.jpg')
   })
 
   test('uploads the raw file with its content type', async () => {
@@ -90,7 +90,7 @@ describe('configureApiClient', () => {
     })
     const request = requests[0]
     expect(request.method).toBe('PUT')
-    expect(new URL(request.url).pathname).toBe('/api/buckets/media/upload/docs/hello.txt')
+    expect(new URL(request.url).pathname).toBe('/maxio/api/buckets/media/upload/docs/hello.txt')
     expect(request.headers.get('Content-Type')).toBe('text/plain')
     expect(await request.text()).toBe('hello')
   })

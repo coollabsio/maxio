@@ -155,8 +155,8 @@ if [ "${MAXIO_SMOKE:-0}" = "1" ]; then
     HEALTH_VERSION=$(json_field "$HEALTH" version)
     assert_eq "live health status is ok" "ok" "$HEALTH_STATUS"
     assert_eq "live health has no version" "" "$HEALTH_VERSION"
-    VER_CODE=$(curl -sS -o "$TMPDIR/api-version" -w '%{http_code}' "$ENDPOINT/api/version" || echo "000")
-    assert_eq "unauthenticated /api/version is denied" "401" "$VER_CODE"
+    VER_CODE=$(curl -sS -o "$TMPDIR/api-version" -w '%{http_code}' "$ENDPOINT/maxio/api/version" || echo "000")
+    assert_eq "unauthenticated /maxio/api/version is denied" "401" "$VER_CODE"
 
     if [ -n "${MAXIO_BIN:-}" ] && [ -x "${MAXIO_BIN}" ]; then
         BIN_VERSION=$("${MAXIO_BIN}" --version | awk '{print $NF}')
@@ -194,7 +194,7 @@ fi
 
 # Service health does not use /healthz or /version, so those names are buckets.
 echo ""
-echo "--- Buckets named version and healthz (path-style) ---"
+echo "--- Buckets named version, healthz, api, and ui (path-style) ---"
 LIVE_BODY=$(curl -fsS "$ENDPOINT/maxio/health/live" || true)
 assert_eq "GET /maxio/health/live status" "ok" "$(json_field "$LIVE_BODY" status)"
 assert_eq "GET /maxio/health/live has no version" "" "$(json_field "$LIVE_BODY" version)"
@@ -203,12 +203,37 @@ assert_eq "HEAD /maxio/health/live is 200" "200" "$LIVE_HEAD"
 READY_BODY=$(curl -fsS "$ENDPOINT/maxio/health/ready" || true)
 assert_eq "GET /maxio/health/ready status" "ok" "$(json_field "$READY_BODY" status)"
 assert_eq "GET /maxio/health/ready has no version" "" "$(json_field "$READY_BODY" version)"
-VER_CODE=$(curl -sS -o "$TMPDIR/unauth-version" -w '%{http_code}' "$ENDPOINT/api/version" || echo "000")
-assert_eq "unauthenticated /api/version is denied" "401" "$VER_CODE"
+VER_CODE=$(curl -sS -o "$TMPDIR/unauth-version" -w '%{http_code}' "$ENDPOINT/maxio/api/version" || echo "000")
+assert_eq "unauthenticated /maxio/api/version is denied" "401" "$VER_CODE"
+curl -sS -c "$TMPDIR/version.cookies" -H 'content-type: application/json' \
+    -d "{\"accessKey\":\"$MAXIO_TEST_ACCESS_KEY\",\"secretKey\":\"$MAXIO_TEST_SECRET_KEY\"}" \
+    -D "$TMPDIR/version.headers" \
+    "$ENDPOINT/maxio/api/auth/login" > /dev/null
+assert_eq "session cookie path is /maxio" "true" \
+    "$(grep -q 'Path=/maxio' "$TMPDIR/version.headers" && echo true || echo false)"
+AUTH_VER=$(curl -sS -b "$TMPDIR/version.cookies" "$ENDPOINT/maxio/api/version" || true)
+assert_eq "authenticated /maxio/api/version" "true" \
+    "$([ -n "$(json_field "$AUTH_VER" version)" ] && echo true || echo false)"
+OLD_API=$(curl -sS -o "$TMPDIR/old-api-version" -w '%{http_code}' "$ENDPOINT/api/version" || echo "000")
+assert_eq "old /api/version is not the console" "true" \
+    "$([ "$OLD_API" != "401" ] && ! grep -q 'Not authenticated' "$TMPDIR/old-api-version" && echo true || echo false)"
 MAXIO_CREATE=$($AWS s3api create-bucket --bucket maxio 2>&1 || true)
 assert_eq "create bucket maxio is InvalidBucketName" "true" \
     "$(echo "$MAXIO_CREATE" | grep -q InvalidBucketName && echo true || echo false)"
-for PROBE_BUCKET in version healthz; do
+UI_CREATE=$($AWS s3api create-bucket --bucket ui 2>&1 || true)
+assert_eq "create bucket ui is InvalidBucketName" "true" \
+    "$(echo "$UI_CREATE" | grep -q InvalidBucketName && echo true || echo false)"
+UI_PAGE=$(curl -sS -o "$TMPDIR/ui-page" -w '%{http_code}' "$ENDPOINT/ui/" || true)
+UI_PAGE_OK=false
+if { [ "$UI_PAGE" = "200" ] || [ "$UI_PAGE" = "503" ]; } \
+    && ! grep -q '<Code>' "$TMPDIR/ui-page"; then
+    UI_PAGE_OK=true
+fi
+assert_eq "unsigned GET /ui/ is the console" "true" "$UI_PAGE_OK"
+UI_SUB=$(curl -sS "$ENDPOINT/ui?versioning" || true)
+assert_eq "unsigned GET /ui?versioning is S3" "true" \
+    "$(printf '%s' "$UI_SUB" | grep -q '<Code>' && echo true || echo false)"
+for PROBE_BUCKET in version healthz api; do
     echo "probe-$PROBE_BUCKET" > "$TMPDIR/probe.txt"
     assert "create bucket $PROBE_BUCKET" $AWS s3 mb "s3://$PROBE_BUCKET"
     LIST_OUT=$($AWS s3 ls 2>&1 || true)
@@ -1958,10 +1983,10 @@ assert "prefix put uploads-private object" $AWS s3 cp "$TMPDIR/prefix-sibling.tx
 assert "prefix put uploadsX object" $AWS s3 cp "$TMPDIR/prefix-glued.txt" "s3://$PREFIX_BUCKET/uploadsX.txt"
 curl -sS -c "$TMPDIR/iam.cookies" -H 'content-type: application/json' \
     -d "{\"accessKey\":\"$MAXIO_TEST_ACCESS_KEY\",\"secretKey\":\"$MAXIO_TEST_SECRET_KEY\"}" \
-    "$ENDPOINT/api/auth/login" > /dev/null
+    "$ENDPOINT/maxio/api/auth/login" > /dev/null
 PREVIEW=$(curl -sS -b "$TMPDIR/iam.cookies" -H 'content-type: application/json' \
     -d "{\"buckets\":[\"$PREFIX_BUCKET\"],\"prefix\":\"uploads/\",\"access\":\"readwrite\"}" \
-    "$ENDPOINT/api/iam/preview")
+    "$ENDPOINT/maxio/api/iam/preview")
 printf '%s' "$PREVIEW" > "$TMPDIR/iam-preview.json"
 python3 - "$TMPDIR/iam-preview.json" "$TMPDIR/iam-prefix-policy.json" <<'PY'
 import json, sys
@@ -2014,7 +2039,7 @@ NOGRANT_SECRET=$(printf '%s' "$NOGRANT_FIRST" | python3 -c 'import json,sys; pri
 NOGRANT_STATUS=$(curl -sS -o "$TMPDIR/nogrant-key.json" -w '%{http_code}' -b "$TMPDIR/iam.cookies" \
     -H 'content-type: application/json' \
     -d "{\"buckets\":[\"$NOGRANT_BUCKET\"],\"prefix\":\"uploads/\",\"access\":\"write\"}" \
-    "$ENDPOINT/api/iam/users/$NOGRANT_USER/keys")
+    "$ENDPOINT/maxio/api/iam/users/$NOGRANT_USER/keys")
 assert_eq "nogrant create key without keyOnly" "200" "$NOGRANT_STATUS"
 assert "nogrant key document is directory scoped" python3 -c \
     'import json,sys; doc=json.load(open(sys.argv[1])).get("documentJson") or ""; rest=doc.replace("uploads/*",""); raise SystemExit(0 if "uploads/*" in doc and "uploads*" not in rest else 1)' \
@@ -2032,7 +2057,7 @@ export AWS_SECRET_ACCESS_KEY="$ROOT_SECRET"
 NOGRANT_FALSE=$(curl -sS -o "$TMPDIR/nogrant-false.json" -w '%{http_code}' -b "$TMPDIR/iam.cookies" \
     -H 'content-type: application/json' \
     -d "{\"buckets\":[\"$NOGRANT_BUCKET\"],\"prefix\":\"uploads/\",\"access\":\"read\",\"keyOnly\":false}" \
-    "$ENDPOINT/api/iam/users/$NOGRANT_USER/keys")
+    "$ENDPOINT/maxio/api/iam/users/$NOGRANT_USER/keys")
 assert_eq "nogrant keyOnly false is rejected" "400" "$NOGRANT_FALSE"
 NOGRANT_POLICIES=$($AWS iam list-user-policies --user-name "$NOGRANT_USER" --output json)
 assert_eq "nogrant user policies after rejection" "read" \
@@ -2530,7 +2555,7 @@ EOF
         AWS_CONFIG_FILE="$AWS_VCONF" "${VAWS[@]}" "$@"
     }
 
-    for PROBE_BUCKET in version healthz; do
+    for PROBE_BUCKET in version healthz api; do
         pin_vhost "${PROBE_BUCKET}.localhost"
         echo "vhost-$PROBE_BUCKET" > "$TMPDIR/vprobe.txt"
         assert "virtual create bucket $PROBE_BUCKET" vaws s3 mb "s3://$PROBE_BUCKET"
@@ -2553,6 +2578,10 @@ EOF
     VMAXIO=$(vaws s3api create-bucket --bucket maxio 2>&1 || true)
     assert_eq "virtual create bucket maxio is InvalidBucketName" "true" \
         "$(echo "$VMAXIO" | grep -q InvalidBucketName && echo true || echo false)"
+    pin_vhost "ui.localhost"
+    VUI=$(vaws s3api create-bucket --bucket ui 2>&1 || true)
+    assert_eq "virtual create bucket ui is InvalidBucketName" "true" \
+        "$(echo "$VUI" | grep -q InvalidBucketName && echo true || echo false)"
 
     assert "virtual create bucket" vaws s3 mb "s3://${VBUCKET}"
     assert "virtual head bucket" vaws s3api head-bucket --bucket "$VBUCKET"
@@ -2660,11 +2689,11 @@ EOF
         --policy-name broad --policy-document "file://$TMPDIR/viam-user.json"
     curl -sS -c "$TMPDIR/viam.cookies" -H 'content-type: application/json' \
         -d "{\"accessKey\":\"$MAXIO_TEST_ACCESS_KEY\",\"secretKey\":\"$MAXIO_TEST_SECRET_KEY\"}" \
-        "$ENDPOINT/api/auth/login" > /dev/null
+        "$ENDPOINT/maxio/api/auth/login" > /dev/null
     VIAM_STATUS=$(curl -sS -o "$TMPDIR/viam-key.json" -w '%{http_code}' -b "$TMPDIR/viam.cookies" \
         -H 'content-type: application/json' \
         -d "{\"buckets\":[\"$VIAM_BUCKET\"],\"prefix\":\"photos/\",\"access\":\"read\"}" \
-        "$ENDPOINT/api/iam/users/$VIAM_USER/keys")
+        "$ENDPOINT/maxio/api/iam/users/$VIAM_USER/keys")
     assert_eq "viam create narrowed key" "200" "$VIAM_STATUS"
     VIAM_KEY=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["accessKeyId"])' "$TMPDIR/viam-key.json")
     VIAM_SECRET=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["secretAccessKey"])' "$TMPDIR/viam-key.json")

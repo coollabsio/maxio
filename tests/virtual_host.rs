@@ -786,7 +786,7 @@ async fn dotted_bucket_uppercase_host_and_service_routes() {
         .no_proxy()
         .build()
         .unwrap()
-        .get(format!("{}/api/auth/check", server.base))
+        .get(format!("{}/maxio/api/auth/check", server.base))
         .send()
         .await
         .unwrap();
@@ -827,7 +827,7 @@ async fn dotted_bucket_uppercase_host_and_service_routes() {
     let (status, body) = raw_http(
         server.port,
         &format!(
-            "GET /api/auth/check HTTP/1.1\r\nhost: photos.localhost:{}\r\nconnection: close\r\n\r\n",
+            "GET /maxio/api/auth/check HTTP/1.1\r\nhost: photos.localhost:{}\r\nconnection: close\r\n\r\n",
             server.port
         )
         .into_bytes(),
@@ -1016,10 +1016,10 @@ async fn forwarded_host_and_longest_domain() {
 #[tokio::test]
 async fn buckets_named_version_and_healthz_work_on_virtual_host() {
     let server = start("localhost").await;
-    let hosts = ["version.localhost", "healthz.localhost"];
+    let hosts = ["version.localhost", "healthz.localhost", "api.localhost"];
     let client = http_client(server.port, &hosts);
 
-    for bucket in ["version", "healthz"] {
+    for bucket in ["version", "healthz", "api"] {
         let host = format!("{bucket}.localhost");
         let root = vurl(&host, server.port, "/");
         let (status, body) = call_status(&client, "PUT", &root, vec![], &[]).await;
@@ -1065,15 +1065,17 @@ async fn buckets_named_version_and_healthz_work_on_virtual_host() {
     assert!(health_body.contains("\"status\":\"ok\""), "{health_body}");
     assert!(!health_body.contains("\"version\""), "{health_body}");
 
-    let reserved = http_client(server.port, &["maxio.localhost"]);
-    let (status, body) = call_status(
-        &reserved,
-        "PUT",
-        &vurl("maxio.localhost", server.port, "/"),
-        vec![],
-        &[],
-    )
-    .await;
-    assert_eq!(status, 400, "{body}");
-    assert!(body.contains("InvalidBucketName"), "{body}");
+    let reserved = http_client(server.port, &["maxio.localhost", "ui.localhost"]);
+    for bucket in ["maxio", "ui"] {
+        let (status, body) = call_status(
+            &reserved,
+            "PUT",
+            &vurl(&format!("{bucket}.localhost"), server.port, "/"),
+            vec![],
+            &[],
+        )
+        .await;
+        assert_eq!(status, 400, "{bucket}: {body}");
+        assert!(body.contains("InvalidBucketName"), "{body}");
+    }
 }

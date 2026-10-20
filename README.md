@@ -204,7 +204,19 @@ mc cp file.txt maxio/my-bucket/
 
 Object bytes, sidecars, multipart parts, version files, and bucket configuration are published with a temp file, `fsync`, rename, and a directory `fsync`. A crash during a write leaves the previous object in place, or a temp file that is not part of the bucket listing.
 
-On startup MaxIO deletes those temp files, restores or drops stranded erasure-coded publish backups, and removes multipart uploads whose metadata never landed. Uploads that have readable metadata are kept so a client can finish them. An hourly sweep aborts uploads that have been idle for 7 days and deletes temp files older than a day (a live upload is younger than that).
+On startup MaxIO deletes those temp files, restores or drops stranded erasure-coded publish backups, restores object bytes left in a `.maxio-promote-*` directory, and removes multipart uploads whose metadata never landed. Uploads that have readable metadata are kept so a client can finish them. An hourly sweep aborts uploads that have been idle for 7 days and deletes temp files older than a day (a live upload is younger than that). Promote directories newer than an hour are left for that sweep so it does not race a promotion that is still running; startup does not wait.
+
+### Key and prefix layout
+
+S3 keys are a flat namespace, so `photos/cat.jpg` and `photos/cat.jpg/thumb` can both exist. MaxIO stores the first object's bytes at `photos/cat.jpg/.maxio.object` and keeps the sidecar next to that directory (`photos/cat.jpg.meta.json`). The sidecar is where an SSE-S3 wrapped data key lives.
+
+This layout is one-way. A data directory written by this version is not readable by older MaxIO builds: GET of a promoted key returns `InternalError`, because those builds open the key path as a file and the path is now a directory. Stay on this version, or a newer one, to read those objects. Do not point an older binary at a data directory that already contains promoted keys.
+
+A crash during the promotion parks the bytes in `.maxio-promote-<id>/.maxio.object` and records the key name in that directory. Startup and `maxio check --repair` move the bytes back to the key, or into `<key>/.maxio.object` when that directory already exists. `maxio check` reports the leftover, including `.maxio-promote-target` and `.maxio-promote-ready` files left inside the published directory. It does not delete the sidecar while a promote directory for that key is still there.
+
+Object keys cannot use those internal names as a path segment (`.maxio.object`, `.maxio-promote-*`, `.maxio-tmp-*`, `.maxio-bak-*`, `.maxio-quarantine`, and the other layout names). Matching is ASCII case-insensitive, so `p/.MAXIO.OBJECT` is rejected too. A write returns `400 InvalidArgument`. A read returns `NoSuchKey`. That stops a client from overwriting `p`'s bytes by putting `p/.maxio.object`.
+
+Objects created by a pre-1.0 build may already use those names. MaxIO refuses to start when it finds one, and `maxio check` reports it as `legacy-reserved-key` without modifying the files. Rename or delete the keys with the previous version (`aws s3 mv`), then start this version. See [UPGRADE.md](UPGRADE.md).
 
 Back up the data directory and the SSE-S3 master key. That key is `<data-dir>/.maxio-keys.json` unless you set `MAXIO_MASTER_KEY` or `MAXIO_MASTER_KEY_FILE`, which stay outside the data directory. Losing the key makes SSE-S3 objects unrecoverable.
 
@@ -221,13 +233,14 @@ maxio check --data-dir ./data
 maxio check --data-dir ./data --repair
 ```
 
-The report lists stale temp files, stranded backups, object bytes without a sidecar, sidecars without bytes, plain-object size / etag / checksum mismatches, multipart debris, and erasure-coded chunks that do not match their manifest. Exit status is 1 when anything is still unresolved.
+The report lists stale temp files, stranded backups, promote directories and leftover promote marker files, object bytes without a sidecar, sidecars without bytes, plain-object size / etag / checksum mismatches, multipart debris, and erasure-coded chunks that do not match their manifest. Exit status is 1 when anything is still unresolved.
 
 `--repair` fixes the cases that are determined by the bytes already on disk:
 
 - delete temp files and finished publish backups; restore a backup when the live object is missing
-- recreate a sidecar for plain object bytes that have none (etag and size taken from the file)
-- delete a sidecar whose bytes are gone, and delete a multipart upload that has no readable metadata
+- restore object bytes stranded in a `.maxio-promote-*` directory (back to the key, or into `<key>/.maxio.object` if that directory exists) and remove the directory. Remove `.maxio-promote-target` and `.maxio-promote-ready` files left inside a published key directory
+- move object bytes that have no sidecar to `<data-dir>/.maxio-quarantine/<bucket>/<path>` and say so in the report. Those bytes are not given a new sidecar: they may be SSE-S3 ciphertext, and serving them as a plain object would return the ciphertext with no encryption headers. Copy a quarantined file back by hand if you know which object it belongs to
+- delete a sidecar whose bytes are gone, and delete a multipart upload that has no readable metadata. A sidecar is kept when a promote directory for that key still exists
 - rewrite a plain object's size, etag, and checksum so they match the file
 - rebuild a missing or corrupt data chunk when parity shards can reconstruct it
 

@@ -28,6 +28,7 @@ pub async fn create_multipart_upload(
     headers: HeaderMap,
 ) -> Result<Response<Body>, S3Error> {
     require_bucket(&state, &bucket).await?;
+    crate::storage::filesystem::reject_writable_key(&key).map_err(map_storage_err)?;
 
     let object_metadata = extract_object_metadata(&headers)?;
     let tags = parse_tagging_header(&headers)?;
@@ -90,12 +91,13 @@ pub async fn create_multipart_upload(
 
 pub async fn upload_part(
     State(state): State<AppState>,
-    Path((bucket, _key)): Path<(String, String)>,
+    Path((bucket, key)): Path<(String, String)>,
     Query(params): Query<HashMap<String, String>>,
     headers: HeaderMap,
     body: Body,
 ) -> Result<Response<Body>, S3Error> {
     require_bucket(&state, &bucket).await?;
+    crate::storage::filesystem::reject_writable_key(&key).map_err(map_storage_err)?;
 
     let upload_id = params
         .get("uploadId")
@@ -149,6 +151,7 @@ pub async fn complete_multipart_upload(
     body: Body,
 ) -> Result<Response<Body>, S3Error> {
     require_bucket(&state, &bucket).await?;
+    crate::storage::filesystem::reject_writable_key(&key).map_err(map_storage_err)?;
     let upload_id = params
         .get("uploadId")
         .ok_or_else(|| S3Error::invalid_argument("missing uploadId"))?;
@@ -158,6 +161,9 @@ pub async fn complete_multipart_upload(
         .map_err(S3Error::internal)?;
     let body_str = String::from_utf8_lossy(&bytes);
     let parts = parse_complete_parts(&body_str)?;
+    if parts.is_empty() {
+        return Err(S3Error::malformed_xml());
+    }
 
     // SSE-C customer key, if the upload was SSE-C, arrives here again.
     let customer_key = extract_customer_key(&headers)?;
@@ -302,6 +308,9 @@ pub(super) fn map_storage_err(err: StorageError) -> S3Error {
         StorageError::EntityTooLarge => S3Error::entity_too_large(),
         StorageError::InvalidKey(msg) if msg.contains("part too small") => {
             S3Error::entity_too_small()
+        }
+        StorageError::InvalidKey(msg) if msg.contains("collides with an internal storage name") => {
+            S3Error::invalid_argument(&msg)
         }
         StorageError::InvalidKey(msg)
             if msg.contains("part")

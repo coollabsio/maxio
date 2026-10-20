@@ -317,14 +317,21 @@ fn canonical_query_string(qs: &str) -> String {
         .join("&")
 }
 
+/// HTTP/1 header values are ISO-8859-1. SigV4 hashes a Unicode canonical
+/// request as UTF-8, so each header byte becomes the character with that
+/// code point (`0xE9` → `é`, not a UTF-8 decode failure).
+pub fn header_value_latin1(value: &http::HeaderValue) -> String {
+    value.as_bytes().iter().map(|&b| b as char).collect()
+}
+
 fn canonical_headers(headers: &HeaderMap, signed_headers: &[String]) -> String {
     let mut result = String::new();
     for name in signed_headers {
         // Collect all values for this header (there can be multiple)
-        let values: Vec<&str> = headers
+        let values: Vec<String> = headers
             .get_all(name.as_str())
             .iter()
-            .filter_map(|v| v.to_str().ok())
+            .map(header_value_latin1)
             .collect();
         let mut value = values.join(",");
         // A signed `content-length: 0` is dropped by Go reverse proxies on

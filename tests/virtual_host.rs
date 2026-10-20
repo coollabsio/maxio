@@ -654,7 +654,9 @@ async fn virtual_multipart_copy_presign_and_subresources() {
     )
     .await;
     assert_eq!(status, 200, "{location}");
-    assert!(location.contains(&format!(">{REGION}<")), "{location}");
+    // us-east-1 is an empty LocationConstraint, the same as AWS.
+    assert!(location.contains("<LocationConstraint"), "{location}");
+    assert!(!location.contains(&format!(">{REGION}<")), "{location}");
 
     let virtual_qs = presign(&format!("{host}:{}", server.port), "GET", "/src.txt");
     let presigned = anon

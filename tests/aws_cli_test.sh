@@ -31,7 +31,7 @@ unset AWS_CONFIG_FILE AWS_PROFILE AWS_DEFAULT_PROFILE
 
 AWS="aws --endpoint-url $ENDPOINT"
 
-VHOST_MARK="# maxio-awscli-vhost"
+VHOST_MARK="# maxio-awscli-vhost-$$-$PORT"
 cleanup() {
     if [ -n "${KEY_PID:-}" ] && kill -0 "$KEY_PID" 2>/dev/null; then
         kill "$KEY_PID" 2>/dev/null || true
@@ -951,14 +951,17 @@ echo ""
 echo "--- Keyring rotate CLI tests ---"
 
 # Locate the maxio binary (script runs against a pre-started server, so the
-# binary path isn't passed in — try both debug and release).
-MAXIO_BIN=""
-for candidate in ./target/debug/maxio ./target/release/maxio; do
-    if [ -x "$candidate" ]; then
-        MAXIO_BIN="$candidate"
-        break
-    fi
-done
+# binary path isn't passed in — try both debug and release). A pre-set
+# MAXIO_BIN is kept so a release binary can be selected explicitly.
+if [ -z "${MAXIO_BIN:-}" ] || [ ! -x "${MAXIO_BIN}" ]; then
+    MAXIO_BIN=""
+    for candidate in ./target/debug/maxio ./target/release/maxio; do
+        if [ -x "$candidate" ]; then
+            MAXIO_BIN="$candidate"
+            break
+        fi
+    done
+fi
 
 if [ -z "$MAXIO_BIN" ]; then
     red "SKIP: keyring rotate tests (./target/debug/maxio and ./target/release/maxio not found)"
@@ -1265,16 +1268,16 @@ echo ""
 echo "--- GetBucketLocation test ---"
 LOC_BUCKET="loc-$$"
 assert "create loc bucket" $AWS s3api create-bucket --bucket "$LOC_BUCKET"
-LOC=$($AWS s3api get-bucket-location --bucket "$LOC_BUCKET" 2>&1)
-# LocationConstraint is "us-east-1" or null-equivalent
-LOC_VAL=$(echo "$LOC" | grep -o '"LocationConstraint": "[^"]*"' | cut -d'"' -f4)
-if [ "$LOC_VAL" = "us-east-1" ] || [ -z "$LOC_VAL" ]; then
-    green "PASS: get-bucket-location returned '$LOC_VAL'"
-    PASS=$((PASS + 1))
-else
-    red "FAIL: get-bucket-location returned '$LOC_VAL'"
-    FAIL=$((FAIL + 1))
-fi
+LOC=$($AWS s3api get-bucket-location --bucket "$LOC_BUCKET" 2>&1 || true)
+# us-east-1 is an empty LocationConstraint. aws CLI prints that as JSON null.
+# grep exits 1 when the value is null, which aborts the script under pipefail.
+LOC_VAL=$(printf '%s' "$LOC" | python3 -c 'import json,sys
+try:
+    value = json.load(sys.stdin).get("LocationConstraint")
+except Exception:
+    value = None
+print("" if value is None else value)' || true)
+assert_eq "get-bucket-location us-east-1 is empty" "" "$LOC_VAL"
 assert "delete loc bucket" $AWS s3api delete-bucket --bucket "$LOC_BUCKET"
 
 # --- Cross-bucket CopyObject ---
@@ -1661,6 +1664,11 @@ EOF
         "$(echo "$LC" | python3 -c 'import sys,json; print(json.load(sys.stdin)["Rules"][0]["NoncurrentVersionExpiration"]["NoncurrentDays"])')"
     assert_eq "lifecycle abort multipart days" "3" \
         "$(echo "$LC" | python3 -c 'import sys,json; print(json.load(sys.stdin)["Rules"][0]["AbortIncompleteMultipartUpload"]["DaysAfterInitiation"])')"
+    echo "log line" > "$TMPDIR/lifecycle-obj.txt"
+    PUT_EXP=$($AWS s3api put-object --bucket "$FEAT_BUCKET" --key logs/a.txt \
+        --body "$TMPDIR/lifecycle-obj.txt" 2>&1 || true)
+    assert_eq "put-object returns x-amz-expiration" "true" \
+        "$(echo "$PUT_EXP" | grep -q 'rule-id=' && echo true || echo false)"
     cat > "$TMPDIR/lifecycle-transition.json" <<'EOF'
 {
   "Rules": [
@@ -1747,8 +1755,10 @@ EOF
     echo "mc-checksum" > "$TMPDIR/mc-sum.txt"
     MC_CP_DEBUG="$TMPDIR/mc-cp.debug"
     MC_CP_EXIT=0
+    # Current mc prints the signed request (including the trailer checksum
+    # mode) on stdout. Keep both streams so the check does not depend on that.
     mc cp --checksum CRC32 --debug "$TMPDIR/mc-sum.txt" "$MC_ALIAS/$FEAT_BUCKET/mc-sum.txt" \
-        > /dev/null 2>"$MC_CP_DEBUG" || MC_CP_EXIT=$?
+        >"$MC_CP_DEBUG" 2>&1 || MC_CP_EXIT=$?
     assert_eq "mc cp --checksum exits 0" "0" "$MC_CP_EXIT"
     assert_eq "mc cp uses STREAMING-UNSIGNED-PAYLOAD-TRAILER" "true" \
         "$(grep -q 'STREAMING-UNSIGNED-PAYLOAD-TRAILER' "$MC_CP_DEBUG" && echo true || echo false)"
@@ -2328,6 +2338,111 @@ EOF
     assert "virtual delete bucket" vaws s3api delete-bucket --bucket "$VBUCKET"
     assert "virtual delete dotted bucket" vaws s3api delete-bucket --bucket "$VDOT"
 fi
+
+# --- S3 compatibility edge cases ---
+echo ""
+echo "=== S3 compatibility edge cases ==="
+
+COMPAT_BUCKET="compat-$$"
+assert "create compat bucket" $AWS s3api create-bucket --bucket "$COMPAT_BUCKET"
+# us-east-1: creating a bucket you already own succeeds.
+assert "recreate owned bucket" $AWS s3api create-bucket --bucket "$COMPAT_BUCKET"
+
+echo "compat-body" > "$TMPDIR/compat.txt"
+assert "put compat object" $AWS s3 cp "$TMPDIR/compat.txt" "s3://$COMPAT_BUCKET/foo/bar"
+assert "put child of that key" $AWS s3 cp "$TMPDIR/compat.txt" "s3://$COMPAT_BUCKET/foo/bar/child"
+assert_eq "read key that is also a prefix" "compat-body" \
+    "$($AWS s3 cp "s3://$COMPAT_BUCKET/foo/bar" - 2>/dev/null)"
+assert_eq "read child key" "compat-body" \
+    "$($AWS s3 cp "s3://$COMPAT_BUCKET/foo/bar/child" - 2>/dev/null)"
+
+COPY_SELF=$($AWS s3api copy-object --bucket "$COMPAT_BUCKET" --key foo/bar \
+    --copy-source "$COMPAT_BUCKET/foo/bar" 2>&1 || true)
+assert_eq "copy object onto itself is InvalidRequest" "true" \
+    "$(echo "$COPY_SELF" | grep -q InvalidRequest && echo true || echo false)"
+
+$AWS s3api get-object --bucket "$COMPAT_BUCKET" --key foo/bar \
+    --part-number 1 "$TMPDIR/part1" >/dev/null
+assert_eq "partNumber 1 of a single object" "compat-body" "$(cat "$TMPDIR/part1")"
+
+cat > "$TMPDIR/lifecycle-prefix.json" << 'EOF'
+{
+  "Rules": [
+    {
+      "ID": "rule1",
+      "Prefix": "days1/",
+      "Status": "Enabled",
+      "Expiration": {"Days": 1}
+    }
+  ]
+}
+EOF
+assert "put lifecycle prefix rule" $AWS s3api put-bucket-lifecycle-configuration \
+    --bucket "$COMPAT_BUCKET" \
+    --lifecycle-configuration "file://$TMPDIR/lifecycle-prefix.json"
+LC_GET=$($AWS s3api get-bucket-lifecycle-configuration --bucket "$COMPAT_BUCKET" 2>/dev/null || true)
+assert_eq "lifecycle prefix round-trips" "days1/" \
+    "$(printf '%s' "$LC_GET" | python3 -c 'import json,sys; print(json.load(sys.stdin)["Rules"][0].get("Prefix",""))' || true)"
+
+# `a` is both an object and a prefix of `a/b`. `maxio check` must read
+# a/.maxio.object instead of opening the directory, and --repair must not
+# delete that payload. Own data dir so the caller-owned server's lock is
+# not in the way.
+echo "prefix-a" > "$TMPDIR/prefix-a.txt"
+echo "prefix-b" > "$TMPDIR/prefix-b.txt"
+assert "put prefix key a" $AWS s3 cp "$TMPDIR/prefix-a.txt" "s3://$COMPAT_BUCKET/a"
+assert "put prefix key a/b" $AWS s3 cp "$TMPDIR/prefix-b.txt" "s3://$COMPAT_BUCKET/a/b"
+PREFIX_BIN="${MAXIO_BIN:-}"
+if [ -z "$PREFIX_BIN" ]; then
+    if [ -x ./target/release/maxio ]; then
+        PREFIX_BIN=./target/release/maxio
+    elif [ -x ./target/debug/maxio ]; then
+        PREFIX_BIN=./target/debug/maxio
+    fi
+fi
+if [ -n "$PREFIX_BIN" ]; then
+    PFX_DATA=$(mktemp -d)
+    PFX_PORT=$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1]); s.close()')
+    PFX_EP="http://127.0.0.1:$PFX_PORT"
+    PFX_CREDS=(--access-key "$MAXIO_TEST_ACCESS_KEY" --secret-key "$MAXIO_TEST_SECRET_KEY")
+    if [ "$MAXIO_TEST_ACCESS_KEY" = "maxioadmin" ] && [ "$MAXIO_TEST_SECRET_KEY" = "maxioadmin" ]; then
+        PFX_CREDS+=(--allow-insecure-dev)
+    fi
+    RUST_LOG=warn "$PREFIX_BIN" --data-dir "$PFX_DATA" --port "$PFX_PORT" \
+        --address 127.0.0.1 "${PFX_CREDS[@]}" >"$PFX_DATA/server.log" 2>&1 &
+    PFX_PID=$!
+    for _ in $(seq 1 50); do
+        curl -sf "$PFX_EP/healthz" >/dev/null 2>&1 && break
+        sleep 0.1
+    done
+    PFX_AWS="aws --endpoint-url $PFX_EP"
+    assert "prefix-check create bucket" $PFX_AWS s3 mb s3://pfx
+    assert "prefix-check put a" $PFX_AWS s3 cp "$TMPDIR/prefix-a.txt" s3://pfx/a
+    assert "prefix-check put a/b" $PFX_AWS s3 cp "$TMPDIR/prefix-b.txt" s3://pfx/a/b
+    assert "prefix-check put sse a" $PFX_AWS s3api put-object --bucket pfx --key sa \
+        --body "$TMPDIR/prefix-a.txt" --server-side-encryption AES256
+    assert "prefix-check put sse a/b" $PFX_AWS s3api put-object --bucket pfx --key sa/b \
+        --body "$TMPDIR/prefix-b.txt" --server-side-encryption AES256
+    kill -TERM "$PFX_PID" 2>/dev/null || true
+    wait "$PFX_PID" 2>/dev/null || true
+    set +e
+    "$PREFIX_BIN" check --data-dir "$PFX_DATA" >"$TMPDIR/prefix-check.txt" 2>"$TMPDIR/prefix-check.err"
+    PREFIX_RC=$?
+    set -e
+    assert_eq "maxio check on prefix key is clean" "0" "$PREFIX_RC"
+    assert "maxio check --repair on prefix key" "$PREFIX_BIN" check --data-dir "$PFX_DATA" --repair
+    assert_eq "prefix payload a kept" "true" \
+        "$([ -f "$PFX_DATA/buckets/pfx/a/.maxio.object" ] && echo true || echo false)"
+    assert_eq "prefix child a/b kept" "prefix-b" "$(cat "$PFX_DATA/buckets/pfx/a/b")"
+    assert_eq "sse prefix payload kept" "true" \
+        "$([ -f "$PFX_DATA/buckets/pfx/sa/.maxio.object" ] && echo true || echo false)"
+    rm -rf "$PFX_DATA"
+else
+    echo "SKIP: maxio binary not found for prefix-key check"
+fi
+
+$AWS s3 rm "s3://$COMPAT_BUCKET" --recursive > /dev/null 2>&1 || true
+assert "delete compat bucket" $AWS s3api delete-bucket --bucket "$COMPAT_BUCKET"
 
 # --- Summary ---
 echo ""

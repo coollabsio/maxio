@@ -25,6 +25,20 @@ use super::multipart;
 pub(crate) fn extract_sse_request(
     headers: &HeaderMap,
 ) -> Result<Option<EncryptionRequest>, S3Error> {
+    let has_sse_c_algo = headers.contains_key("x-amz-server-side-encryption-customer-algorithm");
+    let has_sse_c_key = headers.contains_key("x-amz-server-side-encryption-customer-key");
+    let has_sse_c_md5 = headers.contains_key("x-amz-server-side-encryption-customer-key-md5");
+    let has_sse = headers.contains_key("x-amz-server-side-encryption");
+    if has_sse_c_algo && has_sse {
+        return Err(S3Error::invalid_argument(
+            "Server side encryption headers cannot specify both SSE-C and SSE-S3",
+        ));
+    }
+    if (has_sse_c_key || has_sse_c_md5) && !has_sse_c_algo {
+        return Err(S3Error::invalid_argument(
+            "SSE-C customer key requires x-amz-server-side-encryption-customer-algorithm",
+        ));
+    }
     // SSE-C: customer-supplied key
     if let Some(algo) = headers
         .get("x-amz-server-side-encryption-customer-algorithm")
@@ -48,16 +62,17 @@ pub(crate) fn extract_sse_request(
         }
         let mut key = [0u8; 32];
         key.copy_from_slice(&raw);
-        // Validate optional MD5
-        if let Some(md5_b64) = headers
+        // AWS requires the MD5 of the customer key on every SSE-C request.
+        let md5_b64 = headers
             .get("x-amz-server-side-encryption-customer-key-md5")
             .and_then(|v| v.to_str().ok())
-        {
-            use md5::Digest;
-            let computed = base64::engine::general_purpose::STANDARD.encode(md5::Md5::digest(&key));
-            if computed != md5_b64 {
-                return Err(S3Error::invalid_argument("SSE-C key MD5 mismatch"));
-            }
+            .ok_or_else(|| {
+                S3Error::invalid_argument("missing x-amz-server-side-encryption-customer-key-md5")
+            })?;
+        use md5::Digest;
+        let computed = base64::engine::general_purpose::STANDARD.encode(md5::Md5::digest(&key));
+        if computed != md5_b64 {
+            return Err(S3Error::invalid_argument("SSE-C key MD5 mismatch"));
         }
         return Ok(Some(EncryptionRequest::sse_c(key)));
     }
@@ -228,7 +243,11 @@ fn header_string(headers: &HeaderMap, name: &str) -> Option<String> {
     let values: Vec<String> = headers
         .get_all(name)
         .iter()
-        .map(|v| String::from_utf8_lossy(v.as_bytes()).trim().to_string())
+        .map(|v| {
+            crate::auth::signature_v4::header_value_latin1(v)
+                .trim()
+                .to_string()
+        })
         .collect();
     if values.is_empty() {
         None
@@ -292,7 +311,6 @@ fn decode_tag_component(raw: &str) -> Result<String, S3Error> {
 fn validate_tags(tags: &HashMap<String, String>) -> Result<(), S3Error> {
     let pairs = tags.iter().map(|(k, v)| (k.as_str(), v.as_str()));
     crate::storage::validate_tags(pairs, 10, false)
-        .map_err(|e| S3Error::invalid_argument(&e.message))
 }
 
 /// Parse `x-amz-tagging: k1=v1&k2=v2` (URL-encoded query form).
@@ -324,14 +342,20 @@ pub(crate) fn parse_tagging_header(
 pub(crate) fn extract_write_precondition(
     headers: &HeaderMap,
 ) -> Result<Option<WritePrecondition>, S3Error> {
+    if headers.contains_key("if-none-match") && headers.contains_key("if-match") {
+        return Err(S3Error::invalid_argument(
+            "If-Match and If-None-Match cannot both be specified",
+        ));
+    }
     if let Some(v) = headers.get("if-none-match") {
-        let v = v.to_str().unwrap_or_default().trim();
+        let v = v.to_str().unwrap_or_default().trim().to_string();
         if v == "*" {
             return Ok(Some(WritePrecondition::IfNoneMatchAny));
         }
-        return Err(S3Error::not_implemented(
-            "If-None-Match on writes only supports the value *",
-        ));
+        if v.is_empty() {
+            return Err(S3Error::invalid_argument("invalid If-None-Match header"));
+        }
+        return Ok(Some(WritePrecondition::IfNoneMatch(v)));
     }
     if let Some(v) = headers.get("if-match") {
         let v = v
@@ -596,9 +620,16 @@ const RESPONSE_OVERRIDES: &[(&str, &str)] = &[
 ];
 
 fn insert_header(h: &mut HeaderMap, name: &str, value: &str) {
+    let bytes: Vec<u8> = if value.chars().all(|c| (c as u32) <= 0xFF) {
+        // ISO-8859-1 on the wire so a stored `é` round-trips for clients
+        // that encode user metadata as latin-1 (boto, aws CLI).
+        value.chars().map(|c| c as u8).collect()
+    } else {
+        value.as_bytes().to_vec()
+    };
     if let (Ok(n), Ok(v)) = (
         http::header::HeaderName::from_bytes(name.as_bytes()),
-        http::HeaderValue::from_bytes(value.as_bytes()),
+        http::HeaderValue::from_bytes(&bytes),
     ) {
         h.insert(n, v);
     }
@@ -743,16 +774,23 @@ fn part_range(
 ) -> Result<(u64, u64, usize), S3Error> {
     let part_num: u32 = part_num_str
         .parse()
-        .map_err(|_| S3Error::invalid_argument("invalid partNumber"))?;
-    let part_sizes = meta
-        .part_sizes
-        .as_ref()
-        .ok_or_else(|| S3Error::invalid_argument("object is not a multipart upload"))?;
+        .map_err(|_| S3Error::invalid_part("invalid partNumber"))?;
+    // A non-multipart object is a single part. Part 1 is the whole object;
+    // any other part number is InvalidPart (what GetObject returns on AWS).
+    let Some(part_sizes) = meta.part_sizes.as_ref().filter(|p| !p.is_empty()) else {
+        if part_num == 1 {
+            return Ok((0, meta.size, 1));
+        }
+        // A normal object is one part. AWS answers a later part with 416
+        // InvalidPartNumber. Completed multipart objects stay on InvalidPart,
+        // which is what s3-tests checks.
+        return Err(S3Error::invalid_part_number());
+    };
     let idx = (part_num as usize)
         .checked_sub(1)
-        .ok_or_else(|| S3Error::invalid_argument("partNumber must be >= 1"))?;
+        .ok_or_else(|| S3Error::invalid_part("partNumber must be >= 1"))?;
     if idx >= part_sizes.len() {
-        return Err(S3Error::invalid_argument("partNumber exceeds total parts"));
+        return Err(S3Error::invalid_part("partNumber exceeds total parts"));
     }
     let offset: u64 = part_sizes[..idx].iter().sum();
     Ok((offset, part_sizes[idx], part_sizes.len()))
@@ -1042,7 +1080,26 @@ pub async fn put_object(
         }
         None => {}
     }
+    if let Ok(meta) = state.storage.head_object(&bucket, &key).await {
+        if let Some(exp) = expiration_header_for(&state, &bucket, &meta).await {
+            builder = builder.header("x-amz-expiration", exp);
+        }
+    }
     Ok(builder.body(Body::empty()).unwrap())
+}
+
+async fn expiration_header_for(
+    state: &AppState,
+    bucket: &str,
+    meta: &crate::storage::ObjectMeta,
+) -> Option<String> {
+    let rules = state
+        .storage
+        .get_bucket_lifecycle(bucket)
+        .await
+        .ok()
+        .flatten()?;
+    crate::storage::lifecycle::expiration_header(&rules, meta)
 }
 
 /// Parsed `x-amz-copy-source`: bucket, key and optional `?versionId=`.
@@ -1168,10 +1225,11 @@ fn parse_copy_source_range(
 
 async fn upload_part_copy(
     State(state): State<AppState>,
-    Path((bucket, _key)): Path<(String, String)>,
+    Path((bucket, key)): Path<(String, String)>,
     Query(params): Query<HashMap<String, String>>,
     headers: HeaderMap,
 ) -> Result<Response<Body>, S3Error> {
+    crate::storage::filesystem::reject_writable_key(&key).map_err(|e| map_put_error(e, &key))?;
     let src = parse_copy_source(&headers)?;
 
     let upload_id = params
@@ -1239,12 +1297,86 @@ async fn upload_part_copy(
     Ok(builder.body(Body::from(xml)).unwrap())
 }
 
+fn directive_is_copy(headers: &HeaderMap) -> bool {
+    let meta = headers
+        .get("x-amz-metadata-directive")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("COPY");
+    let tags = headers
+        .get("x-amz-tagging-directive")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("COPY");
+    meta.eq_ignore_ascii_case("COPY") && tags.eq_ignore_ascii_case("COPY")
+}
+
+fn copy_changes_encryption(headers: &HeaderMap) -> bool {
+    headers.contains_key("x-amz-server-side-encryption")
+        || headers.contains_key("x-amz-server-side-encryption-customer-algorithm")
+}
+
+/// SSE-S3 request headers are only valid on writes. GET/HEAD reject them.
+fn reject_sse_request_on_read(headers: &HeaderMap) -> Result<(), S3Error> {
+    if headers.contains_key("x-amz-server-side-encryption")
+        || headers.contains_key("x-amz-server-side-encryption-aws-kms-key-id")
+    {
+        return Err(S3Error::invalid_argument(
+            "x-amz-server-side-encryption is not valid for this operation",
+        ));
+    }
+    Ok(())
+}
+
+/// SSE-C objects cannot be read without the customer key. SSE-C headers on a
+/// plaintext or SSE-S3 object are also rejected.
+fn require_read_encryption(
+    meta: &crate::storage::ObjectMeta,
+    headers: &HeaderMap,
+) -> Result<(), S3Error> {
+    reject_sse_request_on_read(headers)?;
+    let provided = extract_customer_key(headers)?;
+    let sse_c = meta
+        .encryption
+        .as_ref()
+        .is_some_and(|e| e.mode == crate::storage::EncryptionMode::SseC);
+    if sse_c && provided.is_none() {
+        return Err(S3Error::invalid_request(
+            "The object was stored using a form of Server Side Encryption. The correct parameters must be provided to retrieve the object.",
+        ));
+    }
+    if !sse_c && provided.is_some() {
+        return Err(S3Error::invalid_request(
+            "SSE-C headers supplied but the object is not encrypted with SSE-C",
+        ));
+    }
+    if let (Some(em), Some(key)) = (meta.encryption.as_ref(), provided.as_ref()) {
+        if let Some(md5) = &em.customer_key_md5 {
+            use base64::Engine;
+            use md5::Digest;
+            let computed = base64::engine::general_purpose::STANDARD.encode(md5::Md5::digest(key));
+            if computed != *md5 {
+                return Err(S3Error::invalid_argument("SSE-C key MD5 mismatch"));
+            }
+        }
+    }
+    Ok(())
+}
+
 async fn copy_object(
     State(state): State<AppState>,
     Path((bucket, key)): Path<(String, String)>,
     headers: HeaderMap,
 ) -> Result<Response<Body>, S3Error> {
     let src = parse_copy_source(&headers)?;
+
+    // Copying an object onto itself without changing metadata, tags, or
+    // encryption is rejected. Clients use REPLACE (or a new SSE mode) when
+    // they really want an in-place update.
+    let same_object = src.bucket == bucket && src.key == key && src.version_id.is_none();
+    if same_object && directive_is_copy(&headers) && !copy_changes_encryption(&headers) {
+        return Err(S3Error::invalid_request(
+            "This copy request is illegal because it is trying to copy an object to itself without changing the object's metadata, storage class, website redirect location or encryption attributes.",
+        ));
+    }
 
     // Validate destination bucket
     match state.storage.head_bucket(&bucket).await {
@@ -1587,6 +1719,7 @@ pub async fn get_object(
         Resolved::Meta(m) => *m,
         Resolved::Early(resp) => return Ok(resp),
     };
+    require_read_encryption(&meta, &headers)?;
 
     // Conditional headers apply to every GET flavour (full, range, part).
     if let Some(result) = check_conditions(&headers, &meta) {
@@ -1647,6 +1780,9 @@ pub async fn get_object(
     let stream = ReaderStream::with_capacity(reader, 256 * 1024);
     let body = Body::from_stream(stream);
     let mut hdrs = object_headers(&meta, &params);
+    if let Some(exp) = expiration_header_for(&state, &bucket, &meta).await {
+        insert_header(&mut hdrs, "x-amz-expiration", &exp);
+    }
     // A full-object checksum does not describe a partial body; SDKs would
     // validate it against the returned bytes and fail.
     if let (Some((_, length, _)), Some(algo)) = (selection, &meta.checksum_algorithm) {
@@ -1690,6 +1826,7 @@ pub async fn head_object(
         Resolved::Meta(m) => *m,
         Resolved::Early(resp) => return Ok(resp),
     };
+    require_read_encryption(&meta, &headers)?;
 
     if let Some(result) = check_conditions(&headers, &meta) {
         return match result {
@@ -1698,7 +1835,10 @@ pub async fn head_object(
         };
     }
 
-    let hdrs = object_headers(&meta, &params);
+    let mut hdrs = object_headers(&meta, &params);
+    if let Some(exp) = expiration_header_for(&state, &bucket, &meta).await {
+        insert_header(&mut hdrs, "x-amz-expiration", &exp);
+    }
     if let Some(part_num_str) = params.get("partNumber") {
         let (offset, length, total_parts) = part_range(&meta, part_num_str)?;
         let builder = builder_with(StatusCode::PARTIAL_CONTENT, hdrs)
@@ -1766,7 +1906,10 @@ pub async fn delete_object(
         .storage
         .delete_object(&bucket, &key)
         .await
-        .map_err(S3Error::internal)?;
+        .map_err(|e| match e {
+            StorageError::InvalidKey(msg) => S3Error::invalid_argument(&msg),
+            other => S3Error::internal(other),
+        })?;
 
     let mut builder = Response::builder().status(StatusCode::NO_CONTENT);
     if let Some(vid) = &result.version_id {

@@ -46,7 +46,8 @@ pub async fn sealed_master_key_ids(data_dir: &str) -> anyhow::Result<Vec<String>
 }
 
 /// Refuse to mint a new master key when `iam.json` already holds sealed secrets
-/// and neither the keyring file nor `MAXIO_MASTER_KEY` is available.
+/// and neither the keyring file nor a master key (`MAXIO_MASTER_KEY` or
+/// `MAXIO_MASTER_KEY_FILE`) is available.
 ///
 /// Call this before [`crate::storage::keys::Keyring::load`]. That load creates
 /// a fresh keyring when the file is missing; doing so here would make every
@@ -71,7 +72,7 @@ pub async fn refuse_missing_keyring(
                  iam.json requires master key ids: {}\n\
                  \n\
                  Refusing to generate a new master key. Those secrets cannot be recovered without the original key, so a new keyring would make the access keys permanently unverifiable.\n\
-                 Restore {keyring_path} from the same backup as iam.json, or pass that key with --master-key (MAXIO_MASTER_KEY).\n\
+                 Restore {keyring_path} from the same backup as iam.json, or pass that key with --master-key (MAXIO_MASTER_KEY) or --master-key-file (MAXIO_MASTER_KEY_FILE).\n\
                  Back up .maxio-keys.json and iam.json together.",
                 ids.join(", ")
             )
@@ -96,6 +97,8 @@ mod tests {
         let message = err.to_string();
         assert!(message.contains("iam.json"), "{message}");
         assert!(message.contains("master key"), "{message}");
+        assert!(message.contains("--master-key-file"), "{message}");
+        assert!(message.contains("MAXIO_MASTER_KEY_FILE"), "{message}");
         assert!(message.contains("aabbccddeeff0011"), "{message}");
         assert!(!dir.path().join(".maxio-keys.json").exists());
     }

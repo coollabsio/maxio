@@ -109,7 +109,7 @@ A key policy only narrows what that user's policies already allow. Granting acce
 
 The console at `/ui/users` and `/ui/policies` is available to root and to anyone whose policy allows IAM administration. Other IAM users can sign in and see only the buckets their policy allows.
 
-Access-key secrets in `<data-dir>/iam.json` are sealed with the SSE-S3 master key (`.maxio-keys.json`, or `MAXIO_MASTER_KEY`). Back those two files up together. If `iam.json` has secrets and the master key is missing or is a different key, MaxIO refuses to start instead of serving requests that fail later. A new keyring cannot decrypt the old secrets.
+Access-key secrets in `<data-dir>/iam.json` are sealed with the SSE-S3 master key (`.maxio-keys.json`, `MAXIO_MASTER_KEY`, or `MAXIO_MASTER_KEY_FILE`). Back the keyring and `iam.json` up together. If `iam.json` has secrets and the master key is missing or is a different key, MaxIO refuses to start instead of serving requests that fail later. A new keyring cannot decrypt the old secrets. Restore the keyring file, or pass the original key with `--master-key` / `MAXIO_MASTER_KEY` or `--master-key-file` / `MAXIO_MASTER_KEY_FILE`.
 
 ## Benchmarks
 

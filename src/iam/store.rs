@@ -263,7 +263,7 @@ pub async fn ensure_secrets_readable(data_dir: &str, keyring: &Keyring) -> Resul
     match load_memory(&path, keyring).await {
         Ok(_) => Ok(()),
         Err(err) => Err(format!(
-            "Refusing to start: {err}. IAM access-key secrets in {} are sealed with the SSE-S3 master key in .maxio-keys.json. Restore that keyring from the same backup as iam.json, or pass the original key with --master-key (MAXIO_MASTER_KEY). A missing or new master key makes those access keys permanently unverifiable. Back up both files together.",
+            "Refusing to start: {err}. IAM access-key secrets in {} are sealed with the SSE-S3 master key in .maxio-keys.json. Restore that keyring from the same backup as iam.json, or pass the original key with --master-key (MAXIO_MASTER_KEY) or --master-key-file (MAXIO_MASTER_KEY_FILE). A missing or new master key makes those access keys permanently unverifiable. Back up both files together.",
             path.display()
         )),
     }
@@ -1365,6 +1365,8 @@ mod tests {
         assert!(err.contains("Refusing to start"), "{err}");
         assert!(err.contains("iam.json"), "{err}");
         assert!(err.contains("master key"), "{err}");
+        assert!(err.contains("--master-key-file"), "{err}");
+        assert!(err.contains("MAXIO_MASTER_KEY_FILE"), "{err}");
     }
 
     #[tokio::test]

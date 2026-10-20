@@ -224,6 +224,18 @@ async fn scoped_key_allows_reads_and_denies_writes() {
         .unwrap();
     assert_eq!(created.status(), 200, "{}", created.text().await.unwrap());
 
+    // The user can read and write the whole bucket. The key below only narrows
+    // that to read access under pics/albums/. Creating a key does not grant the user.
+    let user_policy = r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["s3:GetObject","s3:GetObjectVersion","s3:PutObject","s3:DeleteObject","s3:ListBucket","s3:GetBucketLocation"],"Resource":["arn:aws:s3:::pics","arn:aws:s3:::pics/*"]}]}"#;
+    let granted = client
+        .put(format!("{base}/api/iam/users/alice/inline/pics-readwrite"))
+        .header("cookie", format!("maxio_session={cookie}"))
+        .json(&serde_json::json!({ "documentJson": user_policy }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(granted.status(), 200, "{}", granted.text().await.unwrap());
+
     let key = client
         .post(format!("{base}/api/iam/users/alice/keys"))
         .header("cookie", format!("maxio_session={cookie}"))

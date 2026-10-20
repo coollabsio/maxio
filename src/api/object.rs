@@ -931,12 +931,13 @@ pub async fn put_object(
         return copy_object(State(state), Path((bucket, key)), headers).await;
     }
 
-    reject_oversized_body(&headers, state.config.max_object_size)?;
-
     if params.contains_key("tagging") {
         return put_object_tagging(State(state), Path((bucket, key)), body).await;
     }
 
+    // UploadPart shares this route. Its cap is max-part-size, applied in
+    // `upload_part`. Checking max-object-size here rejects every part of a
+    // multipart upload that is larger than a single PUT.
     if params.contains_key("uploadId") {
         return multipart::upload_part(
             State(state),
@@ -947,6 +948,8 @@ pub async fn put_object(
         )
         .await;
     }
+
+    reject_oversized_body(&headers, state.config.max_object_size)?;
 
     match state.storage.head_bucket(&bucket).await {
         Ok(true) => {}

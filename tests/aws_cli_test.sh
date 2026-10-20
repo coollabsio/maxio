@@ -1849,6 +1849,52 @@ EOF
     kill -TERM "$LIMIT_PID" 2>/dev/null || true
     wait "$LIMIT_PID" 2>/dev/null || true
     rm -rf "$LIMIT_DATA"
+
+    # Parts are capped by --max-part-size, not --max-object-size. A 5 MiB part
+    # must succeed when the single-PUT cap is 1 MiB and the part cap is 6 MiB.
+    PART_DATA=$(mktemp -d)
+    PART_PORT=$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1]); s.close()')
+    RUST_LOG=warn "$ROBUST_BIN" --data-dir "$PART_DATA" --port "$PART_PORT" \
+        --address 127.0.0.1 --allow-insecure-dev \
+        --max-object-size $((1024 * 1024)) --max-part-size $((6 * 1024 * 1024)) \
+        >"$PART_DATA/server.log" 2>&1 &
+    PART_PID=$!
+    PART_EP="http://127.0.0.1:$PART_PORT"
+    PART_AWS="aws --endpoint-url $PART_EP"
+    for _ in $(seq 1 50); do
+        curl -sf "$PART_EP/healthz" >/dev/null 2>&1 && break
+        sleep 0.1
+    done
+    assert "part-limit create bucket" $PART_AWS s3 mb s3://part-limit
+    dd if=/dev/zero of="$TMPDIR/over-object.bin" bs=1024 count=2048 status=none
+    PART_PUT=$($PART_AWS s3 cp "$TMPDIR/over-object.bin" s3://part-limit/single.bin 2>&1 || true)
+    assert_eq "single PUT over max-object-size is EntityTooLarge" "true" \
+        "$(printf '%s' "$PART_PUT" | grep -q EntityTooLarge && echo true || echo false)"
+    dd if=/dev/zero of="$TMPDIR/part5.bin" bs=1024 count=5120 status=none
+    dd if=/dev/zero of="$TMPDIR/part2.bin" bs=1024 count=2048 status=none
+    PART_UPLOAD=$($PART_AWS s3api create-multipart-upload --bucket part-limit --key multi.bin --query UploadId --output text)
+    PART_E1=$($PART_AWS s3api upload-part --bucket part-limit --key multi.bin --part-number 1 --body "$TMPDIR/part5.bin" --upload-id "$PART_UPLOAD" --query ETag --output text)
+    PART_E2=$($PART_AWS s3api upload-part --bucket part-limit --key multi.bin --part-number 2 --body "$TMPDIR/part2.bin" --upload-id "$PART_UPLOAD" --query ETag --output text)
+    assert_eq "5MiB part accepted under 6MiB part cap" "true" \
+        "$([ -n "$PART_E1" ] && [ "$PART_E1" != "None" ] && echo true || echo false)"
+    cat > "$TMPDIR/part-limit-complete.json" <<EOF
+{
+  "Parts": [
+    {"ETag": $PART_E1, "PartNumber": 1},
+    {"ETag": $PART_E2, "PartNumber": 2}
+  ]
+}
+EOF
+    assert "complete multipart above max-object-size" $PART_AWS s3api complete-multipart-upload \
+        --bucket part-limit --key multi.bin --upload-id "$PART_UPLOAD" \
+        --multipart-upload "file://$TMPDIR/part-limit-complete.json"
+    assert "download multipart above max-object-size" $PART_AWS s3 cp s3://part-limit/multi.bin "$TMPDIR/part-limit-down.bin"
+    assert_eq "multipart above max-object-size size" \
+        "$(($(wc -c < "$TMPDIR/part5.bin") + $(wc -c < "$TMPDIR/part2.bin")))" \
+        "$(wc -c < "$TMPDIR/part-limit-down.bin" | tr -d ' ')"
+    kill -TERM "$PART_PID" 2>/dev/null || true
+    wait "$PART_PID" 2>/dev/null || true
+    rm -rf "$PART_DATA"
 fi
 
 # --- Summary ---

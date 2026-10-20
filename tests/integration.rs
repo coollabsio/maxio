@@ -948,9 +948,9 @@ async fn test_create_bucket_duplicate() {
     let resp = s3_request("PUT", &format!("{}/test-bucket", base_url), vec![]).await;
     assert_eq!(resp.status(), 200);
 
-    // Creating same bucket again should fail
+    // us-east-1 recreating a bucket you own is success, not BucketAlreadyOwnedByYou.
     let resp = s3_request("PUT", &format!("{}/test-bucket", base_url), vec![]).await;
-    assert_eq!(resp.status(), 409);
+    assert_eq!(resp.status(), 200);
 }
 
 #[tokio::test]
@@ -4086,7 +4086,7 @@ async fn test_put_object_tagging_too_many_tags() {
     .await;
     assert_eq!(resp.status(), 400);
     let body = resp.text().await.unwrap();
-    assert!(body.contains("InvalidArgument"));
+    assert!(body.contains("InvalidTag"), "{body}");
 }
 
 #[tokio::test]
@@ -4113,7 +4113,7 @@ async fn test_put_object_tagging_key_too_long() {
     .await;
     assert_eq!(resp.status(), 400);
     let body = resp.text().await.unwrap();
-    assert!(body.contains("InvalidArgument"));
+    assert!(body.contains("InvalidTag"), "{body}");
 }
 
 #[tokio::test]
@@ -4140,7 +4140,7 @@ async fn test_put_object_tagging_value_too_long() {
     .await;
     assert_eq!(resp.status(), 400);
     let body = resp.text().await.unwrap();
-    assert!(body.contains("InvalidArgument"));
+    assert!(body.contains("InvalidTag"), "{body}");
 }
 
 // UploadPartCopy: copy entire source object as a multipart part
@@ -9983,10 +9983,14 @@ async fn test_c_get_head_delete_marker() {
             Some(marker.as_str())
         );
     }
-    // Plain missing keys carry no delete-marker header.
+    // A missing key is not a delete marker. The header is present and false
+    // so clients can tell it apart from a versioned delete marker (true).
     let r = s3_request("GET", &format!("{}/dmark/none", base_url), vec![]).await;
     assert_eq!(r.status(), 404);
-    assert_eq!(c_header(&r, "x-amz-delete-marker"), None);
+    assert_eq!(
+        c_header(&r, "x-amz-delete-marker").as_deref(),
+        Some("false")
+    );
 }
 
 #[tokio::test]
@@ -11213,7 +11217,7 @@ mod lifecycle_l {
              <ObjectSizeLessThan>1000</ObjectSizeLessThan></And>",
             "<Expiration><Days>30</Days></Expiration>",
             "<Status>Disabled</Status>",
-            "<Filter><Prefix>docs/</Prefix></Filter>",
+            "<Prefix>docs/</Prefix>",
             "<NoncurrentVersionExpiration><NoncurrentDays>7</NoncurrentDays>\
              <NewerNoncurrentVersions>2</NewerNoncurrentVersions></NoncurrentVersionExpiration>",
             "<AbortIncompleteMultipartUpload><DaysAfterInitiation>3</DaysAfterInitiation>\
@@ -12139,4 +12143,192 @@ async fn test_console_lifecycle_empty_deletes() {
     assert_eq!(body["rules"], serde_json::json!([]));
     let r = s3_request("GET", &format!("{}/ulcdel?lifecycle", base), vec![]).await;
     assert_eq!(r.status(), 404);
+}
+
+#[tokio::test]
+async fn test_error_request_id_matches_header() {
+    let (base, _tmp) = start_server().await;
+    c_setup(&base, "reqid", false).await;
+    let r = s3_request("GET", &format!("{}/reqid/missing", base), vec![]).await;
+    assert_eq!(r.status(), 404);
+    let header = c_header(&r, "x-amz-request-id").unwrap();
+    let body = r.text().await.unwrap();
+    let xml_id = extract_xml_tag(&body, "RequestId").unwrap();
+    assert_eq!(header, xml_id);
+}
+
+#[tokio::test]
+async fn test_recreate_bucket_us_east_1_is_success() {
+    let (base, _tmp) = start_server().await;
+    let url = format!("{}/recreate-bucket", base);
+    assert_eq!(s3_request("PUT", &url, vec![]).await.status(), 200);
+    let again = s3_request("PUT", &url, vec![]).await;
+    assert_eq!(again.status(), 200, "{}", again.text().await.unwrap());
+}
+
+#[tokio::test]
+async fn test_copy_object_to_itself_is_invalid() {
+    let (base, _tmp) = start_server().await;
+    c_setup(&base, "copyself", false).await;
+    assert_eq!(c_put(&base, "copyself/k", b"data").await.status(), 200);
+    let r = s3_request_with_headers(
+        "PUT",
+        &format!("{}/copyself/k", base),
+        vec![],
+        vec![("x-amz-copy-source", "/copyself/k")],
+    )
+    .await;
+    assert_eq!(r.status(), 400);
+    let body = r.text().await.unwrap();
+    assert!(body.contains("InvalidRequest"), "{body}");
+}
+
+#[tokio::test]
+async fn test_key_and_child_prefix_coexist() {
+    let (base, _tmp) = start_server().await;
+    c_setup(&base, "prefixkey", false).await;
+    assert_eq!(
+        c_put(&base, "prefixkey/foo/bar", b"file").await.status(),
+        200
+    );
+    assert_eq!(
+        c_put(&base, "prefixkey/foo/bar/xyzzy", b"child")
+            .await
+            .status(),
+        200
+    );
+    let (status, body) = c_get_body(&base, "prefixkey/foo/bar").await;
+    assert_eq!(status, 200);
+    assert_eq!(body, b"file");
+    let (status, body) = c_get_body(&base, "prefixkey/foo/bar/xyzzy").await;
+    assert_eq!(status, 200);
+    assert_eq!(body, b"child");
+    let listing = s3_request(
+        "GET",
+        &format!("{}/prefixkey?prefix=foo%2F&delimiter=%2F", base),
+        vec![],
+    )
+    .await;
+    assert_eq!(listing.status(), 200);
+    let xml = listing.text().await.unwrap();
+    assert!(xml.contains("<Key>foo/bar</Key>"), "{xml}");
+    assert!(xml.contains("<Prefix>foo/bar/</Prefix>"), "{xml}");
+}
+
+#[tokio::test]
+async fn test_get_part_number_on_single_object() {
+    let (base, _tmp) = start_server().await;
+    c_setup(&base, "onepart", false).await;
+    assert_eq!(c_put(&base, "onepart/k", b"body").await.status(), 200);
+    let ok = s3_request("GET", &format!("{}/onepart/k?partNumber=1", base), vec![]).await;
+    assert!(ok.status().is_success(), "{}", ok.status());
+    assert_eq!(ok.bytes().await.unwrap().as_ref(), b"body");
+    let bad = s3_request("GET", &format!("{}/onepart/k?partNumber=2", base), vec![]).await;
+    assert_eq!(bad.status(), 400);
+    let text = bad.text().await.unwrap();
+    assert!(text.contains("InvalidPart"), "{text}");
+}
+
+#[tokio::test]
+async fn test_complete_multipart_empty_and_retry() {
+    let (base, _tmp) = start_server().await;
+    c_setup(&base, "mpcompat", false).await;
+    let create = s3_request("POST", &format!("{}/mpcompat/k?uploads=", base), vec![]).await;
+    assert_eq!(create.status(), 200);
+    let upload_id = extract_xml_tag(&create.text().await.unwrap(), "UploadId").unwrap();
+    let empty = s3_request(
+        "POST",
+        &format!("{}/mpcompat/k?uploadId={upload_id}", base),
+        vec![],
+    )
+    .await;
+    assert_eq!(empty.status(), 400);
+    assert!(empty.text().await.unwrap().contains("MalformedXML"));
+
+    let part = s3_request(
+        "PUT",
+        &format!("{}/mpcompat/k?partNumber=1&uploadId={upload_id}", base),
+        b"abc".to_vec(),
+    )
+    .await;
+    assert_eq!(part.status(), 200);
+    let etag = c_header(&part, "etag").unwrap();
+    let xml = format!(
+        "<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>{etag}</ETag></Part></CompleteMultipartUpload>"
+    );
+    let done = s3_request(
+        "POST",
+        &format!("{}/mpcompat/k?uploadId={upload_id}", base),
+        xml.clone().into_bytes(),
+    )
+    .await;
+    assert_eq!(done.status(), 200, "{}", done.text().await.unwrap());
+    let again = s3_request(
+        "POST",
+        &format!("{}/mpcompat/k?uploadId={upload_id}", base),
+        xml.into_bytes(),
+    )
+    .await;
+    assert_eq!(again.status(), 200, "{}", again.text().await.unwrap());
+}
+
+#[tokio::test]
+async fn test_sse_c_requires_md5_and_head_key() {
+    let (base, _tmp) = start_server().await;
+    c_setup(&base, "ssec", false).await;
+    let key_b64 = "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=";
+    let missing_md5 = s3_request_with_headers(
+        "PUT",
+        &format!("{}/ssec/k", base),
+        b"data".to_vec(),
+        vec![
+            ("x-amz-server-side-encryption-customer-algorithm", "AES256"),
+            ("x-amz-server-side-encryption-customer-key", key_b64),
+        ],
+    )
+    .await;
+    assert_eq!(missing_md5.status(), 400);
+
+    use md5::Digest;
+    let raw = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, key_b64).unwrap();
+    let good_md5 = base64::engine::general_purpose::STANDARD.encode(md5::Md5::digest(&raw));
+    let put = s3_request_with_headers(
+        "PUT",
+        &format!("{}/ssec/k", base),
+        b"data".to_vec(),
+        vec![
+            ("x-amz-server-side-encryption-customer-algorithm", "AES256"),
+            ("x-amz-server-side-encryption-customer-key", key_b64),
+            ("x-amz-server-side-encryption-customer-key-md5", &good_md5),
+        ],
+    )
+    .await;
+    assert_eq!(put.status(), 200, "{}", put.text().await.unwrap());
+    let head = s3_request("HEAD", &format!("{}/ssec/k", base), vec![]).await;
+    assert_eq!(head.status(), 400);
+}
+
+#[tokio::test]
+async fn test_lifecycle_prefix_round_trip_and_expiration_header() {
+    let (base, _tmp) = start_server().await;
+    c_setup(&base, "lcrule", false).await;
+    let xml = r#"<LifecycleConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+        <Rule><ID>rule1</ID><Prefix>days1/</Prefix><Status>Enabled</Status>
+        <Expiration><Days>1</Days></Expiration></Rule></LifecycleConfiguration>"#;
+    let put_lc = s3_request(
+        "PUT",
+        &format!("{}/lcrule?lifecycle", base),
+        xml.as_bytes().to_vec(),
+    )
+    .await;
+    assert_eq!(put_lc.status(), 200, "{}", put_lc.text().await.unwrap());
+    let got = s3_request("GET", &format!("{}/lcrule?lifecycle", base), vec![]).await;
+    let body = got.text().await.unwrap();
+    assert!(body.contains("<Prefix>days1/</Prefix>"), "{body}");
+    assert!(!body.contains("<Filter>"), "{body}");
+    let put = c_put(&base, "lcrule/days1/foo", b"bar").await;
+    assert_eq!(put.status(), 200);
+    let exp = c_header(&put, "x-amz-expiration");
+    assert!(exp.is_some(), "missing x-amz-expiration");
+    assert!(exp.unwrap().contains("rule-id=\"rule1\""));
 }

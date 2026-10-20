@@ -31,6 +31,15 @@ const SMALL_OBJECT_THRESHOLD: u64 = 256 * 1024;
 const KEY_LOCK_SHARDS: usize = 1024;
 const BUCKET_LOCK_SHARDS: usize = 256;
 
+#[derive(serde::Serialize, serde::Deserialize)]
+struct CompletedUploadRecord {
+    etag: String,
+    size: u64,
+    version_id: Option<String>,
+    checksum_algorithm: Option<ChecksumAlgorithm>,
+    checksum_value: Option<String>,
+}
+
 pub struct FilesystemStorage {
     buckets_dir: PathBuf,
     erasure_coding: bool,
@@ -505,6 +514,42 @@ impl FilesystemStorage {
         }
     }
 
+    /// Where a plain object's bytes are written. A key that is also a prefix
+    /// of other keys (`foo/bar` and `foo/bar/baz`) keeps its bytes at
+    /// `{key}/.maxio.object` so the key can be both a file and a directory.
+    async fn plain_object_write_path(
+        &self,
+        bucket: &str,
+        key: &str,
+    ) -> Result<PathBuf, StorageError> {
+        let path = self.object_path(bucket, key);
+        if key.ends_with('/') {
+            if let Some(parent) = path.parent() {
+                ensure_dir_preserving_objects(parent).await?;
+            }
+            return Ok(path);
+        }
+        if let Some(parent) = path.parent() {
+            ensure_dir_preserving_objects(parent).await?;
+        }
+        match fs::metadata(&path).await {
+            Ok(meta) if meta.is_dir() => Ok(path.join(INLINE_OBJECT_PAYLOAD)),
+            _ => Ok(path),
+        }
+    }
+
+    /// Path to read a plain object's bytes (the file, or the inline payload
+    /// when the key is also a prefix).
+    async fn plain_object_read_path(&self, bucket: &str, key: &str) -> PathBuf {
+        let path = self.object_path(bucket, key);
+        let inline = path.join(INLINE_OBJECT_PAYLOAD);
+        if matches!(fs::metadata(&inline).await, Ok(m) if m.is_file()) {
+            inline
+        } else {
+            path
+        }
+    }
+
     fn meta_path(&self, bucket: &str, key: &str) -> PathBuf {
         if key.ends_with('/') {
             let dir = key.trim_end_matches('/');
@@ -668,10 +713,7 @@ impl FilesystemStorage {
             (None, Vec::new(), None)
         };
 
-        let obj_path = self.object_path(bucket, key);
-        if let Some(parent) = obj_path.parent() {
-            fs::create_dir_all(parent).await?;
-        }
+        let obj_path = self.plain_object_write_path(bucket, key).await?;
 
         let tmp_obj_path = temp_sibling_path(&obj_path);
         let mut tmp_obj_guard = TempPathGuard::file(tmp_obj_path.clone());
@@ -855,7 +897,7 @@ impl FilesystemStorage {
         let tmp_ec_dir = temp_sibling_path(&ec_dir);
         let mut tmp_ec_guard = TempPathGuard::dir(tmp_ec_dir.clone());
         if let Some(parent) = ec_dir.parent() {
-            fs::create_dir_all(parent).await?;
+            ensure_dir_preserving_objects(parent).await?;
         }
         fs::create_dir_all(&tmp_ec_dir).await?;
 
@@ -1002,7 +1044,7 @@ impl FilesystemStorage {
         }
         tmp_ec_guard.disarm();
         tmp_meta_guard.disarm();
-        remove_file_if_exists(&self.object_path(bucket, key)).await?;
+        remove_plain_payload(&self.object_path(bucket, key)).await?;
 
         Ok(PutResult {
             size: total_size,
@@ -1034,7 +1076,7 @@ impl FilesystemStorage {
         let tmp_ec_dir = temp_sibling_path(&ec_dir);
         let mut tmp_ec_guard = TempPathGuard::dir(tmp_ec_dir.clone());
         if let Some(parent) = ec_dir.parent() {
-            fs::create_dir_all(parent).await?;
+            ensure_dir_preserving_objects(parent).await?;
         }
         fs::create_dir_all(&tmp_ec_dir).await?;
 
@@ -1250,7 +1292,7 @@ impl FilesystemStorage {
         }
         tmp_ec_guard.disarm();
         tmp_meta_guard.disarm();
-        remove_file_if_exists(&self.object_path(bucket, key)).await?;
+        remove_plain_payload(&self.object_path(bucket, key)).await?;
 
         Ok(PutResult {
             size: plaintext_size,
@@ -1349,6 +1391,80 @@ async fn write_chunk_file(path: &Path, index: u32, data: &[u8]) -> Result<ChunkI
         sha256,
         kind: ChunkKind::Data,
     })
+}
+
+/// Payload file stored inside a key directory when that key is also a prefix.
+const INLINE_OBJECT_PAYLOAD: &str = ".maxio.object";
+
+/// Create `dir`, turning any file along the path into a directory that keeps
+/// the object's bytes in `.maxio.object`. S3 keys are a flat namespace, so
+/// `a/b` and `a/b/c` must both exist.
+async fn ensure_dir_preserving_objects(dir: &Path) -> Result<(), StorageError> {
+    let mut prefixes = Vec::new();
+    let mut cur = PathBuf::new();
+    for component in dir.components() {
+        cur.push(component);
+        prefixes.push(cur.clone());
+    }
+    for path in &prefixes {
+        if let Ok(meta) = fs::metadata(path).await {
+            if meta.is_file() {
+                promote_file_to_directory(path).await?;
+            }
+        }
+    }
+    match fs::create_dir_all(dir).await {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists || e.raw_os_error() == Some(17) => {
+            for path in &prefixes {
+                if let Ok(meta) = fs::metadata(path).await {
+                    if meta.is_file() {
+                        promote_file_to_directory(path).await?;
+                    }
+                }
+            }
+            fs::create_dir_all(dir).await.map_err(StorageError::Io)
+        }
+        Err(e) => Err(StorageError::Io(e)),
+    }
+}
+
+async fn promote_file_to_directory(path: &Path) -> Result<(), StorageError> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let tmp = parent.join(format!(".maxio-promote-{}", uuid::Uuid::new_v4()));
+    fs::create_dir(&tmp).await.map_err(StorageError::Io)?;
+    if let Err(e) = fs::rename(path, tmp.join(INLINE_OBJECT_PAYLOAD)).await {
+        let _ = fs::remove_dir_all(&tmp).await;
+        return Err(StorageError::Io(e));
+    }
+    if let Err(e) = fs::rename(&tmp, path).await {
+        let _ = fs::rename(tmp.join(INLINE_OBJECT_PAYLOAD), path).await;
+        let _ = fs::remove_dir_all(&tmp).await;
+        return Err(StorageError::Io(e));
+    }
+    Ok(())
+}
+
+/// Remove a plain object payload. A directory that also holds child keys is
+/// left in place; only `.maxio.object` is deleted.
+async fn remove_plain_payload(path: &Path) -> Result<(), StorageError> {
+    match fs::remove_file(path.join(INLINE_OBJECT_PAYLOAD)).await {
+        Ok(()) => {}
+        // NotFound: no inline payload. NotADirectory: `path` is a normal file,
+        // so `{path}/.maxio.object` cannot exist.
+        Err(e)
+            if e.kind() == std::io::ErrorKind::NotFound
+                || e.kind() == std::io::ErrorKind::NotADirectory => {}
+        Err(e) => return Err(StorageError::Io(e)),
+    }
+    match fs::metadata(path).await {
+        Ok(meta) if meta.is_file() => remove_file_if_exists(path).await?,
+        Ok(meta) if meta.is_dir() => {
+            let _ = fs::remove_dir(path).await;
+        }
+        _ => {}
+    }
+    Ok(())
 }
 
 fn temp_sibling_path(path: &Path) -> PathBuf {
@@ -1765,7 +1881,7 @@ impl FilesystemStorage {
         }
         tmp_ec_guard.disarm();
         tmp_meta_guard.disarm();
-        remove_file_if_exists(&self.object_path(bucket, key)).await?;
+        remove_plain_payload(&self.object_path(bucket, key)).await?;
         drop(_key_guard);
         drop(_bucket_guard);
         // Best-effort: the object is already durably published. A racing
@@ -2060,7 +2176,7 @@ impl FilesystemStorage {
         }
         tmp_ec_guard.disarm();
         tmp_meta_guard.disarm();
-        remove_file_if_exists(&self.object_path(bucket, key)).await?;
+        remove_plain_payload(&self.object_path(bucket, key)).await?;
         drop(_key_guard);
         drop(_bucket_guard);
         // Best-effort: the object is already durably published. A racing
@@ -2094,7 +2210,7 @@ impl FilesystemStorage {
             .buckets_dir
             .join(bucket)
             .join(key.trim_end_matches('/'));
-        fs::create_dir_all(&folder_dir).await?;
+        ensure_dir_preserving_objects(&folder_dir).await?;
 
         let marker_path = folder_dir.join(".folder");
         fs::write(&marker_path, b"").await?;
@@ -2172,7 +2288,7 @@ impl FilesystemStorage {
             let reader = VerifiedChunkReader::new(ec_dir, manifest);
             return Ok((Box::pin(reader), meta));
         }
-        let obj_path = self.object_path(bucket, key);
+        let obj_path = self.plain_object_read_path(bucket, key).await;
         // Encrypted object — wrap in FrameDecryptor
         if let Some(ref enc_meta) = meta.encryption {
             let dek = self.resolve_dek(enc_meta, customer_key)?;
@@ -2235,7 +2351,7 @@ impl FilesystemStorage {
         let meta = self.read_object_meta(bucket, key).await?;
         reject_sse_c_on_plaintext(&meta, customer_key.is_some())?;
         let ec_dir = self.ec_dir(bucket, key);
-        let obj_path = self.object_path(bucket, key);
+        let obj_path = self.plain_object_read_path(bucket, key).await;
         self.open_range_reader(
             bucket,
             key,
@@ -2412,7 +2528,7 @@ impl FilesystemStorage {
                 is_delete_marker: false,
             });
         }
-        remove_file_if_exists(&obj_path).await?;
+        remove_plain_payload(&obj_path).await?;
         remove_file_if_exists(&meta_path).await?;
         remove_dir_all_if_exists(&ec_dir).await?;
 
@@ -2691,7 +2807,18 @@ impl FilesystemStorage {
             }
         }
 
-        let upload_meta = self.read_upload_meta(bucket, upload_id).await?;
+        let upload_meta = match self.read_upload_meta(bucket, upload_id).await {
+            Ok(meta) => meta,
+            // A repeated CompleteMultipartUpload (client retry) returns the
+            // same result instead of NoSuchUpload.
+            Err(StorageError::UploadNotFound(_)) => {
+                if let Some(done) = self.read_completed_upload(bucket, upload_id).await? {
+                    return Ok(done);
+                }
+                return Err(StorageError::UploadNotFound(upload_id.to_string()));
+            }
+            Err(e) => return Err(e),
+        };
         let mut selected = Vec::with_capacity(parts.len());
         for (idx, (part_number, requested_etag)) in parts.iter().enumerate() {
             let meta = self.read_part_meta(bucket, upload_id, *part_number).await?;
@@ -2738,7 +2865,7 @@ impl FilesystemStorage {
                         )));
                     }
                 }
-                return self
+                let result = self
                     .complete_multipart_chunked_encrypted(
                         bucket,
                         upload_id,
@@ -2747,9 +2874,12 @@ impl FilesystemStorage {
                         customer_key,
                         precondition,
                     )
+                    .await?;
+                self.remember_completed_upload(bucket, upload_id, &result)
                     .await;
+                return Ok(result);
             }
-            return self
+            let result = self
                 .complete_multipart_chunked(
                     bucket,
                     upload_id,
@@ -2757,7 +2887,10 @@ impl FilesystemStorage {
                     &selected,
                     precondition,
                 )
+                .await?;
+            self.remember_completed_upload(bucket, upload_id, &result)
                 .await;
+            return Ok(result);
         }
 
         // If the upload was encrypted, verify the SSE-C key (if any) matches
@@ -2847,10 +2980,9 @@ impl FilesystemStorage {
             None
         };
 
-        let obj_path = self.object_path(bucket, &upload_meta.key);
-        if let Some(parent) = obj_path.parent() {
-            fs::create_dir_all(parent).await?;
-        }
+        let obj_path = self
+            .plain_object_write_path(bucket, &upload_meta.key)
+            .await?;
         let tmp_obj_path = temp_sibling_path(&obj_path);
         let mut tmp_obj_guard = TempPathGuard::file(tmp_obj_path.clone());
         let out = fs::File::create(&tmp_obj_path).await?;
@@ -3055,13 +3187,60 @@ impl FilesystemStorage {
             }
         }
 
-        Ok(PutResult {
+        let result = PutResult {
             size: total_size,
             etag,
             version_id,
             checksum_algorithm,
             checksum_value,
-        })
+        };
+        self.remember_completed_upload(bucket, upload_id, &result)
+            .await;
+        Ok(result)
+    }
+
+    fn completed_upload_path(&self, bucket: &str, upload_id: &str) -> PathBuf {
+        self.uploads_dir(bucket)
+            .join(format!(".completed-{upload_id}.json"))
+    }
+
+    async fn remember_completed_upload(&self, bucket: &str, upload_id: &str, result: &PutResult) {
+        let record = CompletedUploadRecord {
+            etag: result.etag.clone(),
+            size: result.size,
+            version_id: result.version_id.clone(),
+            checksum_algorithm: result.checksum_algorithm,
+            checksum_value: result.checksum_value.clone(),
+        };
+        let Ok(json) = serde_json::to_string(&record) else {
+            return;
+        };
+        let path = self.completed_upload_path(bucket, upload_id);
+        if let Some(parent) = path.parent() {
+            let _ = fs::create_dir_all(parent).await;
+        }
+        let _ = fs::write(path, json).await;
+    }
+
+    async fn read_completed_upload(
+        &self,
+        bucket: &str,
+        upload_id: &str,
+    ) -> Result<Option<PutResult>, StorageError> {
+        let path = self.completed_upload_path(bucket, upload_id);
+        let data = match fs::read(&path).await {
+            Ok(data) => data,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(StorageError::Io(e)),
+        };
+        let record: CompletedUploadRecord = serde_json::from_slice(&data)?;
+        Ok(Some(PutResult {
+            size: record.size,
+            etag: record.etag,
+            version_id: record.version_id,
+            checksum_algorithm: record.checksum_algorithm,
+            checksum_value: record.checksum_value,
+        }))
     }
 
     pub async fn abort_multipart_upload(
@@ -3371,6 +3550,10 @@ impl FilesystemStorage {
                     || fname == ".uploads"
                     || fname == ".versions"
                     || fname == ".folder"
+                    || fname == INLINE_OBJECT_PAYLOAD
+                    || fname.starts_with(".maxio-tmp-")
+                    || fname.starts_with(".maxio-promote-")
+                    || fname.starts_with(".maxio-bak-")
                 {
                     continue;
                 }
@@ -3394,6 +3577,22 @@ impl FilesystemStorage {
                 }
 
                 if entry.file_type().await?.is_dir() {
+                    // This directory is also an object (`foo/bar` plus `foo/bar/baz`).
+                    let inline = path.join(INLINE_OBJECT_PAYLOAD);
+                    if matches!(fs::metadata(&inline).await, Ok(m) if m.is_file()) {
+                        if let Ok(rel) = path.strip_prefix(base) {
+                            let key = rel.to_string_lossy().to_string();
+                            if key.starts_with(prefix) {
+                                if let Some(bucket_name) = base.file_name().and_then(|n| n.to_str())
+                                {
+                                    if let Ok(meta) = self.read_object_meta(bucket_name, &key).await
+                                    {
+                                        results.push(meta);
+                                    }
+                                }
+                            }
+                        }
+                    }
                     // Check for folder marker inside this directory
                     let marker = path.join(".folder.meta.json");
                     if marker.exists() {
@@ -4039,8 +4238,8 @@ impl FilesystemStorage {
             remove_dir_all_if_exists(&dst).await?;
             fs::rename(&ec_dir, &dst).await?;
         } else {
-            let obj_path = self.object_path(bucket, key);
-            if fs::try_exists(&obj_path).await? {
+            let obj_path = self.plain_object_read_path(bucket, key).await;
+            if matches!(fs::metadata(&obj_path).await, Ok(m) if m.is_file()) {
                 fs::rename(&obj_path, ver_dir.join("null.data")).await?;
             }
         }
@@ -4173,7 +4372,7 @@ impl FilesystemStorage {
 
         // Remove top-level current files (the pre-versioning object, if any,
         // was already archived as the "null" version above).
-        let _ = fs::remove_file(self.object_path(bucket, key)).await;
+        let _ = remove_plain_payload(&self.object_path(bucket, key)).await;
         let _ = fs::remove_file(self.meta_path(bucket, key)).await;
         let _ = fs::remove_dir_all(self.ec_dir(bucket, key)).await;
 
@@ -4193,7 +4392,7 @@ impl FilesystemStorage {
             // pre-versioning ("null") object stays.
             if let Ok(meta) = self.read_object_meta(bucket, key).await {
                 if meta.version_id.is_some() {
-                    let _ = fs::remove_file(self.object_path(bucket, key)).await;
+                    let _ = remove_plain_payload(&self.object_path(bucket, key)).await;
                     let _ = fs::remove_file(self.meta_path(bucket, key)).await;
                     let _ = fs::remove_dir_all(self.ec_dir(bucket, key)).await;
                 }
@@ -4280,10 +4479,10 @@ impl FilesystemStorage {
                     .await?;
                 tmp_ec_guard.disarm();
                 tmp_meta_guard.disarm();
-                remove_file_if_exists(&self.object_path(bucket, key)).await?;
+                remove_plain_payload(&self.object_path(bucket, key)).await?;
             } else {
                 let ver_data = ver_dir.join(format!("{}.data", vid));
-                let obj_path = self.object_path(bucket, key);
+                let obj_path = self.plain_object_write_path(bucket, key).await?;
                 let tmp_data = temp_sibling_path(&obj_path);
                 let mut tmp_data_guard = TempPathGuard::file(tmp_data.clone());
                 fs::copy(&ver_data, &tmp_data).await?;
@@ -4311,7 +4510,7 @@ impl FilesystemStorage {
         }
 
         // Newest version is a delete marker (or only markers remain) — remove top-level files
-        let _ = fs::remove_file(self.object_path(bucket, key)).await;
+        let _ = remove_plain_payload(&self.object_path(bucket, key)).await;
         let _ = fs::remove_file(self.meta_path(bucket, key)).await;
         let _ = fs::remove_dir_all(self.ec_dir(bucket, key)).await;
         Ok(())
@@ -4454,7 +4653,7 @@ impl FilesystemStorage {
             if meta.version_id.is_some() {
                 return Err(StorageError::VersionNotFound("null".into()));
             }
-            remove_file_if_exists(&self.object_path(bucket, key)).await?;
+            remove_plain_payload(&self.object_path(bucket, key)).await?;
             remove_file_if_exists(&self.meta_path(bucket, key)).await?;
             remove_dir_all_if_exists(&self.ec_dir(bucket, key)).await?;
             self.update_current_version(bucket, key).await?;
@@ -4723,9 +4922,17 @@ impl FilesystemStorage {
         match (precondition, current) {
             (WritePrecondition::IfNoneMatchAny, None) => Ok(()),
             (WritePrecondition::IfNoneMatchAny, Some(_)) => Err(StorageError::PreconditionFailed),
+            (WritePrecondition::IfNoneMatch(_), None) => Ok(()),
+            (WritePrecondition::IfNoneMatch(expected), Some(m)) => {
+                if etag_list_matches(expected, &m.etag) {
+                    Err(StorageError::PreconditionFailed)
+                } else {
+                    Ok(())
+                }
+            }
             (WritePrecondition::IfMatch(_), None) => Err(StorageError::NotFound(key.to_string())),
             (WritePrecondition::IfMatch(expected), Some(m)) => {
-                if etag_list_matches(expected, &m.etag) {
+                if expected.trim() == "*" || etag_list_matches(expected, &m.etag) {
                     Ok(())
                 } else {
                     Err(StorageError::PreconditionFailed)

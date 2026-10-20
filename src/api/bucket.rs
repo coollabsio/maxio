@@ -15,12 +15,43 @@ use crate::storage::{
 use crate::xml::{response::to_xml, types::*};
 use serde::Deserialize;
 
-pub async fn list_buckets(State(state): State<AppState>) -> Result<Response<Body>, S3Error> {
-    let buckets = state
+pub async fn list_buckets(
+    State(state): State<AppState>,
+    Query(params): Query<HashMap<String, String>>,
+) -> Result<Response<Body>, S3Error> {
+    let mut buckets = state
         .storage
         .list_buckets()
         .await
         .map_err(|e| S3Error::internal(e))?;
+
+    if let Some(prefix) = params.get("prefix") {
+        buckets.retain(|b| b.name.starts_with(prefix));
+    }
+    if let Some(token) = params.get("continuation-token").filter(|t| !t.is_empty()) {
+        buckets.retain(|b| b.name.as_str() > token.as_str());
+    }
+    let max_buckets = match params.get("max-buckets") {
+        None => None,
+        Some(raw) => {
+            let n: i64 = raw
+                .parse()
+                .map_err(|_| S3Error::invalid_argument("Invalid value for max-buckets"))?;
+            if !(1..=10_000).contains(&n) {
+                return Err(S3Error::invalid_argument(
+                    "max-buckets must be between 1 and 10000",
+                ));
+            }
+            Some(n as usize)
+        }
+    };
+    let continuation = match max_buckets {
+        Some(max) if buckets.len() > max => {
+            buckets.truncate(max);
+            buckets.last().map(|b| b.name.clone())
+        }
+        _ => None,
+    };
 
     let result = ListAllMyBucketsResult {
         owner: owner(),
@@ -33,6 +64,8 @@ pub async fn list_buckets(State(state): State<AppState>) -> Result<Response<Body
                 })
                 .collect(),
         },
+        prefix: params.get("prefix").cloned().filter(|p| !p.is_empty()),
+        continuation_token: continuation,
     };
 
     let xml = to_xml(&result).map_err(|e| S3Error::internal(e))?;
@@ -47,8 +80,23 @@ pub async fn list_buckets(State(state): State<AppState>) -> Result<Response<Body
 pub async fn create_bucket(
     State(state): State<AppState>,
     Path(bucket): Path<String>,
+    body: Body,
 ) -> Result<Response<Body>, S3Error> {
     validate_bucket_name(&bucket)?;
+    let bytes = axum::body::to_bytes(body, 64 * 1024)
+        .await
+        .map_err(|_| S3Error::malformed_xml())?;
+    let text = String::from_utf8_lossy(&bytes);
+    if let Some(constraint) = location_constraint_value(&text) {
+        // us-east-1 rejects any LocationConstraint, including itself.
+        // Every other region must name this server's region.
+        let ok = state.config.region != "us-east-1" && constraint == state.config.region;
+        if !ok {
+            return Err(S3Error::invalid_argument(
+                "The specified location constraint is not valid",
+            ));
+        }
+    }
 
     let now = chrono::Utc::now()
         .format("%Y-%m-%dT%H:%M:%S%.3fZ")
@@ -75,6 +123,16 @@ pub async fn create_bucket(
         .map_err(|e| S3Error::internal(e))?;
 
     if !created {
+        // In us-east-1, recreating a bucket you already own is success.
+        // Other regions return BucketAlreadyOwnedByYou.
+        if state.config.region == "us-east-1" {
+            return Ok(Response::builder()
+                .status(StatusCode::OK)
+                .header("Location", format!("/{bucket}"))
+                .header("x-amz-bucket-region", state.config.region.as_str())
+                .body(Body::empty())
+                .unwrap());
+        }
         return Err(S3Error::bucket_already_owned(&bucket));
     }
 
@@ -159,7 +217,7 @@ pub async fn handle_bucket_put(
     body: Body,
 ) -> Result<Response<Body>, S3Error> {
     match bucket_subresource(&params) {
-        None => create_bucket(State(state), Path(bucket)).await,
+        None => create_bucket(State(state), Path(bucket), body).await,
         Some("versioning") => put_bucket_versioning(State(state), Path(bucket), body).await,
         Some("cors") => put_bucket_cors(state, bucket, body).await,
         Some("encryption") => put_bucket_encryption(state, bucket, body).await,
@@ -468,6 +526,21 @@ fn extract_xml_tag(xml: &str, tag: &str) -> Option<String> {
     let start = xml.find(&open)? + open.len();
     let end = xml[start..].find(&close)?;
     Some(xml[start..start + end].trim().to_string())
+}
+
+/// Text inside `<LocationConstraint>`, if the element is present and non-empty.
+fn location_constraint_value(body: &str) -> Option<String> {
+    let start = body.find("<LocationConstraint")?;
+    let rest = &body[start..];
+    let open_end = rest.find('>')?;
+    let inner = &rest[open_end + 1..];
+    let close = inner.find("</LocationConstraint>")?;
+    let value = inner[..close].trim();
+    if value.is_empty() {
+        None
+    } else {
+        Some(value.to_string())
+    }
 }
 
 fn validate_bucket_name(name: &str) -> Result<(), S3Error> {

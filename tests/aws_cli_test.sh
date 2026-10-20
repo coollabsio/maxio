@@ -1722,6 +1722,52 @@ EOF
     mc alias rm "$MC_ALIAS" > /dev/null 2>&1 || true
 fi
 
+# --- S3 compatibility edge cases ---
+echo ""
+echo "=== S3 compatibility edge cases ==="
+
+COMPAT_BUCKET="compat-$$"
+assert "create compat bucket" $AWS s3api create-bucket --bucket "$COMPAT_BUCKET"
+# us-east-1: creating a bucket you already own succeeds.
+assert "recreate owned bucket" $AWS s3api create-bucket --bucket "$COMPAT_BUCKET"
+
+echo "compat-body" > "$TMPDIR/compat.txt"
+assert "put compat object" $AWS s3 cp "$TMPDIR/compat.txt" "s3://$COMPAT_BUCKET/foo/bar"
+assert "put child of that key" $AWS s3 cp "$TMPDIR/compat.txt" "s3://$COMPAT_BUCKET/foo/bar/child"
+assert_eq "read key that is also a prefix" "compat-body" \
+    "$($AWS s3 cp "s3://$COMPAT_BUCKET/foo/bar" - 2>/dev/null)"
+assert_eq "read child key" "compat-body" \
+    "$($AWS s3 cp "s3://$COMPAT_BUCKET/foo/bar/child" - 2>/dev/null)"
+
+COPY_SELF=$($AWS s3api copy-object --bucket "$COMPAT_BUCKET" --key foo/bar \
+    --copy-source "$COMPAT_BUCKET/foo/bar" 2>&1 || true)
+assert_eq "copy object onto itself is InvalidRequest" "true" \
+    "$(echo "$COPY_SELF" | grep -q InvalidRequest && echo true || echo false)"
+
+PART_BODY=$($AWS s3api get-object --bucket "$COMPAT_BUCKET" --key foo/bar \
+    --part-number 1 "$TMPDIR/part1" 2>/dev/null && cat "$TMPDIR/part1")
+assert_eq "partNumber 1 of a single object" "compat-body" "$PART_BODY"
+
+LC_XML="$TMPDIR/lifecycle.xml"
+cat > "$LC_XML" << 'EOF'
+<LifecycleConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+  <Rule>
+    <ID>rule1</ID>
+    <Prefix>days1/</Prefix>
+    <Status>Enabled</Status>
+    <Expiration><Days>1</Days></Expiration>
+  </Rule>
+</LifecycleConfiguration>
+EOF
+assert "put lifecycle prefix rule" $AWS s3api put-bucket-lifecycle-configuration \
+    --bucket "$COMPAT_BUCKET" --lifecycle-configuration "file://$LC_XML"
+LC_GET=$($AWS s3api get-bucket-lifecycle-configuration --bucket "$COMPAT_BUCKET" 2>/dev/null || true)
+assert_eq "lifecycle prefix round-trips" "true" \
+    "$(echo "$LC_GET" | grep -q 'days1/' && echo true || echo false)"
+
+$AWS s3 rm "s3://$COMPAT_BUCKET" --recursive > /dev/null 2>&1 || true
+assert "delete compat bucket" $AWS s3api delete-bucket --bucket "$COMPAT_BUCKET"
+
 # --- Summary ---
 echo ""
 echo "=== Results: $PASS passed, $FAIL failed ==="

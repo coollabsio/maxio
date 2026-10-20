@@ -409,14 +409,18 @@ impl IntoResponse for S3Error {
         );
 
         let status = self.code.status_code();
-        (
-            status,
-            [
-                ("content-type", "application/xml"),
-                ("x-amz-request-id", &request_id.to_string()),
-            ],
-            xml,
-        )
-            .into_response()
+        let request_id = request_id.to_string();
+        let mut response = Response::builder()
+            .status(status)
+            .header("content-type", "application/xml")
+            .header("x-amz-request-id", request_id);
+        // A missing key is not a delete marker. Clients (and s3-tests) read
+        // this header on the 404 to distinguish the two.
+        if matches!(self.code, S3ErrorCode::NoSuchKey) {
+            response = response.header("x-amz-delete-marker", "false");
+        }
+        response
+            .body(axum::body::Body::from(xml))
+            .expect("error response headers are valid")
     }
 }

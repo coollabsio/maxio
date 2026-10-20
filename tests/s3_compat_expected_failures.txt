@@ -1,0 +1,37 @@
+# Known gaps that still fail after the compatibility fixes.
+# A failure not listed here fails tests/s3_compat.sh. See docs/s3-compatibility.md.
+s3tests/functional/test_s3.py::test_bucket_list_prefix_unreadable
+s3tests/functional/test_s3.py::test_object_set_get_unicode_metadata
+s3tests/functional/test_s3.py::test_object_delete_key_bucket_gone
+s3tests/functional/test_s3.py::test_multipart_sse_c_get_part
+s3tests/functional/test_s3.py::test_multipart_resend_first_finishes_last
+s3tests/functional/test_s3.py::test_versioning_obj_suspended_copy
+s3tests/functional/test_s3.py::test_encryption_sse_c_multipart_invalid_chunks_2
+s3tests/functional/test_s3.py::test_object_read_unreadable
+s3tests/functional/test_s3.py::test_object_checksum_sha256
+s3tests/functional/test_s3.py::test_object_checksum_crc64nvme
+s3tests/functional/test_s3.py::test_multipart_checksum_sha256
+s3tests/functional/test_s3.py::test_multipart_reupload_checksum_and_etag
+s3tests/functional/test_s3.py::test_multipart_use_cksum_helper_sha256
+s3tests/functional/test_s3.py::test_multipart_use_cksum_helper_crc64nvme
+s3tests/functional/test_s3.py::test_multipart_use_cksum_helper_crc32
+s3tests/functional/test_s3.py::test_multipart_use_cksum_helper_crc32c
+s3tests/functional/test_s3.py::test_multipart_use_cksum_helper_sha1
+s3tests/functional/test_s3.py::test_get_multipart_checksum_object_attributes
+s3tests/functional/test_s3.py::test_get_multipart_object_attributes
+s3tests/functional/test_s3.py::test_get_paginated_multipart_object_attributes
+s3tests/functional/test_s3.py::test_get_single_multipart_object_attributes
+s3tests/functional/test_s3.py::test_get_sse_c_encrypted_object_attributes
+s3tests/functional/test_s3.py::test_delete_marker_suspended
+s3tests/functional/test_s3.py::test_delete_marker_expiration
+s3tests/functional/test_s3.py::test_copy_part_enc[sse-s3-sse-s3-STANDARD-STANDARD-8388608]
+s3tests/functional/test_s3.py::test_copy_part_enc[sse-s3-sse-c-STANDARD-STANDARD-8388608]
+s3tests/functional/test_s3.py::test_copy_part_enc[sse-c-sse-s3-STANDARD-STANDARD-8388608]
+s3tests/functional/test_s3.py::test_copy_part_enc[sse-c-sse-c-STANDARD-STANDARD-8388608]
+s3tests/functional/test_headers.py::test_object_create_bad_contentlength_none
+s3tests/functional/test_headers.py::test_object_create_bad_authorization_empty
+s3tests/functional/test_headers.py::test_object_create_date_and_amz_date
+s3tests/functional/test_headers.py::test_object_create_amz_date_and_no_date
+s3tests/functional/test_headers.py::test_object_create_bad_authorization_none
+s3tests/functional/test_headers.py::test_bucket_create_bad_authorization_empty
+s3tests/functional/test_headers.py::test_bucket_create_bad_authorization_none

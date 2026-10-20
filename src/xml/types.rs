@@ -7,6 +7,10 @@ pub struct ListAllMyBucketsResult {
     pub owner: Owner,
     #[serde(rename = "Buckets")]
     pub buckets: Buckets,
+    #[serde(rename = "Prefix", skip_serializing_if = "Option::is_none")]
+    pub prefix: Option<String>,
+    #[serde(rename = "ContinuationToken", skip_serializing_if = "Option::is_none")]
+    pub continuation_token: Option<String>,
 }
 
 #[derive(Serialize, Clone)]
@@ -282,6 +286,8 @@ pub struct VersionEntry {
     pub etag: String,
     #[serde(rename = "Size")]
     pub size: u64,
+    #[serde(rename = "Owner")]
+    pub owner: Owner,
     #[serde(rename = "StorageClass")]
     pub storage_class: String,
 }
@@ -296,6 +302,8 @@ pub struct DeleteMarkerEntry {
     pub is_latest: bool,
     #[serde(rename = "LastModified")]
     pub last_modified: String,
+    #[serde(rename = "Owner")]
+    pub owner: Owner,
 }
 
 #[derive(Serialize, Deserialize, Debug)]

@@ -156,6 +156,9 @@ pub async fn complete_multipart_upload(
         .map_err(S3Error::internal)?;
     let body_str = String::from_utf8_lossy(&bytes);
     let parts = parse_complete_parts(&body_str)?;
+    if parts.is_empty() {
+        return Err(S3Error::malformed_xml());
+    }
 
     // SSE-C customer key, if the upload was SSE-C, arrives here again.
     let customer_key = extract_customer_key(&headers)?;

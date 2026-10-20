@@ -290,10 +290,14 @@ impl StoredObjectMetadata {
 /// Condition evaluated atomically (under the per-key lock) right before a
 /// write is published.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(clippy::enum_variant_names)]
 pub enum WritePrecondition {
     /// `If-None-Match: *` — fail if a current (non-delete-marker) object exists.
     IfNoneMatchAny,
+    /// `If-None-Match: <etag>` — fail only when the current ETag matches.
+    IfNoneMatch(String),
     /// `If-Match: <etag>` — fail if the current ETag differs; NotFound if absent.
+    /// `*` matches any current object.
     IfMatch(String),
 }
 

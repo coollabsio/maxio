@@ -29,7 +29,7 @@ version-check:
     if [ -e ui/src/version.ts ]; then
         echo "ui/src/version.ts must not exist; the console badge reads /maxio/api/version" >&2
         exit 1
-    }
+    fi
 
 # Fail when a built console asset contains the Cargo version.
 dist-version-check:
@@ -44,7 +44,7 @@ dist-version-check:
     if grep -R -F -n --binary-files=text -e "$cargo_version" ui/dist; then
         echo "ui/dist contains Cargo version $cargo_version; the console must not ship it" >&2
         exit 1
-    }
+    fi
 
 # Full gate (same as CI).
 check:

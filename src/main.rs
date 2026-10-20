@@ -149,7 +149,7 @@ fn default_healthcheck_url() -> String {
         .ok()
         .and_then(|v| v.parse::<u16>().ok())
         .unwrap_or(9000);
-    format!("http://127.0.0.1:{}/healthz", port)
+    format!("http://127.0.0.1:{}/maxio/health/live", port)
 }
 
 #[tokio::main]

@@ -209,8 +209,10 @@ pub struct ServerVersion {
     path = "/api/version",
     operation_id = "getServerVersion",
     tag = "meta",
-    security(()),
-    responses((status = 200, description = "Running server version", body = ServerVersion))
+    responses(
+        (status = 200, description = "Running server version", body = ServerVersion),
+        (status = 401, description = "Not authenticated", body = ErrorResponse),
+    )
 )]
 pub async fn server_version() -> Json<ServerVersion> {
     Json(ServerVersion {
@@ -2113,12 +2115,12 @@ pub fn console_router(state: AppState) -> Router<AppState> {
     let json_body_limit = DefaultBodyLimit::max(state.config.max_console_body_bytes);
 
     let public = Router::new()
-        .route("/version", get(server_version))
         .route("/auth/login", post(login))
         .route("/auth/check", get(check))
         .layer(json_body_limit);
 
     let protected_limited = Router::new()
+        .route("/version", get(server_version))
         .route("/auth/logout", post(logout))
         .route("/auth/capabilities", get(capabilities))
         .route("/buckets", get(list_buckets))

@@ -408,6 +408,7 @@ pub async fn authorize_console(
         .trim_end_matches('/');
     let q = query_map(query);
     if path == "/auth/logout"
+        || (path == "/version" && method == "GET")
         || (path == "/buckets" && method == "GET")
         || (path == "/auth/capabilities" && method == "GET")
     {

@@ -150,18 +150,17 @@ print(value)
 # aws + mc round trip. Set MAXIO_SMOKE=1. The full suite below is unchanged.
 if [ "${MAXIO_SMOKE:-0}" = "1" ]; then
     echo "=== smoke mode ==="
-    HEALTH=$(curl -fsS "$ENDPOINT/healthz" || true)
-    VERSION_BODY=$(curl -fsS "$ENDPOINT/api/version" || true)
+    HEALTH=$(curl -fsS "$ENDPOINT/maxio/health/live" || true)
     HEALTH_STATUS=$(json_field "$HEALTH" status)
     HEALTH_VERSION=$(json_field "$HEALTH" version)
-    API_VERSION=$(json_field "$VERSION_BODY" version)
-    assert_eq "healthz status is ok" "ok" "$HEALTH_STATUS"
-    assert_eq "healthz version is not empty" "true" "$([ -n "$HEALTH_VERSION" ] && echo true || echo false)"
-    assert_eq "/api/version matches /healthz" "$HEALTH_VERSION" "$API_VERSION"
+    assert_eq "live health status is ok" "ok" "$HEALTH_STATUS"
+    assert_eq "live health has no version" "" "$HEALTH_VERSION"
+    VER_CODE=$(curl -sS -o "$TMPDIR/api-version" -w '%{http_code}' "$ENDPOINT/api/version" || echo "000")
+    assert_eq "unauthenticated /api/version is denied" "401" "$VER_CODE"
 
     if [ -n "${MAXIO_BIN:-}" ] && [ -x "${MAXIO_BIN}" ]; then
         BIN_VERSION=$("${MAXIO_BIN}" --version | awk '{print $NF}')
-        assert_eq "maxio --version matches /version" "$API_VERSION" "$BIN_VERSION"
+        assert_eq "maxio --version is not empty" "true" "$([ -n "$BIN_VERSION" ] && echo true || echo false)"
     fi
 
     FORMAT_VERSION=$(python3 -c 'import json,sys
@@ -193,17 +192,22 @@ except Exception:
     [ "$FAIL" -eq 0 ] && exit 0 || exit 1
 fi
 
-# Buckets whose names match probe paths. Unsigned GET /healthz with no query
-# stays the Docker health check; these calls are signed.
+# Service health does not use /healthz or /version, so those names are buckets.
 echo ""
 echo "--- Buckets named version and healthz (path-style) ---"
-PROBE_CODE=$(curl -sS -o "$TMPDIR/healthz-body" -w '%{http_code}' "$ENDPOINT/healthz" || echo "000")
-assert_eq "unsigned GET /healthz is 200" "200" "$PROBE_CODE"
-assert_eq "unsigned GET /healthz is the probe" "true" \
-    "$(grep -q '"status":"ok"' "$TMPDIR/healthz-body" && echo true || echo false)"
-HEAD_CODE=$(curl -sS -o /dev/null -X HEAD -w '%{http_code}' "$ENDPOINT/healthz" || echo "000")
-# curl -I follows and prints headers; -w still reports the status.
-assert_eq "unsigned HEAD /healthz is 200" "200" "$HEAD_CODE"
+LIVE_BODY=$(curl -fsS "$ENDPOINT/maxio/health/live" || true)
+assert_eq "GET /maxio/health/live status" "ok" "$(json_field "$LIVE_BODY" status)"
+assert_eq "GET /maxio/health/live has no version" "" "$(json_field "$LIVE_BODY" version)"
+LIVE_HEAD=$(curl -sS -o /dev/null -X HEAD -w '%{http_code}' "$ENDPOINT/maxio/health/live" || true)
+assert_eq "HEAD /maxio/health/live is 200" "200" "$LIVE_HEAD"
+READY_BODY=$(curl -fsS "$ENDPOINT/maxio/health/ready" || true)
+assert_eq "GET /maxio/health/ready status" "ok" "$(json_field "$READY_BODY" status)"
+assert_eq "GET /maxio/health/ready has no version" "" "$(json_field "$READY_BODY" version)"
+VER_CODE=$(curl -sS -o "$TMPDIR/unauth-version" -w '%{http_code}' "$ENDPOINT/api/version" || echo "000")
+assert_eq "unauthenticated /api/version is denied" "401" "$VER_CODE"
+MAXIO_CREATE=$($AWS s3api create-bucket --bucket maxio 2>&1 || true)
+assert_eq "create bucket maxio is InvalidBucketName" "true" \
+    "$(echo "$MAXIO_CREATE" | grep -q InvalidBucketName && echo true || echo false)"
 for PROBE_BUCKET in version healthz; do
     echo "probe-$PROBE_BUCKET" > "$TMPDIR/probe.txt"
     assert "create bucket $PROBE_BUCKET" $AWS s3 mb "s3://$PROBE_BUCKET"
@@ -2074,7 +2078,7 @@ else
             --address 127.0.0.1 "${cred_args[@]}" >"$ROBUST_DATA/server.log" 2>&1 &
         ROBUST_PID=$!
         for _ in $(seq 1 50); do
-            if curl -sf "$ROBUST_EP/healthz" >/dev/null 2>&1; then
+            if curl -sf "$ROBUST_EP/maxio/health/live" >/dev/null 2>&1; then
                 return 0
             fi
             sleep 0.1
@@ -2167,7 +2171,7 @@ EOF
     LIMIT_PID=$!
     LIMIT_EP="http://127.0.0.1:$LIMIT_PORT"
     for _ in $(seq 1 50); do
-        curl -sf "$LIMIT_EP/healthz" >/dev/null 2>&1 && break
+        curl -sf "$LIMIT_EP/maxio/health/live" >/dev/null 2>&1 && break
         sleep 0.1
     done
     dd if=/dev/zero of="$TMPDIR/too-big.bin" bs=1024 count=2 status=none
@@ -2208,7 +2212,7 @@ EOF
     PART_EP="http://127.0.0.1:$PART_PORT"
     PART_AWS="aws --endpoint-url $PART_EP"
     for _ in $(seq 1 50); do
-        curl -sf "$PART_EP/healthz" >/dev/null 2>&1 && break
+        curl -sf "$PART_EP/maxio/health/live" >/dev/null 2>&1 && break
         sleep 0.1
     done
     assert "part-limit create bucket" $PART_AWS s3 mb s3://part-limit
@@ -2285,7 +2289,7 @@ else
         KEY_PID=$!
         local attempt
         for attempt in $(seq 1 50); do
-            if curl -sf "$KEY_ENDPOINT/healthz" >/dev/null 2>&1; then
+            if curl -sf "$KEY_ENDPOINT/maxio/health/live" >/dev/null 2>&1; then
                 return 0
             fi
             if ! kill -0 "$KEY_PID" 2>/dev/null; then
@@ -2501,9 +2505,9 @@ fi
 echo ""
 echo "--- Virtual-hosted-style (aws + mc) ---"
 VHOST_PROBE=$(curl -sS -o /dev/null -w '%{http_code}' \
-    -H "Host: hprobe.localhost:${PORT}" "http://127.0.0.1:${PORT}/healthz" || echo "000")
+    -H "Host: hprobe.localhost:${PORT}" "http://127.0.0.1:${PORT}/maxio/health/live" || echo "000")
 if [ "$VHOST_PROBE" != "403" ]; then
-    red "FAIL: virtual-hosted-style is off (GET /healthz with Host hprobe.localhost returned ${VHOST_PROBE}, expected 403). Start maxio with --domain localhost."
+    red "FAIL: virtual-hosted-style is off (GET /maxio/health/live with Host hprobe.localhost returned ${VHOST_PROBE}, expected 403). Start maxio with --domain localhost."
     FAIL=$((FAIL + 1))
 else
     green "PASS: virtual-hosted-style enabled"
@@ -2545,6 +2549,10 @@ EOF
         assert "virtual delete object in $PROBE_BUCKET" vaws s3 rm "s3://$PROBE_BUCKET/note.txt"
         assert "virtual delete bucket $PROBE_BUCKET" vaws s3 rb "s3://$PROBE_BUCKET"
     done
+    pin_vhost "maxio.localhost"
+    VMAXIO=$(vaws s3api create-bucket --bucket maxio 2>&1 || true)
+    assert_eq "virtual create bucket maxio is InvalidBucketName" "true" \
+        "$(echo "$VMAXIO" | grep -q InvalidBucketName && echo true || echo false)"
 
     assert "virtual create bucket" vaws s3 mb "s3://${VBUCKET}"
     assert "virtual head bucket" vaws s3api head-bucket --bucket "$VBUCKET"
@@ -2764,7 +2772,7 @@ if [ -n "$PREFIX_BIN" ]; then
         --address 127.0.0.1 "${PFX_CREDS[@]}" >"$PFX_DATA/server.log" 2>&1 &
     PFX_PID=$!
     for _ in $(seq 1 50); do
-        curl -sf "$PFX_EP/healthz" >/dev/null 2>&1 && break
+        curl -sf "$PFX_EP/maxio/health/live" >/dev/null 2>&1 && break
         sleep 0.1
     done
     PFX_AWS="aws --endpoint-url $PFX_EP"

@@ -20,7 +20,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Format 2 is the key-and-prefix layout. A key that is also a prefix is stored at `<key>/.maxio.object`. A build that only understands format 1 refuses a version 2 directory instead of opening that path as a file. Format 3 and newer is refused by this binary
 - React web console with a generated OpenAPI client
 - Bucket lifecycle, bucket tags, anonymous read/list, and streaming trailer checksums
-- `GET /api/version` and a version field on the unauthenticated `GET /healthz` probe (no query, not a virtual-hosted bucket). The console shows the same version. Buckets named `version` and `healthz` stay ordinary S3 buckets
+- `GET /api/version` requires a console session and is what the console badge shows. Unauthenticated callers get 401. `GET` and `HEAD /maxio/health/live` and `/maxio/health/ready` are unauthenticated and report status only, never the version. The bucket name `maxio` is reserved. Buckets named `version` and `healthz` are ordinary buckets
 - Release binaries for Linux (static musl) and macOS, with SHA256 checksums, multi-arch container images, and changelog-backed GitHub Release notes
 
 ### Fixed

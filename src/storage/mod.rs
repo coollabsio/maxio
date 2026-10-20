@@ -525,6 +525,10 @@ pub fn bucket_name_error(name: &str) -> Option<&'static str> {
         return Some("Bucket name must not contain two dots in a row or a dot next to a hyphen.");
     }
 
+    if name == "maxio" {
+        return Some("Bucket name maxio is reserved.");
+    }
+
     let parts: Vec<&str> = name.split('.').collect();
     if parts.len() == 4 && parts.iter().all(|p| p.parse::<u8>().is_ok()) {
         return Some(
@@ -624,6 +628,7 @@ mod validation_tests {
             "a.-b",
             "a-.b",
             "192.168.0.1",
+            "maxio",
         ] {
             assert!(
                 validate_bucket_name(name).is_err(),

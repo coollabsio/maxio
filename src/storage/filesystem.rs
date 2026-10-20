@@ -433,6 +433,9 @@ impl FilesystemStorage {
         if !legacy.is_empty() {
             return Err(anyhow::anyhow!(format_legacy_reserved_error(&legacy)));
         }
+        if reserved_bucket_present(&storage.buckets_dir).await {
+            return Err(anyhow::anyhow!(reserved_bucket_error()));
+        }
         // Nothing is in flight during construction, so crash leftovers (temp
         // files, stranded EC backups, half-finished key promotions, upload
         // dirs with no readable metadata) are safe to clear immediately. The
@@ -1864,6 +1867,21 @@ pub(crate) async fn find_legacy_reserved_keys(buckets_dir: &Path) -> Vec<LegacyR
     found.sort_by(|a, b| (&a.bucket, &a.key).cmp(&(&b.bucket, &b.key)));
     found.dedup();
     found
+}
+
+/// `buckets/maxio` is a bucket created before this name was reserved.
+pub(crate) async fn reserved_bucket_present(buckets_dir: &Path) -> bool {
+    let path = buckets_dir.join("maxio");
+    match tokio::fs::metadata(&path).await {
+        Ok(meta) => meta.is_dir(),
+        Err(_) => false,
+    }
+}
+
+pub(crate) fn reserved_bucket_error() -> String {
+    "refusing to start: this data directory contains a bucket named \"maxio\", which this version of MaxIO reserves.\n\
+     Start the previous MaxIO version on this data directory, move the objects out, and remove the bucket (for example `aws s3 rb`), then start this version."
+        .to_string()
 }
 
 pub(crate) fn format_legacy_reserved_error(keys: &[LegacyReservedKey]) -> String {

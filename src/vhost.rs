@@ -93,18 +93,20 @@ enum HostClass {
 /// replaced `Host` with an internal address). In that case the forwarded value
 /// becomes the `Host` header so signature verification uses the host the
 /// client signed, which is the same host used to choose the bucket.
-/// True when `Host` is `<bucket>.<configured-domain>`.
+/// True when `Host` is `maxio.<configured-domain>`.
 ///
-/// Health probes must not claim those requests: `healthz.localhost/` is the
-/// bucket `healthz`, not `GET /healthz`.
-pub(crate) fn host_is_bucket(request: &Request, domains: &[String]) -> bool {
+/// That name is reserved for service endpoints (`/maxio/health/*`). It is not
+/// rewritten into an S3 bucket route.
+pub(crate) fn is_reserved_service_host(request: &Request, domains: &[String]) -> bool {
     if domains.is_empty() {
         return false;
     }
-    matches!(
-        classify(&request_host(request), domains),
-        HostClass::Bucket(_)
-    )
+    let name = hostname(&request_host(request));
+    domains.iter().any(|domain| {
+        name.strip_suffix(domain.as_str())
+            .and_then(|prefix| prefix.strip_suffix('.'))
+            .is_some_and(|label| label.eq_ignore_ascii_case("maxio") && !label.contains('.'))
+    })
 }
 
 pub(crate) fn apply(request: &mut Request, domains: &[String]) {

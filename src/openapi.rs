@@ -177,11 +177,7 @@ mod tests {
     #[test]
     fn login_and_check_are_public() {
         let doc: serde_json::Value = serde_json::from_str(&openapi_json()).unwrap();
-        for (path, method) in [
-            ("/api/auth/login", "post"),
-            ("/api/auth/check", "get"),
-            ("/api/version", "get"),
-        ] {
+        for (path, method) in [("/api/auth/login", "post"), ("/api/auth/check", "get")] {
             assert_eq!(
                 doc["paths"][path][method]["security"],
                 serde_json::json!([{}])

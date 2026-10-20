@@ -29,10 +29,10 @@ The container equivalent is a copy of the volume while the container is stopped.
 
 ```bash
 maxio --version
-curl -fsS http://127.0.0.1:9000/healthz
+curl -fsS http://127.0.0.1:9000/maxio/health/live
 ```
 
-`/healthz` returns `{"status":"ok","version":"..."}`. The log line `on-disk format version 2` means the data directory was accepted.
+`/maxio/health/live` returns `{"status":"ok"}` and does not include the version. The log line `on-disk format version 2` means the data directory was accepted. `/maxio/health/ready` is `503` when the data directory cannot be read.
 
 ## Upgrade a container
 
@@ -73,4 +73,4 @@ To undo an upgrade that has not yet stored data you need:
 
 1. Stop the new process.
 2. Restore the whole data directory from the backup taken before the upgrade, including `.maxio-keys.json` and `iam.json`. A keyring from a different copy will not decrypt objects or IAM access-key secrets.
-3. Start the previous 1.0.x binary or image tag (not a pre-1.0 build) and check `/healthz`.
+3. Start the previous 1.0.x binary or image tag (not a pre-1.0 build) and check `/maxio/health/live`.

@@ -9,6 +9,7 @@ use maxio::config::Config;
 use maxio::server::{self, AppState};
 use maxio::storage::filesystem::FilesystemStorage;
 use maxio::storage::keys::Keyring;
+use std::os::unix::fs::PermissionsExt;
 use std::sync::Arc;
 use tempfile::TempDir;
 
@@ -779,31 +780,129 @@ fn extract_xml_tag(body: &str, tag: &str) -> Option<String> {
 
 // ---- Tests ----
 
+fn body_has_no_version(body: &str) {
+    assert!(
+        !body.contains("\"version\""),
+        "health body must not name a version: {body}"
+    );
+    assert!(
+        !body.contains(env!("CARGO_PKG_VERSION")),
+        "health body must not leak the release version: {body}"
+    );
+}
+
 #[tokio::test]
 async fn test_healthz_is_public_and_returns_ok() {
     let (base_url, _tmp) = start_server().await;
     let resp = client()
-        .get(format!("{}/healthz", base_url))
+        .get(format!("{base_url}/maxio/health/live"))
         .send()
         .await
         .unwrap();
     assert_eq!(resp.status(), 200);
-    let body: serde_json::Value = resp.json().await.unwrap();
-    assert_eq!(body["status"], "ok");
-    assert_eq!(body["version"], env!("CARGO_PKG_VERSION"));
+    assert!(resp.headers().get("server").is_none());
+    let body = resp.text().await.unwrap();
+    assert!(body.contains("\"status\":\"ok\""), "{body}");
+    body_has_no_version(&body);
+
+    let head = client()
+        .head(format!("{base_url}/maxio/health/live"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(head.status(), 200);
+    assert!(head.headers().get("server").is_none());
 }
 
 #[tokio::test]
 async fn test_version_endpoint_reports_package_version() {
     let (base_url, _tmp) = start_server().await;
-    let resp = client()
+    let denied = client()
         .get(format!("{base_url}/api/version"))
         .send()
         .await
         .unwrap();
+    assert_eq!(denied.status(), 401);
+    body_has_no_version(&denied.text().await.unwrap());
+
+    let login = client()
+        .post(format!("{base_url}/api/auth/login"))
+        .json(&serde_json::json!({
+            "accessKey": ACCESS_KEY,
+            "secretKey": SECRET_KEY
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(login.status(), 200, "root login");
+    let session = login
+        .headers()
+        .get("set-cookie")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .strip_prefix("maxio_session=")
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap()
+        .to_string();
+    let resp = client()
+        .get(format!("{base_url}/api/version"))
+        .header("cookie", format!("maxio_session={session}"))
+        .send()
+        .await
+        .unwrap();
     assert_eq!(resp.status(), 200);
+    assert!(resp.headers().get("server").is_none());
     let body: serde_json::Value = resp.json().await.unwrap();
     assert_eq!(body["version"], env!("CARGO_PKG_VERSION"));
+}
+
+#[tokio::test]
+async fn health_ready_is_503_when_the_data_dir_cannot_be_read() {
+    let (base_url, tmp) = start_server().await;
+    let ready = client()
+        .get(format!("{base_url}/maxio/health/ready"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(ready.status(), 200);
+    body_has_no_version(&ready.text().await.unwrap());
+
+    let mut perms = std::fs::metadata(tmp.path()).unwrap().permissions();
+    perms.set_mode(0o0);
+    std::fs::set_permissions(tmp.path(), perms).unwrap();
+    let denied = client()
+        .get(format!("{base_url}/maxio/health/ready"))
+        .send()
+        .await
+        .unwrap();
+    let status = denied.status();
+    let body = denied.text().await.unwrap();
+    let mut restore = std::fs::metadata(tmp.path()).unwrap().permissions();
+    restore.set_mode(0o755);
+    std::fs::set_permissions(tmp.path(), restore).unwrap();
+    assert_eq!(status, 503, "{body}");
+    body_has_no_version(&body);
+
+    let live = client()
+        .get(format!("{base_url}/maxio/health/live"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(live.status(), 200);
+    body_has_no_version(&live.text().await.unwrap());
+}
+
+#[tokio::test]
+async fn create_bucket_named_maxio_is_rejected() {
+    let (base_url, _tmp) = start_server().await;
+    let resp = signed("PUT", &format!("{base_url}/maxio"), b"").await;
+    let status = resp.status();
+    let body = resp.text().await.unwrap();
+    assert_eq!(status, 400, "{body}");
+    assert!(body.contains("InvalidBucketName"), "{body}");
 }
 
 async fn signed(method: &str, url: &str, body: &[u8]) -> reqwest::Response {
@@ -820,40 +919,40 @@ async fn signed(method: &str, url: &str, body: &[u8]) -> reqwest::Response {
     req.send().await.unwrap()
 }
 
-/// Buckets named `version` and `healthz` are S3 buckets. The probe is only an
-/// unauthenticated GET/HEAD `/healthz` with no query.
+/// Buckets named `version` and `healthz` are S3 buckets. `/maxio/health/live`
+/// is the unauthenticated probe and does not include the version.
 #[tokio::test]
 async fn probe_names_are_buckets_and_unsigned_healthz_stays_a_probe() {
     let (base_url, _tmp) = start_server().await;
 
-    let health = client()
+    let live = client()
+        .get(format!("{base_url}/maxio/health/live"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(live.status(), 200);
+    let live_body = live.text().await.unwrap();
+    assert!(live_body.contains("\"status\":\"ok\""), "{live_body}");
+    body_has_no_version(&live_body);
+
+    let denied = client()
+        .get(format!("{base_url}/api/version"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(denied.status(), 401);
+    let denied_body = denied.text().await.unwrap();
+    body_has_no_version(&denied_body);
+
+    let old = client()
         .get(format!("{base_url}/healthz"))
         .send()
         .await
         .unwrap();
-    assert_eq!(health.status(), 200);
-    let health_body = health.text().await.unwrap();
-    assert!(health_body.contains("\"status\":\"ok\""), "{health_body}");
-
-    let head = client()
-        .head(format!("{base_url}/healthz"))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(head.status(), 200);
-
-    let queried = client()
-        .get(format!("{base_url}/healthz?versioning"))
-        .send()
-        .await
-        .unwrap();
-    let queried_status = queried.status();
-    let queried_body = queried.text().await.unwrap();
-    assert_ne!(queried_status, 200, "{queried_body}");
-    assert!(
-        !queried_body.contains("\"status\":\"ok\""),
-        "{queried_body}"
-    );
+    let old_status = old.status();
+    let old_body = old.text().await.unwrap();
+    assert_ne!(old_status, 200, "{old_body}");
+    body_has_no_version(&old_body);
 
     for bucket in ["version", "healthz"] {
         let root = format!("{base_url}/{bucket}");
@@ -919,7 +1018,7 @@ async fn test_readyz_is_public_and_returns_ok() {
 async fn test_security_headers_are_applied() {
     let (base_url, _tmp) = start_server().await;
     let resp = client()
-        .get(format!("{}/healthz", base_url))
+        .get(format!("{}/maxio/health/live", base_url))
         .send()
         .await
         .unwrap();

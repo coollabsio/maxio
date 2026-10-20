@@ -17,8 +17,9 @@ use crate::error::S3Error;
 pub fn is_health_path(path: &str) -> bool {
     matches!(
         path,
-        "/healthz"
-            | "/readyz"
+        "/readyz"
+            | "/maxio/health/live"
+            | "/maxio/health/ready"
             | "/minio/health/live"
             | "/minio/health/ready"
             | "/minio/health/cluster"

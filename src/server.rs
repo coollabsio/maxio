@@ -1,10 +1,11 @@
+use axum::Json;
 use axum::Router;
 use axum::body::Body;
 use axum::extract::{Request, State};
 use axum::http::{HeaderValue, StatusCode, header};
 use axum::middleware::from_fn_with_state;
+use axum::response::IntoResponse;
 use axum::routing::get;
-use http::Method;
 use std::convert::Infallible;
 use std::future::Future;
 use std::pin::Pin;
@@ -21,11 +22,10 @@ use crate::api::router::s3_router;
 use crate::auth::middleware::auth_middleware;
 use crate::config::Config;
 use crate::embedded::ui_handler;
+use crate::error::S3Error;
 use crate::limits::{limit_headers, limit_inflight, limit_request_time};
 use crate::storage::filesystem::FilesystemStorage;
 use crate::vhost;
-
-const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 #[derive(Clone)]
 pub struct AppState {
@@ -80,10 +80,9 @@ impl Service<Request<Body>> for AppService {
     }
 
     fn call(&mut self, mut request: Request<Body>) -> Self::Future {
-        // Probe only. A signed request, a query (`?versioning`), or a
-        // virtual-hosted bucket named healthz is an S3 call.
-        if is_health_probe(&request, &self.domains) {
-            let response = health_probe_response(request.method());
+        // `maxio.<domain>` is the reserved service host, not an S3 bucket.
+        if vhost::is_reserved_service_host(&request, &self.domains) {
+            let response = S3Error::invalid_bucket_name("maxio").into_response();
             return Box::pin(std::future::ready(Ok(response)));
         }
         vhost::apply(&mut request, &self.domains);
@@ -92,37 +91,6 @@ impl Service<Request<Body>> for AppService {
             request,
         ))
     }
-}
-
-/// Unauthenticated `GET` or `HEAD /healthz` with no query and no virtual-host bucket.
-fn is_health_probe(request: &Request<Body>, domains: &[String]) -> bool {
-    let method = request.method();
-    if *method != Method::GET && *method != Method::HEAD {
-        return false;
-    }
-    let uri = request.uri();
-    if uri.path() != "/healthz" || uri.query().is_some() {
-        return false;
-    }
-    if request.headers().contains_key(http::header::AUTHORIZATION) {
-        return false;
-    }
-    !vhost::host_is_bucket(request, domains)
-}
-
-fn health_probe_response(method: &Method) -> axum::response::Response {
-    let body = if *method == Method::HEAD {
-        Body::empty()
-    } else {
-        Body::from(format!(r#"{{"status":"ok","version":"{VERSION}"}}"#))
-    };
-    let mut response = axum::response::Response::builder()
-        .status(StatusCode::OK)
-        .header(header::CONTENT_TYPE, "application/json")
-        .body(body)
-        .expect("health probe response");
-    insert_security_headers(response.headers_mut());
-    response
 }
 
 fn insert_security_headers(headers: &mut axum::http::HeaderMap) {
@@ -169,11 +137,11 @@ pub fn build_router(state: AppState) -> AppService {
     let mut router = Router::new()
         .nest("/api", console_router(state.clone()))
         .route("/readyz", get(readyz))
-        // MinIO-compatible probes (GET and HEAD, unauthenticated). Registered
-        // here, outside the S3 router, so the SigV4 auth layer never runs.
-        // `/healthz` is not a route: AppService answers the probe only for an
-        // unauthenticated GET/HEAD with no query and no virtual-host bucket.
-        // Everything else, including bucket `healthz`, is S3.
+        // Service probes. Unauthenticated, and they do not carry the version.
+        // Registered outside the S3 router so SigV4 never runs. `GET /healthz`
+        // and `GET /version` are ordinary bucket paths.
+        .route("/maxio/health/live", get(health_live))
+        .route("/maxio/health/ready", get(health_ready))
         .route("/minio/health/live", get(live))
         .route("/minio/health/ready", get(readyz))
         .route("/minio/health/cluster", get(readyz))
@@ -204,6 +172,32 @@ async fn redirect_to_ui_root(uri: axum::http::Uri) -> axum::response::Redirect {
     match uri.query() {
         Some(query) => axum::response::Redirect::permanent(&format!("/ui/?{query}")),
         None => axum::response::Redirect::permanent("/ui/"),
+    }
+}
+
+#[derive(serde::Serialize)]
+struct HealthBody {
+    status: &'static str,
+}
+
+fn health_json(status: &'static str, code: StatusCode) -> axum::response::Response {
+    (code, Json(HealthBody { status })).into_response()
+}
+
+/// Process is answering. Does not inspect storage and does not report a version.
+async fn health_live() -> axum::response::Response {
+    health_json("ok", StatusCode::OK)
+}
+
+/// Data directory can be read. `503` when it cannot, still without a version.
+async fn health_ready(State(state): State<AppState>) -> axum::response::Response {
+    let data_dir = std::path::Path::new(&state.config.data_dir);
+    let usable = tokio::fs::read_dir(data_dir).await.is_ok()
+        && tokio::fs::read_dir(data_dir.join("buckets")).await.is_ok();
+    if usable {
+        health_json("ok", StatusCode::OK)
+    } else {
+        health_json("unavailable", StatusCode::SERVICE_UNAVAILABLE)
     }
 }
 

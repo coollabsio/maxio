@@ -78,8 +78,8 @@ LimitNOFILE=65535
 
 ## Health
 
-- [ ] The process supervisor uses `GET /healthz` or `maxio healthcheck`. A 200 body looks like `{"status":"ok","version":"1.0.0"}`.
-- [ ] `/readyz` is the readiness probe. `/minio/health/live` and `/minio/health/ready` stay empty 200 responses for MinIO-compatible checkers.
+- [ ] The process supervisor uses `GET /maxio/health/live` or `maxio healthcheck`. A 200 body looks like `{"status":"ok"}` and does not include the version.
+- [ ] `/maxio/health/ready` is the readiness probe (`503` when the data directory cannot be read). `/minio/health/live` and `/minio/health/ready` stay empty 200 responses for MinIO-compatible checkers.
 - [ ] The image tag or binary version is pinned. `latest` is for experiments.
 - [ ] You know which version is installed (`maxio --version`) and which format the data directory is on (the startup log, or `.maxio-format`).
 

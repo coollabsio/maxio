@@ -384,7 +384,7 @@ async fn domain_unset_keeps_path_style_and_health() {
     // A bucket-shaped Host is ignored until a domain is configured.
     let (status, body) = raw_http(
         server.port,
-        b"GET /healthz HTTP/1.1\r\nhost: photos.localhost\r\nconnection: close\r\n\r\n",
+        b"GET /maxio/health/live HTTP/1.1\r\nhost: photos.localhost\r\nconnection: close\r\n\r\n",
     )
     .await;
     assert_eq!(status, 200, "{body}");
@@ -756,15 +756,21 @@ async fn dotted_bucket_uppercase_host_and_service_routes() {
         .no_proxy()
         .build()
         .unwrap()
-        .get(format!("{}/healthz", server.base))
+        .get(format!("{}/maxio/health/live", server.base))
         .send()
         .await
         .unwrap();
     assert_eq!(health.status(), 200);
     let health_body = health.text().await.unwrap();
     assert!(health_body.contains("\"status\":\"ok\""), "{health_body}");
+    assert!(!health_body.contains("\"version\""), "{health_body}");
 
-    for path in ["/readyz", "/minio/health/live", "/minio/health/ready"] {
+    for path in [
+        "/readyz",
+        "/minio/health/live",
+        "/minio/health/ready",
+        "/maxio/health/ready",
+    ] {
         let response = reqwest::Client::builder()
             .no_proxy()
             .build()
@@ -949,7 +955,7 @@ async fn forwarded_host_and_longest_domain() {
     let (status, body) = raw_http(
         server.port,
         &format!(
-            "GET /healthz HTTP/1.1\r\nhost: example.test:{}\r\nx-forwarded-host: photos.example.test\r\nconnection: close\r\n\r\n",
+            "GET /maxio/health/live HTTP/1.1\r\nhost: example.test:{}\r\nx-forwarded-host: photos.example.test\r\nconnection: close\r\n\r\n",
             server.port
         )
         .into_bytes(),
@@ -1050,11 +1056,24 @@ async fn buckets_named_version_and_healthz_work_on_virtual_host() {
         .no_proxy()
         .build()
         .unwrap()
-        .get(format!("{}/healthz", server.base))
+        .get(format!("{}/maxio/health/live", server.base))
         .send()
         .await
         .unwrap();
     assert_eq!(health.status(), 200);
     let health_body = health.text().await.unwrap();
     assert!(health_body.contains("\"status\":\"ok\""), "{health_body}");
+    assert!(!health_body.contains("\"version\""), "{health_body}");
+
+    let reserved = http_client(server.port, &["maxio.localhost"]);
+    let (status, body) = call_status(
+        &reserved,
+        "PUT",
+        &vurl("maxio.localhost", server.port, "/"),
+        vec![],
+        &[],
+    )
+    .await;
+    assert_eq!(status, 400, "{body}");
+    assert!(body.contains("InvalidBucketName"), "{body}");
 }

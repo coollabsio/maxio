@@ -1595,6 +1595,15 @@ export type GetServerVersionData = {
     url: '/api/version';
 };
 
+export type GetServerVersionErrors = {
+    /**
+     * Not authenticated
+     */
+    401: ErrorResponse;
+};
+
+export type GetServerVersionError = GetServerVersionErrors[keyof GetServerVersionErrors];
+
 export type GetServerVersionResponses = {
     /**
      * Running server version

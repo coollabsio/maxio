@@ -112,7 +112,7 @@ maxio --domain s3.example.com --data-dir ./data --port 9000
 # MAXIO_DOMAIN=s3.example.com,s3.example.org
 ```
 
-A request whose `Host` is `<bucket>.<domain>` (a port is ignored, and the host is matched case-insensitively) is served from that bucket. The bare domain, an IP address, and any other host stay on path-style, so the web console (`/ui/`), `/api/`, `/healthz`, and `/minio/health/*` on the service host are unchanged. Bucket names follow the S3 rules (lowercase letters, digits, dots, and hyphens). A dotted name such as `my.bucket` is the host `my.bucket.s3.example.com`.
+A request whose `Host` is `<bucket>.<domain>` (a port is ignored, and the host is matched case-insensitively) is served from that bucket. The bare domain, an IP address, and any other host stay on path-style, so the web console (`/ui/`), `/api/`, `/maxio/health/*`, and `/minio/health/*` on the service host are unchanged. The bucket name `maxio` is reserved. Bucket names follow the S3 rules (lowercase letters, digits, dots, and hyphens). A dotted name such as `my.bucket` is the host `my.bucket.s3.example.com`.
 
 When more than one domain is configured, the longest match wins. `album.s3.example.com` is bucket `album` under `s3.example.com`, and the host `s3.example.com` itself stays the service host.
 

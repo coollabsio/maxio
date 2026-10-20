@@ -52,6 +52,8 @@ pub enum IssueKind {
     PromoteLeftover,
     /// Object written by an older build under a name this version reserves.
     LegacyReservedKey,
+    /// Bucket directory `maxio`, reserved by this version.
+    ReservedBucket,
 }
 
 impl IssueKind {
@@ -75,6 +77,7 @@ impl IssueKind {
             Self::KeyringUnverified => "keyring-unverified",
             Self::PromoteLeftover => "promote-leftover",
             Self::LegacyReservedKey => "legacy-reserved-key",
+            Self::ReservedBucket => "reserved-bucket",
         }
     }
 }
@@ -213,6 +216,14 @@ pub async fn check_with(
     let mut report = CheckReport::default();
     let mut saw_sse_s3 = false;
     let buckets_dir = data_dir.join("buckets");
+    if super::filesystem::reserved_bucket_present(&buckets_dir).await {
+        report.push(
+            IssueKind::ReservedBucket,
+            &buckets_dir.join("maxio"),
+            "bucket name maxio is reserved. Start the previous MaxIO version on this data directory, move the objects out, and remove the bucket, then start this version. check does not remove it.",
+            false,
+        );
+    }
     for legacy in find_legacy_reserved_keys(&buckets_dir).await {
         report.push(
             IssueKind::LegacyReservedKey,
@@ -1656,6 +1667,40 @@ mod tests {
             .await
             .unwrap();
         buf
+    }
+
+    #[tokio::test]
+    async fn existing_maxio_bucket_refuses_startup_and_check_leaves_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bucket = tmp.path().join("buckets").join("maxio");
+        std::fs::create_dir_all(&bucket).unwrap();
+        std::fs::write(bucket.join(".bucket.json"), b"{\"name\":\"maxio\"}\n").unwrap();
+        let keyring = Arc::new(
+            Keyring::load(tmp.path().to_str().unwrap(), None)
+                .await
+                .unwrap(),
+        );
+        let err =
+            match FilesystemStorage::new(tmp.path().to_str().unwrap(), false, 1024, 0, keyring)
+                .await
+            {
+                Err(err) => err.to_string(),
+                Ok(_) => panic!("startup should refuse a bucket named maxio"),
+            };
+        assert!(err.contains("refusing to start"), "{err}");
+        assert!(err.contains("bucket named \"maxio\""), "{err}");
+        assert!(err.contains("previous MaxIO version"), "{err}");
+
+        let report = check(tmp.path(), true).await.unwrap();
+        assert!(
+            report
+                .issues
+                .iter()
+                .any(|issue| { issue.kind == IssueKind::ReservedBucket && !issue.repaired }),
+            "{:?}",
+            report.issues
+        );
+        assert!(bucket.join(".bucket.json").exists());
     }
 
     async fn storage_at(dir: &std::path::Path) -> FilesystemStorage {

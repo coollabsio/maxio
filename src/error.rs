@@ -20,7 +20,9 @@ pub enum S3ErrorCode {
     InvalidArgument,
     InvalidBucketName,
     InvalidPart,
+    InvalidPartNumber,
     InvalidPartOrder,
+    IllegalLocationConstraint,
     MalformedXML,
     NoSuchBucket,
     NoSuchKey,
@@ -67,7 +69,9 @@ impl S3ErrorCode {
             Self::InvalidArgument => "InvalidArgument",
             Self::InvalidBucketName => "InvalidBucketName",
             Self::InvalidPart => "InvalidPart",
+            Self::InvalidPartNumber => "InvalidPartNumber",
             Self::InvalidPartOrder => "InvalidPartOrder",
+            Self::IllegalLocationConstraint => "IllegalLocationConstraintException",
             Self::MalformedXML => "MalformedXML",
             Self::NoSuchBucket => "NoSuchBucket",
             Self::NoSuchKey => "NoSuchKey",
@@ -128,7 +132,7 @@ impl S3ErrorCode {
             Self::BucketAlreadyOwnedByYou | Self::BucketNotEmpty => StatusCode::CONFLICT,
             Self::InternalError => StatusCode::INTERNAL_SERVER_ERROR,
             Self::SlowDown => StatusCode::SERVICE_UNAVAILABLE,
-            Self::InvalidRange => StatusCode::RANGE_NOT_SATISFIABLE,
+            Self::InvalidRange | Self::InvalidPartNumber => StatusCode::RANGE_NOT_SATISFIABLE,
             Self::NotImplemented => StatusCode::NOT_IMPLEMENTED,
             Self::PreconditionFailed => StatusCode::PRECONDITION_FAILED,
             Self::MethodNotAllowed => StatusCode::METHOD_NOT_ALLOWED,
@@ -261,6 +265,22 @@ impl S3Error {
             message: "The XML you provided was not well-formed.".into(),
             resource: None,
         }
+    }
+
+    pub fn invalid_part_number() -> Self {
+        Self::new(
+            S3ErrorCode::InvalidPartNumber,
+            "The requested part number is not satisfiable",
+        )
+    }
+
+    pub fn illegal_location_constraint(requested: &str, server_region: &str) -> Self {
+        Self::new(
+            S3ErrorCode::IllegalLocationConstraint,
+            format!(
+                "The {requested} location constraint is incompatible with this endpoint's region ({server_region})."
+            ),
+        )
     }
 
     pub fn invalid_part(msg: &str) -> Self {
@@ -447,14 +467,18 @@ impl IntoResponse for S3Error {
         );
 
         let status = self.code.status_code();
-        (
-            status,
-            [
-                ("content-type", "application/xml"),
-                ("x-amz-request-id", &request_id.to_string()),
-            ],
-            xml,
-        )
-            .into_response()
+        let request_id = request_id.to_string();
+        let mut response = Response::builder()
+            .status(status)
+            .header("content-type", "application/xml")
+            .header("x-amz-request-id", request_id);
+        // A missing key is not a delete marker. Clients (and s3-tests) read
+        // this header on the 404 to distinguish the two.
+        if matches!(self.code, S3ErrorCode::NoSuchKey) {
+            response = response.header("x-amz-delete-marker", "false");
+        }
+        response
+            .body(axum::body::Body::from(xml))
+            .expect("error response headers are valid")
     }
 }

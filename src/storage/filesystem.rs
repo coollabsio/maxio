@@ -41,6 +41,15 @@ fn consume_fault(slot: &AtomicU8, point: u8) -> bool {
         .is_ok()
 }
 
+#[derive(serde::Serialize, serde::Deserialize)]
+struct CompletedUploadRecord {
+    etag: String,
+    size: u64,
+    version_id: Option<String>,
+    checksum_algorithm: Option<ChecksumAlgorithm>,
+    checksum_value: Option<String>,
+}
+
 pub struct FilesystemStorage {
     buckets_dir: PathBuf,
     erasure_coding: bool,
@@ -75,7 +84,7 @@ fn shard_index(parts: &[&str], shards: usize) -> usize {
 }
 
 /// Validate that an object key does not contain path traversal components.
-fn validate_key(key: &str) -> Result<(), StorageError> {
+fn validate_key_shape(key: &str) -> Result<(), StorageError> {
     if key.is_empty() {
         return Err(StorageError::InvalidKey("Key must not be empty".into()));
     }
@@ -97,32 +106,93 @@ fn validate_key(key: &str) -> Result<(), StorageError> {
                     "Key must not be an absolute path".into(),
                 ));
             }
-            Component::Normal(seg) => {
-                let name = seg.to_string_lossy();
-                if is_reserved_segment(&name) {
-                    return Err(StorageError::InvalidKey(format!(
-                        "Key segment '{}' collides with an internal storage name",
-                        name
-                    )));
-                }
-            }
             _ => {}
         }
     }
     Ok(())
 }
 
+fn validate_key(key: &str) -> Result<(), StorageError> {
+    validate_key_shape(key)?;
+    if let Some(name) = reserved_segment_in(key) {
+        return Err(StorageError::InvalidKey(format!(
+            "Key segment '{name}' collides with an internal storage name"
+        )));
+    }
+    Ok(())
+}
+
 /// Reject key path segments that collide with internal on-disk names
-/// (sidecars, bucket metadata, internal dirs, EC dirs, temp files).
-fn is_reserved_segment(name: &str) -> bool {
+/// (sidecars, bucket metadata, internal dirs, EC dirs, temp files, the
+/// inline payload, and key-promotion directories and markers).
+///
+/// Comparison is ASCII case-insensitive so `p/.MAXIO.OBJECT` is rejected on
+/// case-insensitive filesystems as well as on Linux.
+pub(crate) fn is_reserved_segment(name: &str) -> bool {
+    let name = name.to_ascii_lowercase();
     name.ends_with(".meta.json")
         || name.ends_with(".ec")
         || name == ".bucket.json"
         || name == ".uploads"
         || name == ".versions"
         || name == ".folder"
+        || name == ".maxio.object"
+        || name == ".maxio-quarantine"
         || name.starts_with(".maxio-tmp-")
         || name.starts_with(".maxio-bak-")
+        || name.starts_with(".maxio-promote-")
+}
+
+pub(crate) fn key_contains_reserved_segment(key: &str) -> bool {
+    reserved_segment_in(key).is_some()
+}
+
+fn reserved_segment_in(key: &str) -> Option<String> {
+    Path::new(key)
+        .components()
+        .find_map(|component| match component {
+            Component::Normal(seg) => {
+                let name = seg.to_string_lossy();
+                if is_reserved_segment(&name) {
+                    Some(name.into_owned())
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        })
+}
+
+pub(crate) fn is_promote_dir_name(name: &str) -> bool {
+    name.to_ascii_lowercase().starts_with(".maxio-promote-")
+}
+
+/// A directory MaxIO may descend into while looking for objects whose keys
+/// used a name this version now reserves. Upload and version stores have
+/// their own scanners.
+pub(crate) fn is_legacy_container(name: &str) -> bool {
+    if !is_reserved_segment(name) || is_promote_dir_name(name) {
+        return false;
+    }
+    let name = name.to_ascii_lowercase();
+    !matches!(name.as_str(), ".uploads" | ".versions" | ".folder")
+        && !name.starts_with(".maxio-tmp-")
+        && !name.starts_with(".maxio-bak-")
+        && !name.ends_with(".ec")
+}
+
+/// Reads of an internal name are `NoSuchKey`. The bytes, if any, belong to
+/// MaxIO's layout (for example `p/.maxio.object` is the payload of key `p`).
+fn validate_readable_key(key: &str) -> Result<(), StorageError> {
+    if key_contains_reserved_segment(key) {
+        return Err(StorageError::NotFound(key.to_string()));
+    }
+    validate_key(key)
+}
+
+/// Writes of an internal name are `InvalidArgument`.
+pub(crate) fn reject_writable_key(key: &str) -> Result<(), StorageError> {
+    validate_key(key)
 }
 
 /// Version ids are joined into filesystem paths, so accept only "null" or
@@ -348,10 +418,18 @@ impl FilesystemStorage {
             max_part_size: u64::MAX,
             max_multipart_object_size: u64::MAX,
         };
+        // An older build allowed object keys this version reserves. Serving
+        // them in place collides with the on-disk layout, so refuse before
+        // any cleanup rewrites the directory.
+        let legacy = find_legacy_reserved_keys(&storage.buckets_dir).await;
+        if !legacy.is_empty() {
+            return Err(anyhow::anyhow!(format_legacy_reserved_error(&legacy)));
+        }
         // Nothing is in flight during construction, so crash leftovers (temp
-        // files, stranded EC backups, upload dirs with no readable metadata)
-        // are safe to clear immediately. The hourly sweep keeps an age gate
-        // so it cannot delete a live request's temp file.
+        // files, stranded EC backups, half-finished key promotions, upload
+        // dirs with no readable metadata) are safe to clear immediately. The
+        // hourly sweep keeps an age gate so it cannot delete a live request's
+        // temp file or promote directory.
         storage.startup_recover().await;
         Ok(storage)
     }
@@ -562,6 +640,42 @@ impl FilesystemStorage {
         }
     }
 
+    /// Where a plain object's bytes are written. A key that is also a prefix
+    /// of other keys (`foo/bar` and `foo/bar/baz`) keeps its bytes at
+    /// `{key}/.maxio.object` so the key can be both a file and a directory.
+    async fn plain_object_write_path(
+        &self,
+        bucket: &str,
+        key: &str,
+    ) -> Result<PathBuf, StorageError> {
+        let path = self.object_path(bucket, key);
+        if key.ends_with('/') {
+            if let Some(parent) = path.parent() {
+                ensure_dir_preserving_objects(parent).await?;
+            }
+            return Ok(path);
+        }
+        if let Some(parent) = path.parent() {
+            ensure_dir_preserving_objects(parent).await?;
+        }
+        match fs::metadata(&path).await {
+            Ok(meta) if meta.is_dir() => Ok(path.join(INLINE_OBJECT_PAYLOAD)),
+            _ => Ok(path),
+        }
+    }
+
+    /// Path to read a plain object's bytes (the file, or the inline payload
+    /// when the key is also a prefix).
+    async fn plain_object_read_path(&self, bucket: &str, key: &str) -> PathBuf {
+        let path = self.object_path(bucket, key);
+        let inline = path.join(INLINE_OBJECT_PAYLOAD);
+        if matches!(fs::metadata(&inline).await, Ok(m) if m.is_file()) {
+            inline
+        } else {
+            path
+        }
+    }
+
     fn meta_path(&self, bucket: &str, key: &str) -> PathBuf {
         if key.ends_with('/') {
             let dir = key.trim_end_matches('/');
@@ -725,10 +839,7 @@ impl FilesystemStorage {
             (None, Vec::new(), None)
         };
 
-        let obj_path = self.object_path(bucket, key);
-        if let Some(parent) = obj_path.parent() {
-            fs::create_dir_all(parent).await?;
-        }
+        let obj_path = self.plain_object_write_path(bucket, key).await?;
 
         let tmp_obj_path = temp_sibling_path(&obj_path);
         let mut tmp_obj_guard = TempPathGuard::file(tmp_obj_path.clone());
@@ -914,7 +1025,7 @@ impl FilesystemStorage {
         let tmp_ec_dir = temp_sibling_path(&ec_dir);
         let mut tmp_ec_guard = TempPathGuard::dir(tmp_ec_dir.clone());
         if let Some(parent) = ec_dir.parent() {
-            fs::create_dir_all(parent).await?;
+            ensure_dir_preserving_objects(parent).await?;
         }
         fs::create_dir_all(&tmp_ec_dir).await?;
 
@@ -1069,7 +1180,7 @@ impl FilesystemStorage {
         }
         tmp_ec_guard.disarm();
         tmp_meta_guard.disarm();
-        remove_file_if_exists(&self.object_path(bucket, key)).await?;
+        remove_plain_payload(&self.object_path(bucket, key)).await?;
 
         Ok(PutResult {
             size: total_size,
@@ -1101,7 +1212,7 @@ impl FilesystemStorage {
         let tmp_ec_dir = temp_sibling_path(&ec_dir);
         let mut tmp_ec_guard = TempPathGuard::dir(tmp_ec_dir.clone());
         if let Some(parent) = ec_dir.parent() {
-            fs::create_dir_all(parent).await?;
+            ensure_dir_preserving_objects(parent).await?;
         }
         fs::create_dir_all(&tmp_ec_dir).await?;
 
@@ -1325,7 +1436,7 @@ impl FilesystemStorage {
         }
         tmp_ec_guard.disarm();
         tmp_meta_guard.disarm();
-        remove_file_if_exists(&self.object_path(bucket, key)).await?;
+        remove_plain_payload(&self.object_path(bucket, key)).await?;
 
         Ok(PutResult {
             size: plaintext_size,
@@ -1424,6 +1535,678 @@ async fn write_chunk_file(path: &Path, index: u32, data: &[u8]) -> Result<ChunkI
         sha256,
         kind: ChunkKind::Data,
     })
+}
+
+/// Payload file stored inside a key directory when that key is also a prefix.
+pub(crate) const INLINE_OBJECT_PAYLOAD: &str = ".maxio.object";
+
+/// Directory that holds a key's bytes while that key is promoted from a file
+/// to a directory (`p` and `p/q` both exist). The suffix is a UUID; the
+/// target file name lives in [`PROMOTE_TARGET_FILE`] so recovery does not
+/// have to parse the directory name.
+pub(crate) const PROMOTE_DIR_PREFIX: &str = ".maxio-promote-";
+
+/// Single path component (the key's file name) this promote directory belongs
+/// to. Written before the payload is unlinked.
+pub(crate) const PROMOTE_TARGET_FILE: &str = ".maxio-promote-target";
+
+/// Empty marker written only after the payload copy has been fsynced. Recovery
+/// will not publish a promote directory that lacks it, unless the payload is
+/// the original file renamed by an older build (no marker at all).
+pub(crate) const PROMOTE_READY_FILE: &str = ".maxio-promote-ready";
+
+/// Create `dir`, turning any file along the path into a directory that keeps
+/// the object's bytes in `.maxio.object`. S3 keys are a flat namespace, so
+/// `a/b` and `a/b/c` must both exist.
+async fn ensure_dir_preserving_objects(dir: &Path) -> Result<(), StorageError> {
+    let mut prefixes = Vec::new();
+    let mut cur = PathBuf::new();
+    for component in dir.components() {
+        cur.push(component);
+        prefixes.push(cur.clone());
+    }
+    for path in &prefixes {
+        if let Ok(meta) = fs::metadata(path).await {
+            if meta.is_file() {
+                promote_file_to_directory(path).await?;
+            }
+        }
+    }
+    match fs::create_dir_all(dir).await {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists || e.raw_os_error() == Some(17) => {
+            for path in &prefixes {
+                if let Ok(meta) = fs::metadata(path).await {
+                    if meta.is_file() {
+                        promote_file_to_directory(path).await?;
+                    }
+                }
+            }
+            fs::create_dir_all(dir).await.map_err(StorageError::Io)
+        }
+        Err(e) => Err(StorageError::Io(e)),
+    }
+}
+
+fn valid_promote_target(name: &str) -> bool {
+    !name.is_empty()
+        && name != "."
+        && name != ".."
+        && !name.contains('/')
+        && !name.contains('\\')
+        && !name.contains('\0')
+        && !name.contains('\n')
+        && !name.contains('\r')
+}
+
+async fn duplicate_file(src: &Path, dest: &Path) -> Result<(), StorageError> {
+    let src_pb = src.to_path_buf();
+    let dest_pb = dest.to_path_buf();
+    let linked = tokio::task::spawn_blocking(move || std::fs::hard_link(&src_pb, &dest_pb))
+        .await
+        .map_err(|e| {
+            StorageError::Io(std::io::Error::other(format!(
+                "promote hard link task failed: {e}"
+            )))
+        })?;
+    if let Err(err) = linked {
+        tracing::debug!("promote hard link failed ({err}); copying payload");
+        fs::copy(src, dest).await.map_err(StorageError::Io)?;
+    }
+    // The directory entry (hard link) or the copied bytes must hit disk
+    // before the original name is removed.
+    sync_file(dest).await?;
+    Ok(())
+}
+
+/// Turn the file at `path` into a directory whose bytes live in
+/// `.maxio.object`, without a window where those bytes have no name.
+///
+/// The original file stays in place until a second copy has been fsynced and
+/// a target marker names the destination. A crash before that unlink leaves
+/// the original readable. A crash after it leaves `.maxio-promote-*/`, which
+/// startup and `maxio check --repair` move back.
+async fn promote_file_to_directory(path: &Path) -> Result<(), StorageError> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+        return Err(StorageError::Io(std::io::Error::other(
+            "object path has no UTF-8 file name",
+        )));
+    };
+    if !valid_promote_target(name) {
+        return Err(StorageError::Io(std::io::Error::other(
+            "object path is not a single file name",
+        )));
+    }
+
+    let promote = parent.join(format!("{PROMOTE_DIR_PREFIX}{}", uuid::Uuid::new_v4()));
+    fs::create_dir(&promote).await.map_err(StorageError::Io)?;
+    // Armed until the copy is durable. Drop removes the directory if we fail
+    // before the original name is unlinked.
+    let mut guard = TempPathGuard::dir(promote.clone());
+
+    write_file_atomic(&promote.join(PROMOTE_TARGET_FILE), name.as_bytes()).await?;
+    duplicate_file(path, &promote.join(INLINE_OBJECT_PAYLOAD)).await?;
+    sync_dir(&promote).await?;
+    write_file_atomic(&promote.join(PROMOTE_READY_FILE), b"").await?;
+    sync_dir(&promote).await?;
+
+    // Past this point the promote directory is the crash copy. Do not let
+    // the guard delete it if publishing fails.
+    guard.disarm();
+    if let Err(e) = fs::remove_file(path).await {
+        let _ = fs::remove_dir_all(&promote).await;
+        return Err(StorageError::Io(e));
+    }
+    sync_dir(parent).await?;
+    if let Err(e) = publish_promoted(parent, &promote, name).await {
+        // Bytes are only in the promote directory. Put them back at `name`
+        // (or into `name/.maxio.object` if that directory now exists) so a
+        // failed promote does not depend on a later restart.
+        let _ = recover_promotes_in(parent, None).await;
+        return Err(e);
+    }
+    Ok(())
+}
+
+async fn publish_promoted(parent: &Path, promote: &Path, name: &str) -> Result<(), StorageError> {
+    let dest = parent.join(name);
+    match fs::metadata(&dest).await {
+        Ok(meta) if meta.is_dir() => {
+            let inline = dest.join(INLINE_OBJECT_PAYLOAD);
+            if fs::metadata(&inline)
+                .await
+                .map(|m| m.is_file())
+                .unwrap_or(false)
+            {
+                fs::remove_dir_all(promote)
+                    .await
+                    .map_err(StorageError::Io)?;
+            } else {
+                fs::rename(promote.join(INLINE_OBJECT_PAYLOAD), &inline)
+                    .await
+                    .map_err(StorageError::Io)?;
+                sync_dir(&dest).await?;
+                fs::remove_dir_all(promote)
+                    .await
+                    .map_err(StorageError::Io)?;
+            }
+            sync_dir(parent).await?;
+        }
+        Ok(meta) if meta.is_file() => {
+            // A newer object landed at this name. Keep it.
+            fs::remove_dir_all(promote)
+                .await
+                .map_err(StorageError::Io)?;
+            sync_dir(parent).await?;
+        }
+        Ok(_) => {
+            return Err(StorageError::Io(std::io::Error::other(
+                "promote destination is not a file or directory",
+            )));
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            fs::rename(promote, &dest).await.map_err(StorageError::Io)?;
+            sync_dir(parent).await?;
+            let _ = fs::remove_file(dest.join(PROMOTE_TARGET_FILE)).await;
+            let _ = fs::remove_file(dest.join(PROMOTE_READY_FILE)).await;
+            let _ = sync_dir(&dest).await;
+        }
+        Err(e) => return Err(StorageError::Io(e)),
+    }
+    Ok(())
+}
+
+/// What recovery did with one `.maxio-promote-*` directory.
+#[derive(Debug)]
+pub(crate) struct PromoteOutcome {
+    pub path: PathBuf,
+    pub target: Option<String>,
+    /// Bytes are reachable again and the promote directory is gone, or it
+    /// held nothing worth keeping.
+    pub resolved: bool,
+    pub detail: String,
+}
+
+/// Restore or discard promote directories directly inside `dir`.
+///
+/// A `.maxio-promote-*` directory that contains no `*.meta.json` is MaxIO's
+/// own crash leftover: empty directories are removed, a payload whose
+/// original key is still present is removed as a duplicate, and a payload
+/// whose original is missing is restored. A directory that contains a
+/// sidecar is a legacy user key and is not touched.
+///
+/// `max_age` of `None` handles every directory (startup, `check --repair`).
+/// `Some(secs)` skips a directory newer than that, so the hourly sweep cannot
+/// race a promote that is still running.
+pub(crate) async fn recover_promotes_in(dir: &Path, max_age: Option<u64>) -> Vec<PromoteOutcome> {
+    let mut listed = match fs::read_dir(dir).await {
+        Ok(rd) => rd,
+        Err(_) => return Vec::new(),
+    };
+    let mut promotes = Vec::new();
+    while let Ok(Some(entry)) = listed.next_entry().await {
+        let name = entry.file_name().to_string_lossy().to_string();
+        if !is_promote_dir_name(&name) {
+            continue;
+        }
+        if !matches!(entry.file_type().await, Ok(ft) if ft.is_dir()) {
+            continue;
+        }
+        let path = entry.path();
+        if !FilesystemStorage::is_stale(&path, max_age).await {
+            continue;
+        }
+        if promote_dir_has_meta(&path).await {
+            continue;
+        }
+        promotes.push(path);
+    }
+
+    let mut outcomes = Vec::new();
+    for promote in promotes {
+        outcomes.push(cleanup_promote_leftover(dir, &promote).await);
+    }
+    outcomes
+}
+
+/// True when `promote` contains an object sidecar anywhere inside it.
+pub(crate) async fn promote_dir_has_meta(promote: &Path) -> bool {
+    let mut stack = vec![promote.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let mut listed = match fs::read_dir(&dir).await {
+            Ok(rd) => rd,
+            Err(_) => continue,
+        };
+        while let Ok(Some(entry)) = listed.next_entry().await {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name.ends_with(".meta.json") {
+                return true;
+            }
+            if matches!(entry.file_type().await, Ok(ft) if ft.is_dir()) {
+                stack.push(entry.path());
+            }
+        }
+    }
+    false
+}
+
+/// How many legacy keys to name in a startup error or check report.
+pub(crate) const LEGACY_KEY_LIST_LIMIT: usize = 32;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct LegacyReservedKey {
+    pub bucket: String,
+    pub key: String,
+}
+
+/// Object keys from a pre-1.0 data directory that use a reserved path
+/// segment. Detected by a real object sidecar (`*.meta.json`), not by
+/// MaxIO crash leftovers (those have no sidecar).
+pub(crate) async fn find_legacy_reserved_keys(buckets_dir: &Path) -> Vec<LegacyReservedKey> {
+    let mut found = Vec::new();
+    let mut buckets = match fs::read_dir(buckets_dir).await {
+        Ok(rd) => rd,
+        Err(_) => return found,
+    };
+    while let Ok(Some(bucket_entry)) = buckets.next_entry().await {
+        if !matches!(bucket_entry.file_type().await, Ok(ft) if ft.is_dir()) {
+            continue;
+        }
+        let bucket = bucket_entry.file_name().to_string_lossy().to_string();
+        let mut stack = vec![(bucket_entry.path(), String::new())];
+        while let Some((dir, rel)) = stack.pop() {
+            let mut listed = match fs::read_dir(&dir).await {
+                Ok(rd) => rd,
+                Err(_) => continue,
+            };
+            while let Ok(Some(entry)) = listed.next_entry().await {
+                let name = entry.file_name().to_string_lossy().to_string();
+                let is_dir = matches!(entry.file_type().await, Ok(ft) if ft.is_dir());
+                if is_dir {
+                    let child_rel = if rel.is_empty() {
+                        name.clone()
+                    } else {
+                        format!("{rel}/{name}")
+                    };
+                    stack.push((entry.path(), child_rel));
+                    continue;
+                }
+                if let Some(key) = object_key_for_sidecar(&rel, &name) {
+                    if key_contains_reserved_segment(&key) {
+                        found.push(LegacyReservedKey {
+                            bucket: bucket.clone(),
+                            key,
+                        });
+                    }
+                }
+            }
+        }
+    }
+    found.sort_by(|a, b| (&a.bucket, &a.key).cmp(&(&b.bucket, &b.key)));
+    found.dedup();
+    found
+}
+
+pub(crate) fn format_legacy_reserved_error(keys: &[LegacyReservedKey]) -> String {
+    let mut msg = String::from(
+        "refusing to start: this data directory contains object keys that use names reserved by this version of MaxIO.\n\
+         Start the previous MaxIO version on this data directory and rename or delete these keys (for example `aws s3 mv`), then start this version.",
+    );
+    let shown = keys.len().min(LEGACY_KEY_LIST_LIMIT);
+    for key in keys.iter().take(shown) {
+        msg.push_str(&format!("\n  {}/{}", key.bucket, key.key));
+    }
+    if keys.len() > shown {
+        msg.push_str(&format!("\n  and {} more", keys.len() - shown));
+    }
+    msg
+}
+
+/// Map a sidecar file back to an object key. Upload metadata (`.meta.json`
+/// inside an upload id directory) and version files are not object keys;
+/// the object key is reconstructed for version sidecars.
+fn object_key_for_sidecar(rel_dir: &str, filename: &str) -> Option<String> {
+    if filename == ".meta.json" || !filename.ends_with(".meta.json") {
+        return None;
+    }
+    let stem = filename.strip_suffix(".meta.json")?;
+    if stem.is_empty() {
+        return None;
+    }
+    let parts: Vec<&str> = rel_dir.split('/').filter(|s| !s.is_empty()).collect();
+    if let Some(idx) = parts
+        .iter()
+        .rposition(|part| part.eq_ignore_ascii_case(".versions"))
+    {
+        let object_name = parts.get(idx + 1)?;
+        let mut key_parts: Vec<&str> = parts[..idx].to_vec();
+        key_parts.push(object_name);
+        return Some(key_parts.join("/"));
+    }
+    if let Some(idx) = parts
+        .iter()
+        .rposition(|part| part.eq_ignore_ascii_case(".uploads"))
+    {
+        // `bucket/.uploads/{uploadId}/N.meta.json` is part metadata.
+        // `bucket/.uploads/name.meta.json` would be a legacy object key.
+        if idx + 1 != parts.len() {
+            return None;
+        }
+    }
+    if stem == ".folder" {
+        if parts.is_empty() {
+            return None;
+        }
+        return Some(format!("{}/", parts.join("/")));
+    }
+    if parts.is_empty() {
+        Some(stem.to_string())
+    } else {
+        Some(format!("{}/{stem}", parts.join("/")))
+    }
+}
+
+async fn cleanup_promote_leftover(parent: &Path, promote: &Path) -> PromoteOutcome {
+    let mut has_payload = false;
+    let mut only_promote_files = true;
+    let mut listed = match fs::read_dir(promote).await {
+        Ok(rd) => rd,
+        Err(e) => {
+            return promote_outcome(
+                promote,
+                None,
+                false,
+                format!("cannot read promote directory: {e}"),
+            );
+        }
+    };
+    while let Ok(Some(entry)) = listed.next_entry().await {
+        let name = entry.file_name().to_string_lossy().to_string();
+        let is_dir = matches!(entry.file_type().await, Ok(ft) if ft.is_dir());
+        if name == INLINE_OBJECT_PAYLOAD && !is_dir {
+            has_payload = true;
+            continue;
+        }
+        if !is_dir
+            && (name == PROMOTE_TARGET_FILE
+                || name == PROMOTE_READY_FILE
+                || name.starts_with(".maxio-tmp-"))
+        {
+            continue;
+        }
+        only_promote_files = false;
+    }
+    if !only_promote_files {
+        // No sidecar (the caller checked) but the shape is not one this
+        // build writes. Leave it rather than delete an unknown tree.
+        return promote_outcome(
+            promote,
+            None,
+            false,
+            "promote directory has unexpected contents and no sidecar; left untouched",
+        );
+    }
+    if !has_payload {
+        let removed = fs::remove_dir_all(promote).await.is_ok();
+        let _ = sync_dir(parent).await;
+        return promote_outcome(promote, None, removed, "removed empty promote directory");
+    }
+    if let Some(target) = read_promote_target(promote).await {
+        let dest = parent.join(&target);
+        let original_file = fs::metadata(&dest)
+            .await
+            .map(|meta| meta.is_file())
+            .unwrap_or(false);
+        let inline_present = fs::metadata(dest.join(INLINE_OBJECT_PAYLOAD))
+            .await
+            .map(|meta| meta.is_file())
+            .unwrap_or(false);
+        if original_file || inline_present {
+            let removed = fs::remove_dir_all(promote).await.is_ok();
+            let _ = sync_dir(parent).await;
+            return promote_outcome(
+                promote,
+                Some(target),
+                removed,
+                "removed duplicate promote payload; original object is intact",
+            );
+        }
+        return recover_marked_promote(parent, promote, &target).await;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if std::fs::metadata(promote.join(INLINE_OBJECT_PAYLOAD))
+            .map(|meta| meta.nlink() > 1)
+            .unwrap_or(false)
+        {
+            let removed = fs::remove_dir_all(promote).await.is_ok();
+            let _ = sync_dir(parent).await;
+            return promote_outcome(
+                promote,
+                None,
+                removed,
+                "removed hard-linked duplicate promote payload",
+            );
+        }
+    }
+    promote_outcome(
+        promote,
+        None,
+        false,
+        "promote payload has no target marker and is the only copy; left untouched",
+    )
+}
+
+/// Promote directories in `dir` that are MaxIO leftovers (no object sidecar).
+/// Does not change the disk.
+pub(crate) async fn list_promotes(dir: &Path) -> Vec<(PathBuf, Option<String>)> {
+    let mut listed = match fs::read_dir(dir).await {
+        Ok(rd) => rd,
+        Err(_) => return Vec::new(),
+    };
+    let mut found = Vec::new();
+    while let Ok(Some(entry)) = listed.next_entry().await {
+        let name = entry.file_name().to_string_lossy().to_string();
+        if !is_promote_dir_name(&name) {
+            continue;
+        }
+        if !matches!(entry.file_type().await, Ok(ft) if ft.is_dir()) {
+            continue;
+        }
+        let path = entry.path();
+        if promote_dir_has_meta(&path).await {
+            continue;
+        }
+        let target = read_promote_target(&path).await;
+        found.push((path, target));
+    }
+    found
+}
+
+async fn read_promote_target(promote: &Path) -> Option<String> {
+    let raw = fs::read(promote.join(PROMOTE_TARGET_FILE)).await.ok()?;
+    let text = String::from_utf8(raw).ok()?;
+    if !valid_promote_target(&text) {
+        return None;
+    }
+    Some(text)
+}
+
+fn promote_outcome(
+    path: &Path,
+    target: Option<String>,
+    resolved: bool,
+    detail: impl Into<String>,
+) -> PromoteOutcome {
+    PromoteOutcome {
+        path: path.to_path_buf(),
+        target,
+        resolved,
+        detail: detail.into(),
+    }
+}
+
+async fn promote_payload_ready(promote: &Path) -> bool {
+    let ready = promote.join(PROMOTE_READY_FILE);
+    let payload = promote.join(INLINE_OBJECT_PAYLOAD);
+    fs::metadata(&ready)
+        .await
+        .map(|m| m.is_file())
+        .unwrap_or(false)
+        && fs::metadata(&payload)
+            .await
+            .map(|m| m.is_file())
+            .unwrap_or(false)
+}
+
+async fn recover_marked_promote(dir: &Path, promote: &Path, target: &str) -> PromoteOutcome {
+    let dest = dir.join(target);
+    let original_file = fs::metadata(&dest)
+        .await
+        .map(|m| m.is_file())
+        .unwrap_or(false);
+    let inline_present = fs::metadata(dest.join(INLINE_OBJECT_PAYLOAD))
+        .await
+        .map(|m| m.is_file())
+        .unwrap_or(false);
+    if original_file || inline_present {
+        let removed = fs::remove_dir_all(promote).await.is_ok();
+        let _ = sync_dir(dir).await;
+        return promote_outcome(
+            promote,
+            Some(target.to_string()),
+            removed,
+            format!("original object {target} is already in place; promote directory removed"),
+        );
+    }
+    if !promote_payload_ready(promote).await {
+        return promote_outcome(
+            promote,
+            Some(target.to_string()),
+            false,
+            format!(
+                "promote copy of {target} is incomplete and the original file is missing; sidecar kept"
+            ),
+        );
+    }
+    install_promote_payload(dir, promote, target).await
+}
+
+/// Move a complete `.maxio.object` out of `promote` to `target` or, when
+/// `target` is already a directory, to `target/.maxio.object`.
+async fn install_promote_payload(dir: &Path, promote: &Path, target: &str) -> PromoteOutcome {
+    let dest = dir.join(target);
+    let payload = promote.join(INLINE_OBJECT_PAYLOAD);
+    let target_owned = target.to_string();
+    match fs::metadata(&dest).await {
+        Ok(meta) if meta.is_file() => {
+            let removed = fs::remove_dir_all(promote).await.is_ok();
+            let _ = sync_dir(dir).await;
+            promote_outcome(
+                promote,
+                Some(target_owned),
+                removed,
+                format!("original file {target} is still present; promote directory removed"),
+            )
+        }
+        Ok(meta) if meta.is_dir() => {
+            let inline = dest.join(INLINE_OBJECT_PAYLOAD);
+            if fs::metadata(&inline)
+                .await
+                .map(|m| m.is_file())
+                .unwrap_or(false)
+            {
+                let removed = fs::remove_dir_all(promote).await.is_ok();
+                let _ = sync_dir(dir).await;
+                return promote_outcome(
+                    promote,
+                    Some(target_owned),
+                    removed,
+                    format!(
+                        "{target}/{INLINE_OBJECT_PAYLOAD} already exists; promote directory removed"
+                    ),
+                );
+            }
+            match fs::rename(&payload, &inline).await {
+                Ok(()) => {
+                    let _ = sync_dir(&dest).await;
+                    let _ = fs::remove_dir_all(promote).await;
+                    let _ = sync_dir(dir).await;
+                    tracing::warn!("restored promote payload into {}", inline.display());
+                    promote_outcome(
+                        promote,
+                        Some(target_owned),
+                        true,
+                        format!("restored payload into {target}/{INLINE_OBJECT_PAYLOAD}"),
+                    )
+                }
+                Err(e) => promote_outcome(
+                    promote,
+                    Some(target_owned),
+                    false,
+                    format!("failed to restore payload into {}: {e}", inline.display()),
+                ),
+            }
+        }
+        Ok(_) => promote_outcome(
+            promote,
+            Some(target_owned),
+            false,
+            format!("promote destination {target} is not a file or directory"),
+        ),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            match fs::rename(&payload, &dest).await {
+                Ok(()) => {
+                    let _ = sync_dir(dir).await;
+                    let _ = fs::remove_dir_all(promote).await;
+                    let _ = sync_dir(dir).await;
+                    tracing::warn!("restored promote payload back to {}", dest.display());
+                    promote_outcome(
+                        promote,
+                        Some(target_owned),
+                        true,
+                        format!("restored payload back to {target}"),
+                    )
+                }
+                Err(e) => promote_outcome(
+                    promote,
+                    Some(target_owned),
+                    false,
+                    format!("failed to restore payload to {}: {e}", dest.display()),
+                ),
+            }
+        }
+        Err(e) => promote_outcome(
+            promote,
+            Some(target_owned),
+            false,
+            format!("cannot stat promote destination {target}: {e}"),
+        ),
+    }
+}
+
+/// Remove a plain object payload. A directory that also holds child keys is
+/// left in place; only `.maxio.object` is deleted.
+async fn remove_plain_payload(path: &Path) -> Result<(), StorageError> {
+    match fs::remove_file(path.join(INLINE_OBJECT_PAYLOAD)).await {
+        Ok(()) => {}
+        // NotFound: no inline payload. NotADirectory: `path` is a normal file,
+        // so `{path}/.maxio.object` cannot exist.
+        Err(e)
+            if e.kind() == std::io::ErrorKind::NotFound
+                || e.kind() == std::io::ErrorKind::NotADirectory => {}
+        Err(e) => return Err(StorageError::Io(e)),
+    }
+    match fs::metadata(path).await {
+        Ok(meta) if meta.is_file() => remove_file_if_exists(path).await?,
+        Ok(meta) if meta.is_dir() => {
+            let _ = fs::remove_dir(path).await;
+        }
+        _ => {}
+    }
+    Ok(())
 }
 
 fn temp_sibling_path(path: &Path) -> PathBuf {
@@ -1876,7 +2659,7 @@ impl FilesystemStorage {
         }
         tmp_ec_guard.disarm();
         tmp_meta_guard.disarm();
-        remove_file_if_exists(&self.object_path(bucket, key)).await?;
+        remove_plain_payload(&self.object_path(bucket, key)).await?;
         drop(_key_guard);
         drop(_bucket_guard);
         // Best-effort: the object is already durably published. A racing
@@ -2178,7 +2961,7 @@ impl FilesystemStorage {
         }
         tmp_ec_guard.disarm();
         tmp_meta_guard.disarm();
-        remove_file_if_exists(&self.object_path(bucket, key)).await?;
+        remove_plain_payload(&self.object_path(bucket, key)).await?;
         drop(_key_guard);
         drop(_bucket_guard);
         // Best-effort: the object is already durably published. A racing
@@ -2212,7 +2995,7 @@ impl FilesystemStorage {
             .buckets_dir
             .join(bucket)
             .join(key.trim_end_matches('/'));
-        fs::create_dir_all(&folder_dir).await?;
+        ensure_dir_preserving_objects(&folder_dir).await?;
 
         let marker_path = folder_dir.join(".folder");
         write_file_atomic(&marker_path, b"").await?;
@@ -2260,7 +3043,7 @@ impl FilesystemStorage {
         customer_key: Option<[u8; 32]>,
     ) -> Result<(ByteStream, ObjectMeta), StorageError> {
         validate_bucket_name(bucket)?;
-        validate_key(key)?;
+        validate_readable_key(key)?;
         // Hold the key lock across the sidecar read + data-file open so the
         // meta and the opened fd always describe the same object generation.
         // The lock is released when this method returns; streaming continues
@@ -2290,7 +3073,7 @@ impl FilesystemStorage {
             let reader = VerifiedChunkReader::new(ec_dir, manifest);
             return Ok((Box::pin(reader), meta));
         }
-        let obj_path = self.object_path(bucket, key);
+        let obj_path = self.plain_object_read_path(bucket, key).await;
         // Encrypted object — wrap in FrameDecryptor
         if let Some(ref enc_meta) = meta.encryption {
             let dek = self.resolve_dek(enc_meta, customer_key)?;
@@ -2344,7 +3127,7 @@ impl FilesystemStorage {
         customer_key: Option<[u8; 32]>,
     ) -> Result<(ByteStream, ObjectMeta), StorageError> {
         validate_bucket_name(bucket)?;
-        validate_key(key)?;
+        validate_readable_key(key)?;
         // Hold the key lock across the sidecar read + data-file open so the
         // meta and the opened fd always describe the same object generation.
         // The lock is released when this method returns; streaming continues
@@ -2353,7 +3136,7 @@ impl FilesystemStorage {
         let meta = self.read_object_meta(bucket, key).await?;
         reject_sse_c_on_plaintext(&meta, customer_key.is_some())?;
         let ec_dir = self.ec_dir(bucket, key);
-        let obj_path = self.object_path(bucket, key);
+        let obj_path = self.plain_object_read_path(bucket, key).await;
         self.open_range_reader(
             bucket,
             key,
@@ -2369,7 +3152,7 @@ impl FilesystemStorage {
 
     pub async fn head_object(&self, bucket: &str, key: &str) -> Result<ObjectMeta, StorageError> {
         validate_bucket_name(bucket)?;
-        validate_key(key)?;
+        validate_readable_key(key)?;
         let meta = self.read_object_meta(bucket, key).await?;
         Ok(meta)
     }
@@ -2379,7 +3162,7 @@ impl FilesystemStorage {
         bucket: &str,
         key: &str,
     ) -> Result<std::collections::HashMap<String, String>, StorageError> {
-        validate_key(key)?;
+        validate_readable_key(key)?;
         let meta = self.read_object_meta(bucket, key).await?;
         Ok(meta.tags.unwrap_or_default())
     }
@@ -2530,7 +3313,7 @@ impl FilesystemStorage {
                 is_delete_marker: false,
             });
         }
-        remove_file_if_exists(&obj_path).await?;
+        remove_plain_payload(&obj_path).await?;
         remove_file_if_exists(&meta_path).await?;
         remove_dir_all_if_exists(&ec_dir).await?;
 
@@ -2653,6 +3436,7 @@ impl FilesystemStorage {
         }
 
         let upload_meta = self.read_upload_meta(bucket, upload_id).await?;
+        validate_key(&upload_meta.key)?;
         let (cipher_opt, nonce_prefix) = if let Some(ref spec) = upload_meta.encryption_spec {
             let dek = self.resolve_upload_dek(spec, customer_key)?;
             // Fresh random prefix PER UploadPart attempt: all parts share the
@@ -2811,7 +3595,19 @@ impl FilesystemStorage {
             }
         }
 
-        let upload_meta = self.read_upload_meta(bucket, upload_id).await?;
+        let upload_meta = match self.read_upload_meta(bucket, upload_id).await {
+            Ok(meta) => meta,
+            // A repeated CompleteMultipartUpload (client retry) returns the
+            // same result instead of NoSuchUpload.
+            Err(StorageError::UploadNotFound(_)) => {
+                if let Some(done) = self.read_completed_upload(bucket, upload_id).await? {
+                    return Ok(done);
+                }
+                return Err(StorageError::UploadNotFound(upload_id.to_string()));
+            }
+            Err(e) => return Err(e),
+        };
+        validate_key(&upload_meta.key)?;
         let mut selected = Vec::with_capacity(parts.len());
         for (idx, (part_number, requested_etag)) in parts.iter().enumerate() {
             let meta = self.read_part_meta(bucket, upload_id, *part_number).await?;
@@ -2864,7 +3660,7 @@ impl FilesystemStorage {
                         )));
                     }
                 }
-                return self
+                let result = self
                     .complete_multipart_chunked_encrypted(
                         bucket,
                         upload_id,
@@ -2873,9 +3669,12 @@ impl FilesystemStorage {
                         customer_key,
                         precondition,
                     )
+                    .await?;
+                self.remember_completed_upload(bucket, upload_id, &result)
                     .await;
+                return Ok(result);
             }
-            return self
+            let result = self
                 .complete_multipart_chunked(
                     bucket,
                     upload_id,
@@ -2883,7 +3682,10 @@ impl FilesystemStorage {
                     &selected,
                     precondition,
                 )
+                .await?;
+            self.remember_completed_upload(bucket, upload_id, &result)
                 .await;
+            return Ok(result);
         }
 
         // If the upload was encrypted, verify the SSE-C key (if any) matches
@@ -2973,10 +3775,9 @@ impl FilesystemStorage {
             None
         };
 
-        let obj_path = self.object_path(bucket, &upload_meta.key);
-        if let Some(parent) = obj_path.parent() {
-            fs::create_dir_all(parent).await?;
-        }
+        let obj_path = self
+            .plain_object_write_path(bucket, &upload_meta.key)
+            .await?;
         let tmp_obj_path = temp_sibling_path(&obj_path);
         let mut tmp_obj_guard = TempPathGuard::file(tmp_obj_path.clone());
         let out = fs::File::create(&tmp_obj_path).await?;
@@ -3182,13 +3983,60 @@ impl FilesystemStorage {
             }
         }
 
-        Ok(PutResult {
+        let result = PutResult {
             size: total_size,
             etag,
             version_id,
             checksum_algorithm,
             checksum_value,
-        })
+        };
+        self.remember_completed_upload(bucket, upload_id, &result)
+            .await;
+        Ok(result)
+    }
+
+    fn completed_upload_path(&self, bucket: &str, upload_id: &str) -> PathBuf {
+        self.uploads_dir(bucket)
+            .join(format!(".completed-{upload_id}.json"))
+    }
+
+    async fn remember_completed_upload(&self, bucket: &str, upload_id: &str, result: &PutResult) {
+        let record = CompletedUploadRecord {
+            etag: result.etag.clone(),
+            size: result.size,
+            version_id: result.version_id.clone(),
+            checksum_algorithm: result.checksum_algorithm,
+            checksum_value: result.checksum_value.clone(),
+        };
+        let Ok(json) = serde_json::to_string(&record) else {
+            return;
+        };
+        let path = self.completed_upload_path(bucket, upload_id);
+        if let Some(parent) = path.parent() {
+            let _ = fs::create_dir_all(parent).await;
+        }
+        let _ = fs::write(path, json).await;
+    }
+
+    async fn read_completed_upload(
+        &self,
+        bucket: &str,
+        upload_id: &str,
+    ) -> Result<Option<PutResult>, StorageError> {
+        let path = self.completed_upload_path(bucket, upload_id);
+        let data = match fs::read(&path).await {
+            Ok(data) => data,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(StorageError::Io(e)),
+        };
+        let record: CompletedUploadRecord = serde_json::from_slice(&data)?;
+        Ok(Some(PutResult {
+            size: record.size,
+            etag: record.etag,
+            version_id: record.version_id,
+            checksum_algorithm: record.checksum_algorithm,
+            checksum_value: record.checksum_value,
+        }))
     }
 
     pub async fn abort_multipart_upload(
@@ -3258,7 +4106,8 @@ impl FilesystemStorage {
     /// Clear crash leftovers that cannot belong to a live request.
     ///
     /// Called from `new` (process start). Removes every `.maxio-tmp-*` and
-    /// resolves every `.maxio-bak-*` immediately, and deletes multipart upload
+    /// resolves every `.maxio-bak-*` immediately, restores object bytes left
+    /// in `.maxio-promote-*` directories, and deletes multipart upload
     /// directories whose `.meta.json` is missing or unreadable. Uploads with
     /// valid metadata are left for the client to complete or abort; the hourly
     /// sweep removes those that stay idle for 7 days.
@@ -3438,6 +4287,11 @@ impl FilesystemStorage {
     ///   the publish died mid-swap and the backup IS the committed object —
     ///   restore it; if `<name>` exists the publish completed and the backup
     ///   is garbage.
+    /// * `.maxio-promote-*` directories older than `backup_max_age` are
+    ///   restored (payload back at the target key, or into `<key>/.maxio.object`
+    ///   when that directory exists) or discarded when the original file is
+    ///   still in place. The sweep does not recurse into them: the payload is
+    ///   the object, not a temp file.
     fn sweep_stale_artifacts<'a>(
         dir: &'a Path,
         temp_max_age: Option<u64>,
@@ -3445,9 +4299,25 @@ impl FilesystemStorage {
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = u64> + Send + 'a>> {
         Box::pin(async move {
             let mut removed = 0u64;
+            for outcome in recover_promotes_in(dir, backup_max_age).await {
+                if outcome.resolved {
+                    removed += 1;
+                    tracing::info!(
+                        "housekeeping: {} ({})",
+                        outcome.detail,
+                        outcome.path.display()
+                    );
+                } else {
+                    tracing::warn!(
+                        "housekeeping: {} ({})",
+                        outcome.detail,
+                        outcome.path.display()
+                    );
+                }
+            }
             let mut entries = match fs::read_dir(dir).await {
                 Ok(e) => e,
-                Err(_) => return 0,
+                Err(_) => return removed,
             };
             while let Ok(Some(entry)) = entries.next_entry().await {
                 let name = entry.file_name().to_string_lossy().to_string();
@@ -3501,6 +4371,38 @@ impl FilesystemStorage {
                             ),
                         }
                     }
+                    continue;
+                }
+
+                let marker_name = name.to_ascii_lowercase();
+                if marker_name == PROMOTE_TARGET_FILE || marker_name == PROMOTE_READY_FILE {
+                    // Markers left inside a published key directory after a
+                    // crash between the rename and the marker cleanup. A
+                    // sibling sidecar means this name is an object written
+                    // before the segment was reserved; leave those bytes.
+                    // The in-progress copies live inside `.maxio-promote-*`,
+                    // which this sweep does not recurse into.
+                    if fs::try_exists(dir.join(format!("{name}.meta.json")))
+                        .await
+                        .unwrap_or(false)
+                    {
+                        continue;
+                    }
+                    if !Self::is_stale(&path, backup_max_age).await {
+                        continue;
+                    }
+                    match fs::remove_file(&path).await {
+                        Ok(()) => removed += 1,
+                        Err(e) => tracing::warn!(
+                            "housekeeping: failed to remove promote marker {}: {}",
+                            path.display(),
+                            e
+                        ),
+                    }
+                    continue;
+                }
+
+                if is_dir && is_promote_dir_name(&name) {
                     continue;
                 }
 
@@ -3577,7 +4479,9 @@ impl FilesystemStorage {
                     || fname == ".uploads"
                     || fname == ".versions"
                     || fname == ".folder"
+                    || fname == INLINE_OBJECT_PAYLOAD
                     || fname.starts_with(".maxio-tmp-")
+                    || fname.starts_with(".maxio-promote-")
                     || fname.starts_with(".maxio-bak-")
                 {
                     continue;
@@ -3602,6 +4506,22 @@ impl FilesystemStorage {
                 }
 
                 if entry.file_type().await?.is_dir() {
+                    // This directory is also an object (`foo/bar` plus `foo/bar/baz`).
+                    let inline = path.join(INLINE_OBJECT_PAYLOAD);
+                    if matches!(fs::metadata(&inline).await, Ok(m) if m.is_file()) {
+                        if let Ok(rel) = path.strip_prefix(base) {
+                            let key = rel.to_string_lossy().to_string();
+                            if key.starts_with(prefix) {
+                                if let Some(bucket_name) = base.file_name().and_then(|n| n.to_str())
+                                {
+                                    if let Ok(meta) = self.read_object_meta(bucket_name, &key).await
+                                    {
+                                        results.push(meta);
+                                    }
+                                }
+                            }
+                        }
+                    }
                     // Check for folder marker inside this directory
                     let marker = path.join(".folder.meta.json");
                     if marker.exists() {
@@ -3959,7 +4879,7 @@ impl FilesystemStorage {
         key: &str,
     ) -> Result<Vec<ObjectMeta>, StorageError> {
         validate_bucket_name(bucket)?;
-        validate_key(key)?;
+        validate_readable_key(key)?;
         let mut out = Vec::new();
         match self.read_object_meta(bucket, key).await {
             Ok(m) if m.version_id.is_none() => out.push(m),
@@ -4249,8 +5169,8 @@ impl FilesystemStorage {
             sync_parent_dir(&dst).await?;
             sync_parent_dir(&ec_dir).await?;
         } else {
-            let obj_path = self.object_path(bucket, key);
-            if fs::try_exists(&obj_path).await? {
+            let obj_path = self.plain_object_read_path(bucket, key).await;
+            if matches!(fs::metadata(&obj_path).await, Ok(m) if m.is_file()) {
                 let dst = ver_dir.join("null.data");
                 fs::rename(&obj_path, &dst).await?;
                 sync_parent_dir(&dst).await?;
@@ -4389,7 +5309,7 @@ impl FilesystemStorage {
 
         // Remove top-level current files (the pre-versioning object, if any,
         // was already archived as the "null" version above).
-        let _ = fs::remove_file(self.object_path(bucket, key)).await;
+        let _ = remove_plain_payload(&self.object_path(bucket, key)).await;
         let _ = fs::remove_file(self.meta_path(bucket, key)).await;
         let _ = fs::remove_dir_all(self.ec_dir(bucket, key)).await;
 
@@ -4409,7 +5329,7 @@ impl FilesystemStorage {
             // pre-versioning ("null") object stays.
             if let Ok(meta) = self.read_object_meta(bucket, key).await {
                 if meta.version_id.is_some() {
-                    let _ = fs::remove_file(self.object_path(bucket, key)).await;
+                    let _ = remove_plain_payload(&self.object_path(bucket, key)).await;
                     let _ = fs::remove_file(self.meta_path(bucket, key)).await;
                     let _ = fs::remove_dir_all(self.ec_dir(bucket, key)).await;
                 }
@@ -4503,10 +5423,10 @@ impl FilesystemStorage {
                 .await?;
                 tmp_ec_guard.disarm();
                 tmp_meta_guard.disarm();
-                remove_file_if_exists(&self.object_path(bucket, key)).await?;
+                remove_plain_payload(&self.object_path(bucket, key)).await?;
             } else {
                 let ver_data = ver_dir.join(format!("{}.data", vid));
-                let obj_path = self.object_path(bucket, key);
+                let obj_path = self.plain_object_write_path(bucket, key).await?;
                 let tmp_data = temp_sibling_path(&obj_path);
                 let mut tmp_data_guard = TempPathGuard::file(tmp_data.clone());
                 fs::copy(&ver_data, &tmp_data).await?;
@@ -4535,7 +5455,7 @@ impl FilesystemStorage {
         }
 
         // Newest version is a delete marker (or only markers remain) — remove top-level files
-        let _ = fs::remove_file(self.object_path(bucket, key)).await;
+        let _ = remove_plain_payload(&self.object_path(bucket, key)).await;
         let _ = fs::remove_file(self.meta_path(bucket, key)).await;
         let _ = fs::remove_dir_all(self.ec_dir(bucket, key)).await;
         Ok(())
@@ -4549,7 +5469,7 @@ impl FilesystemStorage {
         customer_key: Option<[u8; 32]>,
     ) -> Result<(ByteStream, ObjectMeta), StorageError> {
         validate_bucket_name(bucket)?;
-        validate_key(key)?;
+        validate_readable_key(key)?;
         validate_version_id(version_id)?;
         if version_id == "null"
             && !fs::try_exists(self.version_meta_path(bucket, key, "null")).await?
@@ -4678,7 +5598,7 @@ impl FilesystemStorage {
             if meta.version_id.is_some() {
                 return Err(StorageError::VersionNotFound("null".into()));
             }
-            remove_file_if_exists(&self.object_path(bucket, key)).await?;
+            remove_plain_payload(&self.object_path(bucket, key)).await?;
             remove_file_if_exists(&self.meta_path(bucket, key)).await?;
             remove_dir_all_if_exists(&self.ec_dir(bucket, key)).await?;
             self.update_current_version(bucket, key).await?;
@@ -4947,9 +5867,17 @@ impl FilesystemStorage {
         match (precondition, current) {
             (WritePrecondition::IfNoneMatchAny, None) => Ok(()),
             (WritePrecondition::IfNoneMatchAny, Some(_)) => Err(StorageError::PreconditionFailed),
+            (WritePrecondition::IfNoneMatch(_), None) => Ok(()),
+            (WritePrecondition::IfNoneMatch(expected), Some(m)) => {
+                if etag_list_matches(expected, &m.etag) {
+                    Err(StorageError::PreconditionFailed)
+                } else {
+                    Ok(())
+                }
+            }
             (WritePrecondition::IfMatch(_), None) => Err(StorageError::NotFound(key.to_string())),
             (WritePrecondition::IfMatch(expected), Some(m)) => {
-                if etag_list_matches(expected, &m.etag) {
+                if expected.trim() == "*" || etag_list_matches(expected, &m.etag) {
                     Ok(())
                 } else {
                     Err(StorageError::PreconditionFailed)
@@ -5070,7 +5998,7 @@ impl FilesystemStorage {
         version_id: &str,
     ) -> Result<ObjectMeta, StorageError> {
         validate_bucket_name(bucket)?;
-        validate_key(key)?;
+        validate_readable_key(key)?;
         validate_version_id(version_id)?;
         if version_id == "null"
             && !fs::try_exists(self.version_meta_path(bucket, key, "null")).await?
@@ -5106,7 +6034,7 @@ impl FilesystemStorage {
         key: &str,
     ) -> Result<Option<String>, StorageError> {
         validate_bucket_name(bucket)?;
-        validate_key(key)?;
+        validate_readable_key(key)?;
         match self.read_object_meta(bucket, key).await {
             Ok(m) if !m.is_delete_marker => return Ok(None),
             Ok(_) | Err(StorageError::NotFound(_)) => {}
@@ -5148,7 +6076,7 @@ impl FilesystemStorage {
         customer_key: Option<[u8; 32]>,
     ) -> Result<(ByteStream, ObjectMeta), StorageError> {
         validate_bucket_name(bucket)?;
-        validate_key(key)?;
+        validate_readable_key(key)?;
         validate_version_id(version_id)?;
         if version_id == "null"
             && !fs::try_exists(self.version_meta_path(bucket, key, "null")).await?

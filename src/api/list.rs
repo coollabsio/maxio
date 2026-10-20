@@ -37,11 +37,16 @@ pub async fn handle_bucket_get(
         Some("versions") => return list_object_versions(state, bucket, params).await,
         Some("location") => {
             tracing::debug!("GetBucketLocation for {}", bucket);
+            // us-east-1 is the empty constraint. Any other region is named.
+            let body = if state.config.region == "us-east-1" {
+                String::new()
+            } else {
+                quick_xml::escape::escape(&state.config.region).into_owned()
+            };
             let xml = format!(
                 "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
-                 <LocationConstraint xmlns=\"{}\">{}</LocationConstraint>",
+                 <LocationConstraint xmlns=\"{}\">{body}</LocationConstraint>",
                 bucket::S3_XMLNS,
-                state.config.region
             );
             return Ok(Response::builder()
                 .status(StatusCode::OK)
@@ -424,6 +429,7 @@ async fn list_object_versions(
                 version_id: vid.to_string(),
                 is_latest,
                 last_modified: v.last_modified.clone(),
+                owner: bucket::owner(),
             }));
         } else {
             version_entries.push(VersionListEntry::Version(VersionEntry {
@@ -434,6 +440,7 @@ async fn list_object_versions(
                 etag: v.etag.clone(),
                 size: v.size,
                 storage_class: "STANDARD".to_string(),
+                owner: bucket::owner(),
             }));
         }
     }

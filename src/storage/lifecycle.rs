@@ -51,6 +51,12 @@ pub struct LifecycleFilter {
     /// Only objects strictly smaller than this many bytes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub object_size_less_than: Option<u64>,
+    /// The client sent a legacy top-level `<Prefix>` rather than `<Filter>`.
+    /// GET echoes that form. Absent (false) means the rule was a Filter, which
+    /// is what the AWS CLI, Terraform, and `mc ilm` send.
+    #[serde(default, skip_serializing_if = "is_false")]
+    #[schema(ignore)]
+    pub legacy_prefix: bool,
 }
 
 /// Expiration of current object versions (`Days` or `Date`), or removal of
@@ -160,6 +166,44 @@ pub fn parse_lifecycle_date(s: &str) -> Result<DateTime<Utc>, S3Error> {
 /// Canonical rendering of a lifecycle date (what GET returns).
 pub fn format_lifecycle_date(d: &DateTime<Utc>) -> String {
     d.format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string()
+}
+
+/// `x-amz-expiration` for an object that matches an enabled expiration rule.
+/// The earliest matching expiry wins, matching S3 when several rules apply.
+pub fn expiration_header(rules: &[LifecycleRule], meta: &ObjectMeta) -> Option<String> {
+    let created = DateTime::parse_from_str(&meta.last_modified, "%Y-%m-%dT%H:%M:%S%.3fZ")
+        .or_else(|_| DateTime::parse_from_rfc3339(&meta.last_modified))
+        .ok()?
+        .with_timezone(&Utc);
+    let mut best: Option<(DateTime<Utc>, &str)> = None;
+    for rule in rules {
+        if !rule.is_enabled() || !rule.filter.matches(meta) {
+            continue;
+        }
+        let Some(exp) = &rule.expiration else {
+            continue;
+        };
+        let when = if let Some(days) = exp.days {
+            // One extra second so a timestamp truncated to milliseconds is not
+            // earlier than the client's "now", which would make (expiry - now)
+            // fall just short of N days.
+            created + Duration::days(i64::from(days)) + Duration::seconds(1)
+        } else if let Some(date) = &exp.date {
+            match parse_lifecycle_date(date) {
+                Ok(d) => d,
+                Err(_) => continue,
+            }
+        } else {
+            continue;
+        };
+        match best {
+            Some((at, _)) if when >= at => {}
+            _ => best = Some((when, rule.id.as_str())),
+        }
+    }
+    let (when, id) = best?;
+    let http = when.format("%a, %d %b %Y %H:%M:%S GMT");
+    Some(format!("expiry-date=\"{http}\", rule-id=\"{id}\""))
 }
 
 /// Validate a full configuration the way S3 does, generate missing rule IDs
@@ -666,6 +710,7 @@ mod tests {
             }],
             object_size_greater_than: Some(49),
             object_size_less_than: Some(51),
+            ..Default::default()
         };
         assert!(f.matches(&meta));
         meta.size = 51;

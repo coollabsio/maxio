@@ -154,8 +154,12 @@ async fn request_id_middleware(
 ) -> axum::response::Response {
     let request_id = uuid::Uuid::new_v4().to_string();
     let mut response = next.run(request).await;
-    if let Ok(value) = request_id.parse() {
-        response.headers_mut().insert("x-amz-request-id", value);
+    // Error bodies already carry the id they put in `<RequestId>`. Replacing
+    // it makes the header disagree with the XML (clients compare the two).
+    if !response.headers().contains_key("x-amz-request-id") {
+        if let Ok(value) = request_id.parse() {
+            response.headers_mut().insert("x-amz-request-id", value);
+        }
     }
     response
 }

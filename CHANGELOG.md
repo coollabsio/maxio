@@ -7,18 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.0]
+
 ### Added
 
+- IAM users, scoped access keys, and bucket policies, in the console and over the API. Access-key secrets are sealed in `<data-dir>/iam.json` with the SSE-S3 master key. Back that file up with `.maxio-keys.json`
+- Virtual-hosted bucket URLs (`--domain`)
+- `maxio check` and `maxio check --repair` for crash leftovers, and `maxio keyring merge` to put a recovered key back into the keyring
+- SSE-S3 key safety: MaxIO will not mint a new master key over existing encrypted objects or sealed IAM secrets
+- Request limits and a graceful drain on SIGINT and SIGTERM
+- On-disk format marker `<data-dir>/.maxio-format`. This release writes version 2. A directory with no marker, or with format 1, is upgraded in place: object bytes and `iam.json` are not rewritten. `serve`, `check --repair`, and `keyring merge` run that upgrade. Read-only `check` does not write the marker
+- Format 2 is the key-and-prefix layout. A key that is also a prefix is stored at `<key>/.maxio.object`. A build that only understands format 1 refuses a version 2 directory instead of opening that path as a file. Format 3 and newer is refused by this binary
 - React web console with a generated OpenAPI client
-- Bucket lifecycle, bucket tags, anonymous read/list policy, and streaming trailer checksums
-- On-disk format marker (`.maxio-format`) and a no-op migration hook for future data upgrades. `serve`, `check`, `check --repair`, and `keyring merge` refuse a newer marker
-- Format 2 is reserved for the one-way key-and-prefix layout: a key that is also a prefix is stored at `<key>/.maxio.object`. This binary does not write that layout. A directory marked version 2 is refused, so an older build does not open that path as a file
-- Virtual-hosted bucket addressing (`--domain`)
-- `maxio check`, `maxio check --repair`, and `maxio keyring merge`
-- Graceful connection drain on SIGINT and SIGTERM
+- Bucket lifecycle, bucket tags, anonymous read/list, and streaming trailer checksums
 - `GET /version` and a version field on `GET /healthz`; the same version is shown in the console
 - Release binaries for Linux (static musl) and macOS, with SHA256 checksums, multi-arch container images, and changelog-backed GitHub Release notes
-- Upgrade guide, supported platforms, and a production deployment checklist
 
 ### Fixed
 

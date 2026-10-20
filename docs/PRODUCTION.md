@@ -41,7 +41,7 @@ location / {
 
 ## Data you must be able to restore
 
-- [ ] The data directory and `<data-dir>/.maxio-keys.json` are backed up together, and the backup is not only on the same disk.
+- [ ] The data directory, `<data-dir>/.maxio-keys.json`, and `<data-dir>/iam.json` (IAM users and sealed access-key secrets) are backed up together, and the backup is not only on the same disk.
 - [ ] You have restored that pair onto a spare host once, or you have a written restore command you have actually run.
 - [ ] `MAXIO_MASTER_KEY`, if you set it, is in the same backup plan as the data directory. An override key that is not backed up is the same as losing the keyring.
 - [ ] The volume is large enough for the objects you will store. Erasure coding uses extra space for parity shards when you enable it.

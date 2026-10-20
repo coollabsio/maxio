@@ -32,7 +32,7 @@ maxio --version
 curl -fsS http://127.0.0.1:9000/healthz
 ```
 
-`/healthz` returns `{"status":"ok","version":"..."}`. The log line `on-disk format version 1` means the data directory was accepted.
+`/healthz` returns `{"status":"ok","version":"..."}`. The log line `on-disk format version 2` means the data directory was accepted.
 
 ## Upgrade a container
 
@@ -54,13 +54,12 @@ Keep the previous image on the host until you are sure you do not need to roll b
 
 ## On-disk format
 
-`<data-dir>/.maxio-format` records the layout version (`{"version":1}` for this binary).
+`<data-dir>/.maxio-format` records the layout version. This binary writes `{"version":2}`.
 
-- A missing marker is format 0. `serve`, `check --repair`, and `keyring merge` run a no-op migration and write version 1. Object bytes are not rewritten. Read-only `maxio check` does not write the marker.
-- The same version opens with no further migration.
-- A **newer** marker than this binary understands makes `serve`, `check`, `check --repair`, and `keyring merge` refuse to open the directory. The message names both versions. The data directory is left unchanged. Install the newer release instead of deleting the marker.
-
-Format 2 is the one-way key-and-prefix layout. A key that is also a prefix (`photos/cat.jpg` and `photos/cat.jpg/thumb`) is stored at `photos/cat.jpg/.maxio.object`. A binary that only understands format 1 refuses that marker. It does not open the directory as a file (that path returns `InternalError` on a build that has no format check). This 1.0.0 binary does not write format 2. The release that introduces the layout must bump the marker to 2 before the first `.maxio.object` write.
+- A missing marker is format 0 (a data directory from a build that predates the marker, including the tree at `1ddf339`). Format 1 is the marker with the previous object layout. `serve`, `check --repair`, and `keyring merge` upgrade either one to version 2. Object bytes stay where they are. `iam.json` is not rewritten.
+- Read-only `maxio check` accepts format 0, 1, and 2 and does not write the marker. It refuses a newer marker before it reports anything.
+- Format 2 is the key-and-prefix layout. A key that is also a prefix (`photos/cat.jpg` and `photos/cat.jpg/thumb`) is stored at `photos/cat.jpg/.maxio.object`. A binary that only understands format 1 refuses that marker. It does not open the directory as a file.
+- Format 3 or newer makes `serve`, `check`, `check --repair`, and `keyring merge` refuse to open the directory. The message names both versions. The data directory, including `iam.json`, is left unchanged. Install the newer release instead of deleting the marker.
 
 Future releases append a migration step and bump the marker only after that step succeeds. A failed migration leaves the previous marker in place.
 
@@ -69,9 +68,9 @@ Future releases append a migration step and bump the marker only after that step
 Roll back when the new process fails to start, or when you have not yet accepted its writes.
 
 1. Stop the new process.
-2. If the format version is still 1 and you have not stored new data you need, the previous 0.4.x binary ignores `.maxio-format` and can start on the same directory.
-3. If a future release migrated the layout (the marker version increased and the changelog says the layout changed), restore the backup from before the upgrade. Do not point an older binary at a migrated directory.
-4. Restore `.maxio-keys.json` from the same backup as the objects. A keyring from a different copy will not decrypt those objects.
+2. A 0.4.x binary ignores `.maxio-format`. It can open a directory that has not yet stored a key at `<key>/.maxio.object`. Once any key has been promoted, or the marker is version 2 and you are not willing to risk that, restore the backup taken before this upgrade.
+3. A binary that understands only format 1 refuses a version 2 marker. That refusal is the safe path. Do not delete the marker to force the older binary to start.
+4. Restore `.maxio-keys.json` and `iam.json` from the same backup as the objects. A keyring from a different copy will not decrypt objects or IAM access-key secrets.
 5. Start the previous binary or image tag and check `/healthz`.
 
 Deleting `.maxio-format` to force an older binary to start is not a rollback. If the marker is newer than the binary, the binary is telling you the data needs that newer release.

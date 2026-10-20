@@ -3,20 +3,22 @@
 //! The marker is `{data_dir}/.maxio-format`:
 //!
 //! ```json
-//! { "version": 1 }
+//! { "version": 2 }
 //! ```
 //!
 //! A missing marker is format 0. That covers a brand-new directory and any
-//! directory created before the marker existed. Startup walks [`MIGRATIONS`]
-//! until [`CURRENT_FORMAT_VERSION`] and writes the marker after each step.
-//! A marker newer than this binary is a hard error: opening the directory
-//! would risk writing a layout this release does not understand. `serve`,
-//! `check`, `check --repair`, and `keyring merge` all use that check.
+//! directory created before the marker existed (including the 1ddf339-era
+//! layout). `serve`, `check --repair`, and `keyring merge` walk [`MIGRATIONS`]
+//! until [`CURRENT_FORMAT_VERSION`] and write the marker after each step.
+//! Read-only `check` refuses a newer marker and does not write one.
 //!
-//! Format 2 ([`KEY_AND_PREFIX_FORMAT_VERSION`]) is the one-way key-and-prefix
+//! Format 1 only introduced the marker. Format 2 is the key-and-prefix
 //! layout: a key that is also a prefix is stored at `<key>/.maxio.object`.
-//! This binary does not read or write that layout. A marker of version 2 is
-//! refused so an older build does not open the directory as a file.
+//! Existing plain files stay plain files, and `iam.json` is not part of the
+//! object layout. The 1 → 2 step does not rewrite bytes. A build whose maximum
+//! is format 1 refuses a version 2 marker instead of opening that path as a
+//! file. A marker newer than this binary (format 3 and above) is refused the
+//! same way.
 //!
 //! Add a future upgrade by appending one step whose `to` is `from + 1` and
 //! bumping [`CURRENT_FORMAT_VERSION`] before the first write of the new
@@ -28,14 +30,13 @@ use std::path::{Path, PathBuf};
 
 /// Layout this binary can read and write.
 ///
-/// Format 2 is reserved for the key-and-prefix layout. Do not raise this
-/// until the binary actually reads `<key>/.maxio.object`.
-pub const CURRENT_FORMAT_VERSION: u32 = 1;
+/// Format 2 is the key-and-prefix layout (`<key>/.maxio.object`).
+pub const CURRENT_FORMAT_VERSION: u32 = 2;
 
 /// One-way layout for a key that is also a prefix (`<key>/.maxio.object`).
 ///
-/// Older binaries that only understand [`CURRENT_FORMAT_VERSION`] refuse a
-/// data directory marked with this version.
+/// A binary whose maximum format is 1 refuses a data directory marked with
+/// this version.
 pub const KEY_AND_PREFIX_FORMAT_VERSION: u32 = 2;
 
 /// File name of the marker, relative to the data directory.
@@ -52,16 +53,35 @@ pub struct Migration {
     pub apply: fn(&Path) -> Result<(), String>,
 }
 
-/// Registered upgrades. Format 1 introduced the marker without changing the
-/// bucket or object layout, so the only step today is a no-op.
-pub const MIGRATIONS: &[Migration] = &[Migration {
-    from: 0,
-    to: 1,
-    name: "introduce-format-marker",
-    apply: noop_migration,
-}];
+/// Registered upgrades.
+///
+/// Format 1 introduced the marker. Format 2 records that this binary may
+/// store a key-and-prefix object at `<key>/.maxio.object`. Neither step
+/// rewrites existing object bytes or `iam.json`.
+pub const MIGRATIONS: &[Migration] = &[
+    Migration {
+        from: 0,
+        to: 1,
+        name: "introduce-format-marker",
+        apply: noop_migration,
+    },
+    Migration {
+        from: 1,
+        to: 2,
+        name: "accept-key-and-prefix-layout",
+        apply: accept_key_and_prefix_layout,
+    },
+];
 
 fn noop_migration(_data_dir: &Path) -> Result<(), String> {
+    Ok(())
+}
+
+/// Record that key-and-prefix objects may use `<key>/.maxio.object`.
+///
+/// Plain object files from a format 0 or 1 directory stay where they are.
+/// `iam.json` is IAM state, not an object, and is not touched.
+fn accept_key_and_prefix_layout(_data_dir: &Path) -> Result<(), String> {
     Ok(())
 }
 
@@ -126,8 +146,10 @@ pub async fn ensure_current(data_dir: impl AsRef<Path>) -> Result<u32, FormatErr
 }
 
 fn newer_error(data_dir: &Path, found: u32, supported: u32) -> FormatError {
-    let hint = if found == KEY_AND_PREFIX_FORMAT_VERSION {
-        " Format 2 stores a key that is also a prefix at <key>/.maxio.object. That layout is one-way: this binary does not read it."
+    let hint = if found == KEY_AND_PREFIX_FORMAT_VERSION
+        && supported < KEY_AND_PREFIX_FORMAT_VERSION
+    {
+        " Format 2 stores a key that is also a prefix at <key>/.maxio.object. That layout is one-way: a build that only understands format 1 must not open this directory."
     } else {
         ""
     };
@@ -260,29 +282,53 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn existing_data_without_a_marker_is_stamped_and_left_in_place() {
+    async fn pre_marker_directory_upgrades_to_v2_without_rewriting_objects_or_iam() {
         let dir = tempfile::tempdir().unwrap();
         let bucket = dir.path().join("buckets").join("logs");
         std::fs::create_dir_all(&bucket).unwrap();
         let meta = bucket.join(".bucket.json");
+        let object = bucket.join("note.txt");
         std::fs::write(&meta, b"{\"name\":\"logs\"}\n").unwrap();
+        std::fs::write(&object, b"hello").unwrap();
+        let iam = br#"{"version":1,"users":[],"keys":[],"policies":[]}"#;
+        std::fs::write(dir.path().join("iam.json"), iam).unwrap();
 
         let version = ensure_current(dir.path()).await.unwrap();
-        assert_eq!(version, 1);
+        assert_eq!(version, KEY_AND_PREFIX_FORMAT_VERSION);
         assert_eq!(
             std::fs::read_to_string(meta).unwrap(),
             "{\"name\":\"logs\"}\n"
         );
+        assert_eq!(std::fs::read(object).unwrap(), b"hello");
+        assert_eq!(std::fs::read(dir.path().join("iam.json")).unwrap(), iam);
+    }
+
+    #[tokio::test]
+    async fn format_one_marker_upgrades_to_v2_and_leaves_iam_json() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join(FORMAT_FILENAME);
+        std::fs::write(&marker, b"{\"version\":1}\n").unwrap();
+        let iam = b"{\"version\":1,\"users\":[{\"name\":\"ada\"}]}";
+        std::fs::write(dir.path().join("iam.json"), iam).unwrap();
+
+        assert_eq!(ensure_readable(dir.path()).await.unwrap(), 1);
+        assert_eq!(std::fs::read(&marker).unwrap(), b"{\"version\":1}\n");
+
+        assert_eq!(ensure_current(dir.path()).await.unwrap(), 2);
+        let parsed: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&marker).unwrap()).unwrap();
+        assert_eq!(parsed["version"], 2);
+        assert_eq!(std::fs::read(dir.path().join("iam.json")).unwrap(), iam);
     }
 
     #[tokio::test]
     async fn current_marker_is_not_rewritten() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join(FORMAT_FILENAME);
-        let original = b"{\"version\":1}\n";
+        let original = b"{\"version\":2}\n";
         std::fs::write(&path, original).unwrap();
 
-        assert_eq!(ensure_current(dir.path()).await.unwrap(), 1);
+        assert_eq!(ensure_current(dir.path()).await.unwrap(), 2);
         assert_eq!(std::fs::read(path).unwrap(), original);
     }
 
@@ -297,7 +343,7 @@ mod tests {
         let message = err.to_string();
         assert!(message.contains("refusing to open"), "{message}");
         assert!(message.contains("version 99"), "{message}");
-        assert!(message.contains("version 1"), "{message}");
+        assert!(message.contains("version 2"), "{message}");
         assert!(
             message.contains(&dir.path().display().to_string()),
             "{message}"
@@ -305,11 +351,31 @@ mod tests {
         assert_eq!(std::fs::read(path).unwrap(), original);
     }
 
+    /// A build whose maximum is format 1, simulated by passing that target
+    /// into the same migration engine this binary uses.
     #[tokio::test]
-    async fn key_prefix_format_is_refused_and_names_the_object_file() {
+    async fn format_two_refuses_a_binary_that_only_understands_format_one() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(ensure_current(dir.path()).await.unwrap(), 2);
+        let format_one_only: &[Migration] = &MIGRATIONS[..1];
+        let before = marker_bytes(dir.path()).await.unwrap();
+
+        let err = apply_migrations(dir.path(), 1, format_one_only)
+            .await
+            .unwrap_err();
+        let message = err.to_string();
+        assert!(message.contains("refusing to open"), "{message}");
+        assert!(message.contains("version 2"), "{message}");
+        assert!(message.contains("version 1"), "{message}");
+        assert!(message.contains(".maxio.object"), "{message}");
+        assert_eq!(marker_bytes(dir.path()).await.unwrap(), before);
+    }
+
+    #[tokio::test]
+    async fn format_three_refuses_on_this_build_without_changing_the_file() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join(FORMAT_FILENAME);
-        let original = b"{\"version\":2}\n";
+        let original = b"{\"version\":3}\n";
         std::fs::write(&path, original).unwrap();
 
         for err in [
@@ -318,9 +384,12 @@ mod tests {
         ] {
             let message = err.to_string();
             assert!(message.contains("refusing to open"), "{message}");
+            assert!(message.contains("version 3"), "{message}");
             assert!(message.contains("version 2"), "{message}");
-            assert!(message.contains("version 1"), "{message}");
-            assert!(message.contains(".maxio.object"), "{message}");
+            assert!(
+                !message.contains(".maxio.object"),
+                "a future format should not be described as the v2 layout: {message}"
+            );
         }
         assert_eq!(std::fs::read(path).unwrap(), original);
     }
@@ -400,10 +469,10 @@ mod tests {
             .unwrap_err();
         let message = err.to_string();
         assert!(message.contains("no migration"), "{message}");
-        assert!(message.contains("format 1"), "{message}");
-        // 0 -> 1 succeeded and was committed. The missing 1 -> 2 step stops there.
+        assert!(message.contains("format 2"), "{message}");
+        // 0 -> 1 and 1 -> 2 succeeded. The missing 2 -> 3 step stops there.
         let parsed: serde_json::Value =
             serde_json::from_slice(&marker_bytes(dir.path()).await.unwrap()).unwrap();
-        assert_eq!(parsed["version"], 1);
+        assert_eq!(parsed["version"], 2);
     }
 }

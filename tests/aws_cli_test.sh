@@ -171,7 +171,7 @@ try:
 except Exception:
     print("")
 ' "$DATA_DIR/.maxio-format")
-    assert_eq "on-disk format marker is version 1" "1" "$FORMAT_VERSION"
+    assert_eq "on-disk format marker is version 2" "2" "$FORMAT_VERSION"
 
     SMOKE_BUCKET="smoke-bucket-$$"
     echo "hello maxio" > "$TMPDIR/smoke.txt"

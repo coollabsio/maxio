@@ -8,7 +8,9 @@ set -euo pipefail
 # --allow-insecure-dev). Override them to match a server that uses its own keys:
 #   MAXIO_TEST_ACCESS_KEY=... MAXIO_TEST_SECRET_KEY=... ./tests/aws_cli_test.sh
 # Sections that start their own server use the same variables.
-# Requires aws (AWS CLI v2), mc, python3, and curl.
+# Virtual-hosted-style cases also require --domain localhost (or MAXIO_DOMAIN=localhost).
+# Requires aws (AWS CLI v2), mc, python3, curl, and permission to add *.localhost
+# names to /etc/hosts (those names do not resolve on every OS).
 
 PORT="${1:-9000}"
 DATA_DIR="$(cd "${2:-./data}" && pwd)"
@@ -29,6 +31,7 @@ unset AWS_CONFIG_FILE AWS_PROFILE AWS_DEFAULT_PROFILE
 
 AWS="aws --endpoint-url $ENDPOINT"
 
+VHOST_MARK="# maxio-awscli-vhost"
 cleanup() {
     if [ -n "${KEY_PID:-}" ] && kill -0 "$KEY_PID" 2>/dev/null; then
         kill "$KEY_PID" 2>/dev/null || true
@@ -40,9 +43,31 @@ cleanup() {
     if [ -n "${KEY_DATA:-}" ]; then
         rm -rf "$KEY_DATA"
     fi
+    if grep -q "$VHOST_MARK" /etc/hosts 2>/dev/null; then
+        local filtered
+        filtered=$(grep -v "$VHOST_MARK" /etc/hosts || true)
+        if [ -w /etc/hosts ]; then
+            printf '%s\n' "$filtered" > /etc/hosts
+        else
+            printf '%s\n' "$filtered" | sudo tee /etc/hosts >/dev/null
+        fi
+    fi
     rm -rf "$TMPDIR"
 }
 trap cleanup EXIT
+
+pin_vhost() {
+    local name="$1"
+    if grep -qE "[[:space:]]${name}([[:space:]]|$).*${VHOST_MARK}" /etc/hosts 2>/dev/null; then
+        return 0
+    fi
+    local line="127.0.0.1 ${name} ${VHOST_MARK}"
+    if [ -w /etc/hosts ]; then
+        printf '%s\n' "$line" >> /etc/hosts
+    else
+        printf '%s\n' "$line" | sudo tee -a /etc/hosts >/dev/null
+    fi
+}
 
 red()   { printf "\033[31m%s\033[0m\n" "$1"; }
 green() { printf "\033[32m%s\033[0m\n" "$1"; }
@@ -1982,6 +2007,133 @@ PY
     KEY_DATA=""
     fi
     rm -f "$KEY_EXT"
+fi
+
+# --- Virtual-hosted-style (aws addressing_style=virtual, mc --path off) ---
+# Requires the server to be started with --domain localhost. Bucket hosts are
+# pinned in /etc/hosts because *.localhost does not resolve on every OS.
+echo ""
+echo "--- Virtual-hosted-style (aws + mc) ---"
+VHOST_PROBE=$(curl -sS -o /dev/null -w '%{http_code}' \
+    -H "Host: hprobe.localhost:${PORT}" "http://127.0.0.1:${PORT}/healthz" || echo "000")
+if [ "$VHOST_PROBE" != "403" ]; then
+    red "FAIL: virtual-hosted-style is off (GET /healthz with Host hprobe.localhost returned ${VHOST_PROBE}, expected 403). Start maxio with --domain localhost."
+    FAIL=$((FAIL + 1))
+else
+    green "PASS: virtual-hosted-style enabled"
+    PASS=$((PASS + 1))
+
+    VBUCKET="vhost-${PORT}-$$"
+    VDOT="dot.vhost-${PORT}-$$"
+    pin_vhost "${VBUCKET}.localhost"
+    pin_vhost "${VDOT}.localhost"
+
+    AWS_VCONF="$TMPDIR/aws-virtual.config"
+    cat > "$AWS_VCONF" <<'EOF'
+[default]
+region = us-east-1
+s3 =
+    addressing_style = virtual
+EOF
+    VAWS=(aws --endpoint-url "http://localhost:${PORT}")
+    vaws() {
+        AWS_CONFIG_FILE="$AWS_VCONF" "${VAWS[@]}" "$@"
+    }
+
+    assert "virtual create bucket" vaws s3 mb "s3://${VBUCKET}"
+    assert "virtual head bucket" vaws s3api head-bucket --bucket "$VBUCKET"
+    echo "virtual-body" > "$TMPDIR/vhost.txt"
+    assert "virtual put object" vaws s3 cp "$TMPDIR/vhost.txt" "s3://${VBUCKET}/folder/obj.txt"
+    assert "virtual get object" vaws s3 cp "s3://${VBUCKET}/folder/obj.txt" "$TMPDIR/vhost-down.txt"
+    assert_eq "virtual object body" "virtual-body" "$(cat "$TMPDIR/vhost-down.txt")"
+    VLIST=$(vaws s3api list-objects-v2 --bucket "$VBUCKET" --prefix folder/ 2>&1)
+    assert_eq "virtual list-objects-v2" "true" "$(echo "$VLIST" | grep -q 'folder/obj.txt' && echo true || echo false)"
+
+    assert "virtual copy-object" vaws s3api copy-object --bucket "$VBUCKET" --key copy.txt \
+        --copy-source "${VBUCKET}/folder/obj.txt"
+    assert "virtual download copy" vaws s3 cp "s3://${VBUCKET}/copy.txt" "$TMPDIR/vhost-copy.txt"
+    assert_eq "virtual copy body" "virtual-body" "$(cat "$TMPDIR/vhost-copy.txt")"
+
+    echo "part-a" > "$TMPDIR/vpart.txt"
+    VUPLOAD=$(vaws s3api create-multipart-upload --bucket "$VBUCKET" --key multi.bin --query UploadId --output text)
+    assert_eq "virtual create multipart" "true" "$([ -n "$VUPLOAD" ] && [ "$VUPLOAD" != "None" ] && echo true || echo false)"
+    VETAG=$(vaws s3api upload-part --bucket "$VBUCKET" --key multi.bin --part-number 1 \
+        --upload-id "$VUPLOAD" --body "$TMPDIR/vpart.txt" --query ETag --output text)
+    assert_eq "virtual upload part" "true" "$([ -n "$VETAG" ] && [ "$VETAG" != "None" ] && echo true || echo false)"
+    cat > "$TMPDIR/vcomplete.json" <<EOF
+{"Parts":[{"ETag":${VETAG},"PartNumber":1}]}
+EOF
+    assert "virtual complete multipart" vaws s3api complete-multipart-upload --bucket "$VBUCKET" \
+        --key multi.bin --upload-id "$VUPLOAD" --multipart-upload "file://$TMPDIR/vcomplete.json"
+    assert "virtual download multipart" vaws s3 cp "s3://${VBUCKET}/multi.bin" "$TMPDIR/vmulti.txt"
+    assert_eq "virtual multipart body" "part-a" "$(cat "$TMPDIR/vmulti.txt")"
+
+    cat > "$TMPDIR/vtagging.json" <<'EOF'
+{"TagSet":[{"Key":"env","Value":"prod"}]}
+EOF
+    assert "virtual put-bucket-tagging" vaws s3api put-bucket-tagging --bucket "$VBUCKET" \
+        --tagging "file://$TMPDIR/vtagging.json"
+    VTAGS=$(vaws s3api get-bucket-tagging --bucket "$VBUCKET" 2>&1)
+    assert_eq "virtual get-bucket-tagging" "true" "$(echo "$VTAGS" | grep -q '"Value": "prod"' && echo true || echo false)"
+
+    cat > "$TMPDIR/vlifecycle.json" <<'EOF'
+{
+  "Rules": [
+    {
+      "ID": "logs",
+      "Filter": {"Prefix": "logs/"},
+      "Status": "Enabled",
+      "Expiration": {"Days": 30}
+    }
+  ]
+}
+EOF
+    assert "virtual put-bucket-lifecycle" vaws s3api put-bucket-lifecycle-configuration \
+        --bucket "$VBUCKET" --lifecycle-configuration "file://$TMPDIR/vlifecycle.json"
+    VLC=$(vaws s3api get-bucket-lifecycle-configuration --bucket "$VBUCKET" 2>&1)
+    assert_eq "virtual lifecycle days" "30" "$(echo "$VLC" | python3 -c 'import json,sys; print(json.load(sys.stdin)["Rules"][0]["Expiration"]["Days"])')"
+
+    cat > "$TMPDIR/vpolicy.json" <<EOF
+{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::${VBUCKET}/*"}]}
+EOF
+    assert "virtual put-bucket-policy" vaws s3api put-bucket-policy --bucket "$VBUCKET" \
+        --policy "file://$TMPDIR/vpolicy.json"
+    VPOLICY=$(vaws s3api get-bucket-policy --bucket "$VBUCKET" --query Policy --output text 2>&1)
+    assert_eq "virtual get-bucket-policy" "true" "$(echo "$VPOLICY" | grep -q 's3:GetObject' && echo true || echo false)"
+
+    VPRESIGN=$(vaws s3 presign "s3://${VBUCKET}/folder/obj.txt" --expires-in 300)
+    assert_eq "virtual presign host" "true" "$(echo "$VPRESIGN" | grep -q "://${VBUCKET}.localhost:" && echo true || echo false)"
+    (unset AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY; curl -fsS "$VPRESIGN" -o "$TMPDIR/vpresign.txt")
+    assert_eq "virtual presigned GET" "virtual-body" "$(cat "$TMPDIR/vpresign.txt")"
+
+    # AWS CLI and mc keep dotted bucket names on path-style even with virtual
+    # addressing selected (a one-label wildcard cert cannot cover them). MaxIO
+    # still has to accept that path-style request, and the Rust tests cover
+    # the virtual host my.bucket.localhost directly.
+    assert "dotted bucket create with virtual addressing enabled" vaws s3 mb "s3://${VDOT}"
+    echo "dotted" > "$TMPDIR/vdot.txt"
+    assert "dotted bucket put with virtual addressing enabled" vaws s3 cp "$TMPDIR/vdot.txt" "s3://${VDOT}/a.txt"
+    assert "dotted bucket get with virtual addressing enabled" vaws s3 cp "s3://${VDOT}/a.txt" "$TMPDIR/vdot-down.txt"
+    assert_eq "dotted bucket body" "dotted" "$(cat "$TMPDIR/vdot-down.txt")"
+
+    # Path-style against the same server still addresses the bucket.
+    assert "path-style read of virtual object" $AWS s3 cp "s3://${VBUCKET}/folder/obj.txt" "$TMPDIR/vpath.txt"
+    assert_eq "path-style body matches virtual put" "virtual-body" "$(cat "$TMPDIR/vpath.txt")"
+
+    MC_VHOST="maxiov$$"
+    assert "mc virtual alias" mc alias set "$MC_VHOST" "$ENDPOINT" "$MAXIO_TEST_ACCESS_KEY" "$MAXIO_TEST_SECRET_KEY" \
+        --api S3v4 --path off
+    echo "from-mc" > "$TMPDIR/vmc.txt"
+    assert "mc virtual cp" mc cp "$TMPDIR/vmc.txt" "${MC_VHOST}/${VBUCKET}/mc.txt"
+    MC_BODY=$(mc cat "${MC_VHOST}/${VBUCKET}/mc.txt" 2>/dev/null || true)
+    assert_eq "mc virtual cat" "from-mc" "$MC_BODY"
+    assert "mc virtual rm" mc rm "${MC_VHOST}/${VBUCKET}/mc.txt"
+    mc alias rm "$MC_VHOST" > /dev/null 2>&1 || true
+
+    vaws s3 rm "s3://${VBUCKET}" --recursive > /dev/null 2>&1 || true
+    vaws s3 rm "s3://${VDOT}" --recursive > /dev/null 2>&1 || true
+    assert "virtual delete bucket" vaws s3api delete-bucket --bucket "$VBUCKET"
+    assert "virtual delete dotted bucket" vaws s3api delete-bucket --bucket "$VDOT"
 fi
 
 # --- Summary ---

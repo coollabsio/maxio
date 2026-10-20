@@ -58,7 +58,7 @@ Tasks run through [`just`](https://github.com/casey/just) (see `justfile`). Tool
 just check
 
 # 2. AWS CLI integration tests (start server, run tests, stop server)
-cargo build && RUST_LOG=info ./target/debug/maxio --data-dir /tmp/maxio-test --port 9876 &
+cargo build && RUST_LOG=info ./target/debug/maxio --data-dir /tmp/maxio-test --port 9876 --allow-insecure-dev --domain localhost &
 ./tests/aws_cli_test.sh 9876 /tmp/maxio-test
 kill %1 && rm -rf /tmp/maxio-test
 ```
@@ -97,7 +97,7 @@ This runs both processes concurrently (Ctrl+C kills both):
 
 - **Pure filesystem storage**: No database. Buckets are directories, objects are files at their key path, metadata in `.meta.json` sidecars. Backup-friendly — just copy the data dir
 - **Storage layout**: `{data_dir}/buckets/{bucket-name}/{key-path}` for data, `{key-path}.meta.json` for metadata, `.bucket.json` for bucket metadata
-- **Path-style only**: `/{bucket}/{key}` routing. No virtual-hosted-style yet
+- **Path-style and virtual-hosted-style**: `/{bucket}/{key}` always. With `--domain` / `MAXIO_DOMAIN`, a `Host` of `<bucket>.<domain>` is rewritten to that path before routing; SigV4 still verifies the original path and `Host`. Unset domain keeps path-style only
 - **UNSIGNED-PAYLOAD accepted**: Skips body hashing for PutObject (AWS CLI default)
 - **Embedded UI assets**: Frontend is compiled into the binary via `rust-embed`. `build.rs` runs `bun run build` into `ui/dist/` (skip with `SKIP_FRONTEND=1`); `index.html` is the SPA fallback. Dev uses Vite HMR. In release builds, assets are baked in — single binary, no external files needed
 - **Web console**: React SPA at `/ui/`, API at `/api/` (OpenAPI via utoipa, typed client generated with hey-api). Cookie-based auth (HMAC tokens, not SigV4). Presigned URL generation with configurable expiry (1h/6h/24h/7d picker in UI)

@@ -25,6 +25,10 @@ fn default_default_buckets() -> Option<String> {
     first_env_value(&["MINIO_DEFAULT_BUCKETS"])
 }
 
+fn default_domain() -> String {
+    first_env_value(&["MINIO_DOMAIN"]).unwrap_or_default()
+}
+
 #[derive(Args, Debug, Clone)]
 pub struct Config {
     /// Port to listen on
@@ -101,6 +105,12 @@ pub struct Config {
     /// Max request body size for console JSON/form API routes, in bytes. Object uploads are streaming and not covered by this limit.
     #[arg(long, env = "MAXIO_MAX_CONSOLE_BODY_BYTES", default_value = "1048576")]
     pub max_console_body_bytes: usize,
+
+    /// Comma-separated base domains for virtual-hosted-style addressing.
+    /// A request to `<bucket>.<domain>` is served from that bucket. Unset leaves every host on path-style.
+    /// `MINIO_DOMAIN` is accepted when `MAXIO_DOMAIN` is unset.
+    #[arg(long = "domain", env = "MAXIO_DOMAIN", default_value_t = default_domain())]
+    pub domain: String,
 }
 
 #[cfg(test)]
@@ -123,5 +133,18 @@ mod tests {
         let cli = TestCli::parse_from(["maxio"]);
 
         assert_eq!(cli.config.address, "0.0.0.0");
+    }
+
+    #[test]
+    fn domain_flag_is_comma_separated_and_defaults_empty() {
+        unsafe {
+            std::env::remove_var("MAXIO_DOMAIN");
+            std::env::remove_var("MINIO_DOMAIN");
+        }
+        let cli = TestCli::parse_from(["maxio"]);
+        assert_eq!(cli.config.domain, "");
+
+        let cli = TestCli::parse_from(["maxio", "--domain", "localhost,s3.example.com"]);
+        assert_eq!(cli.config.domain, "localhost,s3.example.com");
     }
 }

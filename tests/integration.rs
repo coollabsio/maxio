@@ -49,6 +49,7 @@ async fn start_server() -> (String, TempDir) {
         parity_shards: 0,
         default_buckets: String::new(),
         max_console_body_bytes: 1024 * 1024,
+        domain: String::new(),
     };
 
     let state = AppState {
@@ -107,6 +108,7 @@ async fn start_server_with_keys(
         parity_shards: 0,
         default_buckets: String::new(),
         max_console_body_bytes: 1024 * 1024,
+        domain: String::new(),
     };
 
     let state = AppState {
@@ -253,6 +255,7 @@ async fn start_server_with_default_buckets(default_buckets: &str) -> (String, Te
         parity_shards: 0,
         default_buckets: default_buckets.to_string(),
         max_console_body_bytes: 1024 * 1024,
+        domain: String::new(),
     };
 
     let state = AppState {
@@ -331,6 +334,7 @@ async fn test_default_buckets_skip_existing() {
         parity_shards: 0,
         default_buckets: String::new(),
         max_console_body_bytes: 1024 * 1024,
+        domain: String::new(),
     };
     let state = AppState {
         storage: Arc::new(storage),
@@ -3201,6 +3205,7 @@ async fn start_server_ec() -> (String, TempDir) {
         parity_shards: 0,
         default_buckets: String::new(),
         max_console_body_bytes: 1024 * 1024,
+        domain: String::new(),
     };
 
     let state = AppState {
@@ -3725,6 +3730,7 @@ async fn start_server_parity(parity_shards: u32) -> (String, TempDir) {
         parity_shards,
         default_buckets: String::new(),
         max_console_body_bytes: 1024 * 1024,
+        domain: String::new(),
     };
 
     let state = AppState {
@@ -6585,6 +6591,7 @@ async fn start_server_ec_parity(chunk_size: u64, parity_shards: u32) -> (String,
         parity_shards,
         default_buckets: String::new(),
         max_console_body_bytes: 1024 * 1024,
+        domain: String::new(),
     };
 
     let state = AppState {

@@ -23,4 +23,5 @@ pub mod error;
 pub mod openapi;
 pub mod server;
 pub mod storage;
+mod vhost;
 pub mod xml;

@@ -93,6 +93,20 @@ enum HostClass {
 /// replaced `Host` with an internal address). In that case the forwarded value
 /// becomes the `Host` header so signature verification uses the host the
 /// client signed, which is the same host used to choose the bucket.
+/// True when `Host` is `<bucket>.<configured-domain>`.
+///
+/// Health probes must not claim those requests: `healthz.localhost/` is the
+/// bucket `healthz`, not `GET /healthz`.
+pub(crate) fn host_is_bucket(request: &Request, domains: &[String]) -> bool {
+    if domains.is_empty() {
+        return false;
+    }
+    matches!(
+        classify(&request_host(request), domains),
+        HostClass::Bucket(_)
+    )
+}
+
 pub(crate) fn apply(request: &mut Request, domains: &[String]) {
     if domains.is_empty() {
         return;

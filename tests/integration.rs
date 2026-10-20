@@ -797,13 +797,111 @@ async fn test_healthz_is_public_and_returns_ok() {
 async fn test_version_endpoint_reports_package_version() {
     let (base_url, _tmp) = start_server().await;
     let resp = client()
-        .get(format!("{base_url}/version"))
+        .get(format!("{base_url}/api/version"))
         .send()
         .await
         .unwrap();
     assert_eq!(resp.status(), 200);
     let body: serde_json::Value = resp.json().await.unwrap();
     assert_eq!(body["version"], env!("CARGO_PKG_VERSION"));
+}
+
+async fn signed(method: &str, url: &str, body: &[u8]) -> reqwest::Response {
+    let mut headers = Vec::new();
+    sign_request(method, url, &mut headers, body);
+    let method = method.parse::<reqwest::Method>().unwrap();
+    let mut req = client().request(method, url);
+    for (name, value) in headers {
+        req = req.header(name, value);
+    }
+    if !body.is_empty() {
+        req = req.body(body.to_vec());
+    }
+    req.send().await.unwrap()
+}
+
+/// Buckets named `version` and `healthz` are S3 buckets. The probe is only an
+/// unauthenticated GET/HEAD `/healthz` with no query.
+#[tokio::test]
+async fn probe_names_are_buckets_and_unsigned_healthz_stays_a_probe() {
+    let (base_url, _tmp) = start_server().await;
+
+    let health = client()
+        .get(format!("{base_url}/healthz"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(health.status(), 200);
+    let health_body = health.text().await.unwrap();
+    assert!(health_body.contains("\"status\":\"ok\""), "{health_body}");
+
+    let head = client()
+        .head(format!("{base_url}/healthz"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(head.status(), 200);
+
+    let queried = client()
+        .get(format!("{base_url}/healthz?versioning"))
+        .send()
+        .await
+        .unwrap();
+    let queried_status = queried.status();
+    let queried_body = queried.text().await.unwrap();
+    assert_ne!(queried_status, 200, "{queried_body}");
+    assert!(
+        !queried_body.contains("\"status\":\"ok\""),
+        "{queried_body}"
+    );
+
+    for bucket in ["version", "healthz"] {
+        let root = format!("{base_url}/{bucket}");
+        let created = signed("PUT", &root, b"").await;
+        assert_eq!(
+            created.status(),
+            200,
+            "{bucket} create {}",
+            created.text().await.unwrap()
+        );
+
+        let listed = signed("GET", &root, b"").await;
+        let listed_status = listed.status();
+        let listed_body = listed.text().await.unwrap();
+        assert_eq!(listed_status, 200, "{listed_body}");
+        assert!(
+            !listed_body.contains("\"status\":\"ok\""),
+            "signed list must not be the version probe: {listed_body}"
+        );
+
+        let versioning = signed("GET", &format!("{root}?versioning"), b"").await;
+        let versioning_status = versioning.status();
+        let versioning_body = versioning.text().await.unwrap();
+        assert_eq!(versioning_status, 200, "{versioning_body}");
+        assert!(
+            versioning_body.contains("VersioningConfiguration"),
+            "{versioning_body}"
+        );
+
+        let object = format!("{root}/note.txt");
+        let put = signed("PUT", &object, b"probe-body").await;
+        assert_eq!(
+            put.status(),
+            200,
+            "{bucket} put {}",
+            put.text().await.unwrap()
+        );
+        let got = signed("GET", &object, b"").await;
+        let got_status = got.status();
+        let got_body = got.text().await.unwrap();
+        assert_eq!(got_status, 200, "{got_body}");
+        assert_eq!(got_body, "probe-body");
+
+        let deleted = signed("DELETE", &object, b"").await;
+        assert_eq!(deleted.status(), 204, "{bucket} delete object");
+        let removed = signed("DELETE", &root, b"").await;
+        assert_eq!(removed.status(), 204, "{bucket} delete bucket");
+    }
 }
 
 #[tokio::test]

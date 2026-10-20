@@ -5,7 +5,7 @@ Versions are [semantic versions](https://semver.org/spec/v2.0.0.html). The numbe
 - `ui/package.json` (`version`)
 - `ui/src/version.ts` (`appVersion`)
 
-`just version-check` fails when they differ. `maxio --version`, `GET /version`, `GET /healthz`, and the console all show that version.
+`just version-check` fails when they differ. `maxio --version`, `GET /api/version`, the unauthenticated `GET /healthz` probe, and the console all show that version.
 
 ## Changelog
 
@@ -95,4 +95,4 @@ docker rm -f maxio-smoke
 rm -rf "$data"
 ```
 
-`MAXIO_SMOKE=1` checks `/healthz`, `/version`, `.maxio-format`, and one `aws` plus `mc` upload. The rest of `tests/aws_cli_test.sh` is the full suite and runs when the variable is unset.
+`MAXIO_SMOKE=1` checks `/healthz`, `/api/version`, `.maxio-format`, and one `aws` plus `mc` upload. The rest of `tests/aws_cli_test.sh` is the full suite and runs when the variable is unset.

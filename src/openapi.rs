@@ -14,6 +14,7 @@ use crate::api::{console, iam_console};
     security(("cookieAuth" = [])),
     modifiers(&CookieAuth),
     paths(
+        console::server_version,
         console::login,
         console::check,
         console::capabilities,
@@ -142,6 +143,7 @@ mod tests {
                 "getObjectInfo",
                 "getObjectTags",
                 "getPublicAccess",
+                "getServerVersion",
                 "getVersioning",
                 "listAccessKeys",
                 "listBuckets",
@@ -175,7 +177,11 @@ mod tests {
     #[test]
     fn login_and_check_are_public() {
         let doc: serde_json::Value = serde_json::from_str(&openapi_json()).unwrap();
-        for (path, method) in [("/api/auth/login", "post"), ("/api/auth/check", "get")] {
+        for (path, method) in [
+            ("/api/auth/login", "post"),
+            ("/api/auth/check", "get"),
+            ("/api/version", "get"),
+        ] {
             assert_eq!(
                 doc["paths"][path][method]["security"],
                 serde_json::json!([{}])

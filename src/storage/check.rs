@@ -206,6 +206,10 @@ pub async fn check_with(
     } else {
         None
     };
+    // The marker is written only while this process holds the lock.
+    if repair {
+        super::format::ensure_current(data_dir).await?;
+    }
     let mut report = CheckReport::default();
     let mut saw_sse_s3 = false;
     let buckets_dir = data_dir.join("buckets");

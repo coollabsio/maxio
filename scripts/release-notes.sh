@@ -3,9 +3,8 @@
 # Usage: scripts/release-notes.sh 1.0.0
 #        scripts/release-notes.sh v1.0.0
 #
-# Prefers "## [1.0.0]". If that heading is absent, prints "## [Unreleased]"
-# with the heading rewritten to the requested version so a first tag still
-# gets notes. Exits 1 when neither section exists.
+# Exits 1 when that version has no heading, or the section has no body.
+# An empty ## [Unreleased] is not a substitute for a missing version.
 set -euo pipefail
 
 if [ "$#" -ne 1 ]; then
@@ -22,48 +21,37 @@ if [ ! -f "$changelog" ]; then
     exit 1
 fi
 
-extract() {
-    local heading="$1"
-    local replace_heading="${2:-}"
-    awk -v heading="$heading" -v replace="$replace_heading" '
-        function section_name(line,   name) {
-            name = line
-            sub(/^## \[/ , "", name)
-            sub(/\].*/, "", name)
-            return name
+notes="$(awk -v heading="$version" '
+    function section_name(line,   name) {
+        name = line
+        sub(/^## \[/ , "", name)
+        sub(/\].*/, "", name)
+        return name
+    }
+    /^## \[/ {
+        if (capture) {
+            exit
         }
-        /^## \[/ {
-            if (capture) {
-                exit
-            }
-            if (section_name($0) == heading) {
-                capture = 1
-                if (replace != "") {
-                    print replace
-                } else {
-                    print
-                }
-                next
-            }
+        if (section_name($0) == heading) {
+            capture = 1
+            print
+            next
         }
-        capture { print }
-        END {
-            if (!capture) {
-                exit 1
-            }
+    }
+    capture { print }
+    END {
+        if (!capture) {
+            exit 1
         }
-    ' "$changelog"
+    }
+' "$changelog")" || {
+    echo "no changelog section for ${version}" >&2
+    exit 1
 }
 
-if notes="$(extract "$version")"; then
-    printf '%s\n' "$notes"
-    exit 0
+if ! printf '%s\n' "$notes" | awk 'NR > 1 && $0 !~ /^[[:space:]]*$/ { found = 1 } END { exit !found }'; then
+    echo "changelog section for ${version} is empty" >&2
+    exit 1
 fi
 
-if notes="$(extract "Unreleased" "## [${version}]")"; then
-    printf '%s\n' "$notes"
-    exit 0
-fi
-
-echo "no changelog section for ${version} or Unreleased" >&2
-exit 1
+printf '%s\n' "$notes"

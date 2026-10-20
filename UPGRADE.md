@@ -36,4 +36,6 @@ A `.maxio-promote-*` directory with no `*.meta.json` sidecar is this version's o
 
 A key that is also a prefix (`photos/cat.jpg` and `photos/cat.jpg/thumb`) keeps its bytes at `photos/cat.jpg/.maxio.object`.
 
-1.0.0 records that layout in `<data-dir>/.maxio-format` as version 2. Opening a directory with no marker, or with format 1, upgrades the marker to 2 and does not rewrite object bytes or `iam.json`. A binary that only understands format 1 refuses a version 2 directory instead of reading `<key>/.maxio.object` as a file (that read is `InternalError` on a build with no format check). Do not delete the marker to force an older binary to start. See [docs/UPGRADE.md](docs/UPGRADE.md).
+1.0.0 records that layout in `<data-dir>/.maxio-format` as version 2. Opening a directory with no marker, or with format 1, upgrades the marker to 2 and does not rewrite object bytes or `iam.json`.
+
+Do not roll back to a pre-1.0 build after upgrading. Those builds ignore the marker, start on a version 2 directory, and return `InternalError` for a promoted key. A future build that only understands an older format refuses a newer marker instead. Do not delete the marker to force an older binary to start. See [docs/UPGRADE.md](docs/UPGRADE.md).

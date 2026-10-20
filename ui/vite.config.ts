@@ -47,7 +47,6 @@ export default defineConfig({
       '/api': { target: backendTarget, changeOrigin: false },
       '/healthz': { target: backendTarget, changeOrigin: false },
       '/readyz': { target: backendTarget, changeOrigin: false },
-      '/version': { target: backendTarget, changeOrigin: false },
     },
   },
 })

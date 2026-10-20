@@ -114,8 +114,37 @@ pub enum FormatError {
         to: u32,
         message: String,
     },
-    #[error("failed to update the on-disk format marker: {0}")]
-    Io(#[from] std::io::Error),
+    #[error("failed to read the on-disk format marker {path}: {source}")]
+    Read {
+        path: String,
+        source: std::io::Error,
+    },
+    #[error("failed to update the on-disk format marker {path}: {source}{hint}")]
+    Update {
+        path: String,
+        source: std::io::Error,
+        hint: &'static str,
+    },
+}
+
+fn read_error(path: &Path, source: std::io::Error) -> FormatError {
+    FormatError::Read {
+        path: path.display().to_string(),
+        source,
+    }
+}
+
+fn update_error(path: &Path, source: std::io::Error) -> FormatError {
+    let hint = if source.kind() == std::io::ErrorKind::PermissionDenied {
+        ". The data directory is not writable by this process. In Docker, use a named volume (-v maxio-data:/data). For a bind mount, give the directory to the container user (uid 999): chown 999:999 <host-path>."
+    } else {
+        ""
+    };
+    FormatError::Update {
+        path: path.display().to_string(),
+        source,
+        hint,
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -129,7 +158,10 @@ struct FormatFile {
 /// `keyring merge` call [`ensure_current`], which also migrates.
 pub async fn ensure_readable(data_dir: impl AsRef<Path>) -> Result<u32, FormatError> {
     let data_dir = data_dir.as_ref();
-    if !tokio::fs::try_exists(data_dir).await? {
+    if !tokio::fs::try_exists(data_dir)
+        .await
+        .map_err(|err| read_error(data_dir, err))?
+    {
         return Ok(0);
     }
     let found = read_format_version(data_dir).await?;
@@ -168,7 +200,9 @@ pub async fn apply_migrations(
     target: u32,
     migrations: &[Migration],
 ) -> Result<u32, FormatError> {
-    tokio::fs::create_dir_all(data_dir).await?;
+    tokio::fs::create_dir_all(data_dir)
+        .await
+        .map_err(|err| update_error(data_dir, err))?;
     let found = read_format_version(data_dir).await?;
     if found > target {
         return Err(newer_error(data_dir, found, target));
@@ -202,7 +236,7 @@ async fn read_format_version(data_dir: &Path) -> Result<u32, FormatError> {
     match tokio::fs::read(&path).await {
         Ok(bytes) => parse_format_version(&path, &bytes),
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(0),
-        Err(err) => Err(err.into()),
+        Err(err) => Err(read_error(&path, err)),
     }
 }
 
@@ -218,14 +252,28 @@ async fn write_format_version(data_dir: &Path, version: u32) -> Result<(), Forma
     let path = data_dir.join(FORMAT_FILENAME);
     let tmp = temp_marker_path(data_dir);
     let _guard = TempFileGuard(tmp.clone());
-    let mut body = serde_json::to_vec_pretty(&FormatFile { version })
-        .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err))?;
+    let mut body = serde_json::to_vec_pretty(&FormatFile { version }).map_err(|err| {
+        update_error(
+            &path,
+            std::io::Error::new(std::io::ErrorKind::InvalidData, err),
+        )
+    })?;
     body.push(b'\n');
-    tokio::fs::write(&tmp, &body).await?;
-    let file = tokio::fs::OpenOptions::new().write(true).open(&tmp).await?;
-    file.sync_all().await?;
+    tokio::fs::write(&tmp, &body)
+        .await
+        .map_err(|err| update_error(&path, err))?;
+    let file = tokio::fs::OpenOptions::new()
+        .write(true)
+        .open(&tmp)
+        .await
+        .map_err(|err| update_error(&path, err))?;
+    file.sync_all()
+        .await
+        .map_err(|err| update_error(&path, err))?;
     drop(file);
-    tokio::fs::rename(&tmp, &path).await?;
+    tokio::fs::rename(&tmp, &path)
+        .await
+        .map_err(|err| update_error(&path, err))?;
     Ok(())
 }
 
@@ -411,6 +459,18 @@ mod tests {
         let err = ensure_current(dir.path()).await.unwrap_err();
         assert!(err.to_string().contains("refusing to open"), "{err}");
         assert_eq!(std::fs::read(path).unwrap(), b"not-json");
+    }
+
+    #[tokio::test]
+    async fn marker_that_is_a_directory_fails_on_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(FORMAT_FILENAME);
+        std::fs::create_dir(&path).unwrap();
+
+        let message = ensure_current(dir.path()).await.unwrap_err().to_string();
+        assert!(message.contains("failed to read"), "{message}");
+        assert!(!message.contains("failed to update"), "{message}");
+        assert!(path.is_dir());
     }
 
     #[tokio::test]

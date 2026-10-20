@@ -1006,3 +1006,55 @@ async fn forwarded_host_and_longest_domain() {
     );
     assert!(!body.contains("<Code>"), "{body}");
 }
+
+#[tokio::test]
+async fn buckets_named_version_and_healthz_work_on_virtual_host() {
+    let server = start("localhost").await;
+    let hosts = ["version.localhost", "healthz.localhost"];
+    let client = http_client(server.port, &hosts);
+
+    for bucket in ["version", "healthz"] {
+        let host = format!("{bucket}.localhost");
+        let root = vurl(&host, server.port, "/");
+        let (status, body) = call_status(&client, "PUT", &root, vec![], &[]).await;
+        assert_eq!(status, 200, "{bucket} create: {body}");
+
+        let key = vurl(&host, server.port, "/note.txt");
+        let (status, body) = call_status(&client, "PUT", &key, b"vhost-probe".to_vec(), &[]).await;
+        assert_eq!(status, 200, "{bucket} put: {body}");
+
+        let (status, body) = call_status(&client, "GET", &key, vec![], &[]).await;
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(body, "vhost-probe");
+
+        let (status, body) = call_status(&client, "GET", &root, vec![], &[]).await;
+        assert_eq!(status, 200, "{body}");
+        assert!(body.contains("note.txt"), "{body}");
+        assert!(
+            !body.contains("\"status\":\"ok\""),
+            "virtual-hosted list must not be the health probe: {body}"
+        );
+
+        let versioning = vurl(&host, server.port, "/?versioning");
+        let (status, body) = call_status(&client, "GET", &versioning, vec![], &[]).await;
+        assert_eq!(status, 200, "{body}");
+        assert!(body.contains("VersioningConfiguration"), "{body}");
+
+        let (status, _) = call_status(&client, "DELETE", &key, vec![], &[]).await;
+        assert_eq!(status, 204, "{bucket} delete object");
+        let (status, body) = call_status(&client, "DELETE", &root, vec![], &[]).await;
+        assert_eq!(status, 204, "{bucket} delete bucket: {body}");
+    }
+
+    let health = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .unwrap()
+        .get(format!("{}/healthz", server.base))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(health.status(), 200);
+    let health_body = health.text().await.unwrap();
+    assert!(health_body.contains("\"status\":\"ok\""), "{health_body}");
+}

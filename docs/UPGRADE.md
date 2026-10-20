@@ -9,7 +9,7 @@ Losing the keyring makes SSE-S3 objects unreadable. There is no escrow key.
 
 ## Before you upgrade
 
-1. Note the running version: `maxio --version`, or `GET /version`.
+1. Note the running version: `maxio --version`, or `GET /api/version`.
 2. Stop the process and confirm nothing else is writing the data directory.
 3. Copy the whole data directory, including hidden files, to a place that is not the live path.
 
@@ -65,12 +65,12 @@ Future releases append a migration step and bump the marker only after that step
 
 ## Rollback
 
-Roll back when the new process fails to start, or when you have not yet accepted its writes.
+Do not roll back to a pre-1.0 build after this upgrade. No format-1 binary was released. Builds from before 1.0.0 ignore `.maxio-format`. They start on a version 2 directory and then return `InternalError` for a key stored at `<key>/.maxio.object`. Deleting the marker does not make those objects readable.
+
+Future releases refuse a marker newer than they understand. That refusal is the safe path. Do not delete the marker to force an older binary to start.
+
+To undo an upgrade that has not yet stored data you need:
 
 1. Stop the new process.
-2. A 0.4.x binary ignores `.maxio-format`. It can open a directory that has not yet stored a key at `<key>/.maxio.object`. Once any key has been promoted, or the marker is version 2 and you are not willing to risk that, restore the backup taken before this upgrade.
-3. A binary that understands only format 1 refuses a version 2 marker. That refusal is the safe path. Do not delete the marker to force the older binary to start.
-4. Restore `.maxio-keys.json` and `iam.json` from the same backup as the objects. A keyring from a different copy will not decrypt objects or IAM access-key secrets.
-5. Start the previous binary or image tag and check `/healthz`.
-
-Deleting `.maxio-format` to force an older binary to start is not a rollback. If the marker is newer than the binary, the binary is telling you the data needs that newer release.
+2. Restore the whole data directory from the backup taken before the upgrade, including `.maxio-keys.json` and `iam.json`. A keyring from a different copy will not decrypt objects or IAM access-key secrets.
+3. Start the previous 1.0.x binary or image tag (not a pre-1.0 build) and check `/healthz`.

@@ -17,8 +17,11 @@ on:
         type: boolean
         default: true
 
-# Tag pushes publish. workflow_dispatch publishes only when dry_run is false.
-# Pull requests always build the Linux amd64 binary and image and publish nothing.
+# Tag pushes of a stable version publish, including the :latest tags.
+# A pre-release tag (v1.0.0-rc.1) publishes that version and does not move :latest.
+# workflow_dispatch publishes only when dry_run is false.
+# Pull requests build the Linux amd64 binary and image and publish nothing.
+# Which targets run is chosen in the plan job. Job-level if cannot read matrix.
 permissions:
   contents: read
 
@@ -33,30 +36,87 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
+  plan:
+    name: Plan
+    runs-on: ubuntu-latest
+    outputs:
+      build: ${{ steps.matrix.outputs.build }}
+      docker: ${{ steps.matrix.outputs.docker }}
+      publish: ${{ steps.matrix.outputs.publish }}
+      latest: ${{ steps.matrix.outputs.latest }}
+      tag: ${{ steps.matrix.outputs.tag }}
+      version: ${{ steps.matrix.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - id: matrix
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_VERSION: ${{ inputs.version }}
+          INPUT_DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json, os, re, tomllib
+          event = os.environ["EVENT_NAME"]
+          raw = os.environ.get("INPUT_VERSION", "")
+          dry = os.environ.get("INPUT_DRY_RUN", "")
+          ref = os.environ.get("GITHUB_REF_NAME", "")
+          semver = re.compile(
+              r"^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)"
+              r"(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$"
+          )
+          if event == "workflow_dispatch":
+              tag = raw.strip()
+          elif event == "push":
+              tag = ref.strip()
+          else:
+              tag = ""
+          version = ""
+          if tag:
+              if not tag.startswith("v") or not semver.fullmatch(tag[1:]):
+                  raise SystemExit(f"refusing tag {tag!r}: expected vMAJOR.MINOR.PATCH or vMAJOR.MINOR.PATCH-prerelease")
+              version = tag[1:]
+              with open("Cargo.toml", "rb") as fh:
+                  cargo = tomllib.load(fh)["package"]["version"]
+              if cargo != version:
+                  raise SystemExit(f"Cargo version {cargo} does not match tag {tag}")
+          publish = event == "push" or (event == "workflow_dispatch" and dry != "true")
+          stable = bool(version) and "-" not in version
+          latest = publish and stable
+          amd64 = {"target": "x86_64-unknown-linux-musl", "runner": "ubuntu-24.04", "artifact": "maxio-linux-amd64"}
+          builds = [
+              amd64,
+              {"target": "aarch64-unknown-linux-musl", "runner": "ubuntu-24.04-arm", "artifact": "maxio-linux-arm64"},
+              {"target": "x86_64-apple-darwin", "runner": "macos-latest", "artifact": "maxio-macos-amd64"},
+              {"target": "aarch64-apple-darwin", "runner": "macos-latest", "artifact": "maxio-macos-arm64"},
+          ]
+          images = [
+              {"arch": "amd64", "platform": "linux/amd64", "runner": "ubuntu-24.04"},
+              {"arch": "aarch64", "platform": "linux/arm64", "runner": "ubuntu-24.04-arm"},
+          ]
+          if event == "pull_request":
+              builds = [amd64]
+              images = [images[0]]
+          out = os.environ["GITHUB_OUTPUT"]
+          with open(out, "a", encoding="utf-8") as fh:
+              fh.write(f"publish={'true' if publish else 'false'}\n")
+              fh.write(f"latest={'true' if latest else 'false'}\n")
+              fh.write(f"tag={tag}\n")
+              fh.write(f"version={version}\n")
+              fh.write(f"build={json.dumps(builds)}\n")
+              fh.write(f"docker={json.dumps(images)}\n")
+          print(f"event={event} publish={publish} latest={latest} tag={tag or '<none>'}")
+          PY
+
   build:
     name: Build ${{ matrix.artifact }}
-    if: github.event_name != 'pull_request' || matrix.pr == 'yes'
+    needs: plan
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - target: x86_64-unknown-linux-musl
-            runner: ubuntu-24.04
-            artifact: maxio-linux-amd64
-            pr: "yes"
-          - target: aarch64-unknown-linux-musl
-            runner: ubuntu-24.04-arm
-            artifact: maxio-linux-arm64
-            pr: "no"
-          - target: x86_64-apple-darwin
-            runner: macos-latest
-            artifact: maxio-macos-amd64
-            pr: "no"
-          - target: aarch64-apple-darwin
-            runner: macos-latest
-            artifact: maxio-macos-arm64
-            pr: "no"
+        include: ${{ fromJSON(needs.plan.outputs.build) }}
 
     steps:
       - uses: actions/checkout@v4
@@ -87,18 +147,6 @@ jobs:
       - name: Install frontend deps
         run: bun install --frozen-lockfile
         working-directory: ui
-
-      - name: Check tag matches Cargo version
-        if: github.event_name != 'pull_request'
-        run: |
-          TAG="${{ github.event.inputs.version || github.ref_name }}"
-          VERSION="$(python3 - <<'PYV'
-          import tomllib
-          with open("Cargo.toml", "rb") as f:
-              print(tomllib.load(f)["package"]["version"])
-          PYV
-          )"
-          test "${TAG#v}" = "$VERSION" || { echo "Cargo version $VERSION does not match tag $TAG"; exit 1; }
 
       - name: Build frontend
         run: bun run build
@@ -162,7 +210,7 @@ jobs:
 
   docker:
     name: Docker ${{ matrix.arch }}
-    if: github.event_name != 'pull_request' || matrix.pr == 'yes'
+    needs: plan
     runs-on: ${{ matrix.runner }}
     permissions:
       contents: read
@@ -170,20 +218,12 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - arch: amd64
-            platform: linux/amd64
-            runner: ubuntu-24.04
-            pr: "yes"
-          - arch: aarch64
-            platform: linux/arm64
-            runner: ubuntu-24.04-arm
-            pr: "no"
+        include: ${{ fromJSON(needs.plan.outputs.docker) }}
 
     steps:
       - uses: actions/checkout@v4
 
-      - name: Get version
+      - name: Image version
         id: version
         run: |
           VERSION="$(python3 - <<'PYV'
@@ -192,14 +232,40 @@ jobs:
               print(tomllib.load(f)["package"]["version"])
           PYV
           )"
-          if [ "${{ github.event_name }}" != "pull_request" ]; then
-            TAG="${{ github.event.inputs.version || github.ref_name }}"
-            test "${TAG#v}" = "$VERSION" || { echo "Cargo version $VERSION does not match tag $TAG"; exit 1; }
-          fi
           echo "VERSION=${VERSION}" >> "$GITHUB_OUTPUT"
 
+      - name: Docker Hub credentials
+        id: dockerhub
+        env:
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+        run: |
+          if [ -n "${DOCKERHUB_USERNAME}" ] && [ -n "${DOCKERHUB_TOKEN}" ]; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=false" >> "$GITHUB_OUTPUT"
+            echo "Docker Hub secrets are unset; this build publishes to GHCR only."
+          fi
+
+      - name: Image tags
+        id: tags
+        env:
+          PUBLISH: ${{ needs.plan.outputs.publish }}
+          DOCKERHUB: ${{ steps.dockerhub.outputs.present }}
+          VERSION: ${{ steps.version.outputs.VERSION }}
+          ARCH: ${{ matrix.arch }}
+        run: |
+          {
+            echo "tags<<EOF"
+            echo "${GITHUB_REGISTRY}/${IMAGE_NAME}:${VERSION}-${ARCH}"
+            if [ "$PUBLISH" = "true" ] && [ "$DOCKERHUB" = "true" ]; then
+              echo "${DOCKER_REGISTRY}/${IMAGE_NAME}:${VERSION}-${ARCH}"
+            fi
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
       - name: Login to ${{ env.GITHUB_REGISTRY }}
-        if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.dry_run == false)
+        if: needs.plan.outputs.publish == 'true'
         uses: docker/login-action@v3
         with:
           registry: ${{ env.GITHUB_REGISTRY }}
@@ -207,7 +273,7 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Login to ${{ env.DOCKER_REGISTRY }}
-        if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.dry_run == false)
+        if: needs.plan.outputs.publish == 'true' && steps.dockerhub.outputs.present == 'true'
         uses: docker/login-action@v3
         with:
           registry: ${{ env.DOCKER_REGISTRY }}
@@ -223,10 +289,8 @@ jobs:
           context: .
           file: Dockerfile
           platforms: ${{ matrix.platform }}
-          push: ${{ github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.dry_run == false) }}
-          tags: |
-            ${{ env.DOCKER_REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.version.outputs.VERSION }}-${{ matrix.arch }}
-            ${{ env.GITHUB_REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.version.outputs.VERSION }}-${{ matrix.arch }}
+          push: ${{ needs.plan.outputs.publish == 'true' }}
+          tags: ${{ steps.tags.outputs.tags }}
           labels: |
             org.opencontainers.image.title=MaxIO
             org.opencontainers.image.description=S3-compatible object storage server
@@ -237,14 +301,26 @@ jobs:
 
   docker-manifest:
     name: Docker manifest
-    needs: docker
-    if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.dry_run == false)
+    needs: [plan, docker]
+    if: needs.plan.outputs.publish == 'true'
     runs-on: ubuntu-24.04
     permissions:
       contents: read
       packages: write
     steps:
       - uses: docker/setup-buildx-action@v3
+
+      - name: Docker Hub credentials
+        id: dockerhub
+        env:
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+        run: |
+          if [ -n "${DOCKERHUB_USERNAME}" ] && [ -n "${DOCKERHUB_TOKEN}" ]; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=false" >> "$GITHUB_OUTPUT"
+          fi
 
       - name: Login to ${{ env.GITHUB_REGISTRY }}
         uses: docker/login-action@v3
@@ -254,54 +330,58 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Login to ${{ env.DOCKER_REGISTRY }}
+        if: steps.dockerhub.outputs.present == 'true'
         uses: docker/login-action@v3
         with:
           registry: ${{ env.DOCKER_REGISTRY }}
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-      - name: Get version
-        id: version
-        run: |
-          TAG="${{ github.event.inputs.version || github.ref_name }}"
-          VERSION="${TAG#v}"
-          echo "VERSION=${VERSION}" >> "$GITHUB_OUTPUT"
-
       - name: Publish multi-arch manifest on ${{ env.GITHUB_REGISTRY }}
+        env:
+          VERSION: ${{ needs.plan.outputs.version }}
+          LATEST: ${{ needs.plan.outputs.latest }}
         run: |
-          docker buildx imagetools create \
-            "${{ env.GITHUB_REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.version.outputs.VERSION }}-amd64" \
-            "${{ env.GITHUB_REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.version.outputs.VERSION }}-aarch64" \
-            --tag "${{ env.GITHUB_REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.version.outputs.VERSION }}" \
-            --tag "${{ env.GITHUB_REGISTRY }}/${{ env.IMAGE_NAME }}:latest"
+          args=(
+            "${GITHUB_REGISTRY}/${IMAGE_NAME}:${VERSION}-amd64"
+            "${GITHUB_REGISTRY}/${IMAGE_NAME}:${VERSION}-aarch64"
+            --tag "${GITHUB_REGISTRY}/${IMAGE_NAME}:${VERSION}"
+          )
+          if [ "$LATEST" = "true" ]; then
+            args+=(--tag "${GITHUB_REGISTRY}/${IMAGE_NAME}:latest")
+          fi
+          docker buildx imagetools create "${args[@]}"
 
       - name: Publish multi-arch manifest on ${{ env.DOCKER_REGISTRY }}
+        if: steps.dockerhub.outputs.present == 'true'
+        env:
+          VERSION: ${{ needs.plan.outputs.version }}
+          LATEST: ${{ needs.plan.outputs.latest }}
         run: |
-          docker buildx imagetools create \
-            "${{ env.DOCKER_REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.version.outputs.VERSION }}-amd64" \
-            "${{ env.DOCKER_REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.version.outputs.VERSION }}-aarch64" \
-            --tag "${{ env.DOCKER_REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.version.outputs.VERSION }}" \
-            --tag "${{ env.DOCKER_REGISTRY }}/${{ env.IMAGE_NAME }}:latest"
+          args=(
+            "${DOCKER_REGISTRY}/${IMAGE_NAME}:${VERSION}-amd64"
+            "${DOCKER_REGISTRY}/${IMAGE_NAME}:${VERSION}-aarch64"
+            --tag "${DOCKER_REGISTRY}/${IMAGE_NAME}:${VERSION}"
+          )
+          if [ "$LATEST" = "true" ]; then
+            args+=(--tag "${DOCKER_REGISTRY}/${IMAGE_NAME}:latest")
+          fi
+          docker buildx imagetools create "${args[@]}"
 
   release:
     name: GitHub Release
-    needs: build
-    if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.dry_run == false)
+    needs: [plan, build]
+    if: needs.plan.outputs.publish == 'true'
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
       - uses: actions/checkout@v4
 
-      - name: Get version
-        id: version
-        run: |
-          TAG="${{ github.event.inputs.version || github.ref_name }}"
-          echo "TAG=${TAG}" >> "$GITHUB_OUTPUT"
-          echo "VERSION=${TAG#v}" >> "$GITHUB_OUTPUT"
-
       - name: Release notes
-        run: bash scripts/release-notes.sh "${{ steps.version.outputs.VERSION }}" > release-notes.md
+        env:
+          RELEASE_VERSION: ${{ needs.plan.outputs.version }}
+        run: bash scripts/release-notes.sh "$RELEASE_VERSION" > release-notes.md
 
       - uses: actions/download-artifact@v4
         with:
@@ -314,8 +394,8 @@ jobs:
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ steps.version.outputs.TAG }}
-          name: MaxIO ${{ steps.version.outputs.VERSION }}
+          tag_name: ${{ needs.plan.outputs.tag }}
+          name: MaxIO ${{ needs.plan.outputs.version }}
           body_path: release-notes.md
           files: |
             *.tar.gz

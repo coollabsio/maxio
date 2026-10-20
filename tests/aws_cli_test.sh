@@ -151,13 +151,13 @@ print(value)
 if [ "${MAXIO_SMOKE:-0}" = "1" ]; then
     echo "=== smoke mode ==="
     HEALTH=$(curl -fsS "$ENDPOINT/healthz" || true)
-    VERSION_BODY=$(curl -fsS "$ENDPOINT/version" || true)
+    VERSION_BODY=$(curl -fsS "$ENDPOINT/api/version" || true)
     HEALTH_STATUS=$(json_field "$HEALTH" status)
     HEALTH_VERSION=$(json_field "$HEALTH" version)
     API_VERSION=$(json_field "$VERSION_BODY" version)
     assert_eq "healthz status is ok" "ok" "$HEALTH_STATUS"
     assert_eq "healthz version is not empty" "true" "$([ -n "$HEALTH_VERSION" ] && echo true || echo false)"
-    assert_eq "/version matches /healthz" "$HEALTH_VERSION" "$API_VERSION"
+    assert_eq "/api/version matches /healthz" "$HEALTH_VERSION" "$API_VERSION"
 
     if [ -n "${MAXIO_BIN:-}" ] && [ -x "${MAXIO_BIN}" ]; then
         BIN_VERSION=$("${MAXIO_BIN}" --version | awk '{print $NF}')
@@ -192,6 +192,36 @@ except Exception:
     echo "=== Results: $PASS passed, $FAIL failed ==="
     [ "$FAIL" -eq 0 ] && exit 0 || exit 1
 fi
+
+# Buckets whose names match probe paths. Unsigned GET /healthz with no query
+# stays the Docker health check; these calls are signed.
+echo ""
+echo "--- Buckets named version and healthz (path-style) ---"
+PROBE_CODE=$(curl -sS -o "$TMPDIR/healthz-body" -w '%{http_code}' "$ENDPOINT/healthz" || echo "000")
+assert_eq "unsigned GET /healthz is 200" "200" "$PROBE_CODE"
+assert_eq "unsigned GET /healthz is the probe" "true" \
+    "$(grep -q '"status":"ok"' "$TMPDIR/healthz-body" && echo true || echo false)"
+HEAD_CODE=$(curl -sS -o /dev/null -X HEAD -w '%{http_code}' "$ENDPOINT/healthz" || echo "000")
+# curl -I follows and prints headers; -w still reports the status.
+assert_eq "unsigned HEAD /healthz is 200" "200" "$HEAD_CODE"
+for PROBE_BUCKET in version healthz; do
+    echo "probe-$PROBE_BUCKET" > "$TMPDIR/probe.txt"
+    assert "create bucket $PROBE_BUCKET" $AWS s3 mb "s3://$PROBE_BUCKET"
+    LIST_OUT=$($AWS s3 ls 2>&1 || true)
+    assert_eq "list-buckets contains $PROBE_BUCKET" "true" \
+        "$(echo "$LIST_OUT" | grep -q "$PROBE_BUCKET" && echo true || echo false)"
+    assert "put object in $PROBE_BUCKET" $AWS s3 cp "$TMPDIR/probe.txt" "s3://$PROBE_BUCKET/note.txt"
+    assert "get object from $PROBE_BUCKET" $AWS s3 cp "s3://$PROBE_BUCKET/note.txt" "$TMPDIR/probe-down.txt"
+    assert_eq "$PROBE_BUCKET object body" "probe-$PROBE_BUCKET" "$(cat "$TMPDIR/probe-down.txt")"
+    OBJ_LIST=$($AWS s3 ls "s3://$PROBE_BUCKET/" 2>&1 || true)
+    assert_eq "list objects in $PROBE_BUCKET" "true" \
+        "$(echo "$OBJ_LIST" | grep -q note.txt && echo true || echo false)"
+    VERS=$($AWS s3api get-bucket-versioning --bucket "$PROBE_BUCKET" 2>&1 || true)
+    assert_eq "$PROBE_BUCKET get-bucket-versioning is not the probe" "true" \
+        "$(echo "$VERS" | grep -q '"status":"ok"' && echo false || echo true)"
+    assert "delete object in $PROBE_BUCKET" $AWS s3 rm "s3://$PROBE_BUCKET/note.txt"
+    assert "delete bucket $PROBE_BUCKET" $AWS s3 rb "s3://$PROBE_BUCKET"
+done
 
 # --- Bucket operations ---
 assert "create bucket" $AWS s3 mb "s3://$BUCKET"
@@ -2495,6 +2525,26 @@ EOF
     vaws() {
         AWS_CONFIG_FILE="$AWS_VCONF" "${VAWS[@]}" "$@"
     }
+
+    for PROBE_BUCKET in version healthz; do
+        pin_vhost "${PROBE_BUCKET}.localhost"
+        echo "vhost-$PROBE_BUCKET" > "$TMPDIR/vprobe.txt"
+        assert "virtual create bucket $PROBE_BUCKET" vaws s3 mb "s3://$PROBE_BUCKET"
+        assert "virtual put object in $PROBE_BUCKET" \
+            vaws s3 cp "$TMPDIR/vprobe.txt" "s3://$PROBE_BUCKET/note.txt"
+        assert "virtual get object from $PROBE_BUCKET" \
+            vaws s3 cp "s3://$PROBE_BUCKET/note.txt" "$TMPDIR/vprobe-down.txt"
+        assert_eq "virtual $PROBE_BUCKET object body" "vhost-$PROBE_BUCKET" \
+            "$(cat "$TMPDIR/vprobe-down.txt")"
+        VLIST=$(vaws s3api list-objects-v2 --bucket "$PROBE_BUCKET" 2>&1 || true)
+        assert_eq "virtual list $PROBE_BUCKET" "true" \
+            "$(echo "$VLIST" | grep -q note.txt && echo true || echo false)"
+        VVERS=$(vaws s3api get-bucket-versioning --bucket "$PROBE_BUCKET" 2>&1 || true)
+        assert_eq "virtual $PROBE_BUCKET versioning is not the probe" "true" \
+            "$(echo "$VVERS" | grep -q '"status":"ok"' && echo false || echo true)"
+        assert "virtual delete object in $PROBE_BUCKET" vaws s3 rm "s3://$PROBE_BUCKET/note.txt"
+        assert "virtual delete bucket $PROBE_BUCKET" vaws s3 rb "s3://$PROBE_BUCKET"
+    done
 
     assert "virtual create bucket" vaws s3 mb "s3://${VBUCKET}"
     assert "virtual head bucket" vaws s3api head-bucket --bucket "$VBUCKET"

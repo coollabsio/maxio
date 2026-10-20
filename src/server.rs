@@ -1,12 +1,13 @@
-use axum::Json;
 use axum::Router;
 use axum::body::Body;
 use axum::extract::{Request, State};
 use axum::http::{HeaderValue, StatusCode, header};
 use axum::middleware::from_fn_with_state;
 use axum::routing::get;
-use serde::Serialize;
+use http::Method;
 use std::convert::Infallible;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Duration;
@@ -72,16 +73,76 @@ impl From<Router> for AppService {
 impl Service<Request<Body>> for AppService {
     type Response = axum::response::Response;
     type Error = Infallible;
-    type Future = <Router as Service<Request<Body>>>::Future;
+    type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
 
     fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         <Router as Service<Request<Body>>>::poll_ready(&mut self.router, cx)
     }
 
     fn call(&mut self, mut request: Request<Body>) -> Self::Future {
+        // Probe only. A signed request, a query (`?versioning`), or a
+        // virtual-hosted bucket named healthz is an S3 call.
+        if is_health_probe(&request, &self.domains) {
+            let response = health_probe_response(request.method());
+            return Box::pin(std::future::ready(Ok(response)));
+        }
         vhost::apply(&mut request, &self.domains);
-        <Router as Service<Request<Body>>>::call(&mut self.router, request)
+        Box::pin(<Router as Service<Request<Body>>>::call(
+            &mut self.router,
+            request,
+        ))
     }
+}
+
+/// Unauthenticated `GET` or `HEAD /healthz` with no query and no virtual-host bucket.
+fn is_health_probe(request: &Request<Body>, domains: &[String]) -> bool {
+    let method = request.method();
+    if *method != Method::GET && *method != Method::HEAD {
+        return false;
+    }
+    let uri = request.uri();
+    if uri.path() != "/healthz" || uri.query().is_some() {
+        return false;
+    }
+    if request.headers().contains_key(http::header::AUTHORIZATION) {
+        return false;
+    }
+    !vhost::host_is_bucket(request, domains)
+}
+
+fn health_probe_response(method: &Method) -> axum::response::Response {
+    let body = if *method == Method::HEAD {
+        Body::empty()
+    } else {
+        Body::from(format!(r#"{{"status":"ok","version":"{VERSION}"}}"#))
+    };
+    let mut response = axum::response::Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(body)
+        .expect("health probe response");
+    insert_security_headers(response.headers_mut());
+    response
+}
+
+fn insert_security_headers(headers: &mut axum::http::HeaderMap) {
+    headers.entry(header::CONTENT_SECURITY_POLICY).or_insert_with(|| {
+        HeaderValue::from_static("default-src 'self'; base-uri 'self'; object-src 'none'; frame-ancestors 'none'; img-src 'self' https: data:; style-src 'self' 'unsafe-inline'; font-src 'self' data:; script-src 'self' 'unsafe-inline'; connect-src 'self'; form-action 'self'")
+    });
+    headers
+        .entry(header::X_CONTENT_TYPE_OPTIONS)
+        .or_insert(HeaderValue::from_static("nosniff"));
+    headers
+        .entry(header::REFERRER_POLICY)
+        .or_insert(HeaderValue::from_static("strict-origin-when-cross-origin"));
+    headers
+        .entry(header::X_FRAME_OPTIONS)
+        .or_insert(HeaderValue::from_static("DENY"));
+    headers
+        .entry("permissions-policy")
+        .or_insert(HeaderValue::from_static(
+            "camera=(), microphone=(), geolocation=()",
+        ));
 }
 
 pub fn build_router(state: AppState) -> AppService {
@@ -107,12 +168,12 @@ pub fn build_router(state: AppState) -> AppService {
 
     let mut router = Router::new()
         .nest("/api", console_router(state.clone()))
-        .route("/healthz", get(healthz))
-        .route("/version", get(version))
         .route("/readyz", get(readyz))
         // MinIO-compatible probes (GET and HEAD, unauthenticated). Registered
         // here, outside the S3 router, so the SigV4 auth layer never runs.
-        // These stay empty 200s; `/healthz` carries the version body.
+        // `/healthz` is not a route: AppService answers the probe only for an
+        // unauthenticated GET/HEAD with no query and no virtual-host bucket.
+        // Everything else, including bucket `healthz`, is S3.
         .route("/minio/health/live", get(live))
         .route("/minio/health/ready", get(readyz))
         .route("/minio/health/cluster", get(readyz))
@@ -146,28 +207,6 @@ async fn redirect_to_ui_root(uri: axum::http::Uri) -> axum::response::Redirect {
     }
 }
 
-#[derive(Serialize)]
-struct HealthResponse {
-    status: &'static str,
-    version: &'static str,
-}
-
-#[derive(Serialize)]
-struct VersionResponse {
-    version: &'static str,
-}
-
-async fn healthz() -> Json<HealthResponse> {
-    Json(HealthResponse {
-        status: "ok",
-        version: VERSION,
-    })
-}
-
-async fn version() -> Json<VersionResponse> {
-    Json(VersionResponse { version: VERSION })
-}
-
 async fn live() -> StatusCode {
     StatusCode::OK
 }
@@ -197,23 +236,6 @@ async fn security_headers_middleware(
     next: axum::middleware::Next,
 ) -> axum::response::Response {
     let mut response = next.run(request).await;
-    let headers = response.headers_mut();
-    headers.entry(header::CONTENT_SECURITY_POLICY).or_insert_with(|| {
-        HeaderValue::from_static("default-src 'self'; base-uri 'self'; object-src 'none'; frame-ancestors 'none'; img-src 'self' https: data:; style-src 'self' 'unsafe-inline'; font-src 'self' data:; script-src 'self' 'unsafe-inline'; connect-src 'self'; form-action 'self'")
-    });
-    headers
-        .entry(header::X_CONTENT_TYPE_OPTIONS)
-        .or_insert(HeaderValue::from_static("nosniff"));
-    headers
-        .entry(header::REFERRER_POLICY)
-        .or_insert(HeaderValue::from_static("strict-origin-when-cross-origin"));
-    headers
-        .entry(header::X_FRAME_OPTIONS)
-        .or_insert(HeaderValue::from_static("DENY"));
-    headers
-        .entry("permissions-policy")
-        .or_insert(HeaderValue::from_static(
-            "camera=(), microphone=(), geolocation=()",
-        ));
+    insert_security_headers(response.headers_mut());
     response
 }

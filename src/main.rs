@@ -182,13 +182,10 @@ async fn main() -> anyhow::Result<()> {
             ref master_key,
             ref master_key_file,
         }) => {
-            // Read-only check must not stamp a marker. --repair may, and only
-            // on a directory that already exists. A newer format is refused
-            // before either path rewrites anything.
+            // Read-only check must not stamp a marker. --repair writes it
+            // only after the data-directory lock is held (see check_with).
+            // A newer format is refused here, before any rewrite.
             storage::format::ensure_readable(data_dir).await?;
-            if repair && tokio::fs::try_exists(data_dir).await? {
-                storage::format::ensure_current(data_dir).await?;
-            }
             let inline = master_key.as_deref().or(cli.config.master_key.as_deref());
             let file = master_key_file
                 .as_deref()
@@ -232,16 +229,15 @@ async fn main() -> anyhow::Result<()> {
         );
     }
 
-    // Stamp or migrate the on-disk format before the keyring or buckets are
-    // written. A newer marker bails here and leaves the directory untouched.
-    let format_version = storage::format::ensure_current(&config.data_dir).await?;
-    tracing::info!("on-disk format version {format_version}");
-    // Held until this process exits, including after a graceful shutdown.
-    // A crash closes the fd and the OS drops the flock, so restart is not blocked.
+    // Lock first, then stamp the format marker, so two processes cannot
+    // migrate the same directory. Held until exit, including a graceful
+    // shutdown. A crash closes the fd and the OS drops the flock.
     let _data_lock = storage::lock::acquire_exclusive(
         std::path::Path::new(&config.data_dir),
         storage::lock::LockReason::Serve,
     )?;
+    let format_version = storage::format::ensure_current(&config.data_dir).await?;
+    tracing::info!("on-disk format version {format_version}");
 
     // Resolve the external key before any keyring file is created. IAM secrets
     // use the same key, so a missing keyring must not be replaced while

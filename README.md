@@ -37,13 +37,26 @@ The server refuses to start with the built-in `maxioadmin` / `maxioadmin` keys. 
 export MAXIO_ACCESS_KEY="local-admin"
 export MAXIO_SECRET_KEY="$(openssl rand -hex 24)"
 
-docker run -d --name maxio -p 9000:9000 -v "$(pwd)/data:/data" \
+# Named volume. The image runs as uid 999, which can write a volume Docker creates.
+docker run -d --name maxio -p 9000:9000 -v maxio-data:/data \
   -e MAXIO_ACCESS_KEY -e MAXIO_SECRET_KEY \
   ghcr.io/coollabsio/maxio
 
 printf 'Open http://localhost:9000/ui/ and sign in with %s / %s\n' \
   "$MAXIO_ACCESS_KEY" "$MAXIO_SECRET_KEY"
 ```
+
+A bind mount of a directory you create (`-v "$(pwd)/data:/data"`) is often root-owned, and the process then fails with `failed to update the on-disk format marker` / `Permission denied`. Either hand the directory to the container user first:
+
+```bash
+mkdir -p data
+sudo chown 999:999 data
+docker run -d --name maxio -p 9000:9000 -v "$(pwd)/data:/data" \
+  -e MAXIO_ACCESS_KEY -e MAXIO_SECRET_KEY \
+  ghcr.io/coollabsio/maxio
+```
+
+or run as your own user so the files stay yours: `--user "$(id -u):$(id -g)"`.
 
 Images are on [GHCR](https://ghcr.io/coollabsio/maxio) and Docker Hub (`coollabsio/maxio`).
 

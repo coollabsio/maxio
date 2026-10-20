@@ -378,6 +378,10 @@ export type RestoreVersionResponse = {
     versionId: string | null;
 };
 
+export type ServerVersion = {
+    version: string;
+};
+
 export type ServiceKeyBody = {
     access?: string | null;
     buckets?: Array<string>;
@@ -1583,3 +1587,19 @@ export type ValidateIamPolicyResponses = {
 };
 
 export type ValidateIamPolicyResponse = ValidateIamPolicyResponses[keyof ValidateIamPolicyResponses];
+
+export type GetServerVersionData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/api/version';
+};
+
+export type GetServerVersionResponses = {
+    /**
+     * Running server version
+     */
+    200: ServerVersion;
+};
+
+export type GetServerVersionResponse = GetServerVersionResponses[keyof GetServerVersionResponses];

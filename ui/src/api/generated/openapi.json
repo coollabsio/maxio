@@ -2244,6 +2244,29 @@
           }
         }
       }
+    },
+    "/api/version": {
+      "get": {
+        "tags": [
+          "meta"
+        ],
+        "operationId": "getServerVersion",
+        "responses": {
+          "200": {
+            "description": "Running server version",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ServerVersion"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {}
+        ]
+      }
     }
   },
   "components": {
@@ -3254,6 +3277,17 @@
               "null"
             ],
             "description": "Version id of the new current version (`null` when versioning is off)."
+          }
+        }
+      },
+      "ServerVersion": {
+        "type": "object",
+        "required": [
+          "version"
+        ],
+        "properties": {
+          "version": {
+            "type": "string"
           }
         }
       },

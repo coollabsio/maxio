@@ -199,6 +199,25 @@ async fn console_auth_middleware(
     next.run(request).await
 }
 
+#[derive(Serialize, ToSchema)]
+pub struct ServerVersion {
+    version: &'static str,
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/version",
+    operation_id = "getServerVersion",
+    tag = "meta",
+    security(()),
+    responses((status = 200, description = "Running server version", body = ServerVersion))
+)]
+pub async fn server_version() -> Json<ServerVersion> {
+    Json(ServerVersion {
+        version: env!("CARGO_PKG_VERSION"),
+    })
+}
+
 #[derive(Deserialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct LoginRequest {
@@ -2094,6 +2113,7 @@ pub fn console_router(state: AppState) -> Router<AppState> {
     let json_body_limit = DefaultBodyLimit::max(state.config.max_console_body_bytes);
 
     let public = Router::new()
+        .route("/version", get(server_version))
         .route("/auth/login", post(login))
         .route("/auth/check", get(check))
         .layer(json_body_limit);

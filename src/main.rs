@@ -96,6 +96,21 @@ enum KeyringCmd {
         #[arg(long, env = "MAXIO_DATA_DIR", default_value = "./data")]
         data_dir: String,
     },
+
+    /// Add every key from another keyring file into this data directory.
+    ///
+    /// Keeps the keys already stored here. The active key does not change when
+    /// this data directory already has one. Use this after
+    /// `--allow-missing-master-key` created a new key and you still have the
+    /// original `.maxio-keys.json`: pass that backup as `--from`. Do not copy
+    /// the backup over the current file; that drops the new key.
+    Merge {
+        #[arg(long, env = "MAXIO_DATA_DIR", default_value = "./data")]
+        data_dir: String,
+        /// Keyring file to merge in. Key material is not printed.
+        #[arg(long)]
+        from: std::path::PathBuf,
+    },
 }
 
 fn default_healthcheck_url() -> String {
@@ -119,6 +134,12 @@ async fn main() -> anyhow::Result<()> {
         }
         Some(Commands::Keyring(KeyringCmd::List { ref data_dir })) => {
             return run_keyring_list(data_dir).await;
+        }
+        Some(Commands::Keyring(KeyringCmd::Merge {
+            ref data_dir,
+            ref from,
+        })) => {
+            return run_keyring_merge(data_dir, from).await;
         }
         Some(Commands::Openapi { ref output }) => {
             let json = openapi::openapi_json();
@@ -364,6 +385,21 @@ async fn run_keyring_rotate(data_dir: &str) -> anyhow::Result<()> {
     println!("  total keys in ring: {}", result.total_keys);
     println!();
     println!("Restart the server to begin encrypting new objects with the new key.");
+    Ok(())
+}
+
+async fn run_keyring_merge(data_dir: &str, from: &std::path::Path) -> anyhow::Result<()> {
+    let result = storage::keys::merge_keyring(data_dir, from).await?;
+    println!("✓ keyring merged into {data_dir}/.maxio-keys.json");
+    if result.added_ids.is_empty() {
+        println!("  added:             <none> (already present)");
+    } else {
+        println!("  added:             {}", result.added_ids.join(", "));
+    }
+    println!("  active key id:     {}", result.active_id);
+    println!("  total keys in ring: {}", result.total_keys);
+    println!();
+    println!("Restart the server so it loads the merged keyring.");
     Ok(())
 }
 

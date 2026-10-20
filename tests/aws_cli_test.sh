@@ -3,8 +3,11 @@ set -euo pipefail
 
 # Integration tests using the AWS CLI and MinIO mc against a running maxio server.
 # Usage: ./tests/aws_cli_test.sh [port] [data_dir]
-# Expects maxio to be running on localhost:${PORT:-9000} with the default
-# maxioadmin/maxioadmin credentials (start it with --allow-insecure-dev).
+# Expects maxio to be running on localhost:${PORT:-9000}.
+# Credentials default to maxioadmin/maxioadmin (start that server with
+# --allow-insecure-dev). Override them to match a server that uses its own keys:
+#   MAXIO_TEST_ACCESS_KEY=... MAXIO_TEST_SECRET_KEY=... ./tests/aws_cli_test.sh
+# Sections that start their own server use the same variables.
 # Requires aws (AWS CLI v2), mc, python3, and curl.
 
 PORT="${1:-9000}"
@@ -15,8 +18,10 @@ TMPDIR=$(mktemp -d)
 PASS=0
 FAIL=0
 
-export AWS_ACCESS_KEY_ID=maxioadmin
-export AWS_SECRET_ACCESS_KEY=maxioadmin
+MAXIO_TEST_ACCESS_KEY="${MAXIO_TEST_ACCESS_KEY:-maxioadmin}"
+MAXIO_TEST_SECRET_KEY="${MAXIO_TEST_SECRET_KEY:-maxioadmin}"
+export AWS_ACCESS_KEY_ID="$MAXIO_TEST_ACCESS_KEY"
+export AWS_SECRET_ACCESS_KEY="$MAXIO_TEST_SECRET_KEY"
 export AWS_DEFAULT_REGION=us-east-1
 # A developer AWS config can switch the transfer client off the CRT path that
 # sends streaming trailer checksums. These tests must not inherit that.
@@ -1757,8 +1762,15 @@ else
 
     start_key_server() {
         : >"$KEY_LOG"
+        local -a cred_args=(
+            --access-key "$MAXIO_TEST_ACCESS_KEY"
+            --secret-key "$MAXIO_TEST_SECRET_KEY"
+        )
+        if [ "$MAXIO_TEST_ACCESS_KEY" = "maxioadmin" ] && [ "$MAXIO_TEST_SECRET_KEY" = "maxioadmin" ]; then
+            cred_args+=(--allow-insecure-dev)
+        fi
         "$MAXIO_BIN" --data-dir "$KEY_DATA" --port "$KEY_PORT" --address 127.0.0.1 \
-            --allow-insecure-dev "$@" >"$KEY_LOG" 2>&1 &
+            "${cred_args[@]}" "$@" >"$KEY_LOG" 2>&1 &
         KEY_PID=$!
         local attempt
         for attempt in $(seq 1 50); do

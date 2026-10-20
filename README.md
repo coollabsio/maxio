@@ -87,9 +87,9 @@ Each variable also has a CLI flag (for example `--port`). Run `maxio --help` for
 
 SSE-S3 objects are encrypted with a per-object data key. That data key is wrapped by a 32-byte master key. Losing every copy of the master key makes those objects unrecoverable. MaxIO does not escrow it.
 
-On first start, when `<data-dir>/.maxio-keys.json` does not exist and the data directory has no SSE-S3 objects, MaxIO generates a master key and writes it to that file (mode `0600` on Unix, created atomically and fsynced). Back this file up **outside** the data directory. `<data-dir>/.maxio-key-check.json` stays with the data. It stores a check value per key id and no key material. Do not delete it to "fix" a startup error.
+On first start, when `<data-dir>/.maxio-keys.json` does not exist and the data directory has no SSE-S3 objects and no key check file, MaxIO generates a master key and writes it to that file (mode `0600` on Unix, created atomically and fsynced). Back this file up **outside** the data directory. `<data-dir>/.maxio-key-check.json` stays with the data. It stores a check value per key id and no key material. Do not delete it to "fix" a startup error.
 
-If the key file is missing or the loaded key does not match the check value, and encrypted objects are present, MaxIO refuses to start and does not generate a replacement key. An unreadable or corrupt key file is never overwritten.
+If the key file is missing, MaxIO refuses to start when encrypted object metadata is present, and also when the key check file records key ids even if every object has been deleted. The error names which of those it found. A loaded key that does not match a check value also refuses to start. An unreadable or corrupt key file is never overwritten.
 
 ```bash
 # Generate a key outside the data directory. The shell variable is local to this command.
@@ -114,7 +114,19 @@ Set only one of `MAXIO_MASTER_KEY` and `MAXIO_MASTER_KEY_FILE`. The value is sta
 
 If the key file's mode is looser than `0600`, startup logs a warning and continues. Restrict it with `chmod 600`.
 
-`--allow-missing-master-key` starts anyway when the key is absent. Objects encrypted with the missing key stay unreadable, and the flag is required on every later start until the original key is restored. It does not override an unreadable key file or a check value that does not match the key you did load.
+`--allow-missing-master-key` starts anyway when the key is absent. Objects encrypted with the missing key stay unreadable, and the flag is required on every later start until the original key is restored. It does not override an unreadable key file or a check value that does not match the key you did load. The flag writes a new `.maxio-keys.json`. Objects created after that use the new key, and the check file still names the original key ids.
+
+### Recovering both keys
+
+Do not copy the original `.maxio-keys.json` over the new file. That drops the new key, and the next start fails with `data directory requires key ids [...]`.
+
+Merge the backup into the current keyring. Keys already on disk stay, including the new active key. Restart after the merge. Both sets of objects decrypt.
+
+```bash
+maxio keyring merge --data-dir /var/lib/maxio --from /backup/.maxio-keys.json
+```
+
+If the backup was already copied over the new file, put that new file back the same way (`--from` the saved copy of the new keyring). Without a copy of the new key, objects written after `--allow-missing-master-key` cannot be decrypted. `maxio keyring list` prints ids only.
 
 ## Usage
 

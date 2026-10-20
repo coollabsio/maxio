@@ -366,7 +366,11 @@ async fn test_default_buckets_skips_invalid_names() {
 
     for bucket in ["INVALID", "b..a", "a.-b", "a-.b", "192.168.0.1"] {
         let resp = s3_request("HEAD", &format!("{}/{}", base_url, bucket), vec![]).await;
-        assert_eq!(resp.status(), 404, "{bucket} should be skipped");
+        assert_eq!(
+            resp.status(),
+            400,
+            "{bucket} should be skipped and rejected as InvalidBucketName"
+        );
     }
 
     let resp = s3_request("HEAD", &format!("{}/valid", base_url), vec![]).await;
@@ -938,7 +942,7 @@ async fn test_create_bucket() {
 async fn test_create_bucket_rejects_canonical_invalid_names() {
     let (base_url, _tmp) = start_server().await;
 
-    for bucket in ["a.-b", "a-.b", "192.168.0.1"] {
+    for bucket in ["c", "ab", "a.-b", "a-.b", "192.168.0.1"] {
         let resp = s3_request("PUT", &format!("{}/{}", base_url, bucket), vec![]).await;
         assert_eq!(resp.status(), 400, "{bucket} should be rejected");
         let body = resp.text().await.unwrap();
@@ -946,6 +950,24 @@ async fn test_create_bucket_rejects_canonical_invalid_names() {
             body.contains("<Code>InvalidBucketName</Code>"),
             "{bucket} should return InvalidBucketName, got {body}"
         );
+    }
+
+    for (method, path) in [
+        ("GET", "/c"),
+        ("HEAD", "/c"),
+        ("DELETE", "/c"),
+        ("PUT", "/c/object.txt"),
+        ("GET", "/c/object.txt"),
+    ] {
+        let resp = s3_request(method, &format!("{base_url}{path}"), vec![]).await;
+        assert_eq!(resp.status(), 400, "{method} {path} should be 400");
+        if method != "HEAD" {
+            let body = resp.text().await.unwrap();
+            assert!(
+                body.contains("<Code>InvalidBucketName</Code>"),
+                "{method} {path} should return InvalidBucketName, got {body}"
+            );
+        }
     }
 }
 

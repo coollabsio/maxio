@@ -52,7 +52,7 @@ pub struct LoadOptions<'a> {
 
 // ── Persisted key file format ─────────────────────────────────────────────────
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Clone)]
 struct KeyEntryJson {
     id: String,
     key_b64: String,
@@ -337,6 +337,122 @@ pub async fn rotate(data_dir: &str) -> anyhow::Result<RotateResult> {
     })
 }
 
+/// Outcome of [`merge_keyring`].
+pub struct MergeResult {
+    pub active_id: String,
+    pub added_ids: Vec<String>,
+    pub total_keys: usize,
+}
+
+/// Merge every key from `from_path` into the data directory keyring.
+///
+/// Keys already in the data directory are kept. The active key stays the one
+/// already active there; if the data directory has no keyring yet, the imported
+/// file's active key becomes active. Conflicting bytes for one id abort the
+/// merge and leave the destination untouched.
+///
+/// Use this to put an original keyring back after `--allow-missing-master-key`
+/// created a new key. Replacing `.maxio-keys.json` with the backup drops the
+/// new key.
+pub async fn merge_keyring(data_dir: &str, from_path: &Path) -> anyhow::Result<MergeResult> {
+    let from_display = from_path.display().to_string();
+    let imported = match read_keyring_file(&from_display).await? {
+        KeyringFileState::Missing => {
+            anyhow::bail!("keyring file {from_display} not found");
+        }
+        KeyringFileState::Parsed(kr) => kr,
+    };
+    let mut imported_keys = HashMap::new();
+    ingest_keyring_entries(&mut imported_keys, &imported)?;
+    if imported.keys.is_empty() {
+        anyhow::bail!("keyring file {from_display} contains no keys");
+    }
+
+    let dest_path = keyring_path(data_dir);
+    if Path::new(&dest_path) == from_path {
+        anyhow::bail!("--from {from_display} is the data directory keyring; nothing to merge");
+    }
+
+    let (mut dest, dest_active) = match read_keyring_file(&dest_path).await? {
+        KeyringFileState::Missing => (KeyringFile { keys: Vec::new() }, None),
+        KeyringFileState::Parsed(kr) => {
+            let mut existing = HashMap::new();
+            let active = ingest_keyring_entries(&mut existing, &kr)?;
+            (kr, active)
+        }
+    };
+
+    let mut known: HashMap<String, [u8; 32]> = HashMap::new();
+    ingest_keyring_entries(&mut known, &dest)?;
+
+    let mut added_ids = Vec::new();
+    let mut active_id = dest_active;
+    for entry in &imported.keys {
+        let bytes = imported_keys[&entry.id];
+        if let Some(existing) = known.get(&entry.id) {
+            if existing != &bytes {
+                anyhow::bail!(
+                    "key id {} in {from_display} does not match the key already stored in {dest_path}. Refusing to merge.",
+                    entry.id
+                );
+            }
+            continue;
+        }
+        let becomes_active = active_id.is_none() && entry.active;
+        if becomes_active {
+            active_id = Some(entry.id.clone());
+        }
+        dest.keys.push(KeyEntryJson {
+            id: entry.id.clone(),
+            key_b64: entry.key_b64.clone(),
+            created_at: entry.created_at.clone(),
+            active: becomes_active,
+        });
+        known.insert(entry.id.clone(), bytes);
+        added_ids.push(entry.id.clone());
+    }
+
+    let active_id = match active_id {
+        Some(id) => id,
+        None => {
+            let id = dest.keys[0].id.clone();
+            dest.keys[0].active = true;
+            id
+        }
+    };
+    // Exactly one active flag. Imported entries that were active in the source
+    // file are stored inactive unless they were chosen above.
+    let mut seen_active = false;
+    for entry in &mut dest.keys {
+        if entry.id == active_id && !seen_active {
+            entry.active = true;
+            seen_active = true;
+        } else {
+            entry.active = false;
+        }
+    }
+
+    let json = serde_json::to_string_pretty(&dest)?;
+    write_private_file_atomic(&dest_path, &json, "SSE-S3 keyring").await?;
+
+    if let Err(err) = reconcile_key_check(data_dir, &known, false).await {
+        return Err(anyhow::anyhow!(
+            "{err}\n\nThe merged keyring was written to {dest_path} (added {}). Restart after the missing keys are merged in.",
+            if added_ids.is_empty() {
+                "nothing".to_string()
+            } else {
+                added_ids.join(", ")
+            }
+        ));
+    }
+
+    Ok(MergeResult {
+        active_id,
+        total_keys: dest.keys.len(),
+        added_ids,
+    })
+}
+
 /// Outcome of a `rotate` call. `previous_active_id` is `None` when rotating an
 /// empty or freshly-bootstrapped keyring.
 pub struct RotateResult {
@@ -598,13 +714,20 @@ enum CheckRead {
 }
 
 struct Requirement {
-    ids: BTreeSet<String>,
+    /// Key ids named by `.maxio-key-check.json`. The file has no key material.
+    check_ids: BTreeSet<String>,
+    /// Key ids found in SSE-S3 object or multipart metadata.
+    object_ids: BTreeSet<String>,
     unresolved: Vec<String>,
 }
 
 impl Requirement {
     fn is_empty(&self) -> bool {
-        self.ids.is_empty() && self.unresolved.is_empty()
+        self.check_ids.is_empty() && self.object_ids.is_empty() && self.unresolved.is_empty()
+    }
+
+    fn has_encrypted_objects(&self) -> bool {
+        !self.object_ids.is_empty() || !self.unresolved.is_empty()
     }
 }
 
@@ -638,7 +761,8 @@ async fn read_check_file(path: &str) -> anyhow::Result<CheckRead> {
 
 async fn collect_requirement(data_dir: &str) -> anyhow::Result<Requirement> {
     let mut req = Requirement {
-        ids: BTreeSet::new(),
+        check_ids: BTreeSet::new(),
+        object_ids: BTreeSet::new(),
         unresolved: Vec::new(),
     };
     match read_check_file(&check_path(data_dir)).await? {
@@ -646,14 +770,14 @@ async fn collect_requirement(data_dir: &str) -> anyhow::Result<Requirement> {
         CheckRead::Parsed(file) => {
             for entry in file.keys {
                 if !entry.id.is_empty() {
-                    req.ids.insert(entry.id);
+                    req.check_ids.insert(entry.id);
                 }
             }
         }
     }
     let scan = scan_sse_s3(data_dir).await?;
-    req.ids.extend(scan.ids);
-    req.unresolved.extend(scan.unresolved);
+    req.object_ids = scan.ids;
+    req.unresolved = scan.unresolved;
     Ok(req)
 }
 
@@ -662,36 +786,51 @@ fn missing_master_key_error(
     keyring_path: &str,
     req: &Requirement,
 ) -> anyhow::Error {
+    let check = check_path(data_dir);
+    let lead = if req.has_encrypted_objects() {
+        "SSE-S3 master key is missing and this data directory contains encrypted objects."
+    } else {
+        "SSE-S3 master key is missing. A key check file records key ids for this data directory; no encrypted object metadata was found."
+    };
     anyhow::anyhow!(
-        "SSE-S3 master key is missing and this data directory contains encrypted objects.\n\
+        "{lead}\n\
          \n\
          keyring file: {keyring_path} (not found)\n\
          data directory: {data_dir}\n\
+         key check file: {check}\n\
          still required: {}\n\
          \n\
-         Refusing to generate a new master key, because that would orphan existing SSE-S3 objects permanently.\n\
+         Refusing to generate a new master key. Restore the key, or pass --allow-missing-master-key\n\
+         (MAXIO_ALLOW_MISSING_MASTER_KEY=true) on every server start until the original keys are restored.\n\
          Restore {keyring_path} from backup, or pass the original key with --master-key / --master-key-file\n\
          (MAXIO_MASTER_KEY / MAXIO_MASTER_KEY_FILE).\n\
-         \n\
-         To abandon those objects and start anyway, pass --allow-missing-master-key\n\
-         (MAXIO_ALLOW_MISSING_MASTER_KEY=true) on every server start until the original keys are restored.\n\
-         That flag does not overwrite an unreadable or corrupt keyring file.",
+         That flag does not overwrite an unreadable or corrupt keyring file. If it creates a new key, merge the original keyring back with `maxio keyring merge` instead of replacing this file.",
         requirement_details(req)
     )
 }
 
 fn keys_do_not_satisfy_error(data_dir: &str, missing: &[String]) -> anyhow::Error {
     anyhow::anyhow!(
-        "SSE-S3 master key mismatch: data directory {data_dir} requires key ids [{}] but they are not in the loaded keyring. Refusing to start so existing objects are not orphaned. Restore .maxio-keys.json or pass the original key with --master-key / --master-key-file (MAXIO_MASTER_KEY / MAXIO_MASTER_KEY_FILE). To abandon those objects, pass --allow-missing-master-key on every start until the original keys are restored.",
+        "SSE-S3 master key mismatch: data directory {data_dir} requires key ids [{}] but they are not in the loaded keyring. Refusing to start so existing objects are not orphaned. If --allow-missing-master-key created a new key, merge that keyring with the original instead of replacing the file: maxio keyring merge --data-dir {data_dir} --from <the-other-keyring.json> then restart. Otherwise restore the original .maxio-keys.json or pass --master-key / --master-key-file (MAXIO_MASTER_KEY / MAXIO_MASTER_KEY_FILE). To abandon the missing keys, pass --allow-missing-master-key on every start until they are restored.",
         missing.join(", ")
     )
 }
 
 fn requirement_details(req: &Requirement) -> String {
     let mut details = Vec::new();
-    if !req.ids.is_empty() {
-        let ids: Vec<&str> = req.ids.iter().map(String::as_str).collect();
-        details.push(format!("key ids: {}", ids.join(", ")));
+    if !req.check_ids.is_empty() {
+        let ids: Vec<&str> = req.check_ids.iter().map(String::as_str).collect();
+        details.push(format!(
+            "key check file records key ids: {}",
+            ids.join(", ")
+        ));
+    }
+    if !req.object_ids.is_empty() {
+        let ids: Vec<&str> = req.object_ids.iter().map(String::as_str).collect();
+        details.push(format!(
+            "encrypted object metadata key ids: {}",
+            ids.join(", ")
+        ));
     }
     if !req.unresolved.is_empty() {
         let shown: Vec<&str> = req.unresolved.iter().take(5).map(String::as_str).collect();
@@ -1244,6 +1383,92 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn missing_key_with_only_check_file_does_not_claim_encrypted_objects() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().to_str().unwrap().to_string();
+        let kr = Keyring::load(&dir, None).await.unwrap();
+        let id = kr.active_id().to_string();
+        std::fs::remove_file(keyring_path(&dir)).unwrap();
+
+        let err = Keyring::load(&dir, None)
+            .await
+            .err()
+            .expect("check file alone must still refuse a new key");
+        let msg = err.to_string();
+        assert!(msg.contains("key check file"), "unexpected error: {msg}");
+        assert!(msg.contains(&id), "unexpected error: {msg}");
+        assert!(
+            msg.contains("no encrypted object metadata was found"),
+            "unexpected error: {msg}"
+        );
+        assert!(
+            !msg.contains("contains encrypted objects"),
+            "empty data dir must not claim encrypted objects: {msg}"
+        );
+        assert!(!std::path::Path::new(&keyring_path(&dir)).exists());
+    }
+
+    #[tokio::test]
+    async fn merge_restores_original_key_without_dropping_the_new_one() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().to_str().unwrap().to_string();
+        let original = Keyring::load(&dir, None).await.unwrap();
+        let old_id = original.active_id().to_string();
+        let dek = Keyring::generate_dek();
+        let (wrapped, nonce) = original.wrap_dek(&old_id, &dek).unwrap();
+        let backup = tmp.path().join("original-keys.json");
+        std::fs::copy(keyring_path(&dir), &backup).unwrap();
+
+        std::fs::remove_file(keyring_path(&dir)).unwrap();
+        let fresh = Keyring::load_with(
+            &dir,
+            LoadOptions {
+                master_key_b64: None,
+                allow_missing_master_key: true,
+            },
+        )
+        .await
+        .unwrap();
+        let new_id = fresh.active_id().to_string();
+        assert_ne!(new_id, old_id);
+        let new_keyring = std::fs::read(keyring_path(&dir)).unwrap();
+
+        // Copying the backup over the new file drops the new key.
+        std::fs::copy(&backup, keyring_path(&dir)).unwrap();
+        let replaced = Keyring::load(&dir, None)
+            .await
+            .err()
+            .expect("restored original alone must not satisfy the new key id");
+        let replaced_msg = replaced.to_string();
+        assert!(
+            replaced_msg.contains(&new_id),
+            "unexpected error: {replaced_msg}"
+        );
+        assert!(
+            replaced_msg.contains("keyring merge"),
+            "unexpected error: {replaced_msg}"
+        );
+
+        std::fs::write(keyring_path(&dir), new_keyring).unwrap();
+        let merged = merge_keyring(&dir, &backup).await.unwrap();
+        assert_eq!(merged.active_id, new_id);
+        assert_eq!(merged.added_ids, vec![old_id.clone()]);
+        assert_eq!(merged.total_keys, 2);
+
+        let loaded = Keyring::load(&dir, None).await.unwrap();
+        assert_eq!(loaded.active_id(), new_id);
+        assert_eq!(loaded.unwrap_dek(&old_id, &wrapped, &nonce).unwrap(), dek);
+        let new_dek = Keyring::generate_dek();
+        let (new_wrapped, new_nonce) = loaded.wrap_dek(&new_id, &new_dek).unwrap();
+        assert_eq!(
+            loaded
+                .unwrap_dek(&new_id, &new_wrapped, &new_nonce)
+                .unwrap(),
+            new_dek
+        );
+    }
+
     fn write_sse_sidecar(dir: &str, rel: &str, body: &str) {
         let path = std::path::PathBuf::from(dir).join(rel);
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -1283,6 +1508,10 @@ mod tests {
         assert!(
             msg.contains("Refusing to generate a new master key"),
             "unexpected error: {msg}"
+        );
+        assert!(
+            msg.contains("contains encrypted objects"),
+            "object metadata must be described as encrypted objects: {msg}"
         );
         assert!(
             msg.contains("aabbccddeeff0011"),

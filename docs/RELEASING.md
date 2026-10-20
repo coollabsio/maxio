@@ -1,9 +1,6 @@
 # Cutting a release
 
-Versions are [semantic versions](https://semver.org/spec/v2.0.0.html). The number in `Cargo.toml` is the release version. These must match it:
-
-- `ui/package.json` (`version`)
-- `ui/src/version.ts` (`appVersion`)
+Versions are [semantic versions](https://semver.org/spec/v2.0.0.html). The number in `Cargo.toml` is the release version. `ui/package.json` (`version`) must match it. The console bundle must not contain that string; the badge reads `GET /maxio/api/version` after login. `just dist-version-check` greps `ui/dist`.
 
 `just version-check` fails when they differ. `maxio --version` prints it. A signed-in console session can read `GET /maxio/api/version`, and the console badge uses that. Unauthenticated health checks are `GET /maxio/health/live` and `/maxio/health/ready`; they report status only.
 

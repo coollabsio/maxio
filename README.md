@@ -46,7 +46,13 @@ printf 'Open http://localhost:9000/ui/ and sign in with %s / %s\n' \
   "$MAXIO_ACCESS_KEY" "$MAXIO_SECRET_KEY"
 ```
 
-A bind mount of a directory you create (`-v "$(pwd)/data:/data"`) is often root-owned, and the process then fails with `failed to update the on-disk format marker` / `Permission denied`. Either hand the directory to the container user first:
+A bind mount of a directory you create (`-v "$(pwd)/data:/data"`) is often root-owned. Startup then fails while creating the lock file:
+
+```text
+failed to create the data-directory lock /data/.maxio.lock: Permission denied (os error 13). The data directory is not writable by this process. In Docker the image runs as uid 999. Use a named volume (-v maxio-data:/data). For a bind mount, chown 999:999 <host-path>, or start the container with --user matching the directory owner.
+```
+
+Either hand the directory to the container user first:
 
 ```bash
 mkdir -p data
@@ -112,7 +118,7 @@ maxio --domain s3.example.com --data-dir ./data --port 9000
 # MAXIO_DOMAIN=s3.example.com,s3.example.org
 ```
 
-A request whose `Host` is `<bucket>.<domain>` (a port is ignored, and the host is matched case-insensitively) is served from that bucket. The bare domain, an IP address, and any other host stay on path-style, so the web console (`/ui/`), `/maxio/api/`, `/maxio/health/*`, and `/minio/health/*` on the service host are unchanged. The bucket names `maxio` and `ui` are reserved. `api` is an ordinary bucket. Bucket names follow the S3 rules (lowercase letters, digits, dots, and hyphens, 3–63 characters). A dotted name such as `my.bucket` is the host `my.bucket.s3.example.com`. `ui.<domain>` is rejected with `InvalidBucketName`, the same as `maxio.<domain>`.
+A request whose `Host` is `<bucket>.<domain>` (a port is ignored, and the host is matched case-insensitively) is served from that bucket. The bare domain, an IP address, and any other host stay on path-style, so the web console (`/ui/`), `/maxio/api/`, and `/maxio/health/*` on the service host are unchanged. The bucket names `maxio` and `ui` are reserved. `api` is an ordinary bucket. Bucket names follow the S3 rules (lowercase letters, digits, dots, and hyphens, 3–63 characters). A dotted name such as `my.bucket` is the host `my.bucket.s3.example.com`. `ui.<domain>` is rejected with `InvalidBucketName`, the same as `maxio.<domain>`.
 
 The console UI stays at `/ui`. An unauthenticated browser `GET` or `HEAD` of `/ui` or `/ui/...` is the console when the request has no `Authorization` header, no `x-amz-*` header, no `X-Amz-*` presign query, and no S3 subresource or listing query. Any other request for that path is handled as S3 and fails because `ui` is not a valid bucket name. A working bucket named `ui` is not possible: S3 names are at least 3 characters, and that path is the console. `CreateBucket` returns `400 InvalidBucketName`. A data directory that already contains `buckets/ui` or `buckets/maxio` refuses to start; `maxio check` reports it and does not delete it. The console API is only `/maxio/api/*`. The session cookie uses `Path=/maxio`.
 

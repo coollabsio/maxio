@@ -136,7 +136,7 @@ fn read_error(path: &Path, source: std::io::Error) -> FormatError {
 
 fn update_error(path: &Path, source: std::io::Error) -> FormatError {
     let hint = if source.kind() == std::io::ErrorKind::PermissionDenied {
-        ". The data directory is not writable by this process. In Docker, use a named volume (-v maxio-data:/data). For a bind mount, give the directory to the container user (uid 999): chown 999:999 <host-path>."
+        ". The data directory is not writable by this process. In Docker the image runs as uid 999. Use a named volume (-v maxio-data:/data). For a bind mount, chown 999:999 <host-path>, or start the container with --user matching the directory owner."
     } else {
         ""
     };
@@ -154,8 +154,8 @@ struct FormatFile {
 
 /// Refuse a newer marker without creating the directory or writing the marker.
 ///
-/// Used by read-only `maxio check`. `serve`, `check --repair`, and
-/// `keyring merge` call [`ensure_current`], which also migrates.
+/// Used by read-only `maxio check`. `serve`, `check --repair`, `keyring rotate`,
+/// and `keyring merge` call [`ensure_current`] only after they hold the data-directory lock.
 pub async fn ensure_readable(data_dir: impl AsRef<Path>) -> Result<u32, FormatError> {
     let data_dir = data_dir.as_ref();
     if !tokio::fs::try_exists(data_dir)

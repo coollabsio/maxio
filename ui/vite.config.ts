@@ -45,7 +45,6 @@ export default defineConfig({
     // Keep the browser's Host header: the console CSRF check compares it with Origin.
     proxy: {
       '/maxio': { target: backendTarget, changeOrigin: false },
-      '/readyz': { target: backendTarget, changeOrigin: false },
     },
   },
 })

@@ -15,15 +15,7 @@ use tokio::sync::Semaphore;
 use crate::error::S3Error;
 
 pub fn is_health_path(path: &str) -> bool {
-    matches!(
-        path,
-        "/readyz"
-            | "/maxio/health/live"
-            | "/maxio/health/ready"
-            | "/minio/health/live"
-            | "/minio/health/ready"
-            | "/minio/health/cluster"
-    )
+    matches!(path, "/maxio/health/live" | "/maxio/health/ready")
 }
 
 fn with_retry_after(error: S3Error) -> Response {

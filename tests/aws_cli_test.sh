@@ -233,7 +233,7 @@ assert_eq "unsigned GET /ui/ is the console" "true" "$UI_PAGE_OK"
 UI_SUB=$(curl -sS "$ENDPOINT/ui?versioning" || true)
 assert_eq "unsigned GET /ui?versioning is S3" "true" \
     "$(printf '%s' "$UI_SUB" | grep -q '<Code>' && echo true || echo false)"
-for PROBE_BUCKET in version healthz api; do
+for PROBE_BUCKET in version healthz api readyz; do
     echo "probe-$PROBE_BUCKET" > "$TMPDIR/probe.txt"
     assert "create bucket $PROBE_BUCKET" $AWS s3 mb "s3://$PROBE_BUCKET"
     LIST_OUT=$($AWS s3 ls 2>&1 || true)
@@ -1112,61 +1112,32 @@ else
     YES_COUNT_BEFORE=$(echo "$LIST_BEFORE" | awk 'NR>1 && $3=="yes"{n++} END{print n+0}')
     assert_eq "pre-rotate: exactly 1 active key" "1" "$YES_COUNT_BEFORE"
 
-    # Run the rotate CLI.
+    # The live server holds the data-directory lock, so rotate must refuse
+    # and must not rewrite the keyring.
+    set +e
     ROTATE_OUT=$("$MAXIO_BIN" keyring rotate --data-dir "$DATA_DIR" 2>&1)
-    if echo "$ROTATE_OUT" | grep -q "keyring rotated"; then
-        green "PASS: rotate CLI output contains 'keyring rotated'"
+    ROTATE_STATUS=$?
+    set -e
+    if [ "$ROTATE_STATUS" -ne 0 ] && printf '%s' "$ROTATE_OUT" | grep -q "rotating the keyring"; then
+        green "PASS: rotate refuses while the server holds the data-dir lock"
         PASS=$((PASS + 1))
     else
-        red "FAIL: rotate CLI output missing 'keyring rotated' — got: $ROTATE_OUT"
+        red "FAIL: rotate should refuse while the server is running — status $ROTATE_STATUS: $ROTATE_OUT"
         FAIL=$((FAIL + 1))
     fi
-
-    NEW_KEY_ID=$(echo "$ROTATE_OUT" | grep "new active key id:" | awk '{print $NF}')
-    if [ -n "$NEW_KEY_ID" ] && [ "$NEW_KEY_ID" != "$PRE_KEY_ID" ]; then
-        green "PASS: rotate produced a new distinct key_id $NEW_KEY_ID"
-        PASS=$((PASS + 1))
-    else
-        red "FAIL: rotate key_id=$NEW_KEY_ID vs pre=$PRE_KEY_ID"
-        FAIL=$((FAIL + 1))
-    fi
-
-    # File perms 0600 (Unix only).
-    if [ "$(uname)" != "MINGW"* ] && [ "$(uname)" != "CYGWIN"* ]; then
-        PERMS=$(stat -c '%a' "$KEYRING_FILE" 2>/dev/null || stat -f '%Lp' "$KEYRING_FILE")
-        assert_eq "keyring file perms are 600 after rotate" "600" "$PERMS"
-    fi
-
-    # `keyring list` after: still exactly 1 active, total count is 2.
     LIST_AFTER=$("$MAXIO_BIN" keyring list --data-dir "$DATA_DIR" 2>&1)
     YES_COUNT_AFTER=$(echo "$LIST_AFTER" | awk 'NR>1 && $3=="yes"{n++} END{print n+0}')
-    NO_COUNT_AFTER=$(echo "$LIST_AFTER" | awk 'NR>1 && $3=="no"{n++} END{print n+0}')
-    assert_eq "post-rotate: exactly 1 active key" "1" "$YES_COUNT_AFTER"
-    assert_eq "post-rotate: previous key demoted (1 inactive)" "1" "$NO_COUNT_AFTER"
+    assert_eq "refused rotate leaves exactly 1 active key" "1" "$YES_COUNT_AFTER"
 
-    # Old object remains decryptable via the live server (its in-memory ring
-    # still has the old active key). This verifies that writing a new key to
-    # disk does NOT break the currently-running server's reads.
     $AWS s3api get-object --bucket "$ROT_BUCKET" --key pre.txt \
         "$TMPDIR/pre-out.txt" > /dev/null
     if cmp -s "$TMPDIR/pre.txt" "$TMPDIR/pre-out.txt"; then
-        green "PASS: pre-rotation object still readable from live server after rotate"
+        green "PASS: object still readable after refused rotate"
         PASS=$((PASS + 1))
     else
-        red "FAIL: pre-rotation object corrupted after rotate"
+        red "FAIL: object unreadable after refused rotate"
         FAIL=$((FAIL + 1))
     fi
-
-    # Second rotate → 3 keys total, 1 active.
-    "$MAXIO_BIN" keyring rotate --data-dir "$DATA_DIR" > /dev/null
-    LIST_FINAL=$("$MAXIO_BIN" keyring list --data-dir "$DATA_DIR" 2>&1)
-    TOTAL_FINAL=$(echo "$LIST_FINAL" | awk 'NR>1' | wc -l | tr -d ' ')
-    assert_eq "second rotate: 3 keys total" "3" "$TOTAL_FINAL"
-
-    # NOTE: verifying decryption AFTER a full restart (so the new key becomes
-    # the in-memory active key while the old keys remain for unwrap) is covered
-    # by the Rust integration test `test_keyring_rotate_preserves_old_objects`.
-    # This shell test cannot restart the caller-owned server process.
 
     $AWS s3 rm "s3://$ROT_BUCKET/pre.txt" > /dev/null || true
     assert "delete rotate bucket" $AWS s3api delete-bucket --bucket "$ROT_BUCKET"
@@ -2555,7 +2526,7 @@ EOF
         AWS_CONFIG_FILE="$AWS_VCONF" "${VAWS[@]}" "$@"
     }
 
-    for PROBE_BUCKET in version healthz api; do
+    for PROBE_BUCKET in version healthz api readyz; do
         pin_vhost "${PROBE_BUCKET}.localhost"
         echo "vhost-$PROBE_BUCKET" > "$TMPDIR/vprobe.txt"
         assert "virtual create bucket $PROBE_BUCKET" vaws s3 mb "s3://$PROBE_BUCKET"

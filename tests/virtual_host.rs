@@ -61,6 +61,7 @@ async fn start(domain: &str) -> Running {
         storage: Arc::new(storage),
         config: Arc::new(config),
         login_rate_limiter: Arc::new(maxio::api::console::LoginRateLimiter::new()),
+        revoked_sessions: Arc::new(maxio::api::console::RevokedSessions::new()),
     };
     let app = server::build_router(state);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -765,12 +766,7 @@ async fn dotted_bucket_uppercase_host_and_service_routes() {
     assert!(health_body.contains("\"status\":\"ok\""), "{health_body}");
     assert!(!health_body.contains("\"version\""), "{health_body}");
 
-    for path in [
-        "/readyz",
-        "/minio/health/live",
-        "/minio/health/ready",
-        "/maxio/health/ready",
-    ] {
+    for path in ["/maxio/health/ready"] {
         let response = reqwest::Client::builder()
             .no_proxy()
             .build()
@@ -1016,10 +1012,15 @@ async fn forwarded_host_and_longest_domain() {
 #[tokio::test]
 async fn buckets_named_version_and_healthz_work_on_virtual_host() {
     let server = start("localhost").await;
-    let hosts = ["version.localhost", "healthz.localhost", "api.localhost"];
+    let hosts = [
+        "version.localhost",
+        "healthz.localhost",
+        "api.localhost",
+        "readyz.localhost",
+    ];
     let client = http_client(server.port, &hosts);
 
-    for bucket in ["version", "healthz", "api"] {
+    for bucket in ["version", "healthz", "api", "readyz"] {
         let host = format!("{bucket}.localhost");
         let root = vurl(&host, server.port, "/");
         let (status, body) = call_status(&client, "PUT", &root, vec![], &[]).await;

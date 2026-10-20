@@ -44,9 +44,7 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: actionlint
-        run: |
-          bash <(curl -fsSL https://raw.githubusercontent.com/rhysd/actionlint/v1.7.7/scripts/download-actionlint.bash) 1.7.7
-          ./actionlint -color
+        uses: rhysd/actionlint@03d0035246f3e81f36aed592ffb4bebf33a03106 # v1.7.7
 
       - name: clippy
         run: cargo clippy --all-targets --all-features -- -D warnings
@@ -54,6 +52,9 @@ jobs:
       - name: Frontend build
         run: bun run build
         working-directory: ui
+
+      - name: Console bundle has no version
+        run: just dist-version-check
 
       - name: Frontend lint
         run: bun run lint

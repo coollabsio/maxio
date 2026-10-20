@@ -1883,15 +1883,29 @@ pub(crate) async fn reserved_buckets_present(buckets_dir: &Path) -> Vec<&'static
 }
 
 pub(crate) fn reserved_bucket_error(names: &[&str]) -> String {
-    let listed = names
-        .iter()
-        .map(|name| format!("\"{name}\""))
-        .collect::<Vec<_>>()
-        .join(" and ");
+    let listed = match names {
+        [name] => format!("a bucket named \"{name}\""),
+        _ => {
+            let quoted: Vec<String> = names.iter().map(|name| format!("\"{name}\"")).collect();
+            format!("buckets named {}", join_or(&quoted))
+        }
+    };
     format!(
-        "refusing to start: this data directory contains a bucket named {listed}, which this version of MaxIO reserves.\n\
+        "refusing to start: this data directory contains {listed}, which this version of MaxIO reserves.\n\
          Start the previous MaxIO version on this data directory, move the objects out, and remove the bucket (for example `aws s3 rb`), then start this version."
     )
+}
+
+fn join_or(items: &[String]) -> String {
+    match items {
+        [] => String::new(),
+        [one] => one.clone(),
+        [first, second] => format!("{first} or {second}"),
+        _ => {
+            let (last, rest) = items.split_last().unwrap();
+            format!("{} or {last}", rest.join(", "))
+        }
+    }
 }
 
 pub(crate) fn format_legacy_reserved_error(keys: &[LegacyReservedKey]) -> String {

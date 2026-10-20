@@ -57,6 +57,7 @@ async fn start_server() -> (String, TempDir) {
         storage: Arc::new(storage),
         config: Arc::new(config),
         login_rate_limiter: Arc::new(maxio::api::console::LoginRateLimiter::new()),
+        revoked_sessions: Arc::new(maxio::api::console::RevokedSessions::new()),
     };
 
     let app = server::build_router(state);
@@ -116,6 +117,7 @@ async fn start_server_with_keys(
         storage: Arc::new(storage),
         config: Arc::new(config),
         login_rate_limiter: Arc::new(maxio::api::console::LoginRateLimiter::new()),
+        revoked_sessions: Arc::new(maxio::api::console::RevokedSessions::new()),
     };
 
     let app = server::build_router(state);
@@ -171,6 +173,7 @@ async fn start_server_with_size_limits(max_object: u64, max_part: u64) -> (Strin
         storage: Arc::new(storage),
         config: Arc::new(config),
         login_rate_limiter: Arc::new(maxio::api::console::LoginRateLimiter::new()),
+        revoked_sessions: Arc::new(maxio::api::console::RevokedSessions::new()),
     };
 
     let app = server::build_router(state);
@@ -318,6 +321,7 @@ async fn start_server_with_default_buckets(default_buckets: &str) -> (String, Te
         storage: Arc::new(storage),
         config: Arc::new(config),
         login_rate_limiter: Arc::new(maxio::api::console::LoginRateLimiter::new()),
+        revoked_sessions: Arc::new(maxio::api::console::RevokedSessions::new()),
     };
 
     let app = server::build_router(state);
@@ -396,6 +400,7 @@ async fn test_default_buckets_skip_existing() {
         storage: Arc::new(storage),
         config: Arc::new(config),
         login_rate_limiter: Arc::new(maxio::api::console::LoginRateLimiter::new()),
+        revoked_sessions: Arc::new(maxio::api::console::RevokedSessions::new()),
     };
     let app = server::build_router(state);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -860,6 +865,62 @@ async fn test_version_endpoint_reports_package_version() {
 }
 
 #[tokio::test]
+async fn logout_rejects_the_old_session_cookie() {
+    let (base_url, _tmp) = start_server().await;
+    let login = client()
+        .post(format!("{base_url}/maxio/api/auth/login"))
+        .json(&serde_json::json!({
+            "accessKey": ACCESS_KEY,
+            "secretKey": SECRET_KEY
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(login.status(), 200);
+    let session = login
+        .headers()
+        .get("set-cookie")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .strip_prefix("maxio_session=")
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap()
+        .to_string();
+    let cookie = format!("maxio_session={session}");
+    let before = client()
+        .get(format!("{base_url}/maxio/api/version"))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(before.status(), 200);
+    let logout = client()
+        .post(format!("{base_url}/maxio/api/auth/logout"))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(logout.status(), 200, "{}", logout.text().await.unwrap());
+    let after = client()
+        .get(format!("{base_url}/maxio/api/version"))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(after.status(), 401, "{}", after.text().await.unwrap());
+    let check = client()
+        .get(format!("{base_url}/maxio/api/auth/check"))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(check.status(), 401);
+}
+
+#[tokio::test]
 async fn health_ready_is_503_when_the_data_dir_cannot_be_read() {
     let (base_url, tmp) = start_server().await;
     let ready = client()
@@ -970,7 +1031,7 @@ async fn probe_names_are_buckets_and_unsigned_healthz_stays_a_probe() {
         "{old_api_body}"
     );
 
-    for bucket in ["version", "healthz", "api"] {
+    for bucket in ["version", "healthz", "api", "readyz"] {
         let root = format!("{base_url}/{bucket}");
         let created = signed("PUT", &root, b"").await;
         assert_eq!(
@@ -1069,14 +1130,25 @@ async fn bucket_ui_is_reserved_and_browser_get_is_the_console() {
 }
 
 #[tokio::test]
-async fn test_readyz_is_public_and_returns_ok() {
+async fn legacy_health_aliases_are_not_probes() {
     let (base_url, _tmp) = start_server().await;
-    let resp = client()
-        .get(format!("{}/readyz", base_url))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), 200);
+    for path in [
+        "/readyz",
+        "/minio/health/live",
+        "/minio/health/ready",
+        "/minio/health/cluster",
+    ] {
+        let resp = client()
+            .get(format!("{base_url}{path}"))
+            .send()
+            .await
+            .unwrap();
+        let status = resp.status();
+        let body = resp.text().await.unwrap();
+        assert_ne!(status, 200, "{path} must not be a health probe: {body}");
+        assert!(body.contains("<Code>"), "{path}: {body}");
+        body_has_no_version(&body);
+    }
 }
 
 #[tokio::test]
@@ -3602,6 +3674,7 @@ async fn start_server_ec() -> (String, TempDir) {
         storage: Arc::new(storage),
         config: Arc::new(config),
         login_rate_limiter: Arc::new(maxio::api::console::LoginRateLimiter::new()),
+        revoked_sessions: Arc::new(maxio::api::console::RevokedSessions::new()),
     };
 
     let app = server::build_router(state);
@@ -4127,6 +4200,7 @@ async fn start_server_parity(parity_shards: u32) -> (String, TempDir) {
         storage: Arc::new(storage),
         config: Arc::new(config),
         login_rate_limiter: Arc::new(maxio::api::console::LoginRateLimiter::new()),
+        revoked_sessions: Arc::new(maxio::api::console::RevokedSessions::new()),
     };
 
     let app = server::build_router(state);
@@ -6994,6 +7068,7 @@ async fn start_server_ec_parity(chunk_size: u64, parity_shards: u32) -> (String,
         storage: Arc::new(storage),
         config: Arc::new(config),
         login_rate_limiter: Arc::new(maxio::api::console::LoginRateLimiter::new()),
+        revoked_sessions: Arc::new(maxio::api::console::RevokedSessions::new()),
     };
 
     let app = server::build_router(state);
@@ -9091,25 +9166,18 @@ async fn test_a_list_encoding_type_and_fetch_owner() {
 }
 
 #[tokio::test]
-async fn test_a_minio_health_endpoints() {
+async fn test_a_minio_health_endpoints_are_not_aliases() {
     let (base, _tmp) = start_server().await;
     for path in [
         "/minio/health/live",
         "/minio/health/ready",
         "/minio/health/cluster",
     ] {
-        let resp = client()
-            .get(format!("{}{}", base, path))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), 200, "GET {}", path);
-        let resp = client()
-            .head(format!("{}{}", base, path))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), 200, "HEAD {}", path);
+        let resp = client().get(format!("{base}{path}")).send().await.unwrap();
+        let status = resp.status();
+        let body = resp.text().await.unwrap();
+        assert_eq!(status, 403, "GET {path}: {body}");
+        assert!(body.contains("<Code>"), "{path}: {body}");
     }
 }
 

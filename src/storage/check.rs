@@ -128,6 +128,61 @@ impl CheckReport {
             .count()
     }
 
+    /// Process exit text. `--repair` never tells the operator to run `--repair` again.
+    pub fn failure_message(&self, repair: bool) -> String {
+        let open: Vec<&Issue> = self
+            .issues
+            .iter()
+            .filter(|issue| !issue.advisory && !issue.repaired)
+            .collect();
+        let mut notes = Vec::new();
+        if open
+            .iter()
+            .any(|issue| issue.kind == IssueKind::KeyringMissing)
+        {
+            notes.push(
+                "A missing or mismatched SSE-S3 master key cannot be cleared with --repair. Pass the original key with --master-key, --master-key-file, MAXIO_MASTER_KEY, or MAXIO_MASTER_KEY_FILE.".to_string(),
+            );
+        }
+        if open
+            .iter()
+            .any(|issue| issue.kind == IssueKind::ReservedBucket)
+        {
+            notes.push(
+                "A reserved bucket has to be emptied with the previous MaxIO version and removed (for example `aws s3 rb`). check does not delete it.".to_string(),
+            );
+        }
+        if open
+            .iter()
+            .any(|issue| issue.kind == IssueKind::LegacyReservedKey)
+        {
+            notes.push(
+                "An object key that uses a reserved name has to be renamed or deleted with the previous MaxIO version (for example `aws s3 mv`). check does not modify it.".to_string(),
+            );
+        }
+        let manual = |kind: IssueKind| {
+            matches!(
+                kind,
+                IssueKind::KeyringMissing
+                    | IssueKind::ReservedBucket
+                    | IssueKind::LegacyReservedKey
+            )
+        };
+        let only_manual = open.iter().all(|issue| manual(issue.kind));
+        if repair || only_manual {
+            if notes.is_empty() {
+                notes.push(
+                    "The remaining issues need a manual fix. The report above names each path."
+                        .to_string(),
+                );
+            }
+            format!("{} unresolved issue(s). {}", open.len(), notes.join(" "))
+        } else {
+            notes.push("rerun with --repair for the cases MaxIO can fix safely".to_string());
+            format!("{} unresolved issue(s); {}", open.len(), notes.join(" "))
+        }
+    }
+
     pub fn print(&self) {
         for issue in &self.issues {
             let action = if issue.repaired {
@@ -1710,6 +1765,56 @@ mod tests {
             );
             assert!(bucket.join(".bucket.json").exists(), "{name}");
         }
+
+        let tmp = tempfile::tempdir().unwrap();
+        for name in ["maxio", "ui"] {
+            let bucket = tmp.path().join("buckets").join(name);
+            std::fs::create_dir_all(&bucket).unwrap();
+        }
+        let keyring = Arc::new(
+            Keyring::load(tmp.path().to_str().unwrap(), None)
+                .await
+                .unwrap(),
+        );
+        let err =
+            match FilesystemStorage::new(tmp.path().to_str().unwrap(), false, 1024, 0, keyring)
+                .await
+            {
+                Err(err) => err.to_string(),
+                Ok(_) => panic!("startup should refuse both reserved buckets"),
+            };
+        assert!(err.contains("buckets named \"maxio\" or \"ui\""), "{err}");
+    }
+
+    #[test]
+    fn repair_does_not_ask_to_rerun_repair() {
+        let mut manual = CheckReport::default();
+        manual.issues.push(Issue {
+            kind: IssueKind::ReservedBucket,
+            path: "buckets/ui".to_string(),
+            detail: "bucket name ui is reserved".to_string(),
+            repaired: false,
+            advisory: false,
+        });
+        let repaired = manual.failure_message(true);
+        assert!(!repaired.contains("rerun with --repair"), "{repaired}");
+        assert!(repaired.contains("aws s3 rb"), "{repaired}");
+        let read_only = manual.failure_message(false);
+        assert!(!read_only.contains("rerun with --repair"), "{read_only}");
+
+        let mut fixable = CheckReport::default();
+        fixable.issues.push(Issue {
+            kind: IssueKind::StaleTemp,
+            path: "buckets/b/.maxio-tmp-x".to_string(),
+            detail: "temp".to_string(),
+            repaired: false,
+            advisory: false,
+        });
+        let suggest = fixable.failure_message(false);
+        assert!(suggest.contains("rerun with --repair"), "{suggest}");
+        let after = fixable.failure_message(true);
+        assert!(!after.contains("rerun with --repair"), "{after}");
+        assert!(after.contains("manual fix"), "{after}");
     }
 
     async fn storage_at(dir: &std::path::Path) -> FilesystemStorage {

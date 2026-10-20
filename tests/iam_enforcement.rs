@@ -45,6 +45,7 @@ async fn start_server() -> (String, TempDir) {
         storage: Arc::new(storage),
         config: Arc::new(config),
         login_rate_limiter: Arc::new(maxio::api::console::LoginRateLimiter::new()),
+        revoked_sessions: Arc::new(maxio::api::console::RevokedSessions::new()),
     };
     let app = server::build_router(state);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

@@ -1,5 +1,6 @@
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::net::SocketAddr;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use axum::{
@@ -23,6 +24,37 @@ use crate::storage::filesystem::FilesystemStorage;
 type HmacSha256 = Hmac<Sha256>;
 
 const COOKIE_NAME: &str = "maxio_session";
+
+/// Cookies that logout has already accepted. A stateless HMAC cookie stays
+/// valid until this set rejects it.
+#[derive(Clone, Default)]
+pub struct RevokedSessions {
+    tokens: Arc<Mutex<HashSet<String>>>,
+}
+
+impl RevokedSessions {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn revoke(&self, token: &str) {
+        match self.tokens.lock() {
+            Ok(mut guard) => {
+                guard.insert(token.to_string());
+            }
+            Err(poisoned) => {
+                poisoned.into_inner().insert(token.to_string());
+            }
+        }
+    }
+
+    pub fn contains(&self, token: &str) -> bool {
+        match self.tokens.lock() {
+            Ok(guard) => guard.contains(token),
+            Err(poisoned) => poisoned.into_inner().contains(token),
+        }
+    }
+}
 const TOKEN_MAX_AGE_SECS: i64 = 7 * 24 * 60 * 60; // 7 days
 
 const RATE_LIMIT_MAX: u32 = 10;
@@ -173,6 +205,9 @@ async fn console_auth_middleware(
     let Some(token) = extract_cookie(request.headers()) else {
         return error(StatusCode::UNAUTHORIZED, "Not authenticated");
     };
+    if state.revoked_sessions.contains(&token) {
+        return error(StatusCode::UNAUTHORIZED, "Not authenticated");
+    }
     let identity = match crate::iam::console_from_token(&state.config, &token).await {
         Ok(identity) => identity,
         Err(()) => return error(StatusCode::UNAUTHORIZED, "Not authenticated"),
@@ -358,6 +393,9 @@ pub async fn check(State(state): State<AppState>, headers: HeaderMap) -> Respons
     let Some(token) = extract_cookie(&headers) else {
         return error(StatusCode::UNAUTHORIZED, "Not authenticated");
     };
+    if state.revoked_sessions.contains(&token) {
+        return error(StatusCode::UNAUTHORIZED, "Not authenticated");
+    }
     match crate::iam::console_from_token(&state.config, &token).await {
         Ok(identity) => (StatusCode::OK, Json(session_response(&identity))).into_response(),
         Err(()) => error(StatusCode::UNAUTHORIZED, "Not authenticated"),
@@ -372,6 +410,9 @@ pub async fn check(State(state): State<AppState>, headers: HeaderMap) -> Respons
     responses((status = 200, body = OkResponse))
 )]
 pub async fn logout(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if let Some(token) = extract_cookie(&headers) {
+        state.revoked_sessions.revoke(&token);
+    }
     let cookie = make_cookie("", 0, console_cookie_secure(&state.config, &headers));
     let mut resp_headers = HeaderMap::new();
     resp_headers.insert("Set-Cookie", cookie.parse().unwrap());

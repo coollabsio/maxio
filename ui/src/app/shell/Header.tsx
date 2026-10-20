@@ -125,7 +125,7 @@ function Brand({ collapsed = false }: { collapsed?: boolean }) {
     <button
       type="button"
       onClick={() => navigate('/')}
-      title={`MaxIO v${version}`}
+      title={version ? `MaxIO v${version}` : 'MaxIO'}
       className="flex min-w-0 items-center gap-2 rounded-md transition-opacity hover:opacity-80 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
     >
       <img src={`${import.meta.env.BASE_URL}logo.svg`} alt="" className="size-5 shrink-0" />

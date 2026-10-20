@@ -32,6 +32,8 @@ pub struct AppState {
     pub storage: Arc<FilesystemStorage>,
     pub config: Arc<Config>,
     pub login_rate_limiter: Arc<LoginRateLimiter>,
+    /// Console cookies rejected after logout. The token itself is stateless.
+    pub revoked_sessions: Arc<crate::api::console::RevokedSessions>,
 }
 
 /// Router plus the pre-routing virtual-host rewrite.
@@ -136,16 +138,10 @@ pub fn build_router(state: AppState) -> AppService {
 
     let mut router = Router::new()
         .nest("/maxio/api", console_router(state.clone()))
-        .route("/readyz", get(readyz))
-        // Service probes. Unauthenticated, and they do not carry the version.
-        // Registered outside the S3 router so SigV4 never runs. `GET /healthz`
-        // and `GET /version` are ordinary bucket paths. The console API is
-        // only `/maxio/api/*`; `/api/*` is an ordinary bucket path.
+        // The only unauthenticated probes. `/readyz`, `/healthz`, `/version`,
+        // and `/minio/health/*` are ordinary bucket paths.
         .route("/maxio/health/live", get(health_live))
         .route("/maxio/health/ready", get(health_ready))
-        .route("/minio/health/live", get(live))
-        .route("/minio/health/ready", get(readyz))
-        .route("/minio/health/cluster", get(readyz))
         // `/ui` is not a static route. Browser GET/HEAD is the console; every
         // other request, including bucket `ui`, falls through to S3.
         .merge(s3_routes)
@@ -256,14 +252,6 @@ async fn health_ready(State(state): State<AppState>) -> axum::response::Response
     } else {
         health_json("unavailable", StatusCode::SERVICE_UNAVAILABLE)
     }
-}
-
-async fn live() -> StatusCode {
-    StatusCode::OK
-}
-
-async fn readyz(State(_state): State<AppState>) -> StatusCode {
-    StatusCode::OK
 }
 
 async fn request_id_middleware(

@@ -44,6 +44,7 @@ jobs:
       docker: ${{ steps.matrix.outputs.docker }}
       publish: ${{ steps.matrix.outputs.publish }}
       latest: ${{ steps.matrix.outputs.latest }}
+      prerelease: ${{ steps.matrix.outputs.prerelease }}
       tag: ${{ steps.matrix.outputs.tag }}
       version: ${{ steps.matrix.outputs.version }}
     steps:
@@ -84,6 +85,7 @@ jobs:
           publish = event == "push" or (event == "workflow_dispatch" and dry != "true")
           stable = bool(version) and "-" not in version
           latest = publish and stable
+          prerelease = publish and bool(version) and not stable
           amd64 = {"target": "x86_64-unknown-linux-musl", "runner": "ubuntu-24.04", "artifact": "maxio-linux-amd64"}
           builds = [
               amd64,
@@ -102,11 +104,12 @@ jobs:
           with open(out, "a", encoding="utf-8") as fh:
               fh.write(f"publish={'true' if publish else 'false'}\n")
               fh.write(f"latest={'true' if latest else 'false'}\n")
+              fh.write(f"prerelease={'true' if prerelease else 'false'}\n")
               fh.write(f"tag={tag}\n")
               fh.write(f"version={version}\n")
               fh.write(f"build={json.dumps(builds)}\n")
               fh.write(f"docker={json.dumps(images)}\n")
-          print(f"event={event} publish={publish} latest={latest} tag={tag or '<none>'}")
+          print(f"event={event} publish={publish} latest={latest} prerelease={prerelease} tag={tag or '<none>'}")
           PY
 
   build:
@@ -397,6 +400,7 @@ jobs:
           tag_name: ${{ needs.plan.outputs.tag }}
           name: MaxIO ${{ needs.plan.outputs.version }}
           body_path: release-notes.md
+          prerelease: ${{ needs.plan.outputs.prerelease == 'true' }}
           files: |
             *.tar.gz
             SHA256SUMS

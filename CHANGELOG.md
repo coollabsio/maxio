@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- The console bundle no longer contains the release version. The badge shows `GET /maxio/api/version` only after login. Logout invalidates that session on the server.
+- `/readyz` and `/minio/health/*` are gone. `/maxio/health/live` and `/maxio/health/ready` are the only health URLs. `readyz` is an ordinary bucket.
+- A data directory the process cannot write, including the lock file, names uid 999, `chown`, and `--user`.
+- `keyring rotate` and `keyring merge` take the data-directory lock before writing, and refuse while a server holds it.
+- A pre-release tag is marked prerelease on the GitHub Release.
+
 ## [1.0.0]
 
 ### Added

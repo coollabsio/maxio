@@ -1,8 +1,10 @@
+pub mod check;
 pub mod chunk_reader;
 pub mod crypto;
 pub mod filesystem;
 pub mod keys;
 pub mod lifecycle;
+pub mod lock;
 
 use base64::Engine;
 use serde::{Deserialize, Serialize};

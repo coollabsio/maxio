@@ -83,7 +83,7 @@ async fn security_headers_middleware(
     let mut response = next.run(request).await;
     let headers = response.headers_mut();
     headers.entry(header::CONTENT_SECURITY_POLICY).or_insert_with(|| {
-        HeaderValue::from_static("default-src 'self'; base-uri 'self'; object-src 'none'; frame-ancestors 'none'; img-src 'self' https: data:; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; connect-src 'self'; form-action 'self'")
+        HeaderValue::from_static("default-src 'self'; base-uri 'self'; object-src 'none'; frame-ancestors 'none'; img-src 'self' https: data:; style-src 'self' 'unsafe-inline'; font-src 'self' data:; script-src 'self' 'unsafe-inline'; connect-src 'self'; form-action 'self'")
     });
     headers
         .entry(header::X_CONTENT_TYPE_OPTIONS)

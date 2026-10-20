@@ -13,10 +13,12 @@ Always spell the product name **MaxIO** (capital M, capital I, capital O). Never
 ## Build & Run
 
 ```bash
-# Build frontend (optional — cargo build also builds and embeds it)
-# Build binary (build.rs runs the UI build and embeds it)
+# bun 1.4.2 is required; build.rs runs `bun run build` and embeds ui/dist
+export MAXIO_ACCESS_KEY="local-admin"
+export MAXIO_SECRET_KEY="$(openssl rand -hex 24)"
 cargo build --release
 ./target/release/maxio --data-dir ./data --port 9000
+# Console: http://localhost:9000/ui/  (sign in with $MAXIO_ACCESS_KEY / $MAXIO_SECRET_KEY)
 ```
 
 Environment variables: `MAXIO_PORT`, `MAXIO_ADDRESS`, `MAXIO_DATA_DIR`, `MAXIO_ACCESS_KEY` (aliases: `MINIO_ROOT_USER`, `MINIO_ACCESS_KEY`), `MAXIO_SECRET_KEY` (aliases: `MINIO_ROOT_PASSWORD`, `MINIO_SECRET_KEY`), `MAXIO_REGION` (aliases: `MINIO_REGION_NAME`, `MINIO_REGION`)
@@ -41,7 +43,7 @@ cargo build --release
 
 The binary serves the web console at `/ui/` (`/ui` redirects there with 308, also in the Vite dev server) with proper MIME types, ETags, and cache headers (immutable for hashed assets, no-store for `index.html` / HTML shell).
 
-Defaults: port 9000, access/secret `maxioadmin`/`maxioadmin`, region `us-east-1`
+Defaults: port 9000, region `us-east-1`. The built-in access/secret `maxioadmin`/`maxioadmin` is refused at startup unless `--allow-insecure-dev` is set. Plain `http://localhost` console login works with your own keys; the session cookie is `Secure` for HTTPS and for any non-loopback host.
 
 ## Development Workflow
 

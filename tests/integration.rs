@@ -72,6 +72,62 @@ async fn start_server() -> (String, TempDir) {
     (base_url, tmp)
 }
 
+/// Server with explicit console credentials and cookie settings.
+/// `secure_cookies` is the production default (`true`); `allow_insecure_dev` is off.
+async fn start_server_with_keys(
+    access_key: &str,
+    secret_key: &str,
+    secure_cookies: bool,
+    allow_insecure_dev: bool,
+) -> (String, TempDir) {
+    let tmp = TempDir::new().unwrap();
+    let data_dir = tmp.path().to_str().unwrap().to_string();
+
+    let keyring = Arc::new(Keyring::load(&data_dir, None).await.unwrap());
+    let storage = FilesystemStorage::new(&data_dir, false, 10 * 1024 * 1024, 0, keyring)
+        .await
+        .unwrap();
+
+    let config = Config {
+        port: 0,
+        address: "127.0.0.1".to_string(),
+        data_dir,
+        access_key: access_key.to_string(),
+        secret_key: secret_key.to_string(),
+        region: REGION.to_string(),
+        master_key: None,
+        allow_insecure_dev,
+        secure_cookies,
+        erasure_coding: false,
+        chunk_size: 10 * 1024 * 1024,
+        parity_shards: 0,
+        default_buckets: String::new(),
+        max_console_body_bytes: 1024 * 1024,
+    };
+
+    let state = AppState {
+        storage: Arc::new(storage),
+        config: Arc::new(config),
+        login_rate_limiter: Arc::new(maxio::api::console::LoginRateLimiter::new()),
+    };
+
+    let app = server::build_router(state);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let base_url = format!("http://{addr}");
+
+    tokio::spawn(async move {
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await
+        .unwrap();
+    });
+
+    (base_url, tmp)
+}
+
 /// Sign a request with AWS Signature V4.
 fn sign_request(method: &str, url: &str, headers: &mut Vec<(String, String)>, body: &[u8]) {
     let parsed = reqwest::Url::parse(url).unwrap();
@@ -687,8 +743,106 @@ async fn test_security_headers_are_applied() {
         resp.headers().get("x-content-type-options").unwrap(),
         "nosniff"
     );
-    assert!(resp.headers().contains_key("content-security-policy"));
+    let csp = resp
+        .headers()
+        .get("content-security-policy")
+        .unwrap()
+        .to_str()
+        .unwrap();
+    assert!(
+        csp.contains("font-src 'self' data:"),
+        "embedded Geist fonts are same-origin files or data: URIs: {csp}"
+    );
+    assert!(csp.contains("script-src 'self' 'unsafe-inline'"), "{csp}");
+    assert!(
+        !csp.contains("script-src 'self' 'unsafe-inline' data:"),
+        "font data: URIs must not widen script-src: {csp}"
+    );
     assert_eq!(resp.headers().get("x-frame-options").unwrap(), "DENY");
+}
+
+#[tokio::test]
+async fn console_login_on_loopback_http_omits_secure_and_authenticates() {
+    let (base_url, _tmp) =
+        start_server_with_keys("test-access", "test-credential", true, false).await;
+    let resp = client()
+        .post(format!("{base_url}/api/auth/login"))
+        .json(&serde_json::json!({
+            "accessKey": "test-access",
+            "secretKey": "test-credential"
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let set_cookie = resp
+        .headers()
+        .get("set-cookie")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+    assert!(
+        !set_cookie.to_ascii_lowercase().contains("secure"),
+        "loopback HTTP login must store a cookie: {set_cookie}"
+    );
+    let session = set_cookie
+        .strip_prefix("maxio_session=")
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap();
+    let check = client()
+        .get(format!("{base_url}/api/auth/check"))
+        .header("cookie", format!("maxio_session={session}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(check.status(), 200);
+}
+
+#[tokio::test]
+async fn console_login_marks_cookie_secure_for_https_and_public_hosts() {
+    let (base_url, _tmp) =
+        start_server_with_keys("test-access", "test-credential", true, false).await;
+    let https = client()
+        .post(format!("{base_url}/api/auth/login"))
+        .header("x-forwarded-proto", "https")
+        .json(&serde_json::json!({
+            "accessKey": "test-access",
+            "secretKey": "test-credential"
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(https.status(), 200);
+    let https_cookie = https.headers().get("set-cookie").unwrap().to_str().unwrap();
+    assert!(
+        https_cookie.contains("Secure"),
+        "HTTPS proxy login should mark the cookie Secure: {https_cookie}"
+    );
+
+    let public_host = client()
+        .post(format!("{base_url}/api/auth/login"))
+        .header("host", "storage.example.com")
+        .json(&serde_json::json!({
+            "accessKey": "test-access",
+            "secretKey": "test-credential"
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(public_host.status(), 200);
+    let public_cookie = public_host
+        .headers()
+        .get("set-cookie")
+        .unwrap()
+        .to_str()
+        .unwrap();
+    assert!(
+        public_cookie.contains("Secure"),
+        "non-loopback HTTP must not mint a browser-stored session: {public_cookie}"
+    );
 }
 
 #[tokio::test]

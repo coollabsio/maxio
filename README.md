@@ -6,7 +6,7 @@ S3-compatible object storage server — single-binary replacement for MinIO.
 
 </div>
 
-> **Warning:** MaxIO is under active development. Do not use it in production yet.
+Version 1.0.0 is the first release intended for production. Read the [production checklist](docs/PRODUCTION.md) before storing data you need to keep: TLS, your own credentials, and backups of the data directory together with the SSE-S3 key file.
 
 MaxIO is a lightweight S3-compatible object storage server written in Rust. One binary, one data directory, no database. Buckets are directories and objects are files, so a backup is a copy of the data dir.
 
@@ -16,6 +16,11 @@ MaxIO is a lightweight S3-compatible object storage server written in Rust. One 
 - Server-side encryption (SSE-S3, SSE-C) and optional erasure coding
 
 See [COMPATIBILITY.md](COMPATIBILITY.md) for the full list of supported S3 and MinIO features.
+
+- [Supported platforms](docs/PLATFORMS.md)
+- [Upgrade and rollback](docs/UPGRADE.md)
+- [Production checklist](docs/PRODUCTION.md)
+- [Cutting a release](docs/RELEASING.md)
 
 ## Quick Start
 

@@ -5,6 +5,7 @@ import userEvent from '@testing-library/user-event'
 import type { ReactNode } from 'react'
 import { MemoryRouter, Route, Routes } from 'react-router'
 import { ThemeContext, useThemeState } from '@/lib/theme'
+import { appVersion } from '@/version'
 import { AppShell } from './AppShell'
 
 type HappyWindow = Window & { happyDOM: { setViewport: (viewport: { width: number; height: number }) => void } }
@@ -59,4 +60,5 @@ test('on desktop the sidebar is always visible and there is no burger button', (
   const screen = renderShell()
   expect(screen.getByRole('navigation', { name: 'Main' }).hasAttribute('inert')).toBe(false)
   expect(screen.queryByRole('button', { name: 'Open menu' })).toBeNull()
+  expect(screen.getByText(`v${appVersion}`).textContent).toBe(`v${appVersion}`)
 })

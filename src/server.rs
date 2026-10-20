@@ -1,7 +1,9 @@
+use axum::Json;
 use axum::Router;
 use axum::extract::State;
 use axum::http::{HeaderValue, StatusCode, header};
 use axum::routing::get;
+use serde::Serialize;
 use std::sync::Arc;
 
 use crate::api::console::{LoginRateLimiter, console_router};
@@ -11,6 +13,8 @@ use crate::auth::middleware::auth_middleware;
 use crate::config::Config;
 use crate::embedded::ui_handler;
 use crate::storage::filesystem::FilesystemStorage;
+
+const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 #[derive(Clone)]
 pub struct AppState {
@@ -33,10 +37,12 @@ pub fn build_router(state: AppState) -> Router {
     Router::new()
         .nest("/api", console_router(state.clone()))
         .route("/healthz", get(healthz))
+        .route("/version", get(version))
         .route("/readyz", get(readyz))
         // MinIO-compatible probes (GET and HEAD, unauthenticated). Registered
         // here, outside the S3 router, so the SigV4 auth layer never runs.
-        .route("/minio/health/live", get(healthz))
+        // These stay empty 200s; `/healthz` carries the version body.
+        .route("/minio/health/live", get(live))
         .route("/minio/health/ready", get(readyz))
         .route("/minio/health/cluster", get(readyz))
         .route("/ui", get(redirect_to_ui_root))
@@ -56,7 +62,29 @@ async fn redirect_to_ui_root(uri: axum::http::Uri) -> axum::response::Redirect {
     }
 }
 
-async fn healthz() -> StatusCode {
+#[derive(Serialize)]
+struct HealthResponse {
+    status: &'static str,
+    version: &'static str,
+}
+
+#[derive(Serialize)]
+struct VersionResponse {
+    version: &'static str,
+}
+
+async fn healthz() -> Json<HealthResponse> {
+    Json(HealthResponse {
+        status: "ok",
+        version: VERSION,
+    })
+}
+
+async fn version() -> Json<VersionResponse> {
+    Json(VersionResponse { version: VERSION })
+}
+
+async fn live() -> StatusCode {
     StatusCode::OK
 }
 

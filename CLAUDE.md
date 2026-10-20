@@ -106,6 +106,8 @@ This runs both processes concurrently (Ctrl+C kills both):
 
 ```
 {data_dir}/
+├── .maxio-format       # { "version": N } — written on startup; newer than this binary refuses to start
+├── .maxio-keys.json    # SSE-S3 keyring (when MAXIO_MASTER_KEY is unset)
 └── buckets/
     └── my-bucket/
         ├── .bucket.json                    # bucket metadata

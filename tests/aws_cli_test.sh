@@ -94,6 +94,65 @@ echo "Server: localhost:$PORT"
 echo "Data dir: $DATA_DIR"
 echo ""
 
+json_field() {
+    local json="$1" field="$2"
+    printf '%s' "$json" | python3 -c 'import json,sys
+raw = sys.stdin.read()
+try:
+    value = json.loads(raw).get(sys.argv[1], "")
+except Exception:
+    value = ""
+print(value)
+' "$field"
+}
+
+# Quick image/binary smoke: version endpoints, on-disk format marker, and one
+# aws + mc round trip. Set MAXIO_SMOKE=1. The full suite below is unchanged.
+if [ "${MAXIO_SMOKE:-0}" = "1" ]; then
+    echo "=== smoke mode ==="
+    HEALTH=$(curl -fsS "$ENDPOINT/healthz" || true)
+    VERSION_BODY=$(curl -fsS "$ENDPOINT/version" || true)
+    HEALTH_STATUS=$(json_field "$HEALTH" status)
+    HEALTH_VERSION=$(json_field "$HEALTH" version)
+    API_VERSION=$(json_field "$VERSION_BODY" version)
+    assert_eq "healthz status is ok" "ok" "$HEALTH_STATUS"
+    assert_eq "healthz version is not empty" "true" "$([ -n "$HEALTH_VERSION" ] && echo true || echo false)"
+    assert_eq "/version matches /healthz" "$HEALTH_VERSION" "$API_VERSION"
+
+    if [ -n "${MAXIO_BIN:-}" ] && [ -x "${MAXIO_BIN}" ]; then
+        BIN_VERSION=$("${MAXIO_BIN}" --version | awk '{print $NF}')
+        assert_eq "maxio --version matches /version" "$API_VERSION" "$BIN_VERSION"
+    fi
+
+    FORMAT_VERSION=$(python3 -c 'import json,sys
+try:
+    with open(sys.argv[1]) as fh:
+        print(json.load(fh).get("version", ""))
+except Exception:
+    print("")
+' "$DATA_DIR/.maxio-format")
+    assert_eq "on-disk format marker is version 1" "1" "$FORMAT_VERSION"
+
+    SMOKE_BUCKET="smoke-bucket-$$"
+    echo "hello maxio" > "$TMPDIR/smoke.txt"
+    assert "smoke create bucket" $AWS s3 mb "s3://$SMOKE_BUCKET"
+    assert "smoke upload object" $AWS s3 cp "$TMPDIR/smoke.txt" "s3://$SMOKE_BUCKET/smoke.txt"
+    assert "smoke download object" $AWS s3 cp "s3://$SMOKE_BUCKET/smoke.txt" "$TMPDIR/smoke-down.txt"
+    assert_eq "smoke object body" "hello maxio" "$(cat "$TMPDIR/smoke-down.txt")"
+
+    MC_ALIAS="maxiosmoke$$"
+    assert "smoke mc alias" mc alias set "$MC_ALIAS" "$ENDPOINT" "$AWS_ACCESS_KEY_ID" "$AWS_SECRET_ACCESS_KEY"
+    MC_BODY=$(mc cat "$MC_ALIAS/$SMOKE_BUCKET/smoke.txt" 2>/dev/null || true)
+    assert_eq "smoke mc cat" "hello maxio" "$MC_BODY"
+    mc alias rm "$MC_ALIAS" > /dev/null 2>&1 || true
+    $AWS s3 rm "s3://$SMOKE_BUCKET/smoke.txt" > /dev/null 2>&1 || true
+    $AWS s3 rb "s3://$SMOKE_BUCKET" > /dev/null 2>&1 || true
+
+    echo ""
+    echo "=== Results: $PASS passed, $FAIL failed ==="
+    [ "$FAIL" -eq 0 ] && exit 0 || exit 1
+fi
+
 # --- Bucket operations ---
 assert "create bucket" $AWS s3 mb "s3://$BUCKET"
 assert_file_exists "bucket dir exists on disk" "$DATA_DIR/buckets/$BUCKET"

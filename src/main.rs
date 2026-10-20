@@ -115,6 +115,8 @@ async fn main() -> anyhow::Result<()> {
             return run_healthcheck(&url, timeout_ms).await;
         }
         Some(Commands::Keyring(KeyringCmd::Rotate { ref data_dir })) => {
+            // Refuse a newer data directory before rotate rewrites the keyring.
+            storage::format::ensure_current(data_dir).await?;
             return run_keyring_rotate(data_dir).await;
         }
         Some(Commands::Keyring(KeyringCmd::List { ref data_dir })) => {
@@ -154,7 +156,10 @@ async fn main() -> anyhow::Result<()> {
         );
     }
 
-    tokio::fs::create_dir_all(&config.data_dir).await?;
+    // Stamp or migrate the on-disk format before the keyring or buckets are
+    // written. A newer marker bails here and leaves the directory untouched.
+    let format_version = storage::format::ensure_current(&config.data_dir).await?;
+    tracing::info!("on-disk format version {format_version}");
 
     // Build the SSE-S3 keyring (bootstrap a random master key on first run).
     let keyring = Arc::new(

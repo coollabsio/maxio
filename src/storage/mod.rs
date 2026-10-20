@@ -1,6 +1,7 @@
 pub mod chunk_reader;
 pub mod crypto;
 pub mod filesystem;
+pub mod format;
 pub mod keys;
 pub mod lifecycle;
 

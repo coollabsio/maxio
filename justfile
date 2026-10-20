@@ -21,9 +21,14 @@ version-check:
     set -euo pipefail
     cargo_version=$(sed -n 's/^version = "\([^"]*\)"$/\1/p' Cargo.toml | head -n1)
     ui_version=$(bun -e 'console.log(require("./ui/package.json").version)')
+    console_version=$(bun -e 'const s = require("fs").readFileSync("ui/src/version.ts","utf8"); const m = s.match(/appVersion = .([0-9]+\.[0-9]+\.[0-9]+)./); if (!m) process.exit(1); console.log(m[1])')
     test -n "$cargo_version"
     test "$ui_version" = "$cargo_version" || {
         echo "version mismatch: Cargo is $cargo_version, ui/package.json is $ui_version" >&2
+        exit 1
+    }
+    test "$console_version" = "$cargo_version" || {
+        echo "version mismatch: Cargo is $cargo_version, ui/src/version.ts is $console_version" >&2
         exit 1
     }
 
@@ -70,6 +75,14 @@ e2e:
         sleep 0.2
     done
     cd ui && MAXIO_E2E_URL=http://127.0.0.1:9876 bun x playwright test
+
+# Rewrite CHANGELOG.md from conventional commits (review the diff before committing).
+changelog:
+    git cliff --output CHANGELOG.md
+
+# Print the Keep a Changelog section for a version (`1.0.0` or `v1.0.0`).
+release-notes version:
+    bash scripts/release-notes.sh {{version}}
 
 # Release binary with the UI embedded.
 build:

@@ -3,40 +3,60 @@ name: release
 on:
   push:
     tags:
-      - 'v*.*.*'
+      - "v*.*.*"
+  pull_request:
   workflow_dispatch:
     inputs:
       version:
-        description: 'Version to release (e.g. v0.1.0)'
+        description: "Version to release (for example v1.0.0). Must match Cargo.toml."
         required: true
         type: string
+      dry_run:
+        description: "Build only. Leave this on to skip the image push and the GitHub Release."
+        required: false
+        type: boolean
+        default: true
 
+# Tag pushes publish. workflow_dispatch publishes only when dry_run is false.
+# Pull requests always build the Linux amd64 binary and image and publish nothing.
 permissions:
-  contents: write
-  packages: write
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
   GITHUB_REGISTRY: ghcr.io
   DOCKER_REGISTRY: docker.io
-  IMAGE_NAME: "coollabsio/maxio"
+  IMAGE_NAME: coollabsio/maxio
+
+concurrency:
+  group: release-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   build:
-    name: Build ${{ matrix.target }}
+    name: Build ${{ matrix.artifact }}
+    if: github.event_name != 'pull_request' || matrix.pr == 'yes'
     runs-on: ${{ matrix.runner }}
     strategy:
+      fail-fast: false
       matrix:
         include:
-          - target: x86_64-unknown-linux-gnu
-            runner: ubuntu-latest
+          - target: x86_64-unknown-linux-musl
+            runner: ubuntu-24.04
             artifact: maxio-linux-amd64
-          - target: aarch64-unknown-linux-gnu
-            runner: ubuntu-latest
+            pr: "yes"
+          - target: aarch64-unknown-linux-musl
+            runner: ubuntu-24.04-arm
             artifact: maxio-linux-arm64
+            pr: "no"
+          - target: x86_64-apple-darwin
+            runner: macos-latest
+            artifact: maxio-macos-amd64
+            pr: "no"
           - target: aarch64-apple-darwin
             runner: macos-latest
             artifact: maxio-macos-arm64
+            pr: "no"
 
     steps:
       - uses: actions/checkout@v4
@@ -44,14 +64,19 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@1.97.1
         with:
-          components: clippy, rustfmt
           targets: ${{ matrix.target }}
 
-      - name: Install cross-compilation tools (ARM64)
-        if: matrix.target == 'aarch64-unknown-linux-gnu'
+      - name: Install musl linker
+        if: contains(matrix.target, 'linux-musl')
         run: |
           sudo apt-get update
-          sudo apt-get install -y gcc-aarch64-linux-gnu
+          sudo apt-get install -y musl-tools
+          linker_env="CARGO_TARGET_$(printf '%s' '${{ matrix.target }}' | tr 'a-z-' 'A-Z_')_LINKER"
+          echo "${linker_env}=musl-gcc" >> "$GITHUB_ENV"
+
+      - name: Select macOS SDK
+        if: runner.os == 'macOS'
+        run: echo "SDKROOT=$(xcrun --sdk macosx --show-sdk-path)" >> "$GITHUB_ENV"
 
       - name: Install bun
         uses: oven-sh/setup-bun@v2
@@ -63,6 +88,7 @@ jobs:
         working-directory: ui
 
       - name: Check tag matches Cargo version
+        if: github.event_name != 'pull_request'
         run: |
           TAG="${{ github.event.inputs.version || github.ref_name }}"
           VERSION="$(python3 - <<'PYV'
@@ -73,30 +99,28 @@ jobs:
           )"
           test "${TAG#v}" = "$VERSION" || { echo "Cargo version $VERSION does not match tag $TAG"; exit 1; }
 
-      - name: fmt
-        run: cargo fmt --all -- --check
-
-      - name: clippy
-        run: cargo clippy --all-targets --all-features -- -D warnings
-
-      - name: test
-        run: cargo test --all --all-features
-
       - name: Build frontend
         run: bun run build
         working-directory: ui
 
-      - name: Configure linker (ARM64)
-        if: matrix.target == 'aarch64-unknown-linux-gnu'
-        run: |
-          mkdir -p .cargo
-          cat >> .cargo/config.toml <<EOF
-          [target.aarch64-unknown-linux-gnu]
-          linker = "aarch64-linux-gnu-gcc"
-          EOF
-
       - name: Build binary
+        env:
+          SKIP_FRONTEND: "1"
         run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Confirm the Linux binary is static
+        if: contains(matrix.target, 'linux-musl')
+        run: |
+          bin="target/${{ matrix.target }}/release/maxio"
+          file "$bin"
+          # Some ldd builds exit 0 and print "statically linked". A dynamic
+          # binary lists libraries with "=>".
+          ldd_out="$(ldd "$bin" 2>&1 || true)"
+          echo "$ldd_out"
+          if printf '%s\n' "$ldd_out" | grep -q '=>'; then
+            echo "expected a statically linked musl binary"
+            exit 1
+          fi
 
       - name: Package
         run: |
@@ -107,9 +131,9 @@ jobs:
           PYV
           )"
           ARCHIVE="${{ matrix.artifact }}-${VERSION}.tar.gz"
-          cp target/${{ matrix.target }}/release/maxio maxio
+          cp "target/${{ matrix.target }}/release/maxio" maxio
           tar czf "${ARCHIVE}" maxio
-          echo "ARCHIVE=${ARCHIVE}" >> $GITHUB_ENV
+          echo "ARCHIVE=${ARCHIVE}" >> "$GITHUB_ENV"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -117,24 +141,64 @@ jobs:
           name: ${{ matrix.artifact }}
           path: ${{ env.ARCHIVE }}
 
+  checksums:
+    name: SHA256SUMS
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: maxio-*
+          merge-multiple: true
+
+      - name: Checksums
+        run: sha256sum *.tar.gz | tee SHA256SUMS
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: SHA256SUMS
+          path: SHA256SUMS
+
   docker:
     name: Docker ${{ matrix.arch }}
-    needs: build
+    if: github.event_name != 'pull_request' || matrix.pr == 'yes'
     runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+      packages: write
     strategy:
+      fail-fast: false
       matrix:
         include:
           - arch: amd64
             platform: linux/amd64
             runner: ubuntu-24.04
+            pr: "yes"
           - arch: aarch64
-            platform: linux/aarch64
+            platform: linux/arm64
             runner: ubuntu-24.04-arm
+            pr: "no"
 
     steps:
       - uses: actions/checkout@v4
 
+      - name: Get version
+        id: version
+        run: |
+          VERSION="$(python3 - <<'PYV'
+          import tomllib
+          with open("Cargo.toml", "rb") as f:
+              print(tomllib.load(f)["package"]["version"])
+          PYV
+          )"
+          if [ "${{ github.event_name }}" != "pull_request" ]; then
+            TAG="${{ github.event.inputs.version || github.ref_name }}"
+            test "${TAG#v}" = "$VERSION" || { echo "Cargo version $VERSION does not match tag $TAG"; exit 1; }
+          fi
+          echo "VERSION=${VERSION}" >> "$GITHUB_OUTPUT"
+
       - name: Login to ${{ env.GITHUB_REGISTRY }}
+        if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.dry_run == false)
         uses: docker/login-action@v3
         with:
           registry: ${{ env.GITHUB_REGISTRY }}
@@ -142,43 +206,43 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Login to ${{ env.DOCKER_REGISTRY }}
+        if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.dry_run == false)
         uses: docker/login-action@v3
         with:
           registry: ${{ env.DOCKER_REGISTRY }}
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-      - name: Get version
-        id: version
-        run: |
-          TAG="${{ github.event.inputs.version || github.ref_name }}"
-          VERSION="$(python3 - <<'PYV'
-          import tomllib
-          with open("Cargo.toml", "rb") as f:
-              print(tomllib.load(f)["package"]["version"])
-          PYV
-          )"
-          test "${TAG#v}" = "$VERSION" || { echo "Cargo version $VERSION does not match tag $TAG"; exit 1; }
-          echo "VERSION=${VERSION}" >> $GITHUB_OUTPUT
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
 
-      - name: Build and Push Image (${{ matrix.arch }})
+      - name: Build and push image (${{ matrix.arch }})
         uses: docker/build-push-action@v6
         with:
           context: .
           file: Dockerfile
           platforms: ${{ matrix.platform }}
-          push: true
+          push: ${{ github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.dry_run == false) }}
           tags: |
             ${{ env.DOCKER_REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.version.outputs.VERSION }}-${{ matrix.arch }}
             ${{ env.GITHUB_REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.version.outputs.VERSION }}-${{ matrix.arch }}
+          labels: |
+            org.opencontainers.image.title=MaxIO
+            org.opencontainers.image.description=S3-compatible object storage server
+            org.opencontainers.image.source=https://github.com/coollabsio/maxio
+            org.opencontainers.image.version=${{ steps.version.outputs.VERSION }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.licenses=Apache-2.0
 
   docker-manifest:
-    name: Docker Manifest
-    needs: [build, docker]
+    name: Docker manifest
+    needs: docker
+    if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.dry_run == false)
     runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
     steps:
-      - uses: actions/checkout@v4
-
       - uses: docker/setup-buildx-action@v3
 
       - name: Login to ${{ env.GITHUB_REGISTRY }}
@@ -199,43 +263,59 @@ jobs:
         id: version
         run: |
           TAG="${{ github.event.inputs.version || github.ref_name }}"
-          VERSION="$(python3 - <<'PYV'
-          import tomllib
-          with open("Cargo.toml", "rb") as f:
-              print(tomllib.load(f)["package"]["version"])
-          PYV
-          )"
-          test "${TAG#v}" = "$VERSION" || { echo "Cargo version $VERSION does not match tag $TAG"; exit 1; }
-          echo "VERSION=${VERSION}" >> $GITHUB_OUTPUT
+          VERSION="${TAG#v}"
+          echo "VERSION=${VERSION}" >> "$GITHUB_OUTPUT"
 
-      - name: Create & publish manifest on ${{ env.GITHUB_REGISTRY }}
+      - name: Publish multi-arch manifest on ${{ env.GITHUB_REGISTRY }}
         run: |
           docker buildx imagetools create \
-          ${{ env.GITHUB_REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.version.outputs.VERSION }}-amd64 \
-          ${{ env.GITHUB_REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.version.outputs.VERSION }}-aarch64 \
-          --tag ${{ env.GITHUB_REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.version.outputs.VERSION }} \
-          --tag ${{ env.GITHUB_REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+            "${{ env.GITHUB_REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.version.outputs.VERSION }}-amd64" \
+            "${{ env.GITHUB_REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.version.outputs.VERSION }}-aarch64" \
+            --tag "${{ env.GITHUB_REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.version.outputs.VERSION }}" \
+            --tag "${{ env.GITHUB_REGISTRY }}/${{ env.IMAGE_NAME }}:latest"
 
-      - name: Create & publish manifest on ${{ env.DOCKER_REGISTRY }}
+      - name: Publish multi-arch manifest on ${{ env.DOCKER_REGISTRY }}
         run: |
           docker buildx imagetools create \
-          ${{ env.DOCKER_REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.version.outputs.VERSION }}-amd64 \
-          ${{ env.DOCKER_REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.version.outputs.VERSION }}-aarch64 \
-          --tag ${{ env.DOCKER_REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.version.outputs.VERSION }} \
-          --tag ${{ env.DOCKER_REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+            "${{ env.DOCKER_REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.version.outputs.VERSION }}-amd64" \
+            "${{ env.DOCKER_REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.version.outputs.VERSION }}-aarch64" \
+            --tag "${{ env.DOCKER_REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.version.outputs.VERSION }}" \
+            --tag "${{ env.DOCKER_REGISTRY }}/${{ env.IMAGE_NAME }}:latest"
 
   release:
-    name: Create Release
+    name: GitHub Release
     needs: build
+    if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.dry_run == false)
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
+      - uses: actions/checkout@v4
+
+      - name: Get version
+        id: version
+        run: |
+          TAG="${{ github.event.inputs.version || github.ref_name }}"
+          echo "TAG=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "VERSION=${TAG#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Release notes
+        run: bash scripts/release-notes.sh "${{ steps.version.outputs.VERSION }}" > release-notes.md
+
       - uses: actions/download-artifact@v4
         with:
           pattern: maxio-*
           merge-multiple: true
 
+      - name: Checksums
+        run: sha256sum *.tar.gz | tee SHA256SUMS
+
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ github.event.inputs.version || github.ref_name }}
-          files: '*.tar.gz'
+          tag_name: ${{ steps.version.outputs.TAG }}
+          name: MaxIO ${{ steps.version.outputs.VERSION }}
+          body_path: release-notes.md
+          files: |
+            *.tar.gz
+            SHA256SUMS

@@ -717,6 +717,22 @@ async fn test_healthz_is_public_and_returns_ok() {
         .await
         .unwrap();
     assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["status"], "ok");
+    assert_eq!(body["version"], env!("CARGO_PKG_VERSION"));
+}
+
+#[tokio::test]
+async fn test_version_endpoint_reports_package_version() {
+    let (base_url, _tmp) = start_server().await;
+    let resp = client()
+        .get(format!("{base_url}/version"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["version"], env!("CARGO_PKG_VERSION"));
 }
 
 #[tokio::test]

@@ -147,6 +147,14 @@ pub(crate) fn key_contains_reserved_segment(key: &str) -> bool {
     reserved_segment_in(key).is_some()
 }
 
+/// Error text for a key that uses an internal path segment. `None` when the
+/// key is a normal object name. Callers reject this before authorization so
+/// the response is `400 InvalidArgument` for every principal.
+pub(crate) fn reserved_key_message(key: &str) -> Option<String> {
+    reserved_segment_in(key)
+        .map(|name| format!("Key segment '{name}' collides with an internal storage name"))
+}
+
 fn reserved_segment_in(key: &str) -> Option<String> {
     Path::new(key)
         .components()
@@ -662,6 +670,16 @@ impl FilesystemStorage {
             Ok(meta) if meta.is_dir() => Ok(path.join(INLINE_OBJECT_PAYLOAD)),
             _ => Ok(path),
         }
+    }
+
+    /// True when this key's bytes are at `{key}/.maxio.object` because the key
+    /// is also a prefix of other keys.
+    pub async fn object_inline_payload(&self, bucket: &str, key: &str) -> bool {
+        if key.is_empty() || key.ends_with('/') {
+            return false;
+        }
+        let path = self.plain_object_read_path(bucket, key).await;
+        path.file_name().and_then(|name| name.to_str()) == Some(INLINE_OBJECT_PAYLOAD)
     }
 
     /// Path to read a plain object's bytes (the file, or the inline payload

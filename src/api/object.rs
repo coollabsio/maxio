@@ -1103,16 +1103,16 @@ async fn expiration_header_for(
 }
 
 /// Parsed `x-amz-copy-source`: bucket, key and optional `?versionId=`.
-struct CopySource {
-    bucket: String,
-    key: String,
-    version_id: Option<String>,
+pub(crate) struct CopySource {
+    pub(crate) bucket: String,
+    pub(crate) key: String,
+    pub(crate) version_id: Option<String>,
 }
 
 /// Parse `x-amz-copy-source` (`[/]bucket/key[?versionId=X]`, URL-encoded).
 /// The query is split off before decoding so an encoded `?` (`%3F`) stays
 /// part of the key.
-fn parse_copy_source(headers: &HeaderMap) -> Result<CopySource, S3Error> {
+pub(crate) fn parse_copy_source(headers: &HeaderMap) -> Result<CopySource, S3Error> {
     let copy_source = headers
         .get("x-amz-copy-source")
         .and_then(|v| v.to_str().ok())
@@ -1951,15 +1951,15 @@ const DELETE_BODY_MAX: usize = 2 * 1024 * 1024;
 const DELETE_OBJECTS_MAX: usize = 1000;
 
 /// One `<Object>` entry of a DeleteObjects request.
-struct DeleteTarget {
-    key: String,
-    version_id: Option<String>,
+pub(crate) struct DeleteTarget {
+    pub(crate) key: String,
+    pub(crate) version_id: Option<String>,
 }
 
 /// Parse `<Delete><Quiet/><Object><Key/><VersionId/></Object>…</Delete>`.
 /// Event-based on purpose: quick-xml's serde deserializer trims text, which
 /// would corrupt keys with leading/trailing whitespace.
-fn parse_delete_request(xml: &str) -> Result<(Vec<DeleteTarget>, bool), S3Error> {
+pub(crate) fn parse_delete_request(xml: &str) -> Result<(Vec<DeleteTarget>, bool), S3Error> {
     let mut reader = quick_xml::Reader::from_str(xml);
     let mut path: Vec<Vec<u8>> = Vec::new();
     let mut targets = Vec::new();

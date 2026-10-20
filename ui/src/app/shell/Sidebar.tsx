@@ -1,5 +1,5 @@
-import { Database, X } from 'lucide-react'
-import { useLocation } from 'react-router'
+import { Database, ScrollText, Users, X } from 'lucide-react'
+import { useLocation, useNavigate } from 'react-router'
 import { cn } from '@/lib/utils'
 import { DESKTOP_QUERY, useMediaQuery } from '@/lib/useMediaQuery'
 import { UserMenu } from './UserMenu'
@@ -12,6 +12,9 @@ interface SidebarProps {
   onToggleCollapsed: () => void
   onHome: () => void
   onLogout: () => void
+  iamAdmin: boolean
+  accountName: string
+  accountDetail: string
 }
 
 function SidebarToggleIcon() {
@@ -30,12 +33,23 @@ export function Sidebar({
   onToggleCollapsed,
   onHome,
   onLogout,
+  iamAdmin,
+  accountName,
+  accountDetail,
 }: SidebarProps) {
   const isDesktop = useMediaQuery(DESKTOP_QUERY)
+  const navigate = useNavigate()
   const { pathname } = useLocation()
   // The mobile sheet is always shown expanded.
   const collapsed = collapsedSetting && isDesktop
   const bucketsActive = pathname === '/' || pathname.startsWith('/buckets')
+  const usersActive = pathname === '/users' || pathname.startsWith('/users/')
+  const policiesActive = pathname === '/policies' || pathname.startsWith('/policies/')
+
+  function go(path: string) {
+    onCloseMobile()
+    navigate(path)
+  }
 
   const nav = (
     <nav
@@ -61,11 +75,40 @@ export function Sidebar({
             {collapsed ? null : <span className="menu-item-label">Buckets</span>}
           </button>
         </li>
+        {iamAdmin ? (
+          <>
+            {collapsed ? null : <li className="nav-section">Access</li>}
+            <li>
+              <button
+                type="button"
+                onClick={() => go('/users')}
+                title="Users"
+                aria-current={usersActive ? 'page' : undefined}
+                className={cn('menu-item', usersActive && 'menu-item-active', collapsed && 'justify-center px-0')}
+              >
+                <Users className="menu-item-icon" aria-hidden="true" />
+                {collapsed ? null : <span className="menu-item-label">Users</span>}
+              </button>
+            </li>
+            <li>
+              <button
+                type="button"
+                onClick={() => go('/policies')}
+                title="Policies"
+                aria-current={policiesActive ? 'page' : undefined}
+                className={cn('menu-item', policiesActive && 'menu-item-active', collapsed && 'justify-center px-0')}
+              >
+                <ScrollText className="menu-item-icon" aria-hidden="true" />
+                {collapsed ? null : <span className="menu-item-label">Policies</span>}
+              </button>
+            </li>
+          </>
+        ) : null}
       </ul>
 
       <div className="app-sidebar-footer sticky bottom-0 mt-auto -mx-2 flex flex-col gap-1 bg-white px-2 py-2 dark:bg-panel lg:-mx-3 lg:px-3">
         <div className={cn('flex items-center gap-1', collapsed ? 'flex-col justify-center' : 'justify-between')}>
-          <UserMenu collapsed={collapsed} onLogout={onLogout} />
+          <UserMenu collapsed={collapsed} onLogout={onLogout} name={accountName} detail={accountDetail} />
           {isDesktop ? (
             <button
               type="button"

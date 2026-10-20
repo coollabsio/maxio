@@ -1,3 +1,13 @@
+export const iamKeys = {
+  all: ['iam'] as const,
+  users: () => [...iamKeys.all, 'users'] as const,
+  user: (name: string) => [...iamKeys.all, 'user', name] as const,
+  keys: (name: string) => [...iamKeys.all, 'keys', name] as const,
+  serviceKeys: () => [...iamKeys.all, 'service-keys'] as const,
+  policies: () => [...iamKeys.all, 'policies'] as const,
+  policy: (name: string) => [...iamKeys.all, 'policy', name] as const,
+}
+
 export const authKeys = {
   all: ['auth'] as const,
   check: () => [...authKeys.all, 'check'] as const,

@@ -20,6 +20,7 @@ pub mod auth;
 pub mod config;
 pub mod embedded;
 pub mod error;
+pub mod iam;
 pub mod limits;
 pub mod openapi;
 pub mod serve;

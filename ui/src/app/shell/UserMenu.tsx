@@ -61,7 +61,17 @@ const navItemsOptions: { value: NavItems; label: string }[] = [
 ]
 
 /** Account button at the bottom of the sidebar. Its menu holds the appearance options and Sign out. */
-export function UserMenu({ collapsed, onLogout }: { collapsed: boolean; onLogout: () => void }) {
+export function UserMenu({
+  collapsed,
+  onLogout,
+  name,
+  detail,
+}: {
+  collapsed: boolean
+  onLogout: () => void
+  name: string
+  detail: string
+}) {
   const [open, setOpen] = useState(false)
   const root = useRef<HTMLDivElement>(null)
   const theme = useTheme()
@@ -100,7 +110,7 @@ export function UserMenu({ collapsed, onLogout }: { collapsed: boolean; onLogout
         </span>
         {collapsed ? null : (
           <>
-            <span className="min-w-0 flex-1 truncate text-left text-xs font-medium">Admin</span>
+            <span className="min-w-0 flex-1 truncate text-left text-xs font-medium">{name}</span>
             <ChevronDown
               className={cn('size-3.5 shrink-0 text-neutral-400 transition-transform dark:text-fg-faint', open && 'rotate-180')}
               aria-hidden="true"
@@ -112,8 +122,8 @@ export function UserMenu({ collapsed, onLogout }: { collapsed: boolean; onLogout
       {open ? (
         <div className="absolute bottom-full left-0 z-[90] mb-1 flex w-52 origin-bottom-left animate-in flex-col gap-px rounded-[10px] border border-line bg-white p-1 shadow-dropdown fade-in-0 zoom-in-95 dark:bg-coolgray-200">
           <div className="min-w-0 px-2 py-1.5">
-            <div className="truncate text-[13px] font-semibold text-black dark:text-fg">Admin</div>
-            <div className="truncate text-[11px] text-neutral-500 dark:text-fg-faint">Root credentials</div>
+            <div className="truncate text-[13px] font-semibold text-black dark:text-fg">{name}</div>
+            <div className="truncate text-[11px] text-neutral-500 dark:text-fg-faint">{detail}</div>
           </div>
           <Divider />
           <SectionLabel>Theme</SectionLabel>

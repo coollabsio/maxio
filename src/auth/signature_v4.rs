@@ -16,6 +16,8 @@ pub struct ParsedAuth {
     pub access_key: String,
     pub date: String,
     pub region: String,
+    /// Credential-scope service (`s3` or `iam`).
+    pub service: String,
     pub signed_headers: Vec<String>,
     pub signature: String,
 }
@@ -96,6 +98,7 @@ pub fn parse_authorization_header(header: &str) -> Result<ParsedAuth, &'static s
         access_key: cred_parts[0].to_string(),
         date: cred_parts[1].to_string(),
         region: cred_parts[2].to_string(),
+        service: cred_parts[3].to_string(),
         signed_headers: signed_headers.split(';').map(|s| s.to_string()).collect(),
         signature: signature.to_string(),
     })
@@ -109,7 +112,22 @@ pub fn verify_signature(
     parsed: &ParsedAuth,
     secret_key: &str,
 ) -> bool {
-    let canonical_request = build_canonical_request(method, uri, query_string, headers, parsed);
+    verify_signature_with_payload(method, uri, query_string, headers, parsed, secret_key, None)
+}
+
+/// `payload_hash` overrides `x-amz-content-sha256`. IAM signs the SHA-256 of
+/// the body without sending that header; S3 sends the header or `UNSIGNED-PAYLOAD`.
+pub fn verify_signature_with_payload(
+    method: &str,
+    uri: &str,
+    query_string: &str,
+    headers: &HeaderMap,
+    parsed: &ParsedAuth,
+    secret_key: &str,
+    payload_hash: Option<&str>,
+) -> bool {
+    let canonical_request =
+        build_canonical_request(method, uri, query_string, headers, parsed, payload_hash);
 
     tracing::debug!("Canonical request:\n{}", canonical_request);
 
@@ -122,7 +140,8 @@ pub fn verify_signature(
 
     tracing::debug!("String to sign:\n{}", string_to_sign);
 
-    let signing_key = derive_signing_key(secret_key, &parsed.date, &parsed.region);
+    let signing_key =
+        derive_signing_key_with_service(secret_key, &parsed.date, &parsed.region, &parsed.service);
 
     let mut mac = HmacSha256::new_from_slice(&signing_key).unwrap();
     mac.update(string_to_sign.as_bytes());
@@ -188,6 +207,7 @@ pub fn parse_presigned_query(query: &str) -> Result<(ParsedAuth, String, u64), &
         access_key: cred_parts[0].to_string(),
         date: cred_parts[1].to_string(),
         region: cred_parts[2].to_string(),
+        service: cred_parts[3].to_string(),
         signed_headers: signed_headers.split(';').map(|s| s.to_string()).collect(),
         signature: signature.to_string(),
     };
@@ -228,7 +248,8 @@ pub fn verify_presigned_signature(
 
     tracing::debug!("Presigned string to sign:\n{}", string_to_sign);
 
-    let signing_key = derive_signing_key(secret_key, &parsed.date, &parsed.region);
+    let signing_key =
+        derive_signing_key_with_service(secret_key, &parsed.date, &parsed.region, &parsed.service);
 
     let mut mac = HmacSha256::new_from_slice(&signing_key).unwrap();
     mac.update(string_to_sign.as_bytes());
@@ -246,16 +267,25 @@ fn build_canonical_request(
     query_string: &str,
     headers: &HeaderMap,
     parsed: &ParsedAuth,
+    payload_hash: Option<&str>,
 ) -> String {
     let canonical_uri = canonical_uri(uri);
     let canonical_qs = canonical_query_string(query_string);
     let canonical_headers = canonical_headers(headers, &parsed.signed_headers);
     let signed_headers = parsed.signed_headers.join(";");
 
-    let payload_hash = headers
-        .get("x-amz-content-sha256")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("UNSIGNED-PAYLOAD");
+    let payload_hash_owned;
+    let payload_hash = match payload_hash {
+        Some(hash) => hash,
+        None => {
+            payload_hash_owned = headers
+                .get("x-amz-content-sha256")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("UNSIGNED-PAYLOAD")
+                .to_string();
+            payload_hash_owned.as_str()
+        }
+    };
 
     format!(
         "{}\n{}\n{}\n{}\n{}\n{}",
@@ -355,7 +385,10 @@ fn canonical_headers(headers: &HeaderMap, signed_headers: &[String]) -> String {
 }
 
 fn build_string_to_sign(canonical_request: &str, timestamp: &str, parsed: &ParsedAuth) -> String {
-    let scope = format!("{}/{}/s3/aws4_request", parsed.date, parsed.region);
+    let scope = format!(
+        "{}/{}/{}/aws4_request",
+        parsed.date, parsed.region, parsed.service
+    );
 
     let hash = Sha256::digest(canonical_request.as_bytes());
     let canonical_hash = hex::encode(hash);
@@ -367,6 +400,15 @@ fn build_string_to_sign(canonical_request: &str, timestamp: &str, parsed: &Parse
 }
 
 pub fn derive_signing_key(secret_key: &str, date: &str, region: &str) -> Vec<u8> {
+    derive_signing_key_with_service(secret_key, date, region, "s3")
+}
+
+pub fn derive_signing_key_with_service(
+    secret_key: &str,
+    date: &str,
+    region: &str,
+    service: &str,
+) -> Vec<u8> {
     let key = format!("AWS4{}", secret_key);
 
     let mut mac = HmacSha256::new_from_slice(key.as_bytes()).unwrap();
@@ -378,7 +420,7 @@ pub fn derive_signing_key(secret_key: &str, date: &str, region: &str) -> Vec<u8>
     let date_region_key = mac.finalize().into_bytes();
 
     let mut mac = HmacSha256::new_from_slice(&date_region_key).unwrap();
-    mac.update(b"s3");
+    mac.update(service.as_bytes());
     let date_region_service_key = mac.finalize().into_bytes();
 
     let mut mac = HmacSha256::new_from_slice(&date_region_service_key).unwrap();

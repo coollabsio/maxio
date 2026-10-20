@@ -200,6 +200,27 @@ mc mb maxio/my-bucket
 mc cp file.txt maxio/my-bucket/
 ```
 
+## Identity and access
+
+The root access key (`MAXIO_ACCESS_KEY` / `MAXIO_SECRET_KEY`) is the administrator. Additional callers are IAM users or standalone service keys. Policies are AWS-style JSON: `Effect`, wildcard actions such as `s3:Get*`, and resource ARNs such as `arn:aws:s3:::bucket` and `arn:aws:s3:::bucket/prefix/*`. An explicit `Deny` wins. Built-in policies are `readonly`, `readwrite`, `writeonly`, and `admin`.
+
+A prefix in the console scope picker is a directory. `uploads` and `uploads/` both allow `bucket/uploads/file` and do not allow `bucket/uploads-private` or `bucket/uploadsX`, because that picker writes `prefix/*`. A policy written with AWS wildcard syntax is stored as given: `prefix*` matches any key that starts with that text, including `uploadsY.txt` and `2026-01.csv`.
+
+Create a user and a key with the AWS CLI (the key secret is printed once):
+
+```bash
+aws --endpoint-url http://localhost:9000 iam create-user --user-name alice
+aws --endpoint-url http://localhost:9000 iam attach-user-policy \
+  --user-name alice --policy-arn arn:aws:iam::000000000000:policy/readonly
+aws --endpoint-url http://localhost:9000 iam create-access-key --user-name alice
+```
+
+A key policy only narrows what that user's policies already allow. Granting access is a separate step: attach a policy, or use **Grant scope to user** in the console (or `PUT /api/iam/users/{name}/inline/{policy}`). **Create access key** (`POST /api/iam/users/{name}/keys`) never adds a policy to the user. The scope is stored on that key only. Omitting `keyOnly` means key-only. Sending `keyOnly: false` is rejected.
+
+The console at `/ui/users` and `/ui/policies` is available to root and to anyone whose policy allows IAM administration. Other IAM users can sign in and see only the buckets their policy allows.
+
+Access-key secrets in `<data-dir>/iam.json` are sealed with the SSE-S3 master key (`.maxio-keys.json`, `MAXIO_MASTER_KEY`, or `MAXIO_MASTER_KEY_FILE`). Back the keyring and `iam.json` up together. If `iam.json` has secrets and the master key is missing or is a different key, MaxIO refuses to start instead of serving requests that fail later. A new keyring cannot decrypt the old secrets. Restore the keyring file, or pass the original key with `--master-key` / `MAXIO_MASTER_KEY` or `--master-key-file` / `MAXIO_MASTER_KEY_FILE`. `maxio keyring merge` keeps those secrets readable: keys already in the data directory stay, including the key that sealed `iam.json`.
+
 ## Durability
 
 Object bytes, sidecars, multipart parts, version files, and bucket configuration are published with a temp file, `fsync`, rename, and a directory `fsync`. A crash during a write leaves the previous object in place, or a temp file that is not part of the bucket listing.

@@ -1774,6 +1774,187 @@ EOF
     mc alias rm "$MC_ALIAS" > /dev/null 2>&1 || true
 fi
 
+# --- IAM users, scoped keys, and mc ---
+IAM_USER="scoped$$"
+IAM_BUCKET="iam-scope-$$"
+echo "scoped-body" > "$TMPDIR/iam-ok.txt"
+echo "other-body" > "$TMPDIR/iam-other.txt"
+assert "iam create scope bucket" $AWS s3 mb "s3://$IAM_BUCKET"
+assert "iam create other bucket" $AWS s3 mb "s3://iam-other-$$"
+assert "iam put readable object" $AWS s3 cp "$TMPDIR/iam-ok.txt" "s3://$IAM_BUCKET/albums/note.txt"
+assert "iam put other object" $AWS s3 cp "$TMPDIR/iam-other.txt" "s3://iam-other-$$/secret.txt"
+
+assert "iam create-user" $AWS iam create-user --user-name "$IAM_USER"
+cat > "$TMPDIR/iam-scope.json" <<EOF
+{"Version":"2012-10-17","Statement":[
+  {"Effect":"Allow","Action":["s3:ListBucket","s3:GetBucketLocation"],"Resource":"arn:aws:s3:::$IAM_BUCKET","Condition":{"StringLike":{"s3:prefix":["albums*"]}}},
+  {"Effect":"Allow","Action":["s3:GetObject","s3:GetObjectVersion"],"Resource":"arn:aws:s3:::$IAM_BUCKET/albums*"},
+  {"Effect":"Deny","Action":"s3:GetObject","Resource":"arn:aws:s3:::$IAM_BUCKET/albums/blocked*"}
+]}
+EOF
+assert "iam put-user-policy" $AWS iam put-user-policy --user-name "$IAM_USER" \
+    --policy-name scope --policy-document "file://$TMPDIR/iam-scope.json"
+KEY_JSON=$($AWS iam create-access-key --user-name "$IAM_USER" --output json)
+SCOPED_KEY=$(printf '%s' "$KEY_JSON" | python3 -c 'import json,sys; print(json.load(sys.stdin)["AccessKey"]["AccessKeyId"])')
+SCOPED_SECRET=$(printf '%s' "$KEY_JSON" | python3 -c 'import json,sys; print(json.load(sys.stdin)["AccessKey"]["SecretAccessKey"])')
+if [ -n "$SCOPED_KEY" ] && [ -n "$SCOPED_SECRET" ]; then
+    green "PASS: iam create-access-key"
+    PASS=$((PASS + 1))
+else
+    red "FAIL: iam create-access-key ($KEY_JSON)"
+    FAIL=$((FAIL + 1))
+fi
+
+ROOT_KEY="$AWS_ACCESS_KEY_ID"
+ROOT_SECRET="$AWS_SECRET_ACCESS_KEY"
+export AWS_ACCESS_KEY_ID="$SCOPED_KEY"
+export AWS_SECRET_ACCESS_KEY="$SCOPED_SECRET"
+assert "scoped key reads allowed object" $AWS s3 cp "s3://$IAM_BUCKET/albums/note.txt" "$TMPDIR/iam-down.txt"
+assert_eq "scoped key object body" "scoped-body" "$(cat "$TMPDIR/iam-down.txt")"
+assert_fail "scoped key cannot write" $AWS s3 cp "$TMPDIR/iam-ok.txt" "s3://$IAM_BUCKET/albums/new.txt"
+assert_fail "scoped key cannot read another bucket" $AWS s3 cp "s3://iam-other-$$/secret.txt" "$TMPDIR/iam-denied.txt"
+assert_fail "scoped key cannot list every bucket" $AWS s3 ls
+export AWS_ACCESS_KEY_ID="$ROOT_KEY"
+export AWS_SECRET_ACCESS_KEY="$ROOT_SECRET"
+echo "blocked" > "$TMPDIR/iam-blocked.txt"
+assert "root writes denied prefix" $AWS s3 cp "$TMPDIR/iam-blocked.txt" "s3://$IAM_BUCKET/albums/blocked.txt"
+export AWS_ACCESS_KEY_ID="$SCOPED_KEY"
+export AWS_SECRET_ACCESS_KEY="$SCOPED_SECRET"
+assert_fail "explicit deny beats the prefix allow" $AWS s3 cp "s3://$IAM_BUCKET/albums/blocked.txt" "$TMPDIR/iam-blocked-down.txt"
+
+if command -v mc >/dev/null 2>&1; then
+    MC_SCOPED="scoped$$"
+    assert "mc alias scoped key" mc alias set "$MC_SCOPED" "$ENDPOINT" "$SCOPED_KEY" "$SCOPED_SECRET"
+    MC_BODY=$(mc cat "$MC_SCOPED/$IAM_BUCKET/albums/note.txt" 2>/dev/null || true)
+    assert_eq "mc cat allowed object" "scoped-body" "$MC_BODY"
+    assert_fail "mc cp into the bucket is denied" mc cp "$TMPDIR/iam-ok.txt" "$MC_SCOPED/$IAM_BUCKET/albums/from-mc.txt"
+    mc alias rm "$MC_SCOPED" >/dev/null 2>&1 || true
+fi
+
+export AWS_ACCESS_KEY_ID="$ROOT_KEY"
+export AWS_SECRET_ACCESS_KEY="$ROOT_SECRET"
+assert "iam deactivate key" $AWS iam update-access-key --user-name "$IAM_USER" \
+    --access-key-id "$SCOPED_KEY" --status Inactive
+export AWS_ACCESS_KEY_ID="$SCOPED_KEY"
+export AWS_SECRET_ACCESS_KEY="$SCOPED_SECRET"
+assert_fail "deactivated key cannot read" $AWS s3 cp "s3://$IAM_BUCKET/albums/note.txt" "$TMPDIR/iam-inactive.txt"
+export AWS_ACCESS_KEY_ID="$ROOT_KEY"
+export AWS_SECRET_ACCESS_KEY="$ROOT_SECRET"
+assert "iam delete key" $AWS iam delete-access-key --user-name "$IAM_USER" --access-key-id "$SCOPED_KEY"
+export AWS_ACCESS_KEY_ID="$SCOPED_KEY"
+export AWS_SECRET_ACCESS_KEY="$SCOPED_SECRET"
+assert_fail "deleted key cannot read" $AWS s3 cp "s3://$IAM_BUCKET/albums/note.txt" "$TMPDIR/iam-deleted.txt"
+export AWS_ACCESS_KEY_ID="$ROOT_KEY"
+export AWS_SECRET_ACCESS_KEY="$ROOT_SECRET"
+assert "iam delete-user-policy" $AWS iam delete-user-policy --user-name "$IAM_USER" --policy-name scope
+assert "iam delete-user" $AWS iam delete-user --user-name "$IAM_USER"
+$AWS s3 rm "s3://$IAM_BUCKET" --recursive >/dev/null 2>&1 || true
+$AWS s3 rm "s3://iam-other-$$" --recursive >/dev/null 2>&1 || true
+assert "iam delete scope bucket" $AWS s3 rb "s3://$IAM_BUCKET"
+assert "iam delete other bucket" $AWS s3 rb "s3://iam-other-$$"
+
+# Directory prefix must keep the trailing slash (uploads/* , not uploads*).
+PREFIX_BUCKET="iam-prefix-$$"
+PREFIX_USER="prefix$$"
+assert "prefix bucket" $AWS s3 mb "s3://$PREFIX_BUCKET"
+echo "inside" > "$TMPDIR/prefix-inside.txt"
+echo "sibling" > "$TMPDIR/prefix-sibling.txt"
+echo "glued" > "$TMPDIR/prefix-glued.txt"
+assert "prefix put uploads object" $AWS s3 cp "$TMPDIR/prefix-inside.txt" "s3://$PREFIX_BUCKET/uploads/ok.txt"
+assert "prefix put uploads-private object" $AWS s3 cp "$TMPDIR/prefix-sibling.txt" "s3://$PREFIX_BUCKET/uploads-private/x.txt"
+assert "prefix put uploadsX object" $AWS s3 cp "$TMPDIR/prefix-glued.txt" "s3://$PREFIX_BUCKET/uploadsX.txt"
+curl -sS -c "$TMPDIR/iam.cookies" -H 'content-type: application/json' \
+    -d "{\"accessKey\":\"$MAXIO_TEST_ACCESS_KEY\",\"secretKey\":\"$MAXIO_TEST_SECRET_KEY\"}" \
+    "$ENDPOINT/api/auth/login" > /dev/null
+PREVIEW=$(curl -sS -b "$TMPDIR/iam.cookies" -H 'content-type: application/json' \
+    -d "{\"buckets\":[\"$PREFIX_BUCKET\"],\"prefix\":\"uploads/\",\"access\":\"readwrite\"}" \
+    "$ENDPOINT/api/iam/preview")
+printf '%s' "$PREVIEW" > "$TMPDIR/iam-preview.json"
+python3 - "$TMPDIR/iam-preview.json" "$TMPDIR/iam-prefix-policy.json" <<'PY'
+import json, sys
+preview = json.load(open(sys.argv[1]))
+doc = json.loads(preview["documentJson"])
+blob = json.dumps(doc)
+if "uploads/*" not in blob or "uploads*\"" in blob.replace("uploads/*", ""):
+    raise SystemExit("preview policy is not directory-scoped: " + blob)
+json.dump(doc, open(sys.argv[2], "w"))
+PY
+assert "prefix create-user" $AWS iam create-user --user-name "$PREFIX_USER"
+assert "prefix put-user-policy" $AWS iam put-user-policy --user-name "$PREFIX_USER" \
+    --policy-name uploads --policy-document "file://$TMPDIR/iam-prefix-policy.json"
+PREFIX_KEY_JSON=$($AWS iam create-access-key --user-name "$PREFIX_USER" --output json)
+PREFIX_KEY=$(printf '%s' "$PREFIX_KEY_JSON" | python3 -c 'import json,sys; print(json.load(sys.stdin)["AccessKey"]["AccessKeyId"])')
+PREFIX_SECRET=$(printf '%s' "$PREFIX_KEY_JSON" | python3 -c 'import json,sys; print(json.load(sys.stdin)["AccessKey"]["SecretAccessKey"])')
+export AWS_ACCESS_KEY_ID="$PREFIX_KEY"
+export AWS_SECRET_ACCESS_KEY="$PREFIX_SECRET"
+assert "prefix key reads uploads/ok.txt" $AWS s3 cp "s3://$PREFIX_BUCKET/uploads/ok.txt" "$TMPDIR/prefix-down.txt"
+assert_eq "prefix key object body" "inside" "$(cat "$TMPDIR/prefix-down.txt")"
+assert "prefix key writes under uploads/" $AWS s3 cp "$TMPDIR/prefix-inside.txt" "s3://$PREFIX_BUCKET/uploads/new.txt"
+assert_fail "prefix key cannot write uploads-private" $AWS s3 cp "$TMPDIR/prefix-sibling.txt" "s3://$PREFIX_BUCKET/uploads-private/y.txt"
+assert_fail "prefix key cannot write uploadsX" $AWS s3 cp "$TMPDIR/prefix-glued.txt" "s3://$PREFIX_BUCKET/uploadsX.txt"
+assert_fail "prefix key cannot read uploads-private" $AWS s3 cp "s3://$PREFIX_BUCKET/uploads-private/x.txt" "$TMPDIR/prefix-denied.txt"
+assert "prefix key lists uploads/" $AWS s3api list-objects-v2 --bucket "$PREFIX_BUCKET" --prefix "uploads/"
+assert_fail "prefix key cannot list uploads-private/" $AWS s3api list-objects-v2 --bucket "$PREFIX_BUCKET" --prefix "uploads-private/"
+export AWS_ACCESS_KEY_ID="$ROOT_KEY"
+export AWS_SECRET_ACCESS_KEY="$ROOT_SECRET"
+assert "prefix delete-access-key" $AWS iam delete-access-key --user-name "$PREFIX_USER" --access-key-id "$PREFIX_KEY"
+assert "prefix delete-user-policy" $AWS iam delete-user-policy --user-name "$PREFIX_USER" --policy-name uploads
+assert "prefix delete-user" $AWS iam delete-user --user-name "$PREFIX_USER"
+$AWS s3 rm "s3://$PREFIX_BUCKET" --recursive >/dev/null 2>&1 || true
+assert "prefix delete bucket" $AWS s3 rb "s3://$PREFIX_BUCKET"
+
+# Creating a key must not attach a user policy, even when keyOnly is omitted.
+NOGRANT_BUCKET="iam-nogrant-$$"
+NOGRANT_USER="nogrant$$"
+assert "nogrant bucket" $AWS s3 mb "s3://$NOGRANT_BUCKET"
+echo "keep" > "$TMPDIR/nogrant.txt"
+assert "nogrant seed object" $AWS s3 cp "$TMPDIR/nogrant.txt" "s3://$NOGRANT_BUCKET/uploads/keep.txt"
+assert "nogrant create-user" $AWS iam create-user --user-name "$NOGRANT_USER"
+cat > "$TMPDIR/nogrant-read.json" <<EOF
+{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["s3:GetObject","s3:GetObjectVersion"],"Resource":"arn:aws:s3:::$NOGRANT_BUCKET/*"}]}
+EOF
+assert "nogrant put-user-policy" $AWS iam put-user-policy --user-name "$NOGRANT_USER" \
+    --policy-name read --policy-document "file://$TMPDIR/nogrant-read.json"
+NOGRANT_FIRST=$($AWS iam create-access-key --user-name "$NOGRANT_USER" --output json)
+NOGRANT_KEY=$(printf '%s' "$NOGRANT_FIRST" | python3 -c 'import json,sys; print(json.load(sys.stdin)["AccessKey"]["AccessKeyId"])')
+NOGRANT_SECRET=$(printf '%s' "$NOGRANT_FIRST" | python3 -c 'import json,sys; print(json.load(sys.stdin)["AccessKey"]["SecretAccessKey"])')
+NOGRANT_STATUS=$(curl -sS -o "$TMPDIR/nogrant-key.json" -w '%{http_code}' -b "$TMPDIR/iam.cookies" \
+    -H 'content-type: application/json' \
+    -d "{\"buckets\":[\"$NOGRANT_BUCKET\"],\"prefix\":\"uploads/\",\"access\":\"write\"}" \
+    "$ENDPOINT/api/iam/users/$NOGRANT_USER/keys")
+assert_eq "nogrant create key without keyOnly" "200" "$NOGRANT_STATUS"
+assert "nogrant key document is directory scoped" python3 -c \
+    'import json,sys; doc=json.load(open(sys.argv[1])).get("documentJson") or ""; rest=doc.replace("uploads/*",""); raise SystemExit(0 if "uploads/*" in doc and "uploads*" not in rest else 1)' \
+    "$TMPDIR/nogrant-key.json"
+NOGRANT_POLICIES=$($AWS iam list-user-policies --user-name "$NOGRANT_USER" --output json)
+assert_eq "nogrant user policies stay read" "read" \
+    "$(printf '%s' "$NOGRANT_POLICIES" | python3 -c 'import json,sys; print(",".join(json.load(sys.stdin)["PolicyNames"]))')"
+export AWS_ACCESS_KEY_ID="$NOGRANT_KEY"
+export AWS_SECRET_ACCESS_KEY="$NOGRANT_SECRET"
+assert "nogrant existing key can read" $AWS s3 cp "s3://$NOGRANT_BUCKET/uploads/keep.txt" "$TMPDIR/nogrant-down.txt"
+assert_fail "nogrant existing key did not gain write" \
+    $AWS s3 cp "$TMPDIR/nogrant.txt" "s3://$NOGRANT_BUCKET/uploads/new.txt"
+export AWS_ACCESS_KEY_ID="$ROOT_KEY"
+export AWS_SECRET_ACCESS_KEY="$ROOT_SECRET"
+NOGRANT_FALSE=$(curl -sS -o "$TMPDIR/nogrant-false.json" -w '%{http_code}' -b "$TMPDIR/iam.cookies" \
+    -H 'content-type: application/json' \
+    -d "{\"buckets\":[\"$NOGRANT_BUCKET\"],\"prefix\":\"uploads/\",\"access\":\"read\",\"keyOnly\":false}" \
+    "$ENDPOINT/api/iam/users/$NOGRANT_USER/keys")
+assert_eq "nogrant keyOnly false is rejected" "400" "$NOGRANT_FALSE"
+NOGRANT_POLICIES=$($AWS iam list-user-policies --user-name "$NOGRANT_USER" --output json)
+assert_eq "nogrant user policies after rejection" "read" \
+    "$(printf '%s' "$NOGRANT_POLICIES" | python3 -c 'import json,sys; print(",".join(json.load(sys.stdin)["PolicyNames"]))')"
+assert "nogrant delete-user-policy" $AWS iam delete-user-policy --user-name "$NOGRANT_USER" --policy-name read
+NOGRANT_KEYS=$($AWS iam list-access-keys --user-name "$NOGRANT_USER" --output json)
+while read -r NOGRANT_ID; do
+    [ -n "$NOGRANT_ID" ] || continue
+    assert "nogrant delete-access-key $NOGRANT_ID" $AWS iam delete-access-key \
+        --user-name "$NOGRANT_USER" --access-key-id "$NOGRANT_ID"
+done < <(printf '%s' "$NOGRANT_KEYS" | python3 -c 'import json,sys; [print(k["AccessKeyId"]) for k in json.load(sys.stdin)["AccessKeyMetadata"]]')
+assert "nogrant delete-user" $AWS iam delete-user --user-name "$NOGRANT_USER"
+$AWS s3 rm "s3://$NOGRANT_BUCKET" --recursive >/dev/null 2>&1 || true
+assert "nogrant delete bucket" $AWS s3 rb "s3://$NOGRANT_BUCKET"
+
 # Crash safety: operations across a restart, plus `maxio check --repair`.
 # Uses its own server so the caller-owned process is left alone.
 ROBUST_BIN="${MAXIO_BIN:-}"
@@ -1909,6 +2090,19 @@ EOF
         "$(printf '%s' "$LIMIT_OUT" | grep -q EntityTooLarge && echo true || echo false)"
     echo "ok" > "$TMPDIR/small-ok.txt"
     assert "put under max object size" aws --endpoint-url "$LIMIT_EP" s3 cp "$TMPDIR/small-ok.txt" s3://limit-bucket/small-ok.txt
+    assert "iam limit create-user" aws --endpoint-url "$LIMIT_EP" iam create-user --user-name limituser
+    cat > "$TMPDIR/limit-iam.json" <<'EOF'
+{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["s3:PutObject","s3:GetObject"],"Resource":"arn:aws:s3:::limit-bucket/*"}]}
+EOF
+    assert "iam limit put-user-policy" aws --endpoint-url "$LIMIT_EP" iam put-user-policy \
+        --user-name limituser --policy-name write --policy-document "file://$TMPDIR/limit-iam.json"
+    LIMIT_KEY_JSON=$(aws --endpoint-url "$LIMIT_EP" iam create-access-key --user-name limituser --output json)
+    LIMIT_IAM_KEY=$(printf '%s' "$LIMIT_KEY_JSON" | python3 -c 'import json,sys; print(json.load(sys.stdin)["AccessKey"]["AccessKeyId"])')
+    LIMIT_IAM_SECRET=$(printf '%s' "$LIMIT_KEY_JSON" | python3 -c 'import json,sys; print(json.load(sys.stdin)["AccessKey"]["SecretAccessKey"])')
+    LIMIT_IAM_OUT=$(AWS_ACCESS_KEY_ID="$LIMIT_IAM_KEY" AWS_SECRET_ACCESS_KEY="$LIMIT_IAM_SECRET" \
+        aws --endpoint-url "$LIMIT_EP" s3 cp "$TMPDIR/too-big.bin" s3://limit-bucket/iam-big.bin 2>&1 || true)
+    assert_eq "iam user put over max object size is EntityTooLarge" "true" \
+        "$(printf '%s' "$LIMIT_IAM_OUT" | grep -q EntityTooLarge && echo true || echo false)"
     kill -TERM "$LIMIT_PID" 2>/dev/null || true
     wait "$LIMIT_PID" 2>/dev/null || true
     rm -rf "$LIMIT_DATA"
@@ -2333,6 +2527,55 @@ EOF
     assert "mc virtual rm" mc rm "${MC_VHOST}/${VBUCKET}/mc.txt"
     mc alias rm "$MC_VHOST" > /dev/null 2>&1 || true
 
+    # IAM user can read and write the bucket. The access key is narrowed to read
+    # photos/, so a virtual-hosted PUT is denied and a presigned GET still works.
+    VIAM_BUCKET="viam-${PORT}-$$"
+    VIAM_USER="viam$$"
+    pin_vhost "${VIAM_BUCKET}.localhost"
+    echo "viam-body" > "$TMPDIR/viam.txt"
+    assert "viam create bucket" $AWS s3 mb "s3://$VIAM_BUCKET"
+    assert "viam seed object" $AWS s3 cp "$TMPDIR/viam.txt" "s3://$VIAM_BUCKET/photos/a.txt"
+    assert "viam create-user" $AWS iam create-user --user-name "$VIAM_USER"
+    cat > "$TMPDIR/viam-user.json" <<EOF
+{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["s3:GetObject","s3:PutObject","s3:DeleteObject","s3:ListBucket","s3:GetBucketLocation"],"Resource":["arn:aws:s3:::$VIAM_BUCKET","arn:aws:s3:::$VIAM_BUCKET/*"]}]}
+EOF
+    assert "viam put-user-policy" $AWS iam put-user-policy --user-name "$VIAM_USER" \
+        --policy-name broad --policy-document "file://$TMPDIR/viam-user.json"
+    curl -sS -c "$TMPDIR/viam.cookies" -H 'content-type: application/json' \
+        -d "{\"accessKey\":\"$MAXIO_TEST_ACCESS_KEY\",\"secretKey\":\"$MAXIO_TEST_SECRET_KEY\"}" \
+        "$ENDPOINT/api/auth/login" > /dev/null
+    VIAM_STATUS=$(curl -sS -o "$TMPDIR/viam-key.json" -w '%{http_code}' -b "$TMPDIR/viam.cookies" \
+        -H 'content-type: application/json' \
+        -d "{\"buckets\":[\"$VIAM_BUCKET\"],\"prefix\":\"photos/\",\"access\":\"read\"}" \
+        "$ENDPOINT/api/iam/users/$VIAM_USER/keys")
+    assert_eq "viam create narrowed key" "200" "$VIAM_STATUS"
+    VIAM_KEY=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["accessKeyId"])' "$TMPDIR/viam-key.json")
+    VIAM_SECRET=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["secretAccessKey"])' "$TMPDIR/viam-key.json")
+    viamaws() {
+        AWS_CONFIG_FILE="$AWS_VCONF" AWS_ACCESS_KEY_ID="$VIAM_KEY" AWS_SECRET_ACCESS_KEY="$VIAM_SECRET" \
+            aws --endpoint-url "http://localhost:${PORT}" "$@"
+    }
+    assert "viam virtual get" viamaws s3 cp "s3://$VIAM_BUCKET/photos/a.txt" "$TMPDIR/viam-down.txt"
+    assert_eq "viam virtual body" "viam-body" "$(cat "$TMPDIR/viam-down.txt")"
+    assert_fail "viam virtual put denied" viamaws s3 cp "$TMPDIR/viam.txt" "s3://$VIAM_BUCKET/photos/b.txt"
+    VIAM_PRESIGN=$(viamaws s3 presign "s3://$VIAM_BUCKET/photos/a.txt" --expires-in 300)
+    assert_eq "viam presign host" "true" \
+        "$(printf '%s' "$VIAM_PRESIGN" | grep -q "://${VIAM_BUCKET}.localhost:" && echo true || echo false)"
+    (unset AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY; curl -fsS "$VIAM_PRESIGN" -o "$TMPDIR/viam-presign.txt")
+    assert_eq "viam presigned GET" "viam-body" "$(cat "$TMPDIR/viam-presign.txt")"
+    MC_VIAM="viam$$"
+    assert "mc viam alias" mc alias set "$MC_VIAM" "$ENDPOINT" "$VIAM_KEY" "$VIAM_SECRET" --api S3v4 --path off
+    assert_eq "mc viam cat" "viam-body" "$(mc cat "$MC_VIAM/$VIAM_BUCKET/photos/a.txt" 2>/dev/null || true)"
+    assert_fail "mc viam put denied" mc cp "$TMPDIR/viam.txt" "$MC_VIAM/$VIAM_BUCKET/photos/from-mc.txt"
+    mc alias rm "$MC_VIAM" >/dev/null 2>&1 || true
+    VIAM_IDS=$($AWS iam list-access-keys --user-name "$VIAM_USER" --query 'AccessKeyMetadata[].AccessKeyId' --output text)
+    for VIAM_ID in $VIAM_IDS; do
+        $AWS iam delete-access-key --user-name "$VIAM_USER" --access-key-id "$VIAM_ID" >/dev/null
+    done
+    $AWS iam delete-user-policy --user-name "$VIAM_USER" --policy-name broad >/dev/null
+    assert "viam delete-user" $AWS iam delete-user --user-name "$VIAM_USER"
+    $AWS s3 rb "s3://$VIAM_BUCKET" --force >/dev/null 2>&1 || true
+
     vaws s3 rm "s3://${VBUCKET}" --recursive > /dev/null 2>&1 || true
     vaws s3 rm "s3://${VDOT}" --recursive > /dev/null 2>&1 || true
     assert "virtual delete bucket" vaws s3api delete-bucket --bucket "$VBUCKET"
@@ -2443,6 +2686,51 @@ fi
 
 $AWS s3 rm "s3://$COMPAT_BUCKET" --recursive > /dev/null 2>&1 || true
 assert "delete compat bucket" $AWS s3api delete-bucket --bucket "$COMPAT_BUCKET"
+
+# IAM prefix policy on a key that is also a prefix, and reserved names.
+# `bucket/a/*` allows a/b and does not allow the object key a.
+# A reserved name is InvalidArgument before authorization, including for a
+# caller whose policy does not cover that key.
+export AWS_ACCESS_KEY_ID="$MAXIO_TEST_ACCESS_KEY"
+export AWS_SECRET_ACCESS_KEY="$MAXIO_TEST_SECRET_KEY"
+IAM_PFX_BUCKET="iam-pfx-$$"
+IAM_PFX_USER="pfx$$"
+echo "child" > "$TMPDIR/iam-pfx-child.txt"
+echo "self" > "$TMPDIR/iam-pfx-self.txt"
+assert "iam prefix-key bucket" $AWS s3 mb "s3://$IAM_PFX_BUCKET"
+assert "iam prefix-key root writes a" $AWS s3api put-object --bucket "$IAM_PFX_BUCKET" --key a --body "$TMPDIR/iam-pfx-self.txt"
+assert "iam prefix-key create-user" $AWS iam create-user --user-name "$IAM_PFX_USER"
+cat > "$TMPDIR/iam-pfx-policy.json" <<EOF
+{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["s3:PutObject","s3:GetObject","s3:DeleteObject"],"Resource":"arn:aws:s3:::$IAM_PFX_BUCKET/a/*"}]}
+EOF
+assert "iam prefix-key put-user-policy" $AWS iam put-user-policy --user-name "$IAM_PFX_USER" \
+    --policy-name children --policy-document "file://$TMPDIR/iam-pfx-policy.json"
+IAM_PFX_JSON=$($AWS iam create-access-key --user-name "$IAM_PFX_USER" --output json)
+IAM_PFX_KEY=$(printf '%s' "$IAM_PFX_JSON" | python3 -c 'import json,sys; print(json.load(sys.stdin)["AccessKey"]["AccessKeyId"])')
+IAM_PFX_SECRET=$(printf '%s' "$IAM_PFX_JSON" | python3 -c 'import json,sys; print(json.load(sys.stdin)["AccessKey"]["SecretAccessKey"])')
+export AWS_ACCESS_KEY_ID="$IAM_PFX_KEY"
+export AWS_SECRET_ACCESS_KEY="$IAM_PFX_SECRET"
+assert "iam prefix-key writes a/b" $AWS s3api put-object --bucket "$IAM_PFX_BUCKET" --key a/b --body "$TMPDIR/iam-pfx-child.txt"
+IAM_PFX_SELF=$($AWS s3api put-object --bucket "$IAM_PFX_BUCKET" --key a --body "$TMPDIR/iam-pfx-self.txt" 2>&1 || true)
+assert_eq "iam prefix-key denies object a" "true" \
+    "$(printf '%s' "$IAM_PFX_SELF" | grep -q AccessDenied && echo true || echo false)"
+IAM_PFX_RESERVED=$($AWS s3api put-object --bucket "$IAM_PFX_BUCKET" --key .maxio.object --body "$TMPDIR/iam-pfx-self.txt" 2>&1 || true)
+assert_eq "iam reserved name is InvalidArgument" "true" \
+    "$(printf '%s' "$IAM_PFX_RESERVED" | grep -q InvalidArgument && echo true || echo false)"
+assert_eq "iam reserved name is not AccessDenied" "false" \
+    "$(printf '%s' "$IAM_PFX_RESERVED" | grep -q AccessDenied && echo true || echo false)"
+IAM_PFX_TMP=$($AWS s3api put-object --bucket "$IAM_PFX_BUCKET" --key 'docs/.maxio-tmp-crash' --body "$TMPDIR/iam-pfx-self.txt" 2>&1 || true)
+assert_eq "iam reserved temp name is InvalidArgument" "true" \
+    "$(printf '%s' "$IAM_PFX_TMP" | grep -q InvalidArgument && echo true || echo false)"
+export AWS_ACCESS_KEY_ID="$MAXIO_TEST_ACCESS_KEY"
+export AWS_SECRET_ACCESS_KEY="$MAXIO_TEST_SECRET_KEY"
+assert "iam prefix-key object a unchanged" $AWS s3api get-object --bucket "$IAM_PFX_BUCKET" --key a "$TMPDIR/iam-pfx-a-down.txt"
+assert_eq "iam prefix-key object a body" "self" "$(cat "$TMPDIR/iam-pfx-a-down.txt")"
+assert "iam prefix-key delete-access-key" $AWS iam delete-access-key --user-name "$IAM_PFX_USER" --access-key-id "$IAM_PFX_KEY"
+assert "iam prefix-key delete-user-policy" $AWS iam delete-user-policy --user-name "$IAM_PFX_USER" --policy-name children
+assert "iam prefix-key delete-user" $AWS iam delete-user --user-name "$IAM_PFX_USER"
+$AWS s3 rm "s3://$IAM_PFX_BUCKET" --recursive >/dev/null 2>&1 || true
+assert "iam prefix-key delete bucket" $AWS s3 rb "s3://$IAM_PFX_BUCKET"
 
 # --- Summary ---
 echo ""

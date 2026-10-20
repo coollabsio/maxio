@@ -88,9 +88,11 @@ export function BucketListPage() {
           title="Buckets"
           description="Object storage containers for your files"
           actions={
-            <Button variant="highlighted" onClick={() => setShowCreate(true)}>
-              <Plus /> Create Bucket
-            </Button>
+            bucketsQuery.data?.createBucket ? (
+              <Button variant="highlighted" onClick={() => setShowCreate(true)}>
+                <Plus /> Create Bucket
+              </Button>
+            ) : null
           }
         />
 
@@ -106,7 +108,9 @@ export function BucketListPage() {
           <Callout type="info">
             <span className="inline-flex items-center gap-2">
               <Database className="size-4 opacity-70" />
-              No buckets yet — create your first bucket to get started.
+              {bucketsQuery.data?.createBucket
+                ? 'No buckets yet — create your first bucket to get started.'
+                : 'No buckets yet.'}
             </span>
           </Callout>
         ) : (
@@ -173,15 +177,17 @@ export function BucketListPage() {
                       >
                         <Settings className="size-4" />
                       </button>
-                      <button
-                        type="button"
-                        className="icon-button hover:!text-error"
-                        onClick={(event) => stop(event, () => setBucketToDelete(bucket.name))}
-                        title="Delete bucket"
-                        aria-label="Delete bucket"
-                      >
-                        <Trash2 className="size-4" />
-                      </button>
+                      {bucket.canDelete ? (
+                        <button
+                          type="button"
+                          className="icon-button hover:!text-error"
+                          onClick={(event) => stop(event, () => setBucketToDelete(bucket.name))}
+                          title="Delete bucket"
+                          aria-label="Delete bucket"
+                        >
+                          <Trash2 className="size-4" />
+                        </button>
+                      ) : null}
                     </div>
                   </TableCell>
                 </TableRow>

@@ -1,12 +1,15 @@
+use axum::body::Body;
 use axum::{
     extract::{Request, State},
     middleware::Next,
     response::Response,
 };
 use chrono::{NaiveDateTime, Utc};
+use sha2::{Digest, Sha256};
 
 use crate::api::chunked::{self, StreamingMode};
 use crate::error::S3Error;
+use crate::iam::{self, Authenticated, Principal};
 use crate::server::AppState;
 
 use super::signature_v4;
@@ -41,6 +44,10 @@ pub async fn auth_middleware(
             method,
             request.uri().path()
         );
+        let mut request = request;
+        request.extensions_mut().insert(Authenticated {
+            principal: Principal::Anonymous,
+        });
         return Ok(next.run(request).await);
     }
 
@@ -66,13 +73,7 @@ pub async fn auth_middleware(
         parsed.signed_headers
     );
 
-    if !signature_v4::constant_time_eq(
-        parsed.access_key.as_bytes(),
-        state.config.access_key.as_bytes(),
-    ) {
-        tracing::debug!("Access key mismatch");
-        return Err(S3Error::invalid_access_key());
-    }
+    let material = iam::signing_material(&state.config, &parsed.access_key).await?;
 
     if !signature_v4::constant_time_eq(parsed.region.as_bytes(), state.config.region.as_bytes()) {
         tracing::debug!("Region mismatch");
@@ -111,18 +112,47 @@ pub async fn auth_middleware(
         tracing::debug!("  signed header '{}': {}", h, redact_header_value(h));
     }
 
-    let valid = signature_v4::verify_signature(
-        &method,
-        &path,
-        &query,
-        request.headers(),
-        &parsed,
-        &state.config.secret_key,
-    );
+    // IAM query calls sign the raw body hash and omit x-amz-content-sha256.
+    let (request, iam_payload_hash) =
+        if parsed.service == "iam" && !request.headers().contains_key("x-amz-content-sha256") {
+            let (parts, body) = request.into_parts();
+            let bytes = axum::body::to_bytes(body, 1024 * 1024)
+                .await
+                .map_err(|_| S3Error::invalid_argument("IAM request body is too large"))?;
+            let hash = hex::encode(Sha256::digest(&bytes));
+            (Request::from_parts(parts, Body::from(bytes)), Some(hash))
+        } else {
+            (request, None)
+        };
+
+    let valid = match iam_payload_hash.as_deref() {
+        Some(hash) => signature_v4::verify_signature_with_payload(
+            &method,
+            &path,
+            &query,
+            request.headers(),
+            &parsed,
+            &material.secret,
+            Some(hash),
+        ),
+        None => signature_v4::verify_signature(
+            &method,
+            &path,
+            &query,
+            request.headers(),
+            &parsed,
+            &material.secret,
+        ),
+    };
 
     if !valid {
         tracing::debug!("Signature verification FAILED");
         return Err(S3Error::signature_mismatch());
+    }
+    if !material.enabled {
+        return Err(S3Error::access_denied(
+            "The access key is inactive or the user is disabled",
+        ));
     }
 
     tracing::debug!("Signature verification OK");
@@ -130,13 +160,14 @@ pub async fn auth_middleware(
     // aws-chunked bodies: chunk signatures chain from the seed (header) signature.
     let signing = match StreamingMode::from_headers(request.headers())? {
         Some(mode) if mode.is_signed() => Some(signature_v4::StreamingSigningContext::new(
-            &state.config.secret_key,
+            &material.secret,
             &parsed,
             &amz_date,
         )),
         _ => None,
     };
-    let (request, failure) = chunked::prepare_request(request, signing)?;
+    let (mut request, failure) = chunked::prepare_request(request, signing)?;
+    request.extensions_mut().insert(material.authenticated);
 
     let response = next.run(request).await;
     if let Some(err) = take_body_failure(&failure) {
@@ -260,12 +291,7 @@ async fn handle_presigned(
     let (parsed, timestamp, expires_secs) =
         signature_v4::parse_presigned_query(query).map_err(|e| S3Error::access_denied(e))?;
 
-    if !signature_v4::constant_time_eq(
-        parsed.access_key.as_bytes(),
-        state.config.access_key.as_bytes(),
-    ) {
-        return Err(S3Error::invalid_access_key());
-    }
+    let material = iam::signing_material(&state.config, &parsed.access_key).await?;
 
     if !signature_v4::constant_time_eq(parsed.region.as_bytes(), state.config.region.as_bytes()) {
         return Err(S3Error::access_denied("Invalid region in credential scope"));
@@ -308,18 +334,24 @@ async fn handle_presigned(
         request.headers(),
         &parsed,
         &timestamp,
-        &state.config.secret_key,
+        &material.secret,
     );
 
     if !valid {
         tracing::debug!("Presigned signature verification FAILED");
         return Err(S3Error::signature_mismatch());
     }
+    if !material.enabled {
+        return Err(S3Error::access_denied(
+            "The access key is inactive or the user is disabled",
+        ));
+    }
 
     tracing::debug!("Presigned signature verification OK");
     // Presigned URLs have no seed signature for chunk signing: only the
     // unsigned aws-chunked variant is accepted.
-    let (request, failure) = chunked::prepare_request(request, None)?;
+    let (mut request, failure) = chunked::prepare_request(request, None)?;
+    request.extensions_mut().insert(material.authenticated);
     let response = next.run(request).await;
     if let Some(err) = take_body_failure(&failure) {
         return Err(err);

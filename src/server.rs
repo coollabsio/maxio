@@ -11,6 +11,7 @@ use std::time::Duration;
 use tokio::sync::Semaphore;
 use tower::Service;
 
+use crate::api::authz::s3_authz_middleware;
 use crate::api::console::{LoginRateLimiter, console_router};
 use crate::api::cors::cors_middleware;
 use crate::api::router::s3_router;
@@ -87,6 +88,10 @@ pub fn build_router(state: AppState) -> AppService {
     let request_timeout = Duration::from_secs(state.config.request_timeout_secs);
     let max_inflight = state.config.max_concurrent_requests;
     let s3_routes = s3_router()
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            s3_authz_middleware,
+        ))
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             auth_middleware,

@@ -1,9 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Integration tests using AWS CLI against a running maxio server.
+# Integration tests using the AWS CLI and MinIO mc against a running maxio server.
 # Usage: ./tests/aws_cli_test.sh [port] [data_dir]
-# Expects maxio to be running on localhost:${PORT:-9000}
+# Expects maxio to be running on localhost:${PORT:-9000} with the default
+# maxioadmin/maxioadmin credentials (start it with --allow-insecure-dev).
+# Requires aws (AWS CLI v2), mc, python3, and curl.
 
 PORT="${1:-9000}"
 DATA_DIR="$(cd "${2:-./data}" && pwd)"
@@ -16,6 +18,9 @@ FAIL=0
 export AWS_ACCESS_KEY_ID=maxioadmin
 export AWS_SECRET_ACCESS_KEY=maxioadmin
 export AWS_DEFAULT_REGION=us-east-1
+# A developer AWS config can switch the transfer client off the CRT path that
+# sends streaming trailer checksums. These tests must not inherit that.
+unset AWS_CONFIG_FILE AWS_PROFILE AWS_DEFAULT_PROFILE
 
 AWS="aws --endpoint-url $ENDPOINT"
 
@@ -1041,10 +1046,17 @@ TAG_AFTER=$($AWS s3api get-object-tagging --bucket "$TAG_BUCKET" --key tag.txt 2
 TAG_AFTER_COUNT=$(echo "$TAG_AFTER" | python3 -c 'import sys,json; print(len(json.load(sys.stdin).get("TagSet",[])))' 2>/dev/null)
 assert_eq "get-object-tagging empty after delete" "0" "$TAG_AFTER_COUNT"
 
-# NOTE: `put-object --tagging 'env=prod&...'` (x-amz-tagging header on PUT) is
-# not yet implemented in MaxIO — only the separate PutObjectTagging API works.
-# When that header lands, add an assertion here that verifies tags are set by
-# PUT+header in one request.
+# Tags supplied on PUT via x-amz-tagging (aws: --tagging, mc: cp --tags).
+echo "header-tagged" > "$TMPDIR/tag-header.txt"
+assert "put-object with tagging header" $AWS s3api put-object \
+    --bucket "$TAG_BUCKET" --key tag-header.txt --body "$TMPDIR/tag-header.txt" \
+    --tagging 'env=prod&app=maxio'
+HDR_TAGS=$($AWS s3api get-object-tagging --bucket "$TAG_BUCKET" --key tag-header.txt 2>&1)
+assert_eq "tagging header sets env=prod" "prod" \
+    "$(echo "$HDR_TAGS" | python3 -c 'import sys,json; d=json.load(sys.stdin); print(next((t["Value"] for t in d.get("TagSet",[]) if t["Key"]=="env"), ""))')"
+assert_eq "tagging header sets app=maxio" "maxio" \
+    "$(echo "$HDR_TAGS" | python3 -c 'import sys,json; d=json.load(sys.stdin); print(next((t["Value"] for t in d.get("TagSet",[]) if t["Key"]=="app"), ""))')"
+$AWS s3 rm "s3://$TAG_BUCKET/tag-header.txt" > /dev/null || true
 
 $AWS s3 rm "s3://$TAG_BUCKET/tag.txt" > /dev/null || true
 assert "delete tag bucket" $AWS s3api delete-bucket --bucket "$TAG_BUCKET"
@@ -1497,6 +1509,218 @@ fi
 
 $AWS s3 rm "s3://$KEY_BUCKET" --recursive > /dev/null 2>&1 || true
 assert "delete keys bucket" $AWS s3api delete-bucket --bucket "$KEY_BUCKET"
+
+# --- Lifecycle, bucket tags, anonymous policy, user metadata, streaming checksums ---
+# Covers the S3 surface added for bucket lifecycle, bucket tagging, anonymous
+# read/list policy, x-amz-meta-* user metadata, and streaming trailer checksums.
+# AWS CLI v2 and mc both send STREAMING-UNSIGNED-PAYLOAD-TRAILER for checksum
+# uploads. Neither client emits STREAMING-AWS4-HMAC-SHA256-PAYLOAD against this
+# plain HTTP endpoint (they send a full-body hash instead); signed chunk
+# verification stays covered by the Rust integration tests.
+echo ""
+echo "--- Lifecycle, tagging, policy, metadata, streaming (aws + mc) ---"
+
+if ! command -v mc >/dev/null 2>&1; then
+    red "FAIL: mc is required (MinIO client)"
+    FAIL=$((FAIL + 1))
+else
+    MC_CONFIG_DIR="$TMPDIR/mc-config"
+    mkdir -p "$MC_CONFIG_DIR"
+    export MC_CONFIG_DIR
+    MC_ALIAS="maxio$$"
+    assert "mc alias" mc alias set "$MC_ALIAS" "$ENDPOINT" "$AWS_ACCESS_KEY_ID" "$AWS_SECRET_ACCESS_KEY"
+
+    FEAT_BUCKET="feat-$$"
+    assert "create feature bucket" $AWS s3api create-bucket --bucket "$FEAT_BUCKET"
+
+    # User metadata (x-amz-meta-*) plus a standard header.
+    echo "meta body" > "$TMPDIR/meta.txt"
+    assert "put-object with user metadata" $AWS s3api put-object \
+        --bucket "$FEAT_BUCKET" --key meta.txt --body "$TMPDIR/meta.txt" \
+        --content-type text/plain --metadata 'color=Blue Sky,count=42' \
+        --cache-control 'max-age=60'
+    META_HEAD=$($AWS s3api head-object --bucket "$FEAT_BUCKET" --key meta.txt 2>&1)
+    assert_eq "head-object metadata color" "Blue Sky" \
+        "$(echo "$META_HEAD" | python3 -c 'import sys,json; print(json.load(sys.stdin).get("Metadata",{}).get("color",""))')"
+    assert_eq "head-object metadata count" "42" \
+        "$(echo "$META_HEAD" | python3 -c 'import sys,json; print(json.load(sys.stdin).get("Metadata",{}).get("count",""))')"
+    assert_eq "head-object cache-control" "max-age=60" \
+        "$(echo "$META_HEAD" | python3 -c 'import sys,json; print(json.load(sys.stdin).get("CacheControl",""))')"
+    if grep -q '"user_metadata"' "$DATA_DIR/buckets/$FEAT_BUCKET/meta.txt.meta.json"; then
+        green "PASS: meta.txt.meta.json records user_metadata"
+        PASS=$((PASS + 1))
+    else
+        red "FAIL: meta.txt.meta.json missing user_metadata"
+        FAIL=$((FAIL + 1))
+    fi
+
+    echo "mc meta" > "$TMPDIR/mc-meta.txt"
+    assert "mc cp --attr stores user metadata" \
+        mc cp --attr "color=Blue Sky;count=42;Cache-Control=max-age=60" \
+        "$TMPDIR/mc-meta.txt" "$MC_ALIAS/$FEAT_BUCKET/mc-meta.txt"
+    MC_STAT=$(mc stat "$MC_ALIAS/$FEAT_BUCKET/mc-meta.txt" 2>&1)
+    assert_eq "mc stat shows x-amz-meta-color" "true" \
+        "$(echo "$MC_STAT" | grep -q 'X-Amz-Meta-Color: Blue Sky' && echo true || echo false)"
+    assert_eq "mc stat shows cache-control" "true" \
+        "$(echo "$MC_STAT" | grep -q 'Cache-Control.*max-age=60' && echo true || echo false)"
+
+    # Bucket tagging.
+    assert "put-bucket-tagging" $AWS s3api put-bucket-tagging --bucket "$FEAT_BUCKET" \
+        --tagging 'TagSet=[{Key=env,Value=prod},{Key=team,Value=storage}]'
+    BTAGS=$($AWS s3api get-bucket-tagging --bucket "$FEAT_BUCKET" 2>&1)
+    assert_eq "get-bucket-tagging env" "prod" \
+        "$(echo "$BTAGS" | python3 -c 'import sys,json; d=json.load(sys.stdin); print(next((t["Value"] for t in d.get("TagSet",[]) if t["Key"]=="env"), ""))')"
+    assert_eq "get-bucket-tagging team" "storage" \
+        "$(echo "$BTAGS" | python3 -c 'import sys,json; d=json.load(sys.stdin); print(next((t["Value"] for t in d.get("TagSet",[]) if t["Key"]=="team"), ""))')"
+    assert "delete-bucket-tagging" $AWS s3api delete-bucket-tagging --bucket "$FEAT_BUCKET"
+    BTAGS_GONE=$($AWS s3api get-bucket-tagging --bucket "$FEAT_BUCKET" 2>&1 || true)
+    assert_eq "get-bucket-tagging missing after delete" "true" \
+        "$(echo "$BTAGS_GONE" | grep -q NoSuchTagSet && echo true || echo false)"
+
+    assert "mc tag set on bucket" mc tag set "$MC_ALIAS/$FEAT_BUCKET" "env=dev&team=storage"
+    MC_BTAGS=$(mc tag list "$MC_ALIAS/$FEAT_BUCKET" 2>&1)
+    assert_eq "mc tag list bucket env" "true" \
+        "$(echo "$MC_BTAGS" | grep -q 'env.*dev' && echo true || echo false)"
+    printf 'y\n' | mc tag remove "$MC_ALIAS/$FEAT_BUCKET" > /dev/null
+    assert_fail "mc tag list empty after remove" mc tag list "$MC_ALIAS/$FEAT_BUCKET"
+
+    echo "mc tagged" > "$TMPDIR/mc-tagged.txt"
+    assert "mc cp --tags sets object tags" \
+        mc cp --tags "kind=note" "$TMPDIR/mc-tagged.txt" "$MC_ALIAS/$FEAT_BUCKET/mc-tagged.txt"
+    MC_OTAGS=$(mc tag list "$MC_ALIAS/$FEAT_BUCKET/mc-tagged.txt" 2>&1)
+    assert_eq "mc tag list object kind=note" "true" \
+        "$(echo "$MC_OTAGS" | grep -q 'kind.*note' && echo true || echo false)"
+
+    # Lifecycle: expiration, noncurrent expiration, abort incomplete multipart.
+    # Transitions are a single storage class and must be rejected.
+    cat > "$TMPDIR/lifecycle.json" <<'EOF'
+{
+  "Rules": [
+    {
+      "ID": "expire-logs",
+      "Filter": {"Prefix": "logs/"},
+      "Status": "Enabled",
+      "Expiration": {"Days": 30},
+      "NoncurrentVersionExpiration": {"NoncurrentDays": 7, "NewerNoncurrentVersions": 2},
+      "AbortIncompleteMultipartUpload": {"DaysAfterInitiation": 3}
+    }
+  ]
+}
+EOF
+    assert "put-bucket-lifecycle-configuration" \
+        $AWS s3api put-bucket-lifecycle-configuration --bucket "$FEAT_BUCKET" \
+        --lifecycle-configuration "file://$TMPDIR/lifecycle.json"
+    LC=$($AWS s3api get-bucket-lifecycle-configuration --bucket "$FEAT_BUCKET" 2>&1)
+    assert_eq "lifecycle expiration days" "30" \
+        "$(echo "$LC" | python3 -c 'import sys,json; print(json.load(sys.stdin)["Rules"][0]["Expiration"]["Days"])')"
+    assert_eq "lifecycle prefix" "logs/" \
+        "$(echo "$LC" | python3 -c 'import sys,json; print(json.load(sys.stdin)["Rules"][0]["Filter"]["Prefix"])')"
+    assert_eq "lifecycle noncurrent days" "7" \
+        "$(echo "$LC" | python3 -c 'import sys,json; print(json.load(sys.stdin)["Rules"][0]["NoncurrentVersionExpiration"]["NoncurrentDays"])')"
+    assert_eq "lifecycle abort multipart days" "3" \
+        "$(echo "$LC" | python3 -c 'import sys,json; print(json.load(sys.stdin)["Rules"][0]["AbortIncompleteMultipartUpload"]["DaysAfterInitiation"])')"
+    cat > "$TMPDIR/lifecycle-transition.json" <<'EOF'
+{
+  "Rules": [
+    {
+      "ID": "glacier",
+      "Filter": {"Prefix": ""},
+      "Status": "Enabled",
+      "Transitions": [{"Days": 30, "StorageClass": "GLACIER"}]
+    }
+  ]
+}
+EOF
+    assert_fail "put-bucket-lifecycle transition is NotImplemented" \
+        $AWS s3api put-bucket-lifecycle-configuration --bucket "$FEAT_BUCKET" \
+        --lifecycle-configuration "file://$TMPDIR/lifecycle-transition.json"
+    assert "delete-bucket-lifecycle" $AWS s3api delete-bucket-lifecycle --bucket "$FEAT_BUCKET"
+    LC_GONE=$($AWS s3api get-bucket-lifecycle-configuration --bucket "$FEAT_BUCKET" 2>&1 || true)
+    assert_eq "get-bucket-lifecycle missing after delete" "true" \
+        "$(echo "$LC_GONE" | grep -q NoSuchLifecycleConfiguration && echo true || echo false)"
+
+    assert "mc ilm rule add" mc ilm rule add --prefix "logs/" --expire-days 30 \
+        --noncurrent-expire-days 7 --noncurrent-expire-newer 2 "$MC_ALIAS/$FEAT_BUCKET"
+    MC_LC=$(mc ilm rule export "$MC_ALIAS/$FEAT_BUCKET" 2>/dev/null)
+    assert_eq "mc ilm export expiration days" "30" \
+        "$(echo "$MC_LC" | python3 -c 'import sys,json; print(json.load(sys.stdin)["Rules"][0]["Expiration"]["Days"])')"
+    assert_eq "mc ilm export prefix" "logs/" \
+        "$(echo "$MC_LC" | python3 -c 'import sys,json; print(json.load(sys.stdin)["Rules"][0]["Filter"]["Prefix"])')"
+    assert_fail "mc ilm transition is NotImplemented" \
+        mc ilm rule add --transition-days 30 --transition-tier WARM "$MC_ALIAS/$FEAT_BUCKET"
+    MC_LC_ID=$(echo "$MC_LC" | python3 -c 'import sys,json; print(json.load(sys.stdin)["Rules"][0]["ID"])')
+    assert "mc ilm rule rm" mc ilm rule rm --id "$MC_LC_ID" "$MC_ALIAS/$FEAT_BUCKET"
+    assert_fail "mc ilm rule ls after remove" mc ilm rule ls "$MC_ALIAS/$FEAT_BUCKET"
+
+    # Anonymous read policy, then mc's download policy (read + list).
+    echo "public body" > "$TMPDIR/public.txt"
+    assert "put public object" $AWS s3api put-object --bucket "$FEAT_BUCKET" \
+        --key pub.txt --body "$TMPDIR/public.txt"
+    cat > "$TMPDIR/policy-read.json" <<EOF
+{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::$FEAT_BUCKET/*"}]}
+EOF
+    assert "put-bucket-policy anonymous read" $AWS s3api put-bucket-policy \
+        --bucket "$FEAT_BUCKET" --policy "file://$TMPDIR/policy-read.json"
+    ANON_GET=$(curl -sS -o "$TMPDIR/anon-get.txt" -w '%{http_code}' "$ENDPOINT/$FEAT_BUCKET/pub.txt")
+    assert_eq "anonymous GetObject" "200" "$ANON_GET"
+    assert_eq "anonymous GetObject body" "public body" "$(cat "$TMPDIR/anon-get.txt")"
+    ANON_LIST=$(curl -sS -o /dev/null -w '%{http_code}' "$ENDPOINT/$FEAT_BUCKET")
+    assert_eq "anonymous ListBucket denied without list policy" "403" "$ANON_LIST"
+    cat > "$TMPDIR/policy-write.json" <<EOF
+{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":["s3:GetObject","s3:PutObject"],"Resource":"arn:aws:s3:::$FEAT_BUCKET/*"}]}
+EOF
+    assert_fail "put-bucket-policy write is NotImplemented" \
+        $AWS s3api put-bucket-policy --bucket "$FEAT_BUCKET" --policy "file://$TMPDIR/policy-write.json"
+
+    assert "mc anonymous set download" mc anonymous set download "$MC_ALIAS/$FEAT_BUCKET"
+    ANON_GET=$(curl -sS -o "$TMPDIR/anon-get-mc.txt" -w '%{http_code}' "$ENDPOINT/$FEAT_BUCKET/pub.txt")
+    assert_eq "anonymous GetObject after mc download" "200" "$ANON_GET"
+    ANON_LIST=$(curl -sS -o /dev/null -w '%{http_code}' "$ENDPOINT/$FEAT_BUCKET")
+    assert_eq "anonymous ListBucket after mc download" "200" "$ANON_LIST"
+    # mc's "public" canned policy includes write/multipart actions. MaxIO only
+    # accepts anonymous read and list, so this must keep failing.
+    assert_fail "mc anonymous set public is NotImplemented" \
+        mc anonymous set public "$MC_ALIAS/$FEAT_BUCKET"
+    assert "delete-bucket-policy" $AWS s3api delete-bucket-policy --bucket "$FEAT_BUCKET"
+    ANON_GET=$(curl -sS -o /dev/null -w '%{http_code}' "$ENDPOINT/$FEAT_BUCKET/pub.txt")
+    assert_eq "anonymous GetObject denied after policy delete" "403" "$ANON_GET"
+
+    # Streaming trailer checksums (aws-chunked + x-amz-checksum trailer).
+    echo "trailer-body" > "$TMPDIR/trailer.txt"
+    AWS_CP_DEBUG="$TMPDIR/aws-cp.debug"
+    AWS_CP_EXIT=0
+    $AWS s3 cp "$TMPDIR/trailer.txt" "s3://$FEAT_BUCKET/trailer.txt" \
+        --checksum-algorithm CRC32 --debug > /dev/null 2>"$AWS_CP_DEBUG" || AWS_CP_EXIT=$?
+    assert_eq "aws s3 cp checksum trailer upload" "0" "$AWS_CP_EXIT"
+    assert_eq "aws s3 cp uses STREAMING-UNSIGNED-PAYLOAD-TRAILER" "true" \
+        "$(grep -q 'STREAMING-UNSIGNED-PAYLOAD-TRAILER' "$AWS_CP_DEBUG" && echo true || echo false)"
+    assert "download aws trailer object" \
+        $AWS s3 cp "s3://$FEAT_BUCKET/trailer.txt" "$TMPDIR/trailer.down"
+    assert_eq "aws trailer object body" "trailer-body" "$(cat "$TMPDIR/trailer.down")"
+    TRAILER_HEAD=$($AWS s3api head-object --bucket "$FEAT_BUCKET" --key trailer.txt \
+        --checksum-mode ENABLED 2>&1)
+    assert_eq "aws trailer checksum stored" "true" \
+        "$(echo "$TRAILER_HEAD" | grep -q ChecksumCRC32 && echo true || echo false)"
+
+    echo "mc-checksum" > "$TMPDIR/mc-sum.txt"
+    MC_CP_DEBUG="$TMPDIR/mc-cp.debug"
+    MC_CP_EXIT=0
+    mc cp --checksum CRC32 --debug "$TMPDIR/mc-sum.txt" "$MC_ALIAS/$FEAT_BUCKET/mc-sum.txt" \
+        > /dev/null 2>"$MC_CP_DEBUG" || MC_CP_EXIT=$?
+    assert_eq "mc cp --checksum exits 0" "0" "$MC_CP_EXIT"
+    assert_eq "mc cp uses STREAMING-UNSIGNED-PAYLOAD-TRAILER" "true" \
+        "$(grep -q 'STREAMING-UNSIGNED-PAYLOAD-TRAILER' "$MC_CP_DEBUG" && echo true || echo false)"
+    MC_SUM_BODY=$(mc cat "$MC_ALIAS/$FEAT_BUCKET/mc-sum.txt" 2>/dev/null)
+    assert_eq "mc trailer object body" "mc-checksum" "$MC_SUM_BODY"
+    MC_SUM_HEAD=$($AWS s3api head-object --bucket "$FEAT_BUCKET" --key mc-sum.txt \
+        --checksum-mode ENABLED 2>&1)
+    assert_eq "mc trailer checksum stored" "true" \
+        "$(echo "$MC_SUM_HEAD" | grep -q ChecksumCRC32 && echo true || echo false)"
+
+    $AWS s3 rm "s3://$FEAT_BUCKET" --recursive > /dev/null 2>&1 || true
+    assert "delete feature bucket" $AWS s3api delete-bucket --bucket "$FEAT_BUCKET"
+    mc alias rm "$MC_ALIAS" > /dev/null 2>&1 || true
+fi
 
 # --- Summary ---
 echo ""

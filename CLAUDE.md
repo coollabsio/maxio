@@ -58,7 +58,7 @@ Tasks run through [`just`](https://github.com/casey/just) (see `justfile`). Tool
 just check
 
 # 2. AWS CLI integration tests (start server, run tests, stop server)
-cargo build && RUST_LOG=info ./target/debug/maxio --data-dir /tmp/maxio-test --port 9876 &
+cargo build && RUST_LOG=info ./target/debug/maxio --data-dir /tmp/maxio-test --port 9876 --allow-insecure-dev --domain localhost &
 ./tests/aws_cli_test.sh 9876 /tmp/maxio-test
 kill %1 && rm -rf /tmp/maxio-test
 ```
@@ -97,7 +97,7 @@ This runs both processes concurrently (Ctrl+C kills both):
 
 - **Pure filesystem storage**: No database. Buckets are directories, objects are files at their key path, metadata in `.meta.json` sidecars. Backup-friendly — just copy the data dir
 - **Storage layout**: `{data_dir}/buckets/{bucket-name}/{key-path}` for data, `{key-path}.meta.json` for metadata, `.bucket.json` for bucket metadata
-- **Path-style only**: `/{bucket}/{key}` routing. No virtual-hosted-style yet
+- **Path-style and virtual-hosted-style**: `/{bucket}/{key}` always. With `--domain` / `MAXIO_DOMAIN`, a `Host` of `<bucket>.<domain>` is rewritten to that path before routing; SigV4 still verifies the original path and `Host`. Unset domain keeps path-style only
 - **UNSIGNED-PAYLOAD accepted**: Skips body hashing for PutObject (AWS CLI default)
 - **Embedded UI assets**: Frontend is compiled into the binary via `rust-embed`. `build.rs` runs `bun run build` into `ui/dist/` (skip with `SKIP_FRONTEND=1`); `index.html` is the SPA fallback. Dev uses Vite HMR. In release builds, assets are baked in — single binary, no external files needed
 - **Web console**: React SPA at `/ui/`, API at `/api/` (OpenAPI via utoipa, typed client generated with hey-api). Cookie-based auth (HMAC tokens, not SigV4). Presigned URL generation with configurable expiry (1h/6h/24h/7d picker in UI)
@@ -212,15 +212,17 @@ MaxIO supports **SSE-S3** (server-managed keys) and **SSE-C** (customer-supplied
 
 | Concern | Behavior |
 |---|---|
-| Bootstrap | First server start auto-generates a 32-byte master key in `<data-dir>/.maxio-keys.json` (file mode 0600 on Unix). Back this file up — losing it makes all SSE-S3 objects unrecoverable |
-| Override | Set `MAXIO_MASTER_KEY` (or `--master-key`) to a base64-encoded 32-byte key. Bypasses the on-disk keyring file |
-| Rotation | `maxio keyring rotate --data-dir <dir>` generates a new active key and demotes the previous active key (retained so existing objects keep decrypting). Restart the server to begin encrypting new objects with the new key. Existing objects remain readable; they do not get rewritten |
+| Bootstrap | First server start auto-generates a 32-byte master key in `<data-dir>/.maxio-keys.json` only when that file is absent and the data dir has no SSE-S3 objects. The file is written atomically, fsynced, mode 0600 on Unix. A missing file with encrypted objects refuses to start. `--allow-missing-master-key` is the explicit override and must be passed on every start until the original key is restored. It does not overwrite an unreadable or corrupt key file |
+| Check value | `<data-dir>/.maxio-key-check.json` stores an HMAC per key id and no key material. It stays with the data. A loaded key that does not match fails startup. A loose key file (not `0600`) logs a warning |
+| External key | `MAXIO_MASTER_KEY` / `--master-key`, or `MAXIO_MASTER_KEY_FILE` / `--master-key-file` (base64 32 bytes, or 32 raw bytes). The key is not copied into the data directory. On-disk keys are merged for older objects. The two sources are mutually exclusive |
+| Rotation | `maxio keyring rotate --data-dir <dir>` generates a new active key and demotes the previous active key (retained so existing objects keep decrypting). Restart the server to begin encrypting new objects with the new key. Existing objects remain readable; they do not get rewritten. Rotate refuses when the key file is missing and encrypted objects or a key check file require a key |
+| Merge | `maxio keyring merge --data-dir <dir> --from <keyring.json>` adds keys from another keyring file without dropping the ones already stored. Use this after `--allow-missing-master-key` instead of copying the backup over `.maxio-keys.json` |
 | Inspection | `maxio keyring list --data-dir <dir>` prints key ids, creation times, and active flag (never the raw key material) |
 | Windows | `0600` file mode is only enforced on Unix — on Windows, restrict ACLs manually or use full-disk encryption |
 
 #### Backup & Recovery
 
-The `.maxio-keys.json` file is the single source of truth for SSE-S3 decryption. **Back it up offline** at the same time as the data directory. Loss of all keys in the ring = permanent data loss for SSE-S3 objects (this is by design — there is no escrow). For disaster recovery, copy the keyring file to the new host before restoring object data.
+`.maxio-keys.json` (or the external master key) is required to decrypt SSE-S3 objects. **Back it up offline**, separately from the data directory, including after every `keyring rotate`. `.maxio-key-check.json` stays with the data and contains no key material. Loss of all key copies is permanent for SSE-S3 objects (there is no escrow). For disaster recovery, restore the key file into the data directory or pass the same `--master-key` / `--master-key-file` before starting. Startup will not generate a replacement key when encrypted objects are present.
 
 ### Frontend Error Logging
 

@@ -23,6 +23,7 @@ mod error;
 mod openapi;
 mod server;
 mod storage;
+mod vhost;
 mod xml;
 
 use clap::Parser;
@@ -111,6 +112,21 @@ enum KeyringCmd {
         #[arg(long, env = "MAXIO_DATA_DIR", default_value = "./data")]
         data_dir: String,
     },
+
+    /// Add every key from another keyring file into this data directory.
+    ///
+    /// Keeps the keys already stored here. The active key does not change when
+    /// this data directory already has one. Use this after
+    /// `--allow-missing-master-key` created a new key and you still have the
+    /// original `.maxio-keys.json`: pass that backup as `--from`. Do not copy
+    /// the backup over the current file; that drops the new key.
+    Merge {
+        #[arg(long, env = "MAXIO_DATA_DIR", default_value = "./data")]
+        data_dir: String,
+        /// Keyring file to merge in. Key material is not printed.
+        #[arg(long)]
+        from: std::path::PathBuf,
+    },
 }
 
 fn default_healthcheck_url() -> String {
@@ -134,6 +150,12 @@ async fn main() -> anyhow::Result<()> {
         }
         Some(Commands::Keyring(KeyringCmd::List { ref data_dir })) => {
             return run_keyring_list(data_dir).await;
+        }
+        Some(Commands::Keyring(KeyringCmd::Merge {
+            ref data_dir,
+            ref from,
+        })) => {
+            return run_keyring_merge(data_dir, from).await;
         }
         Some(Commands::Check {
             ref data_dir,
@@ -163,6 +185,8 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let config = cli.config;
+    let virtual_domains =
+        vhost::parse_domains(&config.domain).map_err(|err| anyhow::anyhow!(err))?;
 
     if config.access_key == "maxioadmin"
         && config.secret_key == "maxioadmin"
@@ -177,21 +201,47 @@ async fn main() -> anyhow::Result<()> {
 
     tokio::fs::create_dir_all(&config.data_dir).await?;
 
-    // Build the SSE-S3 keyring (bootstrap a random master key on first run).
-    let keyring = Arc::new(
-        storage::keys::Keyring::load(&config.data_dir, config.master_key.as_deref()).await?,
-    );
-    if config.master_key.is_none() {
-        tracing::info!(
-            "SSE-S3 keyring: active key id {} (file {}/.maxio-keys.json — BACK THIS UP)",
-            keyring.active_id(),
-            config.data_dir
-        );
+    // SSE-S3 master key. A missing keyring file bootstraps a new key only when
+    // the data directory has no encrypted objects. See storage::keys.
+    let master_key_b64 = storage::keys::resolve_master_key(
+        config.master_key.as_deref(),
+        config.master_key_file.as_deref(),
+    )
+    .await?;
+    let keyring = Arc::new(if config.allow_missing_master_key {
+        storage::keys::Keyring::load_with(
+            &config.data_dir,
+            storage::keys::LoadOptions {
+                master_key_b64: master_key_b64.as_deref(),
+                allow_missing_master_key: true,
+            },
+        )
+        .await?
     } else {
-        tracing::info!(
-            "SSE-S3 keyring: active key id {} (from MAXIO_MASTER_KEY)",
-            keyring.active_id()
-        );
+        storage::keys::Keyring::load(&config.data_dir, master_key_b64.as_deref()).await?
+    });
+    match (&config.master_key, &config.master_key_file) {
+        (_, Some(path)) => {
+            tracing::info!(
+                "SSE-S3 keyring: active key id {} (from master key file {}; not written into the data directory)",
+                keyring.active_id(),
+                path.display()
+            );
+        }
+        (Some(_), None) => {
+            tracing::info!(
+                "SSE-S3 keyring: active key id {} (from MAXIO_MASTER_KEY; not written into the data directory)",
+                keyring.active_id()
+            );
+        }
+        (None, None) => {
+            tracing::info!(
+                "SSE-S3 keyring: active key id {} (file {}/.maxio-keys.json — BACK THIS UP; {}/.maxio-key-check.json stays with the data and has no key material)",
+                keyring.active_id(),
+                config.data_dir,
+                config.data_dir
+            );
+        }
     }
 
     let storage = storage::filesystem::FilesystemStorage::new(
@@ -262,6 +312,14 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!("Secret Key: [REDACTED]");
     tracing::info!("Data dir:   {}", config.data_dir);
     tracing::info!("Region:     {}", config.region);
+    if virtual_domains.is_empty() {
+        tracing::info!("Addressing: path-style");
+    } else {
+        tracing::info!(
+            "Addressing: path-style and virtual-hosted-style ({})",
+            virtual_domains.join(", ")
+        );
+    }
     if config.erasure_coding {
         tracing::info!(
             "Erasure coding: enabled (chunk size: {}MB)",
@@ -371,6 +429,21 @@ async fn run_keyring_rotate(data_dir: &str) -> anyhow::Result<()> {
     println!("  total keys in ring: {}", result.total_keys);
     println!();
     println!("Restart the server to begin encrypting new objects with the new key.");
+    Ok(())
+}
+
+async fn run_keyring_merge(data_dir: &str, from: &std::path::Path) -> anyhow::Result<()> {
+    let result = storage::keys::merge_keyring(data_dir, from).await?;
+    println!("✓ keyring merged into {data_dir}/.maxio-keys.json");
+    if result.added_ids.is_empty() {
+        println!("  added:             <none> (already present)");
+    } else {
+        println!("  added:             {}", result.added_ids.join(", "));
+    }
+    println!("  active key id:     {}", result.active_id);
+    println!("  total keys in ring: {}", result.total_keys);
+    println!();
+    println!("Restart the server so it loads the merged keyring.");
     Ok(())
 }
 

@@ -200,6 +200,19 @@ impl S3Error {
         }
     }
 
+    /// Map a bucket lookup failure. An invalid name is `400 InvalidBucketName`,
+    /// not an internal error and not `NoSuchBucket`.
+    pub fn from_bucket_storage(err: crate::storage::StorageError, bucket: &str) -> Self {
+        match &err {
+            crate::storage::StorageError::InvalidKey(msg)
+                if msg.starts_with("invalid bucket name") =>
+            {
+                Self::invalid_bucket_name(bucket)
+            }
+            _ => Self::internal(err),
+        }
+    }
+
     pub fn invalid_argument(msg: &str) -> Self {
         Self {
             code: S3ErrorCode::InvalidArgument,

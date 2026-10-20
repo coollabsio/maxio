@@ -2,6 +2,7 @@
 name = "maxio"
 version = "1.0.0"
 edition = "2024"
+rust-version = "1.89"
 description = "S3-compatible object storage server — single-binary replacement for MinIO"
 license = "Apache-2.0"
 repository = "https://github.com/coollabsio/maxio"
@@ -16,6 +17,7 @@ tokio = { version = "1", features = ["full"] }
 tower = "0.5"
 tower-http = { version = "0.6", features = ["trace"] }
 hyper = "1"
+hyper-util = { version = "0.1", features = ["tokio", "server-auto", "service"] }
 http = "1"
 bytes = "1"
 

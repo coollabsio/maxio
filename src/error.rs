@@ -31,6 +31,9 @@ pub enum S3ErrorCode {
     InvalidRange,
     NotImplemented,
     EntityTooSmall,
+    EntityTooLarge,
+    SlowDown,
+    RequestTimeout,
     ExpiredPresignedUrl,
     NoSuchCORSConfiguration,
     PreconditionFailed,
@@ -77,6 +80,9 @@ impl S3ErrorCode {
             Self::InvalidRange => "InvalidRange",
             Self::NotImplemented => "NotImplemented",
             Self::EntityTooSmall => "EntityTooSmall",
+            Self::EntityTooLarge => "EntityTooLarge",
+            Self::SlowDown => "SlowDown",
+            Self::RequestTimeout => "RequestTimeout",
             Self::ExpiredPresignedUrl => "AccessDenied",
             Self::PreconditionFailed => "PreconditionFailed",
             Self::NoSuchCORSConfiguration => "NoSuchCORSConfiguration",
@@ -125,6 +131,7 @@ impl S3ErrorCode {
             | Self::NoSuchTagSet => StatusCode::NOT_FOUND,
             Self::BucketAlreadyOwnedByYou | Self::BucketNotEmpty => StatusCode::CONFLICT,
             Self::InternalError => StatusCode::INTERNAL_SERVER_ERROR,
+            Self::SlowDown => StatusCode::SERVICE_UNAVAILABLE,
             Self::InvalidRange | Self::InvalidPartNumber => StatusCode::RANGE_NOT_SATISFIABLE,
             Self::NotImplemented => StatusCode::NOT_IMPLEMENTED,
             Self::PreconditionFailed => StatusCode::PRECONDITION_FAILED,
@@ -204,6 +211,19 @@ impl S3Error {
         }
     }
 
+    /// Map a bucket lookup failure. An invalid name is `400 InvalidBucketName`,
+    /// not an internal error and not `NoSuchBucket`.
+    pub fn from_bucket_storage(err: crate::storage::StorageError, bucket: &str) -> Self {
+        match &err {
+            crate::storage::StorageError::InvalidKey(msg)
+                if msg.starts_with("invalid bucket name") =>
+            {
+                Self::invalid_bucket_name(bucket)
+            }
+            _ => Self::internal(err),
+        }
+    }
+
     pub fn invalid_argument(msg: &str) -> Self {
         Self {
             code: S3ErrorCode::InvalidArgument,
@@ -254,10 +274,12 @@ impl S3Error {
         )
     }
 
-    pub fn illegal_location_constraint() -> Self {
+    pub fn illegal_location_constraint(requested: &str, server_region: &str) -> Self {
         Self::new(
             S3ErrorCode::IllegalLocationConstraint,
-            "The unspecified location constraint is incompatible for the region specific endpoint this request was sent to.",
+            format!(
+                "The {requested} location constraint is incompatible with this endpoint's region ({server_region})."
+            ),
         )
     }
 
@@ -283,6 +305,24 @@ impl S3Error {
             message: "Your proposed upload is smaller than the minimum allowed object size.".into(),
             resource: None,
         }
+    }
+
+    pub fn entity_too_large() -> Self {
+        Self::new(
+            S3ErrorCode::EntityTooLarge,
+            "Your proposed upload exceeds the maximum allowed size.",
+        )
+    }
+
+    pub fn slow_down() -> Self {
+        Self::new(S3ErrorCode::SlowDown, "Please reduce your request rate.")
+    }
+
+    pub fn request_timeout() -> Self {
+        Self::new(
+            S3ErrorCode::RequestTimeout,
+            "Your socket connection to the server was not read from or written to within the timeout period.",
+        )
     }
 
     pub fn expired_presigned_url() -> Self {

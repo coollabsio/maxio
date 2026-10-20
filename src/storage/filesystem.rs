@@ -20,6 +20,7 @@ use sha2::Sha256;
 use std::collections::HashMap;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU8, Ordering};
 use tokio::fs;
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt, BufReader, BufWriter};
 
@@ -30,6 +31,15 @@ const SMALL_OBJECT_THRESHOLD: u64 = 256 * 1024;
 
 const KEY_LOCK_SHARDS: usize = 1024;
 const BUCKET_LOCK_SHARDS: usize = 256;
+
+const FAULT_NONE: u8 = 0;
+const FAULT_BEFORE_PAYLOAD_RENAME: u8 = 1;
+const FAULT_AFTER_PAYLOAD_RENAME: u8 = 2;
+
+fn consume_fault(slot: &AtomicU8, point: u8) -> bool {
+    slot.compare_exchange(point, FAULT_NONE, Ordering::SeqCst, Ordering::SeqCst)
+        .is_ok()
+}
 
 #[derive(serde::Serialize, serde::Deserialize)]
 struct CompletedUploadRecord {
@@ -55,6 +65,13 @@ pub struct FilesystemStorage {
     /// and `.bucket.json` read-modify-write take a write guard. Lock order is
     /// always bucket guard first, then key guard.
     bucket_locks: Vec<tokio::sync::RwLock<()>>,
+    /// Test fault point. Always `FAULT_NONE` in production; `arm_fault` is
+    /// `cfg(test)` only. Kept on the struct so publish can fail one step
+    /// without a process-global flag (tests run in parallel).
+    fault: AtomicU8,
+    max_object_size: u64,
+    max_part_size: u64,
+    max_multipart_object_size: u64,
 }
 
 fn shard_index(parts: &[&str], shards: usize) -> usize {
@@ -325,7 +342,7 @@ impl FilesystemStorage {
     ) -> Result<Self, anyhow::Error> {
         let buckets_dir = Path::new(data_dir).join("buckets");
         fs::create_dir_all(&buckets_dir).await?;
-        Ok(Self {
+        let storage = Self {
             buckets_dir,
             erasure_coding,
             chunk_size,
@@ -335,7 +352,47 @@ impl FilesystemStorage {
             bucket_locks: (0..BUCKET_LOCK_SHARDS)
                 .map(|_| Default::default())
                 .collect(),
-        })
+            fault: AtomicU8::new(FAULT_NONE),
+            max_object_size: u64::MAX,
+            max_part_size: u64::MAX,
+            max_multipart_object_size: u64::MAX,
+        };
+        // Nothing is in flight during construction, so crash leftovers (temp
+        // files, stranded EC backups, upload dirs with no readable metadata)
+        // are safe to clear immediately. The hourly sweep keeps an age gate
+        // so it cannot delete a live request's temp file.
+        storage.startup_recover().await;
+        Ok(storage)
+    }
+
+    /// Caps for a single PutObject, one multipart part, and an assembled
+    /// multipart object. `u64::MAX` disables a cap. Set from server config.
+    pub fn set_upload_limits(&mut self, max_object: u64, max_part: u64, max_multipart: u64) {
+        self.max_object_size = max_object;
+        self.max_part_size = max_part;
+        self.max_multipart_object_size = max_multipart;
+    }
+
+    fn check_object_size(&self, size: u64) -> Result<(), StorageError> {
+        if size > self.max_object_size {
+            Err(StorageError::EntityTooLarge)
+        } else {
+            Ok(())
+        }
+    }
+
+    fn check_part_size(&self, size: u64) -> Result<(), StorageError> {
+        if size > self.max_part_size {
+            Err(StorageError::EntityTooLarge)
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Test-only: the next publish fails once at `point` (`FAULT_*`).
+    #[cfg(test)]
+    fn arm_fault(&self, point: u8) {
+        self.fault.store(point, Ordering::SeqCst);
     }
 
     async fn key_lock(&self, bucket: &str, key: &str) -> tokio::sync::MutexGuard<'_, ()> {
@@ -370,7 +427,7 @@ impl FilesystemStorage {
                     let _ = fs::remove_dir(&bucket_dir).await;
                     return Err(e);
                 }
-                sync_parent_dir(&bucket_dir).await;
+                sync_parent_dir(&bucket_dir).await?;
                 Ok(true)
             }
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
@@ -753,6 +810,7 @@ impl FilesystemStorage {
                 ch.update(&buf[..n]);
             }
             size += n as u64;
+            self.check_object_size(size)?;
             if let Some(ref cipher) = cipher_opt {
                 frame_buf.extend_from_slice(&buf[..n]);
                 while frame_buf.len() >= FRAME_CHUNK_SIZE {
@@ -856,6 +914,7 @@ impl FilesystemStorage {
                 false,
                 &tmp_meta_path,
                 &meta_path,
+                &self.fault,
             )
             .await
         }
@@ -926,6 +985,7 @@ impl FilesystemStorage {
                 ch.update(&read_buf[..n]);
             }
             total_size += n as u64;
+            self.check_object_size(total_size)?;
             chunk_buf.extend_from_slice(&read_buf[..n]);
 
             while chunk_buf.len() >= self.chunk_size as usize {
@@ -1031,8 +1091,15 @@ impl FilesystemStorage {
                 self.write_version_chunked(bucket, key, &meta, &tmp_ec_dir)
                     .await?;
             }
-            publish_temp_payload_and_meta(&tmp_ec_dir, &ec_dir, true, &tmp_meta_path, &meta_path)
-                .await
+            publish_temp_payload_and_meta(
+                &tmp_ec_dir,
+                &ec_dir,
+                true,
+                &tmp_meta_path,
+                &meta_path,
+                &self.fault,
+            )
+            .await
         }
         .await;
         if let Err(e) = publish_result {
@@ -1152,6 +1219,7 @@ impl FilesystemStorage {
                 ch.update(&read_buf[..n]);
             }
             plaintext_size += n as u64;
+            self.check_object_size(plaintext_size)?;
             frame_buf.extend_from_slice(&read_buf[..n]);
             while frame_buf.len() >= FRAME_CHUNK_SIZE {
                 let frame_data: Vec<u8> = frame_buf.drain(..FRAME_CHUNK_SIZE).collect();
@@ -1279,8 +1347,15 @@ impl FilesystemStorage {
                 self.write_version_chunked(bucket, key, &meta, &tmp_ec_dir)
                     .await?;
             }
-            publish_temp_payload_and_meta(&tmp_ec_dir, &ec_dir, true, &tmp_meta_path, &meta_path)
-                .await
+            publish_temp_payload_and_meta(
+                &tmp_ec_dir,
+                &ec_dir,
+                true,
+                &tmp_meta_path,
+                &meta_path,
+                &self.fault,
+            )
+            .await
         }
         .await;
         if let Err(e) = publish_result {
@@ -1394,7 +1469,7 @@ async fn write_chunk_file(path: &Path, index: u32, data: &[u8]) -> Result<ChunkI
 }
 
 /// Payload file stored inside a key directory when that key is also a prefix.
-const INLINE_OBJECT_PAYLOAD: &str = ".maxio.object";
+pub(crate) const INLINE_OBJECT_PAYLOAD: &str = ".maxio.object";
 
 /// Create `dir`, turning any file along the path into a directory that keeps
 /// the object's bytes in `.maxio.object`. S3 keys are a flat namespace, so
@@ -1509,38 +1584,46 @@ async fn sync_file(path: &Path) -> Result<(), StorageError> {
     Ok(())
 }
 
-/// Fsync the parent directory of `path` so a completed rename itself survives
-/// power loss. Best-effort: a failure is logged, not propagated, because the
-/// data blocks are already durable at this point.
-async fn sync_parent_dir(path: &Path) {
+/// Fsync `dir` so its directory entries (renames, creates, unlinks) are on
+/// stable storage. A failure is returned: the bytes may be durable while the
+/// name that points at them is not.
+async fn sync_dir(dir: &Path) -> Result<(), StorageError> {
     #[cfg(unix)]
     {
-        if let Some(parent) = path.parent() {
-            let parent = parent.to_path_buf();
-            let res = tokio::task::spawn_blocking(move || {
-                std::fs::File::open(&parent).and_then(|f| f.sync_all())
-            })
-            .await;
-            match res {
-                Ok(Ok(())) => {}
-                Ok(Err(e)) => {
-                    tracing::warn!("directory fsync failed for {}: {}", path.display(), e)
-                }
-                Err(e) => tracing::warn!("directory fsync task failed: {}", e),
-            }
+        if dir.as_os_str().is_empty() {
+            return Ok(());
         }
+        let dir = dir.to_path_buf();
+        tokio::task::spawn_blocking(move || std::fs::File::open(&dir).and_then(|f| f.sync_all()))
+            .await
+            .map_err(|e| {
+                StorageError::Io(std::io::Error::other(format!(
+                    "directory fsync task failed: {e}"
+                )))
+            })?
+            .map_err(StorageError::Io)?;
     }
     #[cfg(not(unix))]
     {
-        let _ = path;
+        let _ = dir;
     }
+    Ok(())
+}
+
+/// Fsync the parent directory of `path` so a completed rename itself survives
+/// power loss.
+async fn sync_parent_dir(path: &Path) -> Result<(), StorageError> {
+    if let Some(parent) = path.parent() {
+        sync_dir(parent).await?;
+    }
+    Ok(())
 }
 
 /// Durable atomic write for small metadata files (sidecars, `.bucket.json`,
 /// version metadata, part metadata): temp sibling → fsync → rename over the
 /// final path → parent-dir fsync. Readers see either the old or the new
 /// complete file, never a torn one, and the result survives power loss.
-async fn write_file_atomic(path: &Path, bytes: &[u8]) -> Result<(), StorageError> {
+pub(crate) async fn write_file_atomic(path: &Path, bytes: &[u8]) -> Result<(), StorageError> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).await?;
     }
@@ -1552,7 +1635,7 @@ async fn write_file_atomic(path: &Path, bytes: &[u8]) -> Result<(), StorageError
     drop(f);
     fs::rename(&tmp, path).await?;
     guard.disarm();
-    sync_parent_dir(path).await;
+    sync_parent_dir(path).await?;
     Ok(())
 }
 
@@ -1602,6 +1685,7 @@ async fn publish_temp_payload_and_meta(
     payload_is_dir: bool,
     tmp_meta: &Path,
     final_meta: &Path,
+    fault: &AtomicU8,
 ) -> Result<(), StorageError> {
     if let Some(parent) = final_payload.parent() {
         fs::create_dir_all(parent).await?;
@@ -1611,11 +1695,21 @@ async fn publish_temp_payload_and_meta(
     }
 
     // Make the new bytes durable BEFORE they become visible. Directory
-    // payloads (EC) are synced chunk-by-chunk at write time.
-    if !payload_is_dir {
+    // payloads (EC) are synced chunk-by-chunk at write time; the directory
+    // entry itself still needs an fsync or a crash can publish a dir whose
+    // chunk names never hit disk.
+    if payload_is_dir {
+        sync_dir(tmp_payload).await?;
+    } else {
         sync_file(tmp_payload).await?;
     }
     sync_file(tmp_meta).await?;
+
+    if consume_fault(fault, FAULT_BEFORE_PAYLOAD_RENAME) {
+        return Err(StorageError::Io(std::io::Error::other(
+            "injected fault before payload rename",
+        )));
+    }
 
     if payload_is_dir {
         // rename(2) cannot replace a non-empty directory, so the old EC dir is
@@ -1637,6 +1731,11 @@ async fn publish_temp_payload_and_meta(
             restore_backup(final_payload, &backup, true).await;
             return Err(StorageError::Io(e));
         }
+        if consume_fault(fault, FAULT_AFTER_PAYLOAD_RENAME) {
+            return Err(StorageError::Io(std::io::Error::other(
+                "injected fault after payload rename",
+            )));
+        }
         if let Err(e) = fs::rename(tmp_meta, final_meta).await {
             remove_path_if_exists(final_payload, true).await;
             restore_backup(final_payload, &backup, true).await;
@@ -1647,6 +1746,11 @@ async fn publish_temp_payload_and_meta(
         // Plain files: rename atomically replaces the destination, so the old
         // object is never moved aside and can never be lost mid-publish.
         fs::rename(tmp_payload, final_payload).await?;
+        if consume_fault(fault, FAULT_AFTER_PAYLOAD_RENAME) {
+            return Err(StorageError::Io(std::io::Error::other(
+                "injected fault after payload rename",
+            )));
+        }
         if let Err(e) = fs::rename(tmp_meta, final_meta).await {
             // Same-directory rename only fails if the filesystem itself is
             // failing. The payload replace cannot be undone at this point, so
@@ -1659,9 +1763,9 @@ async fn publish_temp_payload_and_meta(
         }
     }
 
-    sync_parent_dir(final_payload).await;
+    sync_parent_dir(final_payload).await?;
     if final_meta.parent() != final_payload.parent() {
-        sync_parent_dir(final_meta).await;
+        sync_parent_dir(final_meta).await?;
     }
     Ok(())
 }
@@ -1868,8 +1972,15 @@ impl FilesystemStorage {
                 self.write_version_chunked(bucket, key, &object_meta, &tmp_ec_dir)
                     .await?;
             }
-            publish_temp_payload_and_meta(&tmp_ec_dir, &ec_dir, true, &tmp_meta_path, &meta_path)
-                .await
+            publish_temp_payload_and_meta(
+                &tmp_ec_dir,
+                &ec_dir,
+                true,
+                &tmp_meta_path,
+                &meta_path,
+                &self.fault,
+            )
+            .await
         }
         .await;
         if let Err(e) = publish_result {
@@ -2163,8 +2274,15 @@ impl FilesystemStorage {
                 self.write_version_chunked(bucket, key, &object_meta, &tmp_ec_dir)
                     .await?;
             }
-            publish_temp_payload_and_meta(&tmp_ec_dir, &ec_dir, true, &tmp_meta_path, &meta_path)
-                .await
+            publish_temp_payload_and_meta(
+                &tmp_ec_dir,
+                &ec_dir,
+                true,
+                &tmp_meta_path,
+                &meta_path,
+                &self.fault,
+            )
+            .await
         }
         .await;
         if let Err(e) = publish_result {
@@ -2213,7 +2331,7 @@ impl FilesystemStorage {
         ensure_dir_preserving_objects(&folder_dir).await?;
 
         let marker_path = folder_dir.join(".folder");
-        fs::write(&marker_path, b"").await?;
+        write_file_atomic(&marker_path, b"").await?;
 
         let etag = "\"d41d8cd98f00b204e9800998ecf8427e\"".to_string();
         let now = chrono::Utc::now()
@@ -2704,6 +2822,7 @@ impl FilesystemStorage {
                 ch.update(&buf[..n]);
             }
             size += n as u64;
+            self.check_part_size(size)?;
             if let Some(ref cipher) = cipher_opt {
                 frame_buf.extend_from_slice(&buf[..n]);
                 while frame_buf.len() >= FRAME_CHUNK_SIZE {
@@ -2768,6 +2887,7 @@ impl FilesystemStorage {
         // truncated part behind a stale sidecar.
         fs::rename(&tmp_part_path, &part_path).await?;
         tmp_part_guard.disarm();
+        sync_parent_dir(&part_path).await?;
         if let Err(e) = write_file_atomic(
             &self.part_meta_path(bucket, upload_id, part_number),
             serde_json::to_string_pretty(&meta)?.as_bytes(),
@@ -2832,6 +2952,12 @@ impl FilesystemStorage {
                 return Err(StorageError::InvalidKey("part too small".into()));
             }
             selected.push(meta);
+        }
+        let assembled = selected
+            .iter()
+            .fold(0u64, |acc, part| acc.saturating_add(part.size));
+        if assembled > self.max_multipart_object_size {
+            return Err(StorageError::EntityTooLarge);
         }
 
         if self.erasure_coding {
@@ -3158,6 +3284,7 @@ impl FilesystemStorage {
                 false,
                 &tmp_meta_path,
                 &meta_path,
+                &self.fault,
             )
             .await
         }
@@ -3307,6 +3434,72 @@ impl FilesystemStorage {
         Ok(uploads)
     }
 
+    /// Clear crash leftovers that cannot belong to a live request.
+    ///
+    /// Called from `new` (process start). Removes every `.maxio-tmp-*` and
+    /// resolves every `.maxio-bak-*` immediately, and deletes multipart upload
+    /// directories whose `.meta.json` is missing or unreadable. Uploads with
+    /// valid metadata are left for the client to complete or abort; the hourly
+    /// sweep removes those that stay idle for 7 days.
+    ///
+    /// Returns `(uploads_removed, artifacts_removed)`.
+    pub async fn startup_recover(&self) -> (u64, u64) {
+        let mut uploads_removed = 0u64;
+        let mut artifacts = 0u64;
+        let mut bucket_entries = match fs::read_dir(&self.buckets_dir).await {
+            Ok(entries) => entries,
+            Err(e) => {
+                tracing::warn!("startup recovery: cannot read buckets dir: {}", e);
+                return (0, 0);
+            }
+        };
+        while let Ok(Some(bucket_entry)) = bucket_entries.next_entry().await {
+            if !matches!(bucket_entry.file_type().await, Ok(ft) if ft.is_dir()) {
+                continue;
+            }
+            let bucket_dir = bucket_entry.path();
+            let uploads_dir = bucket_dir.join(".uploads");
+            if let Ok(mut uploads) = fs::read_dir(&uploads_dir).await {
+                while let Ok(Some(up)) = uploads.next_entry().await {
+                    if !matches!(up.file_type().await, Ok(ft) if ft.is_dir()) {
+                        continue;
+                    }
+                    let meta_path = up.path().join(".meta.json");
+                    let readable = match fs::read_to_string(&meta_path).await {
+                        Ok(data) => serde_json::from_str::<MultipartUploadMeta>(&data).is_ok(),
+                        Err(_) => false,
+                    };
+                    if readable {
+                        continue;
+                    }
+                    match fs::remove_dir_all(up.path()).await {
+                        Ok(()) => {
+                            uploads_removed += 1;
+                            tracing::warn!(
+                                "startup recovery: removed multipart upload without readable metadata at {}",
+                                up.path().display()
+                            );
+                        }
+                        Err(e) => tracing::warn!(
+                            "startup recovery: failed to remove upload {}: {}",
+                            up.path().display(),
+                            e
+                        ),
+                    }
+                }
+            }
+            artifacts += Self::sweep_stale_artifacts(&bucket_dir, None, None).await;
+        }
+        if uploads_removed > 0 || artifacts > 0 {
+            tracing::info!(
+                "startup recovery: removed {} upload(s) without metadata, {} temp/backup artifact(s)",
+                uploads_removed,
+                artifacts
+            );
+        }
+        (uploads_removed, artifacts)
+    }
+
     /// Background housekeeping: abort multipart uploads whose `.meta.json`
     /// `initiated` timestamp is older than `stale_after`, and remove
     /// leftover `.maxio-tmp-*` files from crashed writes. Returns
@@ -3384,10 +3577,22 @@ impl FilesystemStorage {
             }
 
             // 2. Leftover temp/backup files from crashed writes, at any depth.
-            temp_removed += Self::sweep_stale_artifacts(&bucket_dir).await;
+            //    Age-gated so an in-flight request's temp file is left alone.
+            temp_removed +=
+                Self::sweep_stale_artifacts(&bucket_dir, Some(24 * 3600), Some(3600)).await;
         }
 
         (uploads_removed, temp_removed)
+    }
+
+    /// `None` means "any age" (startup). `Some(secs)` is true only when mtime
+    /// is strictly older than `secs`. Errs on the side of "not old" when a
+    /// positive age is required, so a stat failure never deletes a live file.
+    async fn is_stale(path: &Path, max_age: Option<u64>) -> bool {
+        let Some(secs) = max_age else {
+            return true;
+        };
+        Self::entry_older_than(path, secs).await
     }
 
     /// True if `path`'s mtime is older than `secs` seconds. Errs on the side
@@ -3403,18 +3608,20 @@ impl FilesystemStorage {
     }
 
     /// Recursively sweep crash leftovers under `dir`:
-    /// * `.maxio-tmp-*` entries older than `TEMP_STALE_AFTER_SECS` are removed.
-    ///   The age gate matters: an in-flight upload keeps touching its temp
-    ///   file, so a young temp may belong to a live request and must be kept.
-    /// * `.maxio-bak-<name>` entries older than `BACKUP_STALE_AFTER_SECS` are
-    ///   crash-stranded EC publish backups: if `<name>` is missing the publish
-    ///   died mid-swap and the backup IS the committed object — restore it;
-    ///   if `<name>` exists the publish completed and the backup is garbage.
-    fn sweep_stale_artifacts(
-        dir: &Path,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = u64> + Send + '_>> {
-        const TEMP_STALE_AFTER_SECS: u64 = 24 * 3600;
-        const BACKUP_STALE_AFTER_SECS: u64 = 3600;
+    /// * `.maxio-tmp-*` entries older than `temp_max_age` seconds are removed.
+    ///   `None` removes them regardless of age (startup, when nothing is in
+    ///   flight). The age gate matters while the server is running: an
+    ///   in-flight upload keeps touching its temp file.
+    /// * `.maxio-bak-<name>` entries older than `backup_max_age` (`None` = any
+    ///   age) are crash-stranded EC publish backups: if `<name>` is missing
+    ///   the publish died mid-swap and the backup IS the committed object —
+    ///   restore it; if `<name>` exists the publish completed and the backup
+    ///   is garbage.
+    fn sweep_stale_artifacts<'a>(
+        dir: &'a Path,
+        temp_max_age: Option<u64>,
+        backup_max_age: Option<u64>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = u64> + Send + 'a>> {
         Box::pin(async move {
             let mut removed = 0u64;
             let mut entries = match fs::read_dir(dir).await {
@@ -3427,9 +3634,7 @@ impl FilesystemStorage {
                 let is_dir = matches!(entry.file_type().await, Ok(ft) if ft.is_dir());
 
                 if let Some(orig_name) = name.strip_prefix(".maxio-bak-") {
-                    if orig_name.is_empty()
-                        || !Self::entry_older_than(&path, BACKUP_STALE_AFTER_SECS).await
-                    {
+                    if orig_name.is_empty() || !Self::is_stale(&path, backup_max_age).await {
                         continue;
                     }
                     let orig = dir.join(orig_name);
@@ -3479,7 +3684,7 @@ impl FilesystemStorage {
                 }
 
                 if name.starts_with(".maxio-tmp-") {
-                    if !Self::entry_older_than(&path, TEMP_STALE_AFTER_SECS).await {
+                    if !Self::is_stale(&path, temp_max_age).await {
                         continue;
                     }
                     let result = if is_dir {
@@ -3505,7 +3710,8 @@ impl FilesystemStorage {
                 }
 
                 if is_dir {
-                    removed += Self::sweep_stale_artifacts(&path).await;
+                    removed +=
+                        Self::sweep_stale_artifacts(&path, temp_max_age, backup_max_age).await;
                 }
             }
             removed
@@ -4237,13 +4443,19 @@ impl FilesystemStorage {
             let dst = ver_dir.join("null.ec");
             remove_dir_all_if_exists(&dst).await?;
             fs::rename(&ec_dir, &dst).await?;
+            sync_parent_dir(&dst).await?;
+            sync_parent_dir(&ec_dir).await?;
         } else {
             let obj_path = self.plain_object_read_path(bucket, key).await;
             if matches!(fs::metadata(&obj_path).await, Ok(m) if m.is_file()) {
-                fs::rename(&obj_path, ver_dir.join("null.data")).await?;
+                let dst = ver_dir.join("null.data");
+                fs::rename(&obj_path, &dst).await?;
+                sync_parent_dir(&dst).await?;
+                sync_parent_dir(&obj_path).await?;
             }
         }
         let _ = fs::remove_file(self.meta_path(bucket, key)).await;
+        sync_parent_dir(&self.meta_path(bucket, key)).await?;
         Ok(())
     }
 
@@ -4293,6 +4505,7 @@ impl FilesystemStorage {
         let ver_data = ver_dir.join(format!("{}.data", version_id));
         fs::copy(data_path, &ver_data).await?;
         sync_file(&ver_data).await?;
+        sync_parent_dir(&ver_data).await?;
 
         // Write version metadata (atomic: a crash can leave an orphan .data
         // file, but never a torn sidecar).
@@ -4323,6 +4536,7 @@ impl FilesystemStorage {
             fs::copy(entry.path(), &dest).await?;
             sync_file(&dest).await?;
         }
+        sync_dir(&dst_ec).await?;
 
         let ver_meta = ver_dir.join(format!("{}.meta.json", version_id));
         write_file_atomic(&ver_meta, serde_json::to_string_pretty(meta)?.as_bytes()).await?;
@@ -4475,8 +4689,15 @@ impl FilesystemStorage {
                     fs::copy(entry.path(), &dest).await?;
                     sync_file(&dest).await?;
                 }
-                publish_temp_payload_and_meta(&tmp_ec, &dst_ec, true, &tmp_meta, &obj_meta_path)
-                    .await?;
+                publish_temp_payload_and_meta(
+                    &tmp_ec,
+                    &dst_ec,
+                    true,
+                    &tmp_meta,
+                    &obj_meta_path,
+                    &self.fault,
+                )
+                .await?;
                 tmp_ec_guard.disarm();
                 tmp_meta_guard.disarm();
                 remove_plain_payload(&self.object_path(bucket, key)).await?;
@@ -4492,6 +4713,7 @@ impl FilesystemStorage {
                     false,
                     &tmp_meta,
                     &obj_meta_path,
+                    &self.fault,
                 )
                 .await?;
                 tmp_data_guard.disarm();
@@ -5164,5 +5386,214 @@ impl FilesystemStorage {
             customer_key,
         )
         .await
+    }
+}
+
+#[cfg(test)]
+mod durability_tests {
+    use super::*;
+    use crate::storage::keys::Keyring;
+    use crate::storage::{BucketMeta, ObjectMeta};
+    use std::io::Cursor;
+    use std::time::{Duration, SystemTime};
+    use tokio::io::AsyncReadExt;
+
+    async fn storage_at(dir: &std::path::Path) -> FilesystemStorage {
+        let keyring = Arc::new(Keyring::load(dir.to_str().unwrap(), None).await.unwrap());
+        FilesystemStorage::new(dir.to_str().unwrap(), false, 1024 * 1024, 0, keyring)
+            .await
+            .unwrap()
+    }
+
+    fn bucket_meta(name: &str) -> BucketMeta {
+        BucketMeta {
+            name: name.to_string(),
+            created_at: "2020-01-01T00:00:00.000Z".into(),
+            region: "us-east-1".into(),
+            versioning: false,
+            cors_rules: None,
+            encryption_config: None,
+            public_read: false,
+            public_list: false,
+            versioning_suspended: false,
+            tags: None,
+            lifecycle: None,
+        }
+    }
+
+    async fn put(storage: &FilesystemStorage, key: &str, body: &[u8]) {
+        storage
+            .put_object(
+                "bkt",
+                key,
+                "text/plain",
+                Box::pin(Cursor::new(body.to_vec())),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+    }
+
+    async fn read_obj(storage: &FilesystemStorage, key: &str) -> (Vec<u8>, u64) {
+        let (mut reader, meta) = storage.get_object("bkt", key, None).await.unwrap();
+        let mut buf = Vec::new();
+        reader.read_to_end(&mut buf).await.unwrap();
+        (buf, meta.size)
+    }
+
+    fn count_named(dir: &std::path::Path, prefix: &str) -> usize {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().starts_with(prefix))
+            .count()
+    }
+
+    #[tokio::test]
+    async fn fault_before_rename_keeps_the_previous_object() {
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = storage_at(tmp.path()).await;
+        storage.create_bucket(&bucket_meta("bkt")).await.unwrap();
+        put(&storage, "a.txt", b"hello").await;
+
+        storage.arm_fault(FAULT_BEFORE_PAYLOAD_RENAME);
+        let err = match storage
+            .put_object(
+                "bkt",
+                "a.txt",
+                "text/plain",
+                Box::pin(Cursor::new(b"hello world".to_vec())),
+                None,
+                None,
+            )
+            .await
+        {
+            Err(err) => err,
+            Ok(_) => panic!("put should fail before the payload is published"),
+        };
+        assert!(err.to_string().contains("injected fault"), "{err}");
+
+        let (body, size) = read_obj(&storage, "a.txt").await;
+        assert_eq!(body, b"hello");
+        assert_eq!(size, 5);
+        let bucket = tmp.path().join("buckets/bkt");
+        assert_eq!(count_named(&bucket, ".maxio-tmp-"), 0);
+    }
+
+    #[tokio::test]
+    async fn fault_after_rename_is_repaired_from_the_bytes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = storage_at(tmp.path()).await;
+        storage.create_bucket(&bucket_meta("bkt")).await.unwrap();
+        put(&storage, "a.txt", b"hello").await;
+
+        storage.arm_fault(FAULT_AFTER_PAYLOAD_RENAME);
+        let err = match storage
+            .put_object(
+                "bkt",
+                "a.txt",
+                "text/plain",
+                Box::pin(Cursor::new(b"hello world".to_vec())),
+                None,
+                None,
+            )
+            .await
+        {
+            Err(err) => err,
+            Ok(_) => panic!("put should fail after the payload rename"),
+        };
+        assert!(err.to_string().contains("injected fault"), "{err}");
+
+        let data = std::fs::read(tmp.path().join("buckets/bkt/a.txt")).unwrap();
+        assert_eq!(data, b"hello world");
+        let meta: ObjectMeta = serde_json::from_str(
+            &std::fs::read_to_string(tmp.path().join("buckets/bkt/a.txt.meta.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(meta.size, 5, "old sidecar must stay until repair");
+
+        let report = crate::storage::check::check(tmp.path(), true)
+            .await
+            .unwrap();
+        assert!(
+            report.issues.iter().any(|issue| issue.kind
+                == crate::storage::check::IssueKind::SizeMismatch
+                && issue.repaired),
+            "{:?}",
+            report.issues
+        );
+        let (body, size) = read_obj(&storage, "a.txt").await;
+        assert_eq!(body, b"hello world");
+        assert_eq!(size, 11);
+    }
+
+    #[tokio::test]
+    async fn housekeeping_keeps_fresh_temps_and_startup_removes_them() {
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = storage_at(tmp.path()).await;
+        let bucket = tmp.path().join("buckets/bkt");
+        std::fs::create_dir_all(&bucket).unwrap();
+        let fresh = bucket.join(".maxio-tmp-fresh");
+        let old = bucket.join(".maxio-tmp-old");
+        std::fs::write(&fresh, b"live").unwrap();
+        std::fs::write(&old, b"stale").unwrap();
+        let old_path = old.clone();
+        std::fs::File::options()
+            .write(true)
+            .open(&old_path)
+            .unwrap()
+            .set_times(
+                std::fs::FileTimes::new()
+                    .set_modified(SystemTime::now() - Duration::from_secs(48 * 3600)),
+            )
+            .unwrap();
+
+        let upload = bucket.join(".uploads/dead");
+        std::fs::create_dir_all(&upload).unwrap();
+        std::fs::write(upload.join("1"), b"part").unwrap();
+
+        storage.housekeeping_sweep(chrono::Duration::days(7)).await;
+        assert!(
+            fresh.exists(),
+            "in-flight temp must survive the hourly sweep"
+        );
+        assert!(!old.exists(), "day-old temp is crash debris");
+
+        let (uploads, artifacts) = storage.startup_recover().await;
+        assert!(!fresh.exists(), "startup has no in-flight writes");
+        assert!(
+            uploads >= 1,
+            "upload without metadata is removed, got {uploads}"
+        );
+        assert!(
+            artifacts >= 1,
+            "fresh temp removed at startup, got {artifacts}"
+        );
+    }
+
+    #[tokio::test]
+    async fn put_over_the_object_cap_is_rejected_and_not_published() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut storage = storage_at(tmp.path()).await;
+        storage.set_upload_limits(4, 100, 150);
+        storage.create_bucket(&bucket_meta("bkt")).await.unwrap();
+        let err = storage
+            .put_object(
+                "bkt",
+                "big.txt",
+                "text/plain",
+                Box::pin(Cursor::new(b"hello".to_vec())),
+                None,
+                None,
+            )
+            .await;
+        assert!(matches!(err, Err(StorageError::EntityTooLarge)));
+        assert!(storage.get_object("bkt", "big.txt", None).await.is_err());
+
+        put(&storage, "ok.txt", b"hey").await;
+        let (body, size) = read_obj(&storage, "ok.txt").await;
+        assert_eq!(body, b"hey");
+        assert_eq!(size, 3);
     }
 }

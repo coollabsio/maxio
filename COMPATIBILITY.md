@@ -88,7 +88,7 @@ Status: ✅ supported · 🟡 partial · ❌ not supported
 
 | Feature | Status | Notes |
 |---|---|---|
-| SSE-S3 | ✅ | Local keyring, rotatable master key |
+| SSE-S3 | ✅ | Local keyring or external master key. Startup refuses a missing or wrong key when encrypted objects exist |
 | SSE-C | ✅ | |
 | SSE-KMS | ❌ | Rejected with `InvalidEncryptionAlgorithm` |
 
@@ -96,8 +96,8 @@ Status: ✅ supported · 🟡 partial · ❌ not supported
 
 | Feature | Status | Notes |
 |---|---|---|
-| Path-style (`/{bucket}/{key}`) | ✅ | |
-| Virtual-hosted-style (`{bucket}.host`) | ❌ | |
+| Path-style (`/{bucket}/{key}`) | ✅ | Always available |
+| Virtual-hosted-style (`{bucket}.host/key`) | ✅ | `--domain` / `MAXIO_DOMAIN` (alias `MINIO_DOMAIN`). See README |
 
 ## MinIO-Specific
 

@@ -467,6 +467,13 @@ impl tokio::io::AsyncRead for Md5VerifyingReader {
     }
 }
 
+fn bucket_name_from_storage_msg(msg: &str) -> &str {
+    msg.split_once(':')
+        .map(|(_, name)| name.trim())
+        .filter(|name| !name.is_empty())
+        .unwrap_or(msg)
+}
+
 /// True when a storage error was produced by a Content-MD5 mismatch.
 pub(crate) fn is_content_md5_mismatch(err: &StorageError) -> bool {
     matches!(err, StorageError::Io(io)
@@ -479,12 +486,16 @@ fn map_put_error(e: StorageError, key: &str) -> S3Error {
         return S3Error::bad_digest();
     }
     match e {
+        StorageError::InvalidKey(msg) if msg.starts_with("invalid bucket name") => {
+            S3Error::invalid_bucket_name(bucket_name_from_storage_msg(&msg))
+        }
         StorageError::InvalidKey(msg) => S3Error::invalid_argument(&msg),
         StorageError::ChecksumMismatch(_) => S3Error::bad_checksum("x-amz-checksum"),
         StorageError::EncryptionError(msg) => S3Error::invalid_argument(&msg),
         StorageError::IntegrityError(msg) => S3Error::invalid_argument(&msg),
         StorageError::PreconditionFailed => S3Error::precondition_failed(),
         StorageError::NotFound(_) => S3Error::no_such_key(key),
+        StorageError::EntityTooLarge => S3Error::entity_too_large(),
         _ => S3Error::internal(e),
     }
 }
@@ -494,6 +505,9 @@ fn map_read_error(e: StorageError, key: &str, version_id: Option<&str>) -> S3Err
     match e {
         StorageError::VersionNotFound(v) => S3Error::no_such_version(version_id.unwrap_or(&v)),
         StorageError::NotFound(_) => S3Error::no_such_key(key),
+        StorageError::InvalidKey(msg) if msg.starts_with("invalid bucket name") => {
+            S3Error::invalid_bucket_name(bucket_name_from_storage_msg(&msg))
+        }
         StorageError::InvalidKey(msg) => S3Error::invalid_argument(&msg),
         StorageError::DecryptionError(msg) => S3Error::invalid_argument(&msg),
         StorageError::IntegrityError(msg) => S3Error::invalid_argument(&msg),
@@ -972,6 +986,9 @@ pub async fn put_object(
         return put_object_tagging(State(state), Path((bucket, key)), body).await;
     }
 
+    // UploadPart shares this route. Its cap is max-part-size, applied in
+    // `upload_part`. Checking max-object-size here rejects every part of a
+    // multipart upload that is larger than a single PUT.
     if params.contains_key("uploadId") {
         return multipart::upload_part(
             State(state),
@@ -983,10 +1000,12 @@ pub async fn put_object(
         .await;
     }
 
+    reject_oversized_body(&headers, state.config.max_object_size)?;
+
     match state.storage.head_bucket(&bucket).await {
         Ok(true) => {}
         Ok(false) => return Err(S3Error::no_such_bucket(&bucket)),
-        Err(e) => return Err(S3Error::internal(e)),
+        Err(e) => return Err(S3Error::from_bucket_storage(e, &bucket)),
     }
 
     let content_type = headers
@@ -1013,7 +1032,7 @@ pub async fn put_object(
         match state.storage.get_bucket_encryption(&bucket).await {
             Ok(Some(cfg)) => encryption = Some(encryption_from_bucket_default(&cfg)),
             Ok(None) => {}
-            Err(e) => return Err(S3Error::internal(e)),
+            Err(e) => return Err(S3Error::from_bucket_storage(e, &bucket)),
         }
     }
     let applied_mode = encryption.as_ref().map(|e| e.mode.clone());
@@ -1362,7 +1381,7 @@ async fn copy_object(
     match state.storage.head_bucket(&bucket).await {
         Ok(true) => {}
         Ok(false) => return Err(S3Error::no_such_bucket(&bucket)),
-        Err(e) => return Err(S3Error::internal(e)),
+        Err(e) => return Err(S3Error::from_bucket_storage(e, &bucket)),
     }
 
     let directive = headers
@@ -1414,6 +1433,9 @@ async fn copy_object(
     };
     let (reader, src_meta) =
         opened.map_err(|e| map_read_error(e, &src.key, src.version_id.as_deref()))?;
+    if src_meta.size > state.config.max_object_size {
+        return Err(S3Error::entity_too_large());
+    }
     // The object may have changed between the precondition check and open.
     if check_conditions_with_prefix(&headers, &src_meta, "x-amz-copy-source-").is_some() {
         return Err(S3Error::precondition_failed());
@@ -1856,7 +1878,7 @@ pub async fn delete_object(
     match state.storage.head_bucket(&bucket).await {
         Ok(true) => {}
         Ok(false) => return Err(S3Error::no_such_bucket(&bucket)),
-        Err(e) => return Err(S3Error::internal(e)),
+        Err(e) => return Err(S3Error::from_bucket_storage(e, &bucket)),
     }
 
     // Permanent version deletion
@@ -2011,7 +2033,7 @@ pub async fn delete_objects(
     match state.storage.head_bucket(&bucket).await {
         Ok(true) => {}
         Ok(false) => return Err(S3Error::no_such_bucket(&bucket)),
-        Err(e) => return Err(S3Error::internal(e)),
+        Err(e) => return Err(S3Error::from_bucket_storage(e, &bucket)),
     }
 
     let bytes = axum::body::to_bytes(body, DELETE_BODY_MAX)
@@ -2332,6 +2354,29 @@ mod tests {
         let h = headers_with(&[("if-modified-since", "not-a-date")]);
         assert!(matches!(check_conditions(&h, &meta), None));
     }
+}
+
+/// Reject a body whose declared length already exceeds `max`.
+/// `x-amz-decoded-content-length` is the object size for aws-chunked uploads;
+/// otherwise `Content-Length` is used. Chunked bodies with no length are
+/// enforced while the bytes are written.
+pub(crate) fn reject_oversized_body(headers: &HeaderMap, max: u64) -> Result<(), S3Error> {
+    let raw = headers
+        .get("x-amz-decoded-content-length")
+        .or_else(|| headers.get(http::header::CONTENT_LENGTH));
+    let Some(raw) = raw else {
+        return Ok(());
+    };
+    let text = raw
+        .to_str()
+        .map_err(|_| S3Error::invalid_argument("invalid content length"))?;
+    let len: u64 = text
+        .parse()
+        .map_err(|_| S3Error::invalid_argument("invalid content length"))?;
+    if len > max {
+        return Err(S3Error::entity_too_large());
+    }
+    Ok(())
 }
 
 /// Request body → reader. aws-chunked decoding (signature/checksum

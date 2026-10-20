@@ -92,7 +92,10 @@ pub async fn create_bucket(
         // Every other region must name this server's region.
         let ok = state.config.region != "us-east-1" && constraint == state.config.region;
         if !ok {
-            return Err(S3Error::illegal_location_constraint());
+            return Err(S3Error::illegal_location_constraint(
+                &constraint,
+                &state.config.region,
+            ));
         }
     }
 
@@ -148,8 +151,7 @@ pub async fn head_bucket(
     match state.storage.head_bucket(&bucket).await {
         Ok(true) => {}
         Ok(false) => return Err(S3Error::no_such_bucket(&bucket)),
-        Err(StorageError::InvalidKey(_)) => return Err(S3Error::no_such_bucket(&bucket)),
-        Err(e) => return Err(S3Error::internal(e)),
+        Err(e) => return Err(S3Error::from_bucket_storage(e, &bucket)),
     }
 
     Ok(Response::builder()
@@ -203,7 +205,7 @@ pub async fn delete_bucket(
             .unwrap()),
         Ok(false) => Err(S3Error::no_such_bucket(&bucket)),
         Err(StorageError::BucketNotEmpty) => Err(S3Error::bucket_not_empty(&bucket)),
-        Err(e) => Err(S3Error::internal(e)),
+        Err(e) => Err(S3Error::from_bucket_storage(e, &bucket)),
     }
 }
 
@@ -256,7 +258,7 @@ async fn put_bucket_versioning(
     match state.storage.head_bucket(&bucket).await {
         Ok(true) => {}
         Ok(false) => return Err(S3Error::no_such_bucket(&bucket)),
-        Err(e) => return Err(S3Error::internal(e)),
+        Err(e) => return Err(S3Error::from_bucket_storage(e, &bucket)),
     }
 
     let body_bytes = axum::body::to_bytes(body, 1024 * 64)
@@ -319,7 +321,7 @@ async fn put_bucket_cors(
     match state.storage.head_bucket(&bucket).await {
         Ok(true) => {}
         Ok(false) => return Err(S3Error::no_such_bucket(&bucket)),
-        Err(e) => return Err(S3Error::internal(e)),
+        Err(e) => return Err(S3Error::from_bucket_storage(e, &bucket)),
     }
 
     let body_bytes = axum::body::to_bytes(body, 64 * 1024)
@@ -412,7 +414,7 @@ async fn delete_bucket_cors(state: AppState, bucket: String) -> Result<Response<
     match state.storage.head_bucket(&bucket).await {
         Ok(true) => {}
         Ok(false) => return Err(S3Error::no_such_bucket(&bucket)),
-        Err(e) => return Err(S3Error::internal(e)),
+        Err(e) => return Err(S3Error::from_bucket_storage(e, &bucket)),
     }
 
     state
@@ -437,7 +439,7 @@ async fn put_bucket_encryption(
     match state.storage.head_bucket(&bucket).await {
         Ok(true) => {}
         Ok(false) => return Err(S3Error::no_such_bucket(&bucket)),
-        Err(e) => return Err(S3Error::internal(e)),
+        Err(e) => return Err(S3Error::from_bucket_storage(e, &bucket)),
     }
 
     let body_bytes = axum::body::to_bytes(body, 64 * 1024)
@@ -505,7 +507,7 @@ async fn delete_bucket_encryption(
     match state.storage.head_bucket(&bucket).await {
         Ok(true) => {}
         Ok(false) => return Err(S3Error::no_such_bucket(&bucket)),
-        Err(e) => return Err(S3Error::internal(e)),
+        Err(e) => return Err(S3Error::from_bucket_storage(e, &bucket)),
     }
     state
         .storage
@@ -617,12 +619,12 @@ fn unsupported_subresource(method: &str, sub: &str) -> S3Error {
     ))
 }
 
-/// `NoSuchBucket` unless `bucket` exists (invalid names count as missing).
+/// `NoSuchBucket` unless `bucket` exists. An invalid name is `InvalidBucketName`.
 pub(super) async fn require_bucket(state: &AppState, bucket: &str) -> Result<(), S3Error> {
     match state.storage.head_bucket(bucket).await {
         Ok(true) => Ok(()),
-        Ok(false) | Err(StorageError::InvalidKey(_)) => Err(S3Error::no_such_bucket(bucket)),
-        Err(e) => Err(S3Error::internal(e)),
+        Ok(false) => Err(S3Error::no_such_bucket(bucket)),
+        Err(e) => Err(S3Error::from_bucket_storage(e, bucket)),
     }
 }
 

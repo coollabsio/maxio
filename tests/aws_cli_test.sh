@@ -962,6 +962,8 @@ done
 
 if [ -z "$MAXIO_BIN" ]; then
     red "SKIP: keyring rotate tests (./target/debug/maxio and ./target/release/maxio not found)"
+elif [ -n "${MAXIO_MASTER_KEY:-}" ] || [ -n "${MAXIO_MASTER_KEY_FILE:-}" ]; then
+    echo "SKIP: keyring rotate tests (external master key is in use; the on-disk keyring is not the active key)"
 else
     KEYRING_FILE="$DATA_DIR/.maxio-keys.json"
 
@@ -1953,6 +1955,11 @@ fi
 # server above is left running.
 echo ""
 echo "--- SSE-S3 master key safety ---"
+
+# This section creates and deletes its own on-disk keyring. An ambient
+# external key (the caller-owned server's MAXIO_MASTER_KEY) would skip that
+# file and make the missing-key cases pass for the wrong reason.
+unset MAXIO_MASTER_KEY MAXIO_MASTER_KEY_FILE
 
 if [ -z "${MAXIO_BIN:-}" ] || [ ! -x "${MAXIO_BIN}" ]; then
     red "SKIP: SSE-S3 key safety tests (maxio binary not found)"

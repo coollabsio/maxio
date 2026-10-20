@@ -669,6 +669,101 @@ pub async fn resolve_master_key(
     Ok(None)
 }
 
+/// Read-only view of whether this data directory's SSE-S3 master key is present.
+///
+/// Does not create a keyring or rewrite `.maxio-key-check.json`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MasterKeyAssessment {
+    /// On-disk keyring and/or the supplied key satisfy `.maxio-key-check.json`.
+    Satisfied,
+    /// The check file records an external key, and this invocation did not receive one.
+    ExternalKeyUnverified { ids: Vec<String> },
+    /// The key is missing or does not match. `--repair` cannot fix this.
+    Unrecoverable { detail: String },
+}
+
+pub async fn assess_master_key(
+    data_dir: &str,
+    supplied_b64: Option<&str>,
+) -> anyhow::Result<MasterKeyAssessment> {
+    let mut keys: HashMap<String, [u8; 32]> = HashMap::new();
+    let keyring_present = match read_keyring_file(&keyring_path(data_dir)).await? {
+        KeyringFileState::Missing => false,
+        KeyringFileState::Parsed(kr) => {
+            ingest_keyring_entries(&mut keys, &kr)?;
+            true
+        }
+    };
+    if let Some(b64) = supplied_b64 {
+        let raw = decode_master_key(b64)?;
+        keys.insert(key_id_from_bytes(&raw), raw);
+    }
+
+    let check_entries = match read_check_file(&check_path(data_dir)).await? {
+        CheckRead::Missing => Vec::new(),
+        CheckRead::Parsed(file) => file.keys,
+    };
+    let scan = scan_sse_s3(data_dir).await?;
+
+    let mut required: BTreeSet<String> = BTreeSet::new();
+    for entry in &check_entries {
+        if !entry.id.is_empty() {
+            required.insert(entry.id.clone());
+        }
+    }
+    required.extend(scan.ids.iter().cloned());
+
+    if required.is_empty() && scan.unresolved.is_empty() {
+        return Ok(MasterKeyAssessment::Satisfied);
+    }
+
+    if keys.is_empty() {
+        if !check_entries.is_empty() && !keyring_present && supplied_b64.is_none() {
+            return Ok(MasterKeyAssessment::ExternalKeyUnverified {
+                ids: required.into_iter().collect(),
+            });
+        }
+        return Ok(MasterKeyAssessment::Unrecoverable {
+            detail: "SSE-S3 objects are present but no master key is available (.maxio-keys.json is missing and no key was passed). Their plaintext cannot be recovered without the original key.".into(),
+        });
+    }
+
+    let mut missing = Vec::new();
+    for id in &required {
+        let Some(key) = keys.get(id) else {
+            missing.push(id.clone());
+            continue;
+        };
+        if let Some(entry) = check_entries.iter().find(|entry| &entry.id == id) {
+            if let Some(stored) = &entry.check {
+                let stored_bytes = B64.decode(stored).unwrap_or_default();
+                let actual = key_check_mac(key)?;
+                if !ct_eq(&stored_bytes, &actual) {
+                    return Ok(MasterKeyAssessment::Unrecoverable {
+                        detail: format!(
+                            "master key for id {id} does not match .maxio-key-check.json"
+                        ),
+                    });
+                }
+            }
+        }
+    }
+    if missing.is_empty() {
+        return Ok(MasterKeyAssessment::Satisfied);
+    }
+    if supplied_b64.is_none() && !keyring_present && !check_entries.is_empty() {
+        return Ok(MasterKeyAssessment::ExternalKeyUnverified { ids: missing });
+    }
+    let supplied_ids: Vec<&str> = keys.keys().map(String::as_str).collect();
+    Ok(MasterKeyAssessment::Unrecoverable {
+        detail: format!(
+            "supplied master key does not match .maxio-key-check.json (required key ids: {}; available: {})",
+            missing.join(", "),
+            supplied_ids.join(", ")
+        ),
+    })
+}
+
 async fn read_master_key_file(path: &Path) -> anyhow::Result<String> {
     let raw = fs::read(path)
         .await

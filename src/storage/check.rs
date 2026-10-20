@@ -37,6 +37,8 @@ pub enum IssueKind {
     ChunkChecksumMismatch,
     AmbiguousPayload,
     KeyringMissing,
+    /// External master key was not passed to this check. Not a failure.
+    KeyringUnverified,
 }
 
 impl IssueKind {
@@ -57,6 +59,7 @@ impl IssueKind {
             Self::ChunkChecksumMismatch => "chunk-checksum-mismatch",
             Self::AmbiguousPayload => "ambiguous-payload",
             Self::KeyringMissing => "keyring-missing",
+            Self::KeyringUnverified => "keyring-unverified",
         }
     }
 }
@@ -67,6 +70,8 @@ pub struct Issue {
     pub path: String,
     pub detail: String,
     pub repaired: bool,
+    /// Printed, but does not fail the process. `--repair` does not apply.
+    pub advisory: bool,
 }
 
 #[derive(Debug, Default)]
@@ -77,12 +82,21 @@ pub struct CheckReport {
 
 impl CheckReport {
     pub fn unresolved(&self) -> usize {
-        self.issues.iter().filter(|issue| !issue.repaired).count()
+        self.issues
+            .iter()
+            .filter(|issue| !issue.advisory && !issue.repaired)
+            .count()
     }
 
     pub fn print(&self) {
         for issue in &self.issues {
-            let action = if issue.repaired { "repaired" } else { "report" };
+            let action = if issue.repaired {
+                "repaired"
+            } else if issue.advisory {
+                "note"
+            } else {
+                "report"
+            };
             println!(
                 "{:<24} {:<22} {}  {}",
                 action,
@@ -105,14 +119,53 @@ impl CheckReport {
             path: path.display().to_string(),
             detail: detail.into(),
             repaired,
+            advisory: false,
+        });
+    }
+
+    fn note(&mut self, kind: IssueKind, path: &Path, detail: impl Into<String>) {
+        self.issues.push(Issue {
+            kind,
+            path: path.display().to_string(),
+            detail: detail.into(),
+            repaired: false,
+            advisory: true,
         });
     }
 }
 
+#[allow(dead_code)] // used by the library tests; the binary calls `check_with`
 pub async fn check(data_dir: &Path, repair: bool) -> anyhow::Result<CheckReport> {
+    check_with(data_dir, repair, None).await
+}
+
+/// `master_key_b64` is the canonical base64 key from [`super::keys::resolve_master_key`].
+pub async fn check_with(
+    data_dir: &Path,
+    repair: bool,
+    master_key_b64: Option<&str>,
+) -> anyhow::Result<CheckReport> {
     if !tokio::fs::try_exists(data_dir).await? {
         anyhow::bail!("data directory does not exist: {}", data_dir.display());
     }
+    if super::lock::is_locked(data_dir)? {
+        if repair {
+            anyhow::bail!(
+                "refusing to repair {}: a maxio server holds {}/.maxio.lock. Stop the server first. --repair would delete temp files an in-flight upload still needs.",
+                data_dir.display(),
+                data_dir.display()
+            );
+        }
+        eprintln!(
+            "warning: a maxio server is using {}. This read-only check can race with in-flight writes. Stop the server before trusting the report or running --repair.",
+            data_dir.display()
+        );
+    }
+    let _repair_lock = if repair {
+        Some(super::lock::acquire_exclusive(data_dir)?)
+    } else {
+        None
+    };
     let mut report = CheckReport::default();
     let mut saw_sse_s3 = false;
     let buckets_dir = data_dir.join("buckets");
@@ -124,16 +177,39 @@ pub async fn check(data_dir: &Path, repair: bool) -> anyhow::Result<CheckReport>
             }
         }
     }
-    let keyring = data_dir.join(".maxio-keys.json");
-    if saw_sse_s3 && !tokio::fs::try_exists(&keyring).await? {
-        report.push(
-            IssueKind::KeyringMissing,
-            &keyring,
-            "SSE-S3 objects are present but .maxio-keys.json is missing; their plaintext cannot be recovered",
-            false,
-        );
-    }
+    let _ = saw_sse_s3;
+    note_master_key(data_dir, master_key_b64, &mut report).await?;
     Ok(report)
+}
+
+async fn note_master_key(
+    data_dir: &Path,
+    master_key_b64: Option<&str>,
+    report: &mut CheckReport,
+) -> anyhow::Result<()> {
+    let data_dir_str = data_dir.to_string_lossy();
+    match super::keys::assess_master_key(&data_dir_str, master_key_b64).await? {
+        super::keys::MasterKeyAssessment::Satisfied => {}
+        super::keys::MasterKeyAssessment::ExternalKeyUnverified { ids } => {
+            report.note(
+                IssueKind::KeyringUnverified,
+                &data_dir.join(".maxio-key-check.json"),
+                format!(
+                    "SSE-S3 data was encrypted with an external master key (key ids: {}). Pass --master-key or --master-key-file, or set MAXIO_MASTER_KEY / MAXIO_MASTER_KEY_FILE, to verify it. No key was supplied to this check.",
+                    ids.join(", ")
+                ),
+            );
+        }
+        super::keys::MasterKeyAssessment::Unrecoverable { detail } => {
+            report.push(
+                IssueKind::KeyringMissing,
+                &data_dir.join(".maxio-keys.json"),
+                detail,
+                false,
+            );
+        }
+    }
+    Ok(())
 }
 
 async fn scan_bucket(
@@ -907,4 +983,157 @@ async fn file_checksum(path: &Path, algo: ChecksumAlgorithm) -> anyhow::Result<S
         hasher.update(&buf[..n]);
     }
     Ok(hasher.finalize_base64())
+}
+
+#[cfg(test)]
+mod master_key_tests {
+    use super::*;
+    use crate::storage::keys::{Keyring, resolve_master_key};
+    use crate::storage::{EncryptionMeta, EncryptionMode};
+    use base64::Engine;
+
+    fn encode_key(key: &[u8; 32]) -> String {
+        base64::engine::general_purpose::STANDARD.encode(key)
+    }
+
+    async fn external_dir(key: &[u8; 32]) -> (tempfile::TempDir, String) {
+        let tmp = tempfile::tempdir().unwrap();
+        let b64 = encode_key(key);
+        let keyring = Keyring::load(tmp.path().to_str().unwrap(), Some(&b64))
+            .await
+            .unwrap();
+        let id = keyring.active_id().to_string();
+        let bucket = tmp.path().join("buckets/bkt");
+        std::fs::create_dir_all(&bucket).unwrap();
+        std::fs::write(bucket.join("a.txt"), b"").unwrap();
+        let meta = ObjectMeta {
+            key: "a.txt".into(),
+            size: 0,
+            etag: "\"d41d8cd98f00b204e9800998ecf8427e\"".into(),
+            content_type: "application/octet-stream".into(),
+            last_modified: "2020-01-01T00:00:00.000Z".into(),
+            encryption: Some(EncryptionMeta {
+                algorithm: "AES256".into(),
+                mode: EncryptionMode::SseS3,
+                key_id: Some(id),
+                wrapped_dek: None,
+                wrap_nonce: None,
+                customer_key_md5: None,
+                nonce_prefix: "AAAA".into(),
+                chunk_size: 65536,
+                sidecar_mac: String::new(),
+            }),
+            ..ObjectMeta::default()
+        };
+        std::fs::write(
+            bucket.join("a.txt.meta.json"),
+            serde_json::to_string_pretty(&meta).unwrap(),
+        )
+        .unwrap();
+        assert!(!tmp.path().join(".maxio-keys.json").exists());
+        (tmp, b64)
+    }
+
+    fn keyring_issues(report: &CheckReport) -> Vec<&Issue> {
+        report
+            .issues
+            .iter()
+            .filter(|issue| {
+                matches!(
+                    issue.kind,
+                    IssueKind::KeyringMissing | IssueKind::KeyringUnverified
+                )
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn supplied_master_key_matches_external_key_check() {
+        let key = [9u8; 32];
+        let (tmp, b64) = external_dir(&key).await;
+        let from_env = resolve_master_key(Some(&b64), None).await.unwrap().unwrap();
+        let report = check_with(tmp.path(), false, Some(&from_env))
+            .await
+            .unwrap();
+        assert!(
+            keyring_issues(&report).is_empty(),
+            "{:?}",
+            keyring_issues(&report)
+        );
+        assert_eq!(report.unresolved(), 0);
+    }
+
+    #[tokio::test]
+    async fn master_key_file_matches_external_key_check() {
+        let key = [4u8; 32];
+        let (tmp, b64) = external_dir(&key).await;
+        let key_path = tmp.path().join("outside.key");
+        std::fs::write(&key_path, format!("{b64}\n")).unwrap();
+        let from_file = resolve_master_key(None, Some(&key_path))
+            .await
+            .unwrap()
+            .unwrap();
+        let report = check_with(tmp.path(), false, Some(&from_file))
+            .await
+            .unwrap();
+        assert!(keyring_issues(&report).is_empty(), "{:?}", report.issues);
+        assert_eq!(report.unresolved(), 0);
+    }
+
+    #[tokio::test]
+    async fn external_key_check_without_a_key_is_a_note() {
+        let key = [5u8; 32];
+        let (tmp, _) = external_dir(&key).await;
+        let report = check_with(tmp.path(), false, None).await.unwrap();
+        assert_eq!(report.unresolved(), 0, "{:?}", report.issues);
+        let notes = keyring_issues(&report);
+        assert_eq!(notes.len(), 1);
+        assert!(notes[0].advisory);
+        assert_eq!(notes[0].kind, IssueKind::KeyringUnverified);
+        assert!(
+            notes[0].detail.contains("--master-key"),
+            "{}",
+            notes[0].detail
+        );
+        assert!(
+            !notes[0].detail.contains("cannot be recovered"),
+            "{}",
+            notes[0].detail
+        );
+    }
+
+    #[tokio::test]
+    async fn wrong_master_key_is_an_error() {
+        let key = [6u8; 32];
+        let (tmp, _) = external_dir(&key).await;
+        let wrong = encode_key(&[8u8; 32]);
+        let resolved = resolve_master_key(Some(&wrong), None)
+            .await
+            .unwrap()
+            .unwrap();
+        let report = check_with(tmp.path(), false, Some(&resolved))
+            .await
+            .unwrap();
+        assert!(report.unresolved() >= 1, "{:?}", report.issues);
+        let issues = keyring_issues(&report);
+        assert!(
+            issues.iter().any(|issue| {
+                issue.kind == IssueKind::KeyringMissing
+                    && !issue.advisory
+                    && issue.detail.contains("does not match")
+            }),
+            "{:?}",
+            report.issues
+        );
+    }
+
+    #[tokio::test]
+    async fn repair_refuses_while_the_data_dir_lock_is_held() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _lock = crate::storage::lock::acquire_exclusive(tmp.path()).unwrap();
+        let err = check(tmp.path(), true).await.unwrap_err();
+        assert!(err.to_string().contains(".maxio.lock"), "{err}");
+        let report = check(tmp.path(), false).await.unwrap();
+        assert_eq!(report.unresolved(), 0);
+    }
 }

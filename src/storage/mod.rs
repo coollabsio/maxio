@@ -600,6 +600,8 @@ pub enum StorageError {
     IntegrityError(String),
     #[error("Precondition failed")]
     PreconditionFailed,
+    #[error("entity exceeds the configured size limit")]
+    EntityTooLarge,
 }
 
 #[cfg(test)]

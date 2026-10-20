@@ -49,7 +49,7 @@ async fn start_server() -> (String, TempDir) {
         parity_shards: 0,
         default_buckets: String::new(),
         max_console_body_bytes: 1024 * 1024,
-        domain: String::new(),
+        ..Config::default()
     };
 
     let state = AppState {
@@ -108,7 +108,62 @@ async fn start_server_with_keys(
         parity_shards: 0,
         default_buckets: String::new(),
         max_console_body_bytes: 1024 * 1024,
-        domain: String::new(),
+        ..Config::default()
+    };
+
+    let state = AppState {
+        storage: Arc::new(storage),
+        config: Arc::new(config),
+        login_rate_limiter: Arc::new(maxio::api::console::LoginRateLimiter::new()),
+    };
+
+    let app = server::build_router(state);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let base_url = format!("http://{addr}");
+
+    tokio::spawn(async move {
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await
+        .unwrap();
+    });
+
+    (base_url, tmp)
+}
+
+/// Server with explicit single-PUT and multipart-part caps. Storage and the
+/// HTTP check must agree, matching `main`.
+async fn start_server_with_size_limits(max_object: u64, max_part: u64) -> (String, TempDir) {
+    let tmp = TempDir::new().unwrap();
+    let data_dir = tmp.path().to_str().unwrap().to_string();
+
+    let keyring = Arc::new(Keyring::load(&data_dir, None).await.unwrap());
+    let mut storage = FilesystemStorage::new(&data_dir, false, 10 * 1024 * 1024, 0, keyring)
+        .await
+        .unwrap();
+    storage.set_upload_limits(max_object, max_part, u64::MAX);
+
+    let config = Config {
+        port: 0,
+        address: "127.0.0.1".to_string(),
+        data_dir,
+        access_key: ACCESS_KEY.to_string(),
+        secret_key: SECRET_KEY.to_string(),
+        region: REGION.to_string(),
+        master_key: None,
+        allow_insecure_dev: true,
+        secure_cookies: false,
+        erasure_coding: false,
+        chunk_size: 10 * 1024 * 1024,
+        parity_shards: 0,
+        default_buckets: String::new(),
+        max_console_body_bytes: 1024 * 1024,
+        max_object_size: max_object,
+        max_part_size: max_part,
+        ..Config::default()
     };
 
     let state = AppState {
@@ -255,7 +310,7 @@ async fn start_server_with_default_buckets(default_buckets: &str) -> (String, Te
         parity_shards: 0,
         default_buckets: default_buckets.to_string(),
         max_console_body_bytes: 1024 * 1024,
-        domain: String::new(),
+        ..Config::default()
     };
 
     let state = AppState {
@@ -334,7 +389,7 @@ async fn test_default_buckets_skip_existing() {
         parity_shards: 0,
         default_buckets: String::new(),
         max_console_body_bytes: 1024 * 1024,
-        domain: String::new(),
+        ..Config::default()
     };
     let state = AppState {
         storage: Arc::new(storage),
@@ -1745,6 +1800,63 @@ async fn test_chunked_upload_multi_chunk() {
     assert_eq!(
         resp.headers().get("content-length").unwrap(),
         &total_len.to_string()
+    );
+}
+
+#[tokio::test]
+async fn test_upload_part_uses_part_limit_not_object_limit() {
+    // A part may be larger than a single PUT. 16 bytes sits between the two caps.
+    let (base_url, _tmp) = start_server_with_size_limits(8, 32).await;
+    s3_request("PUT", &format!("{base_url}/bkt"), vec![]).await;
+
+    let too_big_for_put = s3_request("PUT", &format!("{base_url}/bkt/obj"), vec![b'a'; 16]).await;
+    assert_eq!(too_big_for_put.status(), 400);
+    let put_body = too_big_for_put.text().await.unwrap();
+    assert!(
+        put_body.contains("EntityTooLarge"),
+        "single PUT over max-object-size: {put_body}"
+    );
+
+    let small_put = s3_request("PUT", &format!("{base_url}/bkt/ok"), vec![b'a'; 4]).await;
+    assert_eq!(small_put.status(), 200);
+
+    let create = s3_request(
+        "POST",
+        &format!("{base_url}/bkt/multi.bin?uploads="),
+        vec![],
+    )
+    .await;
+    assert_eq!(create.status(), 200);
+    let upload_id = extract_xml_tag(&create.text().await.unwrap(), "UploadId").unwrap();
+
+    let part = s3_request(
+        "PUT",
+        &format!("{base_url}/bkt/multi.bin?partNumber=1&uploadId={upload_id}"),
+        vec![b'b'; 16],
+    )
+    .await;
+    assert_eq!(
+        part.status(),
+        200,
+        "part under max-part-size must be accepted"
+    );
+    let part_body = part.text().await.unwrap();
+    assert!(
+        !part_body.contains("EntityTooLarge"),
+        "UploadPart must not use max-object-size: {part_body}"
+    );
+
+    let over_part = s3_request(
+        "PUT",
+        &format!("{base_url}/bkt/multi.bin?partNumber=2&uploadId={upload_id}"),
+        vec![b'c'; 40],
+    )
+    .await;
+    assert_eq!(over_part.status(), 400);
+    let over_body = over_part.text().await.unwrap();
+    assert!(
+        over_body.contains("EntityTooLarge"),
+        "part over max-part-size: {over_body}"
     );
 }
 
@@ -3205,7 +3317,7 @@ async fn start_server_ec() -> (String, TempDir) {
         parity_shards: 0,
         default_buckets: String::new(),
         max_console_body_bytes: 1024 * 1024,
-        domain: String::new(),
+        ..Config::default()
     };
 
     let state = AppState {
@@ -3730,7 +3842,7 @@ async fn start_server_parity(parity_shards: u32) -> (String, TempDir) {
         parity_shards,
         default_buckets: String::new(),
         max_console_body_bytes: 1024 * 1024,
-        domain: String::new(),
+        ..Config::default()
     };
 
     let state = AppState {
@@ -6591,7 +6703,7 @@ async fn start_server_ec_parity(chunk_size: u64, parity_shards: u32) -> (String,
         parity_shards,
         default_buckets: String::new(),
         max_console_body_bytes: 1024 * 1024,
-        domain: String::new(),
+        ..Config::default()
     };
 
     let state = AppState {

@@ -471,6 +471,7 @@ fn map_put_error(e: StorageError, key: &str) -> S3Error {
         StorageError::IntegrityError(msg) => S3Error::invalid_argument(&msg),
         StorageError::PreconditionFailed => S3Error::precondition_failed(),
         StorageError::NotFound(_) => S3Error::no_such_key(key),
+        StorageError::EntityTooLarge => S3Error::entity_too_large(),
         _ => S3Error::internal(e),
     }
 }
@@ -947,6 +948,9 @@ pub async fn put_object(
         return put_object_tagging(State(state), Path((bucket, key)), body).await;
     }
 
+    // UploadPart shares this route. Its cap is max-part-size, applied in
+    // `upload_part`. Checking max-object-size here rejects every part of a
+    // multipart upload that is larger than a single PUT.
     if params.contains_key("uploadId") {
         return multipart::upload_part(
             State(state),
@@ -957,6 +961,8 @@ pub async fn put_object(
         )
         .await;
     }
+
+    reject_oversized_body(&headers, state.config.max_object_size)?;
 
     match state.storage.head_bucket(&bucket).await {
         Ok(true) => {}
@@ -1296,6 +1302,9 @@ async fn copy_object(
     };
     let (reader, src_meta) =
         opened.map_err(|e| map_read_error(e, &src.key, src.version_id.as_deref()))?;
+    if src_meta.size > state.config.max_object_size {
+        return Err(S3Error::entity_too_large());
+    }
     // The object may have changed between the precondition check and open.
     if check_conditions_with_prefix(&headers, &src_meta, "x-amz-copy-source-").is_some() {
         return Err(S3Error::precondition_failed());
@@ -2206,6 +2215,29 @@ mod tests {
         let h = headers_with(&[("if-modified-since", "not-a-date")]);
         assert!(matches!(check_conditions(&h, &meta), None));
     }
+}
+
+/// Reject a body whose declared length already exceeds `max`.
+/// `x-amz-decoded-content-length` is the object size for aws-chunked uploads;
+/// otherwise `Content-Length` is used. Chunked bodies with no length are
+/// enforced while the bytes are written.
+pub(crate) fn reject_oversized_body(headers: &HeaderMap, max: u64) -> Result<(), S3Error> {
+    let raw = headers
+        .get("x-amz-decoded-content-length")
+        .or_else(|| headers.get(http::header::CONTENT_LENGTH));
+    let Some(raw) = raw else {
+        return Ok(());
+    };
+    let text = raw
+        .to_str()
+        .map_err(|_| S3Error::invalid_argument("invalid content length"))?;
+    let len: u64 = text
+        .parse()
+        .map_err(|_| S3Error::invalid_argument("invalid content length"))?;
+    if len > max {
+        return Err(S3Error::entity_too_large());
+    }
+    Ok(())
 }
 
 /// Request body → reader. aws-chunked decoding (signature/checksum

@@ -16,7 +16,8 @@ use super::bucket::require_bucket;
 use super::object::{
     Md5VerifyingReader, body_to_reader, encryption_from_bucket_default, extract_checksum,
     extract_customer_key, extract_object_metadata, extract_sse_request, extract_write_precondition,
-    is_content_md5_mismatch, parse_content_md5, parse_tagging_header, spec_from_request,
+    is_content_md5_mismatch, parse_content_md5, parse_tagging_header, reject_oversized_body,
+    spec_from_request,
 };
 
 const COMPLETE_BODY_MAX: usize = 1024 * 1024;
@@ -105,6 +106,7 @@ pub async fn upload_part(
         .parse::<u32>()
         .map_err(|_| S3Error::invalid_part("invalid part number"))?;
 
+    reject_oversized_body(&headers, state.config.max_part_size)?;
     let checksum = extract_checksum(&headers);
     let customer_key = extract_customer_key(&headers)?;
     // Content-MD5 is checked while the part streams to its temp file; a
@@ -297,6 +299,7 @@ pub(super) fn map_storage_err(err: StorageError) -> S3Error {
         StorageError::ChecksumMismatch(_) => S3Error::bad_checksum("x-amz-checksum"),
         StorageError::UploadNotFound(upload_id) => S3Error::no_such_upload(&upload_id),
         StorageError::InvalidPartOrder => S3Error::invalid_part_order(),
+        StorageError::EntityTooLarge => S3Error::entity_too_large(),
         StorageError::InvalidKey(msg) if msg.contains("part too small") => {
             S3Error::entity_too_small()
         }

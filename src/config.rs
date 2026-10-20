@@ -106,11 +106,91 @@ pub struct Config {
     #[arg(long, env = "MAXIO_MAX_CONSOLE_BODY_BYTES", default_value = "1048576")]
     pub max_console_body_bytes: usize,
 
+    /// Seconds to drain in-flight requests after SIGTERM or SIGINT before exiting.
+    /// Docker's default stop timeout is 10s, so the default here finishes first.
+    /// Raise both together when in-flight uploads should be allowed to finish.
+    #[arg(long, env = "MAXIO_SHUTDOWN_TIMEOUT_SECS", default_value_t = 8)]
+    pub shutdown_timeout_secs: u64,
+
+    /// Max bytes in one PutObject or CopyObject. Larger objects must use multipart.
+    /// Default is 5 GiB, the S3 single-PUT limit.
+    #[arg(long, env = "MAXIO_MAX_OBJECT_SIZE", default_value_t = 5 * 1024 * 1024 * 1024)]
+    pub max_object_size: u64,
+
+    /// Max bytes in one multipart part. Default is 5 GiB.
+    #[arg(long, env = "MAXIO_MAX_PART_SIZE", default_value_t = 5 * 1024 * 1024 * 1024)]
+    pub max_part_size: u64,
+
+    /// Max assembled size of one multipart object. Default is 5 TiB.
+    #[arg(
+        long,
+        env = "MAXIO_MAX_MULTIPART_OBJECT_SIZE",
+        default_value_t = 5 * 1024 * 1024 * 1024 * 1024
+    )]
+    pub max_multipart_object_size: u64,
+
+    /// Max total request-header bytes. Hyper also rejects a header block larger
+    /// than this (minimum 8192, which is hyper's floor).
+    #[arg(long, env = "MAXIO_MAX_HEADER_BYTES", default_value_t = 64 * 1024)]
+    pub max_header_bytes: usize,
+
+    /// Max accepted TCP connections. Extra connections receive SlowDown (503) and are closed.
+    /// 0 disables the cap.
+    #[arg(long, env = "MAXIO_MAX_CONNECTIONS", default_value_t = 1024)]
+    pub max_connections: usize,
+
+    /// Max requests handled at once. Further requests receive SlowDown (503).
+    /// Health checks are exempt. 0 disables the cap.
+    #[arg(long, env = "MAXIO_MAX_CONCURRENT_REQUESTS", default_value_t = 256)]
+    pub max_concurrent_requests: usize,
+
+    /// Max seconds a request may run, including the body upload. 0 disables the cap.
+    #[arg(long, env = "MAXIO_REQUEST_TIMEOUT_SECS", default_value_t = 3600)]
+    pub request_timeout_secs: u64,
+
+    /// Seconds a keep-alive connection may sit idle before it is closed.
+    /// 0 disables the cap.
+    #[arg(long, env = "MAXIO_IDLE_TIMEOUT_SECS", default_value_t = 60)]
+    pub idle_timeout_secs: u64,
+
     /// Comma-separated base domains for virtual-hosted-style addressing.
     /// A request to `<bucket>.<domain>` is served from that bucket. Unset leaves every host on path-style.
     /// `MINIO_DOMAIN` is accepted when `MAXIO_DOMAIN` is unset.
     #[arg(long = "domain", env = "MAXIO_DOMAIN", default_value_t = default_domain())]
     pub domain: String,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            port: 9000,
+            address: "0.0.0.0".into(),
+            data_dir: "./data".into(),
+            access_key: default_access_key(),
+            secret_key: default_secret_key(),
+            region: default_region(),
+            master_key: None,
+            master_key_file: None,
+            allow_missing_master_key: false,
+            allow_insecure_dev: false,
+            secure_cookies: true,
+            erasure_coding: false,
+            chunk_size: 10_485_760,
+            parity_shards: 0,
+            default_buckets: String::new(),
+            max_console_body_bytes: 1_048_576,
+            shutdown_timeout_secs: 8,
+            max_object_size: 5 * 1024 * 1024 * 1024,
+            max_part_size: 5 * 1024 * 1024 * 1024,
+            max_multipart_object_size: 5 * 1024 * 1024 * 1024 * 1024,
+            max_header_bytes: 64 * 1024,
+            max_connections: 1024,
+            max_concurrent_requests: 256,
+            request_timeout_secs: 3600,
+            idle_timeout_secs: 60,
+            domain: String::new(),
+        }
+    }
 }
 
 #[cfg(test)]

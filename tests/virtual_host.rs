@@ -55,6 +55,7 @@ async fn start(domain: &str) -> Running {
         default_buckets: String::new(),
         max_console_body_bytes: 1024 * 1024,
         domain: domain.to_string(),
+        ..Config::default()
     };
     let state = AppState {
         storage: Arc::new(storage),

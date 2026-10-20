@@ -20,7 +20,9 @@ mod auth;
 mod config;
 mod embedded;
 mod error;
+mod limits;
 mod openapi;
+mod serve;
 mod server;
 mod storage;
 mod vhost;
@@ -30,7 +32,6 @@ use clap::Parser;
 use clap::Subcommand;
 use config::Config;
 use http::Uri;
-use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -220,7 +221,10 @@ async fn main() -> anyhow::Result<()> {
     tokio::fs::create_dir_all(&config.data_dir).await?;
     // Held until this process exits, including after a graceful shutdown.
     // A crash closes the fd and the OS drops the flock, so restart is not blocked.
-    let _data_lock = storage::lock::acquire_exclusive(std::path::Path::new(&config.data_dir))?;
+    let _data_lock = storage::lock::acquire_exclusive(
+        std::path::Path::new(&config.data_dir),
+        storage::lock::LockReason::Serve,
+    )?;
 
     // SSE-S3 master key. A missing keyring file bootstraps a new key only when
     // the data directory has no encrypted objects. See storage::keys.
@@ -265,7 +269,7 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    let storage = storage::filesystem::FilesystemStorage::new(
+    let mut storage = storage::filesystem::FilesystemStorage::new(
         &config.data_dir,
         config.erasure_coding,
         config.chunk_size,
@@ -273,6 +277,11 @@ async fn main() -> anyhow::Result<()> {
         keyring.clone(),
     )
     .await?;
+    storage.set_upload_limits(
+        config.max_object_size,
+        config.max_part_size,
+        config.max_multipart_object_size,
+    );
 
     storage::provision_default_buckets(&storage, &config.default_buckets, &config.region).await;
 
@@ -284,14 +293,25 @@ async fn main() -> anyhow::Result<()> {
 
     // Background housekeeping: abort stale multipart uploads (>7 days),
     // remove leftover temp files from crashed writes, and apply bucket
-    // lifecycle rules. Runs once at startup, then hourly.
+    // lifecycle rules. Runs once at startup, then hourly. Stops when the
+    // process begins draining for shutdown.
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     {
         let storage = state.storage.clone();
+        let mut shutdown_rx = shutdown_rx.clone();
         tokio::spawn(async move {
             let stale_after = chrono::Duration::days(7);
             let mut ticker = tokio::time::interval(Duration::from_secs(3600));
             loop {
-                ticker.tick().await;
+                tokio::select! {
+                    _ = ticker.tick() => {}
+                    changed = shutdown_rx.changed() => {
+                        if changed.is_err() || *shutdown_rx.borrow() {
+                            break;
+                        }
+                        continue;
+                    }
+                }
                 let (uploads, temps) = storage.housekeeping_sweep(stale_after).await;
                 if uploads > 0 || temps > 0 {
                     tracing::info!(
@@ -322,13 +342,18 @@ async fn main() -> anyhow::Result<()> {
 
     let addr = format!("{}:{}", config.address, config.port);
     let listener = tokio::net::TcpListener::bind(&addr).await?;
+    let bound = listener.local_addr()?;
     if config.access_key == "maxioadmin" && config.secret_key == "maxioadmin" {
         tracing::warn!(
             "WARNING: Using default credentials because insecure development mode is enabled."
         );
     }
 
-    tracing::info!("MaxIO v{} listening on {}", env!("CARGO_PKG_VERSION"), addr);
+    tracing::info!(
+        "MaxIO v{} listening on {}",
+        env!("CARGO_PKG_VERSION"),
+        bound
+    );
     tracing::info!("Access Key: {}", config.access_key);
     tracing::info!("Secret Key: [REDACTED]");
     tracing::info!("Data dir:   {}", config.data_dir);
@@ -361,14 +386,31 @@ async fn main() -> anyhow::Result<()> {
     } else {
         &config.address
     };
-    tracing::info!("Web UI:     http://{}:{}/ui/", display_host, config.port);
+    tracing::info!("Web UI:     http://{}:{}/ui/", display_host, bound.port());
 
-    axum::serve(
-        listener,
-        app.into_make_service_with_connect_info::<SocketAddr>(),
-    )
-    .with_graceful_shutdown(shutdown_signal())
-    .await?;
+    let serve_opts = serve::ServeOptions {
+        max_header_bytes: config.max_header_bytes,
+        max_connections: config.max_connections,
+        idle_timeout: Duration::from_secs(config.idle_timeout_secs),
+        shutdown_timeout: Duration::from_secs(config.shutdown_timeout_secs),
+    };
+    let shutdown_tx_for_signal = shutdown_tx.clone();
+    tokio::spawn(async move {
+        shutdown_signal().await;
+        let _ = shutdown_tx_for_signal.send(true);
+    });
+    match serve::serve(listener, app, serve_opts, shutdown_rx).await? {
+        serve::ShutdownOutcome::Drained => {
+            tracing::info!("in-flight requests drained; shutdown complete");
+        }
+        serve::ShutdownOutcome::TimedOut => {
+            tracing::warn!(
+                "shutdown timeout of {}s elapsed; aborted remaining connections",
+                config.shutdown_timeout_secs
+            );
+        }
+    }
+    let _ = shutdown_tx.send(true);
 
     Ok(())
 }
@@ -470,7 +512,10 @@ async fn run_keyring_rotate(data_dir: &str) -> anyhow::Result<()> {
 }
 
 async fn run_keyring_merge(data_dir: &str, from: &std::path::Path) -> anyhow::Result<()> {
-    let _lock = storage::lock::acquire_exclusive(std::path::Path::new(data_dir))?;
+    let _lock = storage::lock::acquire_exclusive(
+        std::path::Path::new(data_dir),
+        storage::lock::LockReason::MergeKeyring,
+    )?;
     let result = storage::keys::merge_keyring(data_dir, from).await?;
     println!("✓ keyring merged into {data_dir}/.maxio-keys.json");
     if result.added_ids.is_empty() {

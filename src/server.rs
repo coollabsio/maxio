@@ -2,10 +2,13 @@ use axum::Router;
 use axum::body::Body;
 use axum::extract::{Request, State};
 use axum::http::{HeaderValue, StatusCode, header};
+use axum::middleware::from_fn_with_state;
 use axum::routing::get;
 use std::convert::Infallible;
 use std::sync::Arc;
 use std::task::{Context, Poll};
+use std::time::Duration;
+use tokio::sync::Semaphore;
 use tower::Service;
 
 use crate::api::console::{LoginRateLimiter, console_router};
@@ -14,6 +17,7 @@ use crate::api::router::s3_router;
 use crate::auth::middleware::auth_middleware;
 use crate::config::Config;
 use crate::embedded::ui_handler;
+use crate::limits::{limit_headers, limit_inflight, limit_request_time};
 use crate::storage::filesystem::FilesystemStorage;
 use crate::vhost;
 
@@ -44,6 +48,22 @@ impl AppService {
     }
 }
 
+impl AppService {
+    /// `domains` empty leaves every host on path-style.
+    pub fn new(router: Router, domains: Vec<String>) -> Self {
+        Self {
+            router,
+            domains: domains.into(),
+        }
+    }
+}
+
+impl From<Router> for AppService {
+    fn from(router: Router) -> Self {
+        Self::new(router, Vec::new())
+    }
+}
+
 impl Service<Request<Body>> for AppService {
     type Response = axum::response::Response;
     type Error = Infallible;
@@ -60,9 +80,12 @@ impl Service<Request<Body>> for AppService {
 }
 
 pub fn build_router(state: AppState) -> AppService {
-    let domains = vhost::parse_domains(&state.config.domain)
+    let domains: Arc<[String]> = vhost::parse_domains(&state.config.domain)
         .expect("virtual-host domains")
         .into();
+    let max_header_bytes = state.config.max_header_bytes;
+    let request_timeout = Duration::from_secs(state.config.request_timeout_secs);
+    let max_inflight = state.config.max_concurrent_requests;
     let s3_routes = s3_router()
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
@@ -73,7 +96,7 @@ pub fn build_router(state: AppState) -> AppService {
             cors_middleware,
         ));
 
-    let router = Router::new()
+    let mut router = Router::new()
         .nest("/api", console_router(state.clone()))
         .route("/healthz", get(healthz))
         .route("/readyz", get(readyz))
@@ -86,6 +109,17 @@ pub fn build_router(state: AppState) -> AppService {
         .route("/ui/", get(ui_handler))
         .route("/ui/{*path}", get(ui_handler))
         .merge(s3_routes)
+        .layer(from_fn_with_state(max_header_bytes, limit_headers));
+
+    if !request_timeout.is_zero() {
+        router = router.layer(from_fn_with_state(request_timeout, limit_request_time));
+    }
+    if max_inflight > 0 {
+        let slots = Arc::new(Semaphore::new(max_inflight));
+        router = router.layer(from_fn_with_state(slots, limit_inflight));
+    }
+
+    let router = router
         .layer(axum::middleware::from_fn(security_headers_middleware))
         .layer(axum::middleware::from_fn(request_id_middleware))
         .with_state(state);

@@ -26,15 +26,37 @@ fn open_lock_file(data_dir: &Path) -> std::io::Result<std::fs::File> {
         .open(lock_path(data_dir))
 }
 
+/// Why this process wants the data-directory lock. The refusal names that reason.
+#[derive(Clone, Copy)]
+pub enum LockReason {
+    /// A server is starting.
+    Serve,
+    /// `check --repair` is about to rewrite the data directory.
+    Repair,
+    /// `keyring merge` is about to write `.maxio-keys.json`.
+    MergeKeyring,
+}
+
+impl LockReason {
+    fn refusal(self) -> &'static str {
+        match self {
+            Self::Serve => "Stop that server before starting another one on this data directory.",
+            Self::Repair => "Stop that server before repairing.",
+            Self::MergeKeyring => "Stop that server before merging the keyring.",
+        }
+    }
+}
+
 /// Non-blocking exclusive lock. Fails if another live process already holds it.
-pub fn acquire_exclusive(data_dir: &Path) -> anyhow::Result<DataDirLock> {
+pub fn acquire_exclusive(data_dir: &Path, reason: LockReason) -> anyhow::Result<DataDirLock> {
     let file = open_lock_file(data_dir)?;
     match file.try_lock() {
         Ok(()) => Ok(DataDirLock { _file: file }),
         Err(std::fs::TryLockError::WouldBlock) => anyhow::bail!(
-            "data directory {} is in use by another maxio process ({}). Stop that server before repairing or merging the keyring.",
+            "data directory {} is in use by another maxio process ({}). {}",
             data_dir.display(),
-            lock_path(data_dir).display()
+            lock_path(data_dir).display(),
+            reason.refusal()
         ),
         Err(std::fs::TryLockError::Error(err)) => Err(err.into()),
     }
@@ -64,15 +86,39 @@ mod tests {
     #[test]
     fn exclusive_lock_blocks_a_second_acquire_and_releases_on_drop() {
         let tmp = tempfile::tempdir().unwrap();
-        let first = acquire_exclusive(tmp.path()).unwrap();
-        let err = match acquire_exclusive(tmp.path()) {
+        let first = acquire_exclusive(tmp.path(), LockReason::Serve).unwrap();
+        let err = match acquire_exclusive(tmp.path(), LockReason::Serve) {
             Err(err) => err,
             Ok(_) => panic!("second acquire should fail while the first lock is held"),
         };
-        assert!(err.to_string().contains(".maxio.lock"), "{err}");
+        let msg = err.to_string();
+        assert!(msg.contains(".maxio.lock"), "{msg}");
+        assert!(
+            msg.contains("starting another one"),
+            "a second server should not be told to repair or merge: {msg}"
+        );
+        assert!(!msg.contains("repairing"), "{msg}");
         assert!(is_locked(tmp.path()).unwrap());
         drop(first);
         assert!(!is_locked(tmp.path()).unwrap());
-        let _second = acquire_exclusive(tmp.path()).unwrap();
+        let _second = acquire_exclusive(tmp.path(), LockReason::Serve).unwrap();
+    }
+
+    #[test]
+    fn repair_and_merge_refusals_name_their_own_action() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _held = acquire_exclusive(tmp.path(), LockReason::Serve).unwrap();
+        let repair = match acquire_exclusive(tmp.path(), LockReason::Repair) {
+            Err(err) => err.to_string(),
+            Ok(_) => panic!("repair acquire should fail while the lock is held"),
+        };
+        assert!(repair.contains("before repairing"), "{repair}");
+        assert!(!repair.contains("merging the keyring"), "{repair}");
+        let merge = match acquire_exclusive(tmp.path(), LockReason::MergeKeyring) {
+            Err(err) => err.to_string(),
+            Ok(_) => panic!("merge acquire should fail while the lock is held"),
+        };
+        assert!(merge.contains("before merging the keyring"), "{merge}");
+        assert!(!merge.contains("starting another"), "{merge}");
     }
 }

@@ -703,7 +703,15 @@ pub async fn upload_object(
             }),
         )
             .into_response(),
-        Err(e) => internal(e),
+        Err(e) => {
+            if matches!(e, crate::storage::StorageError::EntityTooLarge) {
+                return error(
+                    StatusCode::BAD_REQUEST,
+                    "upload exceeds the maximum object size",
+                );
+            }
+            internal(e)
+        }
     }
 }
 
@@ -2103,7 +2111,7 @@ mod tests {
             parity_shards: 0,
             default_buckets: String::new(),
             max_console_body_bytes: 1024 * 1024,
-            domain: String::new(),
+            ..Default::default()
         }
     }
 

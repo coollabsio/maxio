@@ -176,6 +176,7 @@ fn convert_filter(f: XmlFilter) -> Result<LifecycleFilter, S3Error> {
             tags: tags(and.tags),
             object_size_greater_than: size_bound(and.size_gt, "ObjectSizeGreaterThan")?,
             object_size_less_than: size_bound(and.size_lt, "ObjectSizeLessThan")?,
+            legacy_prefix: false,
         });
     }
     if singles > 1 {
@@ -189,6 +190,7 @@ fn convert_filter(f: XmlFilter) -> Result<LifecycleFilter, S3Error> {
         tags: tags(f.tags),
         object_size_greater_than: size_bound(f.size_gt, "ObjectSizeGreaterThan")?,
         object_size_less_than: size_bound(f.size_lt, "ObjectSizeLessThan")?,
+        legacy_prefix: false,
     })
 }
 
@@ -248,6 +250,7 @@ pub fn parse_lifecycle_xml(body: &str) -> Result<Vec<LifecycleRule>, S3Error> {
             }
             (Some(prefix), None) => LifecycleFilter {
                 prefix,
+                legacy_prefix: true,
                 ..Default::default()
             },
             (None, Some(f)) => convert_filter(f)?,
@@ -307,10 +310,6 @@ fn push_tag(out: &mut String, t: &LifecycleTag) {
     out.push_str("</Value></Tag>");
 }
 
-fn filter_is_prefix_only(f: &LifecycleFilter) -> bool {
-    f.tags.is_empty() && f.object_size_greater_than.is_none() && f.object_size_less_than.is_none()
-}
-
 fn render_filter(out: &mut String, f: &LifecycleFilter) {
     let conditions = (!f.prefix.is_empty()) as usize
         + f.tags.len()
@@ -353,9 +352,9 @@ pub fn render_lifecycle_xml(rules: &[LifecycleRule]) -> String {
         out.push_str("<Rule><ID>");
         out.push_str(&escape(r.id.as_str()));
         out.push_str("</ID>");
-        if filter_is_prefix_only(&r.filter) {
-            // Legacy `<Prefix>` so clients that PUT a prefix (boto, aws CLI)
-            // read the same shape back. Richer filters stay inside `<Filter>`.
+        if r.filter.legacy_prefix {
+            // Echo a legacy top-level `<Prefix>` only when that is what was
+            // stored. A `<Filter><Prefix>` (AWS CLI, Terraform, mc) stays a Filter.
             out.push_str("<Prefix>");
             out.push_str(&escape(r.filter.prefix.as_str()));
             out.push_str("</Prefix>");

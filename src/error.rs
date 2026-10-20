@@ -20,7 +20,9 @@ pub enum S3ErrorCode {
     InvalidArgument,
     InvalidBucketName,
     InvalidPart,
+    InvalidPartNumber,
     InvalidPartOrder,
+    IllegalLocationConstraint,
     MalformedXML,
     NoSuchBucket,
     NoSuchKey,
@@ -64,7 +66,9 @@ impl S3ErrorCode {
             Self::InvalidArgument => "InvalidArgument",
             Self::InvalidBucketName => "InvalidBucketName",
             Self::InvalidPart => "InvalidPart",
+            Self::InvalidPartNumber => "InvalidPartNumber",
             Self::InvalidPartOrder => "InvalidPartOrder",
+            Self::IllegalLocationConstraint => "IllegalLocationConstraintException",
             Self::MalformedXML => "MalformedXML",
             Self::NoSuchBucket => "NoSuchBucket",
             Self::NoSuchKey => "NoSuchKey",
@@ -121,7 +125,7 @@ impl S3ErrorCode {
             | Self::NoSuchTagSet => StatusCode::NOT_FOUND,
             Self::BucketAlreadyOwnedByYou | Self::BucketNotEmpty => StatusCode::CONFLICT,
             Self::InternalError => StatusCode::INTERNAL_SERVER_ERROR,
-            Self::InvalidRange => StatusCode::RANGE_NOT_SATISFIABLE,
+            Self::InvalidRange | Self::InvalidPartNumber => StatusCode::RANGE_NOT_SATISFIABLE,
             Self::NotImplemented => StatusCode::NOT_IMPLEMENTED,
             Self::PreconditionFailed => StatusCode::PRECONDITION_FAILED,
             Self::MethodNotAllowed => StatusCode::METHOD_NOT_ALLOWED,
@@ -241,6 +245,20 @@ impl S3Error {
             message: "The XML you provided was not well-formed.".into(),
             resource: None,
         }
+    }
+
+    pub fn invalid_part_number() -> Self {
+        Self::new(
+            S3ErrorCode::InvalidPartNumber,
+            "The requested part number is not satisfiable",
+        )
+    }
+
+    pub fn illegal_location_constraint() -> Self {
+        Self::new(
+            S3ErrorCode::IllegalLocationConstraint,
+            "The unspecified location constraint is incompatible for the region specific endpoint this request was sent to.",
+        )
     }
 
     pub fn invalid_part(msg: &str) -> Self {

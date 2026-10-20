@@ -92,9 +92,7 @@ pub async fn create_bucket(
         // Every other region must name this server's region.
         let ok = state.config.region != "us-east-1" && constraint == state.config.region;
         if !ok {
-            return Err(S3Error::invalid_argument(
-                "The specified location constraint is not valid",
-            ));
+            return Err(S3Error::illegal_location_constraint());
         }
     }
 

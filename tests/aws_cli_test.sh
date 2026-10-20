@@ -1223,16 +1223,16 @@ echo ""
 echo "--- GetBucketLocation test ---"
 LOC_BUCKET="loc-$$"
 assert "create loc bucket" $AWS s3api create-bucket --bucket "$LOC_BUCKET"
-LOC=$($AWS s3api get-bucket-location --bucket "$LOC_BUCKET" 2>&1)
-# LocationConstraint is "us-east-1" or null-equivalent
-LOC_VAL=$(echo "$LOC" | grep -o '"LocationConstraint": "[^"]*"' | cut -d'"' -f4)
-if [ "$LOC_VAL" = "us-east-1" ] || [ -z "$LOC_VAL" ]; then
-    green "PASS: get-bucket-location returned '$LOC_VAL'"
-    PASS=$((PASS + 1))
-else
-    red "FAIL: get-bucket-location returned '$LOC_VAL'"
-    FAIL=$((FAIL + 1))
-fi
+LOC=$($AWS s3api get-bucket-location --bucket "$LOC_BUCKET" 2>&1 || true)
+# us-east-1 is an empty LocationConstraint. aws CLI prints that as JSON null.
+# grep exits 1 when the value is null, which aborts the script under pipefail.
+LOC_VAL=$(printf '%s' "$LOC" | python3 -c 'import json,sys
+try:
+    value = json.load(sys.stdin).get("LocationConstraint")
+except Exception:
+    value = None
+print("" if value is None else value)' || true)
+assert_eq "get-bucket-location us-east-1 is empty" "" "$LOC_VAL"
 assert "delete loc bucket" $AWS s3api delete-bucket --bucket "$LOC_BUCKET"
 
 # --- Cross-bucket CopyObject ---
@@ -1619,6 +1619,11 @@ EOF
         "$(echo "$LC" | python3 -c 'import sys,json; print(json.load(sys.stdin)["Rules"][0]["NoncurrentVersionExpiration"]["NoncurrentDays"])')"
     assert_eq "lifecycle abort multipart days" "3" \
         "$(echo "$LC" | python3 -c 'import sys,json; print(json.load(sys.stdin)["Rules"][0]["AbortIncompleteMultipartUpload"]["DaysAfterInitiation"])')"
+    echo "log line" > "$TMPDIR/lifecycle-obj.txt"
+    PUT_EXP=$($AWS s3api put-object --bucket "$FEAT_BUCKET" --key logs/a.txt \
+        --body "$TMPDIR/lifecycle-obj.txt" 2>&1 || true)
+    assert_eq "put-object returns x-amz-expiration" "true" \
+        "$(echo "$PUT_EXP" | grep -q 'rule-id=' && echo true || echo false)"
     cat > "$TMPDIR/lifecycle-transition.json" <<'EOF'
 {
   "Rules": [
@@ -1705,8 +1710,10 @@ EOF
     echo "mc-checksum" > "$TMPDIR/mc-sum.txt"
     MC_CP_DEBUG="$TMPDIR/mc-cp.debug"
     MC_CP_EXIT=0
+    # Current mc prints the signed request (including the trailer checksum
+    # mode) on stdout. Keep both streams so the check does not depend on that.
     mc cp --checksum CRC32 --debug "$TMPDIR/mc-sum.txt" "$MC_ALIAS/$FEAT_BUCKET/mc-sum.txt" \
-        > /dev/null 2>"$MC_CP_DEBUG" || MC_CP_EXIT=$?
+        >"$MC_CP_DEBUG" 2>&1 || MC_CP_EXIT=$?
     assert_eq "mc cp --checksum exits 0" "0" "$MC_CP_EXIT"
     assert_eq "mc cp uses STREAMING-UNSIGNED-PAYLOAD-TRAILER" "true" \
         "$(grep -q 'STREAMING-UNSIGNED-PAYLOAD-TRAILER' "$MC_CP_DEBUG" && echo true || echo false)"
@@ -1744,26 +1751,28 @@ COPY_SELF=$($AWS s3api copy-object --bucket "$COMPAT_BUCKET" --key foo/bar \
 assert_eq "copy object onto itself is InvalidRequest" "true" \
     "$(echo "$COPY_SELF" | grep -q InvalidRequest && echo true || echo false)"
 
-PART_BODY=$($AWS s3api get-object --bucket "$COMPAT_BUCKET" --key foo/bar \
-    --part-number 1 "$TMPDIR/part1" 2>/dev/null && cat "$TMPDIR/part1")
-assert_eq "partNumber 1 of a single object" "compat-body" "$PART_BODY"
+$AWS s3api get-object --bucket "$COMPAT_BUCKET" --key foo/bar \
+    --part-number 1 "$TMPDIR/part1" >/dev/null
+assert_eq "partNumber 1 of a single object" "compat-body" "$(cat "$TMPDIR/part1")"
 
-LC_XML="$TMPDIR/lifecycle.xml"
-cat > "$LC_XML" << 'EOF'
-<LifecycleConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
-  <Rule>
-    <ID>rule1</ID>
-    <Prefix>days1/</Prefix>
-    <Status>Enabled</Status>
-    <Expiration><Days>1</Days></Expiration>
-  </Rule>
-</LifecycleConfiguration>
+cat > "$TMPDIR/lifecycle-prefix.json" << 'EOF'
+{
+  "Rules": [
+    {
+      "ID": "rule1",
+      "Prefix": "days1/",
+      "Status": "Enabled",
+      "Expiration": {"Days": 1}
+    }
+  ]
+}
 EOF
 assert "put lifecycle prefix rule" $AWS s3api put-bucket-lifecycle-configuration \
-    --bucket "$COMPAT_BUCKET" --lifecycle-configuration "file://$LC_XML"
+    --bucket "$COMPAT_BUCKET" \
+    --lifecycle-configuration "file://$TMPDIR/lifecycle-prefix.json"
 LC_GET=$($AWS s3api get-bucket-lifecycle-configuration --bucket "$COMPAT_BUCKET" 2>/dev/null || true)
-assert_eq "lifecycle prefix round-trips" "true" \
-    "$(echo "$LC_GET" | grep -q 'days1/' && echo true || echo false)"
+assert_eq "lifecycle prefix round-trips" "days1/" \
+    "$(printf '%s' "$LC_GET" | python3 -c 'import json,sys; print(json.load(sys.stdin)["Rules"][0].get("Prefix",""))' || true)"
 
 $AWS s3 rm "s3://$COMPAT_BUCKET" --recursive > /dev/null 2>&1 || true
 assert "delete compat bucket" $AWS s3api delete-bucket --bucket "$COMPAT_BUCKET"

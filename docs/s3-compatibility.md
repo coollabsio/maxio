@@ -18,9 +18,9 @@ Scored tests are the ones that exercise behavior MaxIO claims to support. Tests 
 | | Scored tests | Passed | Failed | Pass rate |
 |---|---:|---:|---:|---:|
 | Baseline (before these fixes) | 391 | 316 | 75 | 81% |
-| After the fixes | 391 | 356 | 35 | 91% |
+| After the fixes | 391 | 354 | 37 | 91% |
 
-The full marker-filtered run, before name-based skips, was 316/613 (52%) at baseline and 356/613 (58%) after the fixes. Another 273 tests are removed by the marker expression (IAM, object lock, storage classes, and the rest of the list below). The scored numbers above also drop tests that have no marker but still require an unsupported feature (POST uploads, canned ACLs, SSE-KMS, and so on).
+The full marker-filtered run, before name-based skips, was 316/613 (52%) at baseline and 354/613 (58%) after the fixes. Another 273 tests are removed by the marker expression (IAM, object lock, storage classes, and the rest of the list below). The scored numbers above also drop tests that have no marker but still require an unsupported feature (POST uploads, canned ACLs, SSE-KMS, and so on).
 
 ## Skip list
 
@@ -69,13 +69,13 @@ These were wrong for clients that already work against AWS, and each has a regre
 - In `us-east-1`, creating a bucket you already own returns 200. Other regions still return `BucketAlreadyOwnedByYou`.
 - `CopyObject` onto the same key without a metadata, tagging, or encryption change returns `InvalidRequest`.
 - `CompleteMultipartUpload` with an empty body returns `MalformedXML`. Repeating a successful complete returns the same result, so a client retry does not see `NoSuchUpload`.
-- `partNumber=1` on a non-multipart object returns the object. A part number past the end returns `InvalidPart`.
+- `partNumber=1` on a non-multipart object returns the object. A part number past the end of a non-multipart object returns `416 InvalidPartNumber` (AWS). A part past the end of a completed multipart object stays `400 InvalidPart`, which is what s3-tests checks.
 - The `x-amz-request-id` header matches `<RequestId>` in the error XML.
 - A missing key's 404 carries `x-amz-delete-marker: false`.
 - SSE-C requires the key MD5. HEAD/GET of an SSE-C object without the customer key returns 400. Sending both SSE-C and SSE-S3, or a customer key without the algorithm, returns 400. `x-amz-server-side-encryption` on GET/HEAD returns 400.
 - `If-None-Match` on PUT accepts a specific ETag as well as `*`. `If-Match: *` matches any current object.
 - Too many tags, or a tag that is too long, returns `InvalidTag`.
-- `GetBucketLifecycleConfiguration` returns a prefix-only rule as a top-level `<Prefix>`, which is the shape boto and the AWS CLI send. PUT and HEAD include `x-amz-expiration` when a rule matches.
+- `GetBucketLifecycleConfiguration` echoes the form the client stored: a legacy top-level `<Prefix>` stays a `<Prefix>` (what s3-tests and older boto send), and `<Filter><Prefix>` stays a Filter (AWS CLI, Terraform, `mc ilm`). PUT and HEAD include `x-amz-expiration` when a rule matches.
 - A malformed lifecycle transition date is 400. A well-formed transition is still `NotImplemented`.
 - `ListBuckets` honors `max-buckets`, `continuation-token`, and `prefix`.
 - `GetBucketLocation` for `us-east-1` is an empty `<LocationConstraint>`.
@@ -84,7 +84,7 @@ These were wrong for clients that already work against AWS, and each has a regre
 
 ## Known gaps
 
-These 35 tests still fail and are listed in `tests/s3_compat_expected_failures.txt`. They are the ones most likely to matter to a client next:
+These 37 tests still fail and are listed in `tests/s3_compat_expected_failures.txt`. They are the ones most likely to matter to a client next:
 
 - **Multipart checksums and `GetObjectAttributes`.** Complete and attributes responses do not yet surface `ChecksumAlgorithm` / `ChecksumSHA256` or `PartsCount` the way the suite expects. Trailer checksums on ordinary PUT already work (see `tests/aws_cli_test.sh`).
 - **`UploadPartCopy` between SSE-S3 and SSE-C** on an 8 MiB object. The copy response is missing `x-amz-server-side-encryption`.

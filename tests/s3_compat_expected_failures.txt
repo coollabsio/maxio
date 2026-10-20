@@ -4,6 +4,8 @@ s3tests/functional/test_s3.py::test_bucket_list_prefix_unreadable
 s3tests/functional/test_s3.py::test_object_set_get_unicode_metadata
 s3tests/functional/test_s3.py::test_object_delete_key_bucket_gone
 s3tests/functional/test_s3.py::test_multipart_sse_c_get_part
+s3tests/functional/test_s3.py::test_non_multipart_get_part
+s3tests/functional/test_s3.py::test_non_multipart_sse_c_get_part
 s3tests/functional/test_s3.py::test_multipart_resend_first_finishes_last
 s3tests/functional/test_s3.py::test_versioning_obj_suspended_copy
 s3tests/functional/test_s3.py::test_encryption_sse_c_multipart_invalid_chunks_2

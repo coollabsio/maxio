@@ -11217,7 +11217,7 @@ mod lifecycle_l {
              <ObjectSizeLessThan>1000</ObjectSizeLessThan></And>",
             "<Expiration><Days>30</Days></Expiration>",
             "<Status>Disabled</Status>",
-            "<Prefix>docs/</Prefix>",
+            "<Filter><Prefix>docs/</Prefix></Filter>",
             "<NoncurrentVersionExpiration><NoncurrentDays>7</NoncurrentDays>\
              <NewerNoncurrentVersions>2</NewerNoncurrentVersions></NoncurrentVersionExpiration>",
             "<AbortIncompleteMultipartUpload><DaysAfterInitiation>3</DaysAfterInitiation>\
@@ -11245,6 +11245,14 @@ mod lifecycle_l {
         let first_id = extract_xml_tag(&body, "ID").unwrap();
         assert!(!first_id.is_empty() && first_id.len() <= 255, "{}", body);
         assert!(body.contains("<Prefix>old/</Prefix>"), "{}", body);
+        assert!(
+            !body.contains("<Filter><Prefix>old/</Prefix></Filter>"),
+            "legacy Prefix must not be rewritten as Filter: {body}"
+        );
+        assert!(
+            body.contains("<Filter><Prefix></Prefix></Filter>"),
+            "Filter form must round-trip: {body}"
+        );
 
         let r = s3_request("DELETE", &url, vec![]).await;
         assert_eq!(r.status(), 204);
@@ -12224,9 +12232,9 @@ async fn test_get_part_number_on_single_object() {
     assert!(ok.status().is_success(), "{}", ok.status());
     assert_eq!(ok.bytes().await.unwrap().as_ref(), b"body");
     let bad = s3_request("GET", &format!("{}/onepart/k?partNumber=2", base), vec![]).await;
-    assert_eq!(bad.status(), 400);
+    assert_eq!(bad.status(), 416);
     let text = bad.text().await.unwrap();
-    assert!(text.contains("InvalidPart"), "{text}");
+    assert!(text.contains("InvalidPartNumber"), "{text}");
 }
 
 #[tokio::test]
@@ -12331,4 +12339,34 @@ async fn test_lifecycle_prefix_round_trip_and_expiration_header() {
     let exp = c_header(&put, "x-amz-expiration");
     assert!(exp.is_some(), "missing x-amz-expiration");
     assert!(exp.unwrap().contains("rule-id=\"rule1\""));
+
+    // Filter form must round-trip as Filter. Rewriting it as a legacy Prefix
+    // breaks the AWS CLI, Terraform, and `mc ilm rule export`.
+    let xml = r#"<LifecycleConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+        <Rule><ID>logs</ID><Filter><Prefix>logs/</Prefix></Filter><Status>Enabled</Status>
+        <Expiration><Days>7</Days></Expiration></Rule></LifecycleConfiguration>"#;
+    let put_lc = s3_request(
+        "PUT",
+        &format!("{}/lcrule?lifecycle", base),
+        xml.as_bytes().to_vec(),
+    )
+    .await;
+    assert_eq!(put_lc.status(), 200, "{}", put_lc.text().await.unwrap());
+    let body = s3_request("GET", &format!("{}/lcrule?lifecycle", base), vec![])
+        .await
+        .text()
+        .await
+        .unwrap();
+    assert!(
+        body.contains("<Filter><Prefix>logs/</Prefix></Filter>"),
+        "{body}"
+    );
+    assert!(
+        !body.contains("<Prefix>logs/</Prefix></ID>") && !body.contains("</ID><Prefix>logs/"),
+        "{body}"
+    );
+    let put = c_put(&base, "lcrule/logs/a", b"bar").await;
+    assert_eq!(put.status(), 200);
+    let exp = c_header(&put, "x-amz-expiration").unwrap_or_default();
+    assert!(exp.contains("rule-id=\"logs\""), "{exp}");
 }

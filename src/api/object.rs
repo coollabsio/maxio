@@ -767,7 +767,10 @@ fn part_range(
         if part_num == 1 {
             return Ok((0, meta.size, 1));
         }
-        return Err(S3Error::invalid_part("partNumber exceeds total parts"));
+        // A normal object is one part. AWS answers a later part with 416
+        // InvalidPartNumber. Completed multipart objects stay on InvalidPart,
+        // which is what s3-tests checks.
+        return Err(S3Error::invalid_part_number());
     };
     let idx = (part_num as usize)
         .checked_sub(1)

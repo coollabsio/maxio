@@ -51,6 +51,12 @@ pub struct LifecycleFilter {
     /// Only objects strictly smaller than this many bytes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub object_size_less_than: Option<u64>,
+    /// The client sent a legacy top-level `<Prefix>` rather than `<Filter>`.
+    /// GET echoes that form. Absent (false) means the rule was a Filter, which
+    /// is what the AWS CLI, Terraform, and `mc ilm` send.
+    #[serde(default, skip_serializing_if = "is_false")]
+    #[schema(ignore)]
+    pub legacy_prefix: bool,
 }
 
 /// Expiration of current object versions (`Days` or `Date`), or removal of
@@ -704,6 +710,7 @@ mod tests {
             }],
             object_size_greater_than: Some(49),
             object_size_less_than: Some(51),
+            ..Default::default()
         };
         assert!(f.matches(&meta));
         meta.size = 51;

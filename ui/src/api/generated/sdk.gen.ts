@@ -2,7 +2,7 @@
 
 import type { Client, ClientMeta, Options as Options2, RequestResult, TDataShape } from './client';
 import { client } from './client.gen';
-import type { CheckAuthData, CheckAuthErrors, CheckAuthResponses, CreateBucketData, CreateBucketErrors, CreateBucketResponses, CreateFolderData, CreateFolderErrors, CreateFolderResponses, DeleteBucketData, DeleteBucketErrors, DeleteBucketResponses, DeleteObjectData, DeleteObjectErrors, DeleteObjectResponses, DeleteVersionData, DeleteVersionResponses, DownloadObjectData, DownloadObjectErrors, DownloadObjectResponses, DownloadVersionData, DownloadVersionErrors, DownloadVersionResponses, GetBucketLifecycleData, GetBucketLifecycleErrors, GetBucketLifecycleResponses, GetBucketPolicyData, GetBucketPolicyErrors, GetBucketPolicyResponses, GetBucketTagsData, GetBucketTagsErrors, GetBucketTagsResponses, GetEncryptionData, GetEncryptionResponses, GetObjectInfoData, GetObjectInfoErrors, GetObjectInfoResponses, GetObjectTagsData, GetObjectTagsErrors, GetObjectTagsResponses, GetPublicAccessData, GetPublicAccessResponses, GetVersioningData, GetVersioningResponses, ListBucketsData, ListBucketsErrors, ListBucketsResponses, ListObjectsData, ListObjectsErrors, ListObjectsResponses, ListVersionsData, ListVersionsResponses, LoginData, LoginErrors, LoginResponses, LogoutData, LogoutResponses, PresignObjectData, PresignObjectErrors, PresignObjectResponses, RestoreVersionData, RestoreVersionErrors, RestoreVersionResponses, SetBucketLifecycleData, SetBucketLifecycleErrors, SetBucketLifecycleResponses, SetBucketTagsData, SetBucketTagsErrors, SetBucketTagsResponses, SetEncryptionData, SetEncryptionResponses, SetObjectTagsData, SetObjectTagsErrors, SetObjectTagsResponses, SetPublicAccessData, SetPublicAccessResponses, SetVersioningData, SetVersioningResponses, UploadObjectData, UploadObjectErrors, UploadObjectResponses } from './types.gen';
+import type { AttachUserPolicyData, AttachUserPolicyResponses, CheckAuthData, CheckAuthErrors, CheckAuthResponses, CreateAccessKeyData, CreateAccessKeyResponses, CreateBucketData, CreateBucketErrors, CreateBucketResponses, CreateFolderData, CreateFolderErrors, CreateFolderResponses, CreateIamPolicyData, CreateIamPolicyResponses, CreateIamUserData, CreateIamUserErrors, CreateIamUserResponses, CreateServiceKeyData, CreateServiceKeyResponses, DeleteAccessKeyData, DeleteAccessKeyResponses, DeleteBucketData, DeleteBucketErrors, DeleteBucketResponses, DeleteIamPolicyData, DeleteIamPolicyResponses, DeleteIamUserData, DeleteIamUserResponses, DeleteInlineUserPolicyData, DeleteInlineUserPolicyResponses, DeleteObjectData, DeleteObjectErrors, DeleteObjectResponses, DeleteServiceKeyData, DeleteServiceKeyResponses, DeleteVersionData, DeleteVersionResponses, DetachUserPolicyData, DetachUserPolicyResponses, DownloadObjectData, DownloadObjectErrors, DownloadObjectResponses, DownloadVersionData, DownloadVersionErrors, DownloadVersionResponses, GetBucketLifecycleData, GetBucketLifecycleErrors, GetBucketLifecycleResponses, GetBucketPolicyData, GetBucketPolicyErrors, GetBucketPolicyResponses, GetBucketTagsData, GetBucketTagsErrors, GetBucketTagsResponses, GetCapabilitiesData, GetCapabilitiesResponses, GetEncryptionData, GetEncryptionResponses, GetIamPolicyData, GetIamPolicyResponses, GetIamUserData, GetIamUserErrors, GetIamUserResponses, GetObjectInfoData, GetObjectInfoErrors, GetObjectInfoResponses, GetObjectTagsData, GetObjectTagsErrors, GetObjectTagsResponses, GetPublicAccessData, GetPublicAccessResponses, GetVersioningData, GetVersioningResponses, ListAccessKeysData, ListAccessKeysResponses, ListBucketsData, ListBucketsErrors, ListBucketsResponses, ListIamPoliciesData, ListIamPoliciesResponses, ListIamUsersData, ListIamUsersErrors, ListIamUsersResponses, ListObjectsData, ListObjectsErrors, ListObjectsResponses, ListServiceKeysData, ListServiceKeysResponses, ListVersionsData, ListVersionsResponses, LoginData, LoginErrors, LoginResponses, LogoutData, LogoutResponses, PresignObjectData, PresignObjectErrors, PresignObjectResponses, PreviewIamPolicyData, PreviewIamPolicyResponses, PutInlineUserPolicyData, PutInlineUserPolicyResponses, RestoreVersionData, RestoreVersionErrors, RestoreVersionResponses, SetAccessKeyStatusData, SetAccessKeyStatusResponses, SetBucketLifecycleData, SetBucketLifecycleErrors, SetBucketLifecycleResponses, SetBucketTagsData, SetBucketTagsErrors, SetBucketTagsResponses, SetEncryptionData, SetEncryptionResponses, SetIamUserStatusData, SetIamUserStatusResponses, SetObjectTagsData, SetObjectTagsErrors, SetObjectTagsResponses, SetPublicAccessData, SetPublicAccessResponses, SetServiceKeyStatusData, SetServiceKeyStatusResponses, SetVersioningData, SetVersioningResponses, UpdateIamPolicyData, UpdateIamPolicyResponses, UploadObjectData, UploadObjectErrors, UploadObjectResponses, ValidateIamPolicyData, ValidateIamPolicyErrors, ValidateIamPolicyResponses } from './types.gen';
 
 export type Options<TData extends TDataShape = TDataShape, ThrowOnError extends boolean = boolean, TResponse = unknown> = Options2<TData, ThrowOnError, TResponse> & {
     /**
@@ -17,6 +17,16 @@ export type Options<TData extends TDataShape = TDataShape, ThrowOnError extends 
      */
     meta?: keyof ClientMeta extends never ? Record<string, unknown> : ClientMeta;
 };
+
+export const getCapabilities = <ThrowOnError extends boolean = false>(options?: Options<GetCapabilitiesData, ThrowOnError>): RequestResult<GetCapabilitiesResponses, unknown, ThrowOnError> => (options?.client ?? client).get<GetCapabilitiesResponses, unknown, ThrowOnError>({
+    security: [{
+            in: 'cookie',
+            name: 'maxio_session',
+            type: 'apiKey'
+        }],
+    url: '/api/auth/capabilities',
+    ...options
+});
 
 export const checkAuth = <ThrowOnError extends boolean = false>(options?: Options<CheckAuthData, ThrowOnError>): RequestResult<CheckAuthResponses, CheckAuthErrors, ThrowOnError> => (options?.client ?? client).get<CheckAuthResponses, CheckAuthErrors, ThrowOnError>({ url: '/api/auth/check', ...options });
 
@@ -344,4 +354,292 @@ export const restoreVersion = <ThrowOnError extends boolean = false>(options: Op
         }],
     url: '/api/buckets/{bucket}/versions/{versionId}/restore/{key}',
     ...options
+});
+
+export const listIamPolicies = <ThrowOnError extends boolean = false>(options?: Options<ListIamPoliciesData, ThrowOnError>): RequestResult<ListIamPoliciesResponses, unknown, ThrowOnError> => (options?.client ?? client).get<ListIamPoliciesResponses, unknown, ThrowOnError>({
+    security: [{
+            in: 'cookie',
+            name: 'maxio_session',
+            type: 'apiKey'
+        }],
+    url: '/api/iam/policies',
+    ...options
+});
+
+export const createIamPolicy = <ThrowOnError extends boolean = false>(options: Options<CreateIamPolicyData, ThrowOnError>): RequestResult<CreateIamPolicyResponses, unknown, ThrowOnError> => (options.client ?? client).post<CreateIamPolicyResponses, unknown, ThrowOnError>({
+    security: [{
+            in: 'cookie',
+            name: 'maxio_session',
+            type: 'apiKey'
+        }],
+    url: '/api/iam/policies',
+    ...options,
+    headers: {
+        'Content-Type': 'application/json',
+        ...options.headers
+    }
+});
+
+export const deleteIamPolicy = <ThrowOnError extends boolean = false>(options: Options<DeleteIamPolicyData, ThrowOnError>): RequestResult<DeleteIamPolicyResponses, unknown, ThrowOnError> => (options.client ?? client).delete<DeleteIamPolicyResponses, unknown, ThrowOnError>({
+    security: [{
+            in: 'cookie',
+            name: 'maxio_session',
+            type: 'apiKey'
+        }],
+    url: '/api/iam/policies/{name}',
+    ...options
+});
+
+export const getIamPolicy = <ThrowOnError extends boolean = false>(options: Options<GetIamPolicyData, ThrowOnError>): RequestResult<GetIamPolicyResponses, unknown, ThrowOnError> => (options.client ?? client).get<GetIamPolicyResponses, unknown, ThrowOnError>({
+    security: [{
+            in: 'cookie',
+            name: 'maxio_session',
+            type: 'apiKey'
+        }],
+    url: '/api/iam/policies/{name}',
+    ...options
+});
+
+export const updateIamPolicy = <ThrowOnError extends boolean = false>(options: Options<UpdateIamPolicyData, ThrowOnError>): RequestResult<UpdateIamPolicyResponses, unknown, ThrowOnError> => (options.client ?? client).put<UpdateIamPolicyResponses, unknown, ThrowOnError>({
+    security: [{
+            in: 'cookie',
+            name: 'maxio_session',
+            type: 'apiKey'
+        }],
+    url: '/api/iam/policies/{name}',
+    ...options,
+    headers: {
+        'Content-Type': 'application/json',
+        ...options.headers
+    }
+});
+
+export const previewIamPolicy = <ThrowOnError extends boolean = false>(options: Options<PreviewIamPolicyData, ThrowOnError>): RequestResult<PreviewIamPolicyResponses, unknown, ThrowOnError> => (options.client ?? client).post<PreviewIamPolicyResponses, unknown, ThrowOnError>({
+    security: [{
+            in: 'cookie',
+            name: 'maxio_session',
+            type: 'apiKey'
+        }],
+    url: '/api/iam/preview',
+    ...options,
+    headers: {
+        'Content-Type': 'application/json',
+        ...options.headers
+    }
+});
+
+export const listServiceKeys = <ThrowOnError extends boolean = false>(options?: Options<ListServiceKeysData, ThrowOnError>): RequestResult<ListServiceKeysResponses, unknown, ThrowOnError> => (options?.client ?? client).get<ListServiceKeysResponses, unknown, ThrowOnError>({
+    security: [{
+            in: 'cookie',
+            name: 'maxio_session',
+            type: 'apiKey'
+        }],
+    url: '/api/iam/service-keys',
+    ...options
+});
+
+export const createServiceKey = <ThrowOnError extends boolean = false>(options: Options<CreateServiceKeyData, ThrowOnError>): RequestResult<CreateServiceKeyResponses, unknown, ThrowOnError> => (options.client ?? client).post<CreateServiceKeyResponses, unknown, ThrowOnError>({
+    security: [{
+            in: 'cookie',
+            name: 'maxio_session',
+            type: 'apiKey'
+        }],
+    url: '/api/iam/service-keys',
+    ...options,
+    headers: {
+        'Content-Type': 'application/json',
+        ...options.headers
+    }
+});
+
+export const deleteServiceKey = <ThrowOnError extends boolean = false>(options: Options<DeleteServiceKeyData, ThrowOnError>): RequestResult<DeleteServiceKeyResponses, unknown, ThrowOnError> => (options.client ?? client).delete<DeleteServiceKeyResponses, unknown, ThrowOnError>({
+    security: [{
+            in: 'cookie',
+            name: 'maxio_session',
+            type: 'apiKey'
+        }],
+    url: '/api/iam/service-keys/{id}',
+    ...options
+});
+
+export const setServiceKeyStatus = <ThrowOnError extends boolean = false>(options: Options<SetServiceKeyStatusData, ThrowOnError>): RequestResult<SetServiceKeyStatusResponses, unknown, ThrowOnError> => (options.client ?? client).put<SetServiceKeyStatusResponses, unknown, ThrowOnError>({
+    security: [{
+            in: 'cookie',
+            name: 'maxio_session',
+            type: 'apiKey'
+        }],
+    url: '/api/iam/service-keys/{id}',
+    ...options,
+    headers: {
+        'Content-Type': 'application/json',
+        ...options.headers
+    }
+});
+
+export const listIamUsers = <ThrowOnError extends boolean = false>(options?: Options<ListIamUsersData, ThrowOnError>): RequestResult<ListIamUsersResponses, ListIamUsersErrors, ThrowOnError> => (options?.client ?? client).get<ListIamUsersResponses, ListIamUsersErrors, ThrowOnError>({
+    security: [{
+            in: 'cookie',
+            name: 'maxio_session',
+            type: 'apiKey'
+        }],
+    url: '/api/iam/users',
+    ...options
+});
+
+export const createIamUser = <ThrowOnError extends boolean = false>(options: Options<CreateIamUserData, ThrowOnError>): RequestResult<CreateIamUserResponses, CreateIamUserErrors, ThrowOnError> => (options.client ?? client).post<CreateIamUserResponses, CreateIamUserErrors, ThrowOnError>({
+    security: [{
+            in: 'cookie',
+            name: 'maxio_session',
+            type: 'apiKey'
+        }],
+    url: '/api/iam/users',
+    ...options,
+    headers: {
+        'Content-Type': 'application/json',
+        ...options.headers
+    }
+});
+
+export const deleteIamUser = <ThrowOnError extends boolean = false>(options: Options<DeleteIamUserData, ThrowOnError>): RequestResult<DeleteIamUserResponses, unknown, ThrowOnError> => (options.client ?? client).delete<DeleteIamUserResponses, unknown, ThrowOnError>({
+    security: [{
+            in: 'cookie',
+            name: 'maxio_session',
+            type: 'apiKey'
+        }],
+    url: '/api/iam/users/{name}',
+    ...options
+});
+
+export const getIamUser = <ThrowOnError extends boolean = false>(options: Options<GetIamUserData, ThrowOnError>): RequestResult<GetIamUserResponses, GetIamUserErrors, ThrowOnError> => (options.client ?? client).get<GetIamUserResponses, GetIamUserErrors, ThrowOnError>({
+    security: [{
+            in: 'cookie',
+            name: 'maxio_session',
+            type: 'apiKey'
+        }],
+    url: '/api/iam/users/{name}',
+    ...options
+});
+
+export const deleteInlineUserPolicy = <ThrowOnError extends boolean = false>(options: Options<DeleteInlineUserPolicyData, ThrowOnError>): RequestResult<DeleteInlineUserPolicyResponses, unknown, ThrowOnError> => (options.client ?? client).delete<DeleteInlineUserPolicyResponses, unknown, ThrowOnError>({
+    security: [{
+            in: 'cookie',
+            name: 'maxio_session',
+            type: 'apiKey'
+        }],
+    url: '/api/iam/users/{name}/inline/{policy}',
+    ...options
+});
+
+export const putInlineUserPolicy = <ThrowOnError extends boolean = false>(options: Options<PutInlineUserPolicyData, ThrowOnError>): RequestResult<PutInlineUserPolicyResponses, unknown, ThrowOnError> => (options.client ?? client).put<PutInlineUserPolicyResponses, unknown, ThrowOnError>({
+    security: [{
+            in: 'cookie',
+            name: 'maxio_session',
+            type: 'apiKey'
+        }],
+    url: '/api/iam/users/{name}/inline/{policy}',
+    ...options,
+    headers: {
+        'Content-Type': 'application/json',
+        ...options.headers
+    }
+});
+
+export const listAccessKeys = <ThrowOnError extends boolean = false>(options: Options<ListAccessKeysData, ThrowOnError>): RequestResult<ListAccessKeysResponses, unknown, ThrowOnError> => (options.client ?? client).get<ListAccessKeysResponses, unknown, ThrowOnError>({
+    security: [{
+            in: 'cookie',
+            name: 'maxio_session',
+            type: 'apiKey'
+        }],
+    url: '/api/iam/users/{name}/keys',
+    ...options
+});
+
+export const createAccessKey = <ThrowOnError extends boolean = false>(options: Options<CreateAccessKeyData, ThrowOnError>): RequestResult<CreateAccessKeyResponses, unknown, ThrowOnError> => (options.client ?? client).post<CreateAccessKeyResponses, unknown, ThrowOnError>({
+    security: [{
+            in: 'cookie',
+            name: 'maxio_session',
+            type: 'apiKey'
+        }],
+    url: '/api/iam/users/{name}/keys',
+    ...options,
+    headers: {
+        'Content-Type': 'application/json',
+        ...options.headers
+    }
+});
+
+export const deleteAccessKey = <ThrowOnError extends boolean = false>(options: Options<DeleteAccessKeyData, ThrowOnError>): RequestResult<DeleteAccessKeyResponses, unknown, ThrowOnError> => (options.client ?? client).delete<DeleteAccessKeyResponses, unknown, ThrowOnError>({
+    security: [{
+            in: 'cookie',
+            name: 'maxio_session',
+            type: 'apiKey'
+        }],
+    url: '/api/iam/users/{name}/keys/{id}',
+    ...options
+});
+
+export const setAccessKeyStatus = <ThrowOnError extends boolean = false>(options: Options<SetAccessKeyStatusData, ThrowOnError>): RequestResult<SetAccessKeyStatusResponses, unknown, ThrowOnError> => (options.client ?? client).put<SetAccessKeyStatusResponses, unknown, ThrowOnError>({
+    security: [{
+            in: 'cookie',
+            name: 'maxio_session',
+            type: 'apiKey'
+        }],
+    url: '/api/iam/users/{name}/keys/{id}',
+    ...options,
+    headers: {
+        'Content-Type': 'application/json',
+        ...options.headers
+    }
+});
+
+export const attachUserPolicy = <ThrowOnError extends boolean = false>(options: Options<AttachUserPolicyData, ThrowOnError>): RequestResult<AttachUserPolicyResponses, unknown, ThrowOnError> => (options.client ?? client).post<AttachUserPolicyResponses, unknown, ThrowOnError>({
+    security: [{
+            in: 'cookie',
+            name: 'maxio_session',
+            type: 'apiKey'
+        }],
+    url: '/api/iam/users/{name}/policies',
+    ...options,
+    headers: {
+        'Content-Type': 'application/json',
+        ...options.headers
+    }
+});
+
+export const detachUserPolicy = <ThrowOnError extends boolean = false>(options: Options<DetachUserPolicyData, ThrowOnError>): RequestResult<DetachUserPolicyResponses, unknown, ThrowOnError> => (options.client ?? client).delete<DetachUserPolicyResponses, unknown, ThrowOnError>({
+    security: [{
+            in: 'cookie',
+            name: 'maxio_session',
+            type: 'apiKey'
+        }],
+    url: '/api/iam/users/{name}/policies/{policy}',
+    ...options
+});
+
+export const setIamUserStatus = <ThrowOnError extends boolean = false>(options: Options<SetIamUserStatusData, ThrowOnError>): RequestResult<SetIamUserStatusResponses, unknown, ThrowOnError> => (options.client ?? client).put<SetIamUserStatusResponses, unknown, ThrowOnError>({
+    security: [{
+            in: 'cookie',
+            name: 'maxio_session',
+            type: 'apiKey'
+        }],
+    url: '/api/iam/users/{name}/status',
+    ...options,
+    headers: {
+        'Content-Type': 'application/json',
+        ...options.headers
+    }
+});
+
+export const validateIamPolicy = <ThrowOnError extends boolean = false>(options: Options<ValidateIamPolicyData, ThrowOnError>): RequestResult<ValidateIamPolicyResponses, ValidateIamPolicyErrors, ThrowOnError> => (options.client ?? client).post<ValidateIamPolicyResponses, ValidateIamPolicyErrors, ThrowOnError>({
+    security: [{
+            in: 'cookie',
+            name: 'maxio_session',
+            type: 'apiKey'
+        }],
+    url: '/api/iam/validate',
+    ...options,
+    headers: {
+        'Content-Type': 'application/json',
+        ...options.headers
+    }
 });

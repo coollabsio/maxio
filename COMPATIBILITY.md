@@ -2,6 +2,8 @@
 
 This file tracks which S3 and MinIO features MaxIO supports. Update it when you add or change a feature.
 
+Measured against Ceph's s3-tests: [docs/s3-compatibility.md](docs/s3-compatibility.md) (`just s3-compat`).
+
 Status: ✅ supported · 🟡 partial · ❌ not supported
 
 ## Buckets

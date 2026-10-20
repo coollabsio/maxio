@@ -54,9 +54,18 @@ describe('toApiError', () => {
 
 describe('configureApiClient', () => {
   test('returns data and sends same-origin JSON requests', async () => {
-    const { client, requests } = setup(() => json(200, { ok: true }))
+    const session = {
+      ok: true,
+      root: true,
+      iamAdmin: true,
+      kind: 'root',
+      accessKeyId: 'maxioadmin',
+      userName: null,
+      label: null,
+    }
+    const { client, requests } = setup(() => json(200, session))
     const { data } = await sdk.login({ client, body: { accessKey: 'a', secretKey: 'b' }, throwOnError: true })
-    expect(data).toEqual({ ok: true })
+    expect(data).toEqual(session)
     expect(requests[0].method).toBe('POST')
     expect(requests[0].credentials).toBe('same-origin')
     expect(new URL(requests[0].url).pathname).toBe('/api/auth/login')

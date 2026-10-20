@@ -1,16 +1,16 @@
-/** Object sizes in the object browser: `512 B`, `1.5 KB`, `2.0 MB`, `1.0 GB`. */
+/** Object sizes in the object browser. Divisors are 1024, so the labels are KiB/MiB/GiB. */
 export function formatSize(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`
-  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`
-  if (bytes < 1024 * 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)} MB`
-  return `${(bytes / (1024 * 1024 * 1024)).toFixed(1)} GB`
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KiB`
+  if (bytes < 1024 * 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)} MiB`
+  return `${(bytes / (1024 * 1024 * 1024)).toFixed(1)} GiB`
 }
 
-/** Version sizes in the version history: trailing `.0` dropped (`0 B`, `1 KB`, `1.5 MB`). */
+/** Version sizes in the version history: trailing `.0` dropped (`0 B`, `1 KiB`, `1.5 MiB`). */
 export function formatVersionSize(bytes: number): string {
   if (bytes === 0) return '0 B'
   const k = 1024
-  const sizes = ['B', 'KB', 'MB', 'GB']
+  const sizes = ['B', 'KiB', 'MiB', 'GiB']
   const i = Math.min(Math.floor(Math.log(bytes) / Math.log(k)), sizes.length - 1)
   return `${parseFloat((bytes / Math.pow(k, i)).toFixed(1))} ${sizes[i]}`
 }

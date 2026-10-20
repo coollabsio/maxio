@@ -61,6 +61,10 @@ api-check:
         exit 1
     }
 
+# Ceph s3-tests against a local MaxIO. See docs/s3-compatibility.md.
+s3-compat:
+    bash tests/s3_compat.sh
+
 # Playwright e2e against a fresh server on port 9876.
 e2e:
     #!/usr/bin/env bash

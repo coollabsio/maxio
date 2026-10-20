@@ -205,11 +205,44 @@ mc mb maxio/my-bucket
 mc cp file.txt maxio/my-bucket/
 ```
 
+## Identity and access
+
+The root access key (`MAXIO_ACCESS_KEY` / `MAXIO_SECRET_KEY`) is the administrator. Additional callers are IAM users or standalone service keys. Policies are AWS-style JSON: `Effect`, wildcard actions such as `s3:Get*`, and resource ARNs such as `arn:aws:s3:::bucket` and `arn:aws:s3:::bucket/prefix/*`. An explicit `Deny` wins. Built-in policies are `readonly`, `readwrite`, `writeonly`, and `admin`.
+
+A prefix in the console scope picker is a directory. `uploads` and `uploads/` both allow `bucket/uploads/file` and do not allow `bucket/uploads-private` or `bucket/uploadsX`, because that picker writes `prefix/*`. A policy written with AWS wildcard syntax is stored as given: `prefix*` matches any key that starts with that text, including `uploadsY.txt` and `2026-01.csv`.
+
+Create a user and a key with the AWS CLI (the key secret is printed once):
+
+```bash
+aws --endpoint-url http://localhost:9000 iam create-user --user-name alice
+aws --endpoint-url http://localhost:9000 iam attach-user-policy \
+  --user-name alice --policy-arn arn:aws:iam::000000000000:policy/readonly
+aws --endpoint-url http://localhost:9000 iam create-access-key --user-name alice
+```
+
+A key policy only narrows what that user's policies already allow. Granting access is a separate step: attach a policy, or use **Grant scope to user** in the console (or `PUT /api/iam/users/{name}/inline/{policy}`). **Create access key** (`POST /api/iam/users/{name}/keys`) never adds a policy to the user. The scope is stored on that key only. Omitting `keyOnly` means key-only. Sending `keyOnly: false` is rejected.
+
+The console at `/ui/users` and `/ui/policies` is available to root and to anyone whose policy allows IAM administration. Other IAM users can sign in and see only the buckets their policy allows.
+
+Access-key secrets in `<data-dir>/iam.json` are sealed with the SSE-S3 master key (`.maxio-keys.json`, `MAXIO_MASTER_KEY`, or `MAXIO_MASTER_KEY_FILE`). Back the keyring and `iam.json` up together. If `iam.json` has secrets and the master key is missing or is a different key, MaxIO refuses to start instead of serving requests that fail later. A new keyring cannot decrypt the old secrets. Restore the keyring file, or pass the original key with `--master-key` / `MAXIO_MASTER_KEY` or `--master-key-file` / `MAXIO_MASTER_KEY_FILE`. `maxio keyring merge` keeps those secrets readable: keys already in the data directory stay, including the key that sealed `iam.json`.
+
 ## Durability
 
 Object bytes, sidecars, multipart parts, version files, and bucket configuration are published with a temp file, `fsync`, rename, and a directory `fsync`. A crash during a write leaves the previous object in place, or a temp file that is not part of the bucket listing.
 
-On startup MaxIO deletes those temp files, restores or drops stranded erasure-coded publish backups, and removes multipart uploads whose metadata never landed. Uploads that have readable metadata are kept so a client can finish them. An hourly sweep aborts uploads that have been idle for 7 days and deletes temp files older than a day (a live upload is younger than that).
+On startup MaxIO deletes those temp files, restores or drops stranded erasure-coded publish backups, restores object bytes left in a `.maxio-promote-*` directory, and removes multipart uploads whose metadata never landed. Uploads that have readable metadata are kept so a client can finish them. An hourly sweep aborts uploads that have been idle for 7 days and deletes temp files older than a day (a live upload is younger than that). Promote directories newer than an hour are left for that sweep so it does not race a promotion that is still running; startup does not wait.
+
+### Key and prefix layout
+
+S3 keys are a flat namespace, so `photos/cat.jpg` and `photos/cat.jpg/thumb` can both exist. MaxIO stores the first object's bytes at `photos/cat.jpg/.maxio.object` and keeps the sidecar next to that directory (`photos/cat.jpg.meta.json`). The sidecar is where an SSE-S3 wrapped data key lives.
+
+This layout is one-way. A data directory written by this version is not readable by older MaxIO builds: GET of a promoted key returns `InternalError`, because those builds open the key path as a file and the path is now a directory. Stay on this version, or a newer one, to read those objects. Do not point an older binary at a data directory that already contains promoted keys.
+
+A crash during the promotion parks the bytes in `.maxio-promote-<id>/.maxio.object` and records the key name in that directory. Startup and `maxio check --repair` move the bytes back to the key, or into `<key>/.maxio.object` when that directory already exists. `maxio check` reports the leftover, including `.maxio-promote-target` and `.maxio-promote-ready` files left inside the published directory. It does not delete the sidecar while a promote directory for that key is still there.
+
+Object keys cannot use those internal names as a path segment (`.maxio.object`, `.maxio-promote-*`, `.maxio-tmp-*`, `.maxio-bak-*`, `.maxio-quarantine`, and the other layout names). Matching is ASCII case-insensitive, so `p/.MAXIO.OBJECT` is rejected too. A write returns `400 InvalidArgument`. A read returns `NoSuchKey`. That stops a client from overwriting `p`'s bytes by putting `p/.maxio.object`.
+
+Objects created by a pre-1.0 build may already use those names. MaxIO refuses to start when it finds one, and `maxio check` reports it as `legacy-reserved-key` without modifying the files. Rename or delete the keys with the previous version (`aws s3 mv`), then start this version. See [UPGRADE.md](UPGRADE.md).
 
 Back up the data directory and the SSE-S3 master key. That key is `<data-dir>/.maxio-keys.json` unless you set `MAXIO_MASTER_KEY` or `MAXIO_MASTER_KEY_FILE`, which stay outside the data directory. Losing the key makes SSE-S3 objects unrecoverable.
 
@@ -226,13 +259,14 @@ maxio check --data-dir ./data
 maxio check --data-dir ./data --repair
 ```
 
-The report lists stale temp files, stranded backups, object bytes without a sidecar, sidecars without bytes, plain-object size / etag / checksum mismatches, multipart debris, and erasure-coded chunks that do not match their manifest. Exit status is 1 when anything is still unresolved.
+The report lists stale temp files, stranded backups, promote directories and leftover promote marker files, object bytes without a sidecar, sidecars without bytes, plain-object size / etag / checksum mismatches, multipart debris, and erasure-coded chunks that do not match their manifest. Exit status is 1 when anything is still unresolved.
 
 `--repair` fixes the cases that are determined by the bytes already on disk:
 
 - delete temp files and finished publish backups; restore a backup when the live object is missing
-- recreate a sidecar for plain object bytes that have none (etag and size taken from the file)
-- delete a sidecar whose bytes are gone, and delete a multipart upload that has no readable metadata
+- restore object bytes stranded in a `.maxio-promote-*` directory (back to the key, or into `<key>/.maxio.object` if that directory exists) and remove the directory. Remove `.maxio-promote-target` and `.maxio-promote-ready` files left inside a published key directory
+- move object bytes that have no sidecar to `<data-dir>/.maxio-quarantine/<bucket>/<path>` and say so in the report. Those bytes are not given a new sidecar: they may be SSE-S3 ciphertext, and serving them as a plain object would return the ciphertext with no encryption headers. Copy a quarantined file back by hand if you know which object it belongs to
+- delete a sidecar whose bytes are gone, and delete a multipart upload that has no readable metadata. A sidecar is kept when a promote directory for that key still exists
 - rewrite a plain object's size, etag, and checksum so they match the file
 - rebuild a missing or corrupt data chunk when parity shards can reconstruct it
 

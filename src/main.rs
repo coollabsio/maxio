@@ -20,6 +20,7 @@ mod auth;
 mod config;
 mod embedded;
 mod error;
+mod iam;
 mod limits;
 mod openapi;
 mod serve;
@@ -75,9 +76,11 @@ enum Commands {
 
     /// Scan the data directory for crash leftovers and inconsistent objects.
     ///
-    /// Reports orphaned data, sidecar mismatches, stale temp files, and
-    /// multipart debris. `--repair` fixes the cases that can be made
-    /// consistent from the bytes already on disk. Stop the server first.
+    /// Reports orphaned data, sidecar mismatches, stale temp files, promote
+    /// directories, and multipart debris. `--repair` fixes the cases that can
+    /// be made consistent from the bytes already on disk. Bytes with no
+    /// sidecar are moved to `.maxio-quarantine/` instead of being adopted.
+    /// Stop the server first.
     Check {
         /// Data directory to scan
         #[arg(long, env = "MAXIO_DATA_DIR", default_value = "./data")]
@@ -240,11 +243,18 @@ async fn main() -> anyhow::Result<()> {
         storage::lock::LockReason::Serve,
     )?;
 
-    // SSE-S3 master key. A missing keyring file bootstraps a new key only when
-    // the data directory has no encrypted objects. See storage::keys.
+    // Resolve the external key before any keyring file is created. IAM secrets
+    // use the same key, so a missing keyring must not be replaced while
+    // iam.json still holds sealed secrets.
     let master_key_b64 = storage::keys::resolve_master_key(
         config.master_key.as_deref(),
         config.master_key_file.as_deref(),
+    )
+    .await?;
+    iam::secrets::refuse_missing_keyring(
+        &config.data_dir,
+        master_key_b64.is_some(),
+        config.allow_missing_master_key,
     )
     .await?;
     let keyring = Arc::new(if config.allow_missing_master_key {
@@ -259,6 +269,18 @@ async fn main() -> anyhow::Result<()> {
     } else {
         storage::keys::Keyring::load(&config.data_dir, master_key_b64.as_deref()).await?
     });
+    iam::store::ensure_secrets_readable(&config.data_dir, &keyring)
+        .await
+        .map_err(|err| {
+            if config.allow_missing_master_key {
+                anyhow::Error::msg(format!(
+                    "{err}\n\n{}",
+                    iam::secrets::allow_missing_does_not_cover_iam(&config.data_dir)
+                ))
+            } else {
+                anyhow::Error::msg(err)
+            }
+        })?;
     match (&config.master_key, &config.master_key_file) {
         (_, Some(path)) => {
             tracing::info!(

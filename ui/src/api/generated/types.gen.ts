@@ -8,6 +8,10 @@ export type AbortIncompleteMultipartUpload = {
     daysAfterInitiation: number;
 };
 
+export type AttachBody = {
+    name: string;
+};
+
 /**
  * Raw object bytes (upload body and download response).
  */
@@ -15,6 +19,10 @@ export type BinaryBody = Blob | File;
 
 export type BucketListResponse = {
     buckets: Array<BucketSummary>;
+    /**
+     * Caller may create a bucket.
+     */
+    createBucket: boolean;
 };
 
 export type BucketPolicyResponse = {
@@ -26,6 +34,10 @@ export type BucketPolicyResponse = {
 };
 
 export type BucketSummary = {
+    /**
+     * Caller may call DeleteBucket on this bucket.
+     */
+    canDelete: boolean;
     createdAt: string;
     encryption: boolean;
     name: string;
@@ -44,12 +56,66 @@ export type BucketSummary = {
     versioning: boolean;
 };
 
+export type Capabilities = {
+    createBucket: boolean;
+    deleteBucket: boolean;
+    deleteObject: boolean;
+    putObject: boolean;
+};
+
 export type CreateBucketRequest = {
     name: string;
 };
 
 export type CreateFolderRequest = {
     name: string;
+};
+
+export type CreateKeyBody = {
+    /**
+     * `read`, `write`, `readwrite`, or `admin`.
+     */
+    access?: string | null;
+    /**
+     * Bucket names. Empty with `access` set means every bucket.
+     */
+    buckets?: Array<string>;
+    /**
+     * Raw policy JSON. Used instead of `access` when set.
+     */
+    documentJson?: string | null;
+    /**
+     * Omitted means true. The scope is stored on this key only. `false` is rejected: creating a key never grants the user.
+     */
+    keyOnly?: boolean;
+    prefix?: string;
+};
+
+export type CreateUserBody = {
+    name: string;
+};
+
+export type CreatedKeyResponse = {
+    accessKeyId: string;
+    createdAt: string;
+    /**
+     * Policy saved with this key, when the request included a scope or document.
+     */
+    documentJson?: string | null;
+    secretAccessKey: string;
+    status: string;
+};
+
+export type DocumentBody = {
+    documentJson: string;
+};
+
+export type DocumentResponse = {
+    documentJson: string;
+};
+
+export type EnabledBody = {
+    enabled: boolean;
 };
 
 export type EnabledResponse = {
@@ -63,8 +129,39 @@ export type EncryptionResponse = {
     enabled: boolean;
 };
 
+export type ErrorBody = {
+    error: string;
+};
+
 export type ErrorResponse = {
     error: string;
+};
+
+export type InlinePolicyView = {
+    documentJson: string;
+    name: string;
+};
+
+export type KeyListResponse = {
+    keys: Array<KeyView>;
+};
+
+export type KeyStatusBody = {
+    status: string;
+};
+
+export type KeyView = {
+    accessKeyId: string;
+    createdAt: string;
+    hasPolicy: boolean;
+    label: string;
+    policyJson?: string | null;
+    /**
+     * Set when the key has its own policy. That policy only narrows the user.
+     */
+    policySummary?: string | null;
+    status: string;
+    userName?: string | null;
 };
 
 /**
@@ -182,6 +279,10 @@ export type ObjectInfo = {
     encryption: null | ObjectEncryption;
     etag: string;
     expires: string | null;
+    /**
+     * Bytes are at `{key}/.maxio.object` because this key is also a prefix.
+     */
+    inlinePayload: boolean;
     isDeleteMarker: boolean;
     key: string;
     lastModified: string;
@@ -230,9 +331,39 @@ export type OkResponse = {
     ok: boolean;
 };
 
+export type PolicyListResponse = {
+    policies: Array<PolicyView>;
+};
+
+export type PolicyUpdateBody = {
+    description?: string | null;
+    documentJson: string;
+};
+
+export type PolicyView = {
+    builtin: boolean;
+    createdAt: string;
+    description: string;
+    documentJson: string;
+    name: string;
+    updatedAt: string;
+};
+
+export type PolicyWriteBody = {
+    description?: string;
+    documentJson: string;
+    name: string;
+};
+
 export type PresignResponse = {
     expiresIn: number;
     url: string;
+};
+
+export type PreviewBody = {
+    access: string;
+    buckets?: Array<string>;
+    prefix?: string;
 };
 
 export type PublicAccess = {
@@ -245,6 +376,27 @@ export type RestoreVersionResponse = {
      * Version id of the new current version (`null` when versioning is off).
      */
     versionId: string | null;
+};
+
+export type ServiceKeyBody = {
+    access?: string | null;
+    buckets?: Array<string>;
+    documentJson?: string | null;
+    name: string;
+    prefix?: string;
+};
+
+export type SessionResponse = {
+    accessKeyId: string;
+    iamAdmin: boolean;
+    /**
+     * `root`, `user`, or `service`.
+     */
+    kind: string;
+    label?: string | null;
+    ok: boolean;
+    root: boolean;
+    userName?: string | null;
 };
 
 export type SetEnabledRequest = {
@@ -271,9 +423,42 @@ export type UploadResponse = {
     size: number;
 };
 
+export type UserListResponse = {
+    users: Array<UserView>;
+};
+
+export type UserView = {
+    attachedPolicies: Array<string>;
+    createdAt: string;
+    enabled: boolean;
+    inlinePolicies: Array<InlinePolicyView>;
+    keyCount: number;
+    name: string;
+    userId: string;
+};
+
 export type VersionListResponse = {
     versions: Array<ObjectVersion>;
 };
+
+export type GetCapabilitiesData = {
+    body?: never;
+    path?: never;
+    query?: {
+        /**
+         * When set, `putObject` and `deleteObject` are evaluated under this prefix.
+         */
+        bucket?: string;
+        prefix?: string;
+    };
+    url: '/api/auth/capabilities';
+};
+
+export type GetCapabilitiesResponses = {
+    200: Capabilities;
+};
+
+export type GetCapabilitiesResponse = GetCapabilitiesResponses[keyof GetCapabilitiesResponses];
 
 export type CheckAuthData = {
     body?: never;
@@ -292,7 +477,7 @@ export type CheckAuthErrors = {
 export type CheckAuthError = CheckAuthErrors[keyof CheckAuthErrors];
 
 export type CheckAuthResponses = {
-    200: OkResponse;
+    200: SessionResponse;
 };
 
 export type CheckAuthResponse = CheckAuthResponses[keyof CheckAuthResponses];
@@ -310,6 +495,10 @@ export type LoginErrors = {
      */
     401: ErrorResponse;
     /**
+     * Access key or user is disabled
+     */
+    403: ErrorResponse;
+    /**
      * Too many login attempts
      */
     429: ErrorResponse;
@@ -318,7 +507,7 @@ export type LoginErrors = {
 export type LoginError = LoginErrors[keyof LoginErrors];
 
 export type LoginResponses = {
-    200: OkResponse;
+    200: SessionResponse;
 };
 
 export type LoginResponse = LoginResponses[keyof LoginResponses];
@@ -1010,3 +1199,387 @@ export type RestoreVersionResponses = {
 };
 
 export type RestoreVersionResponse2 = RestoreVersionResponses[keyof RestoreVersionResponses];
+
+export type ListIamPoliciesData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/api/iam/policies';
+};
+
+export type ListIamPoliciesResponses = {
+    200: PolicyListResponse;
+};
+
+export type ListIamPoliciesResponse = ListIamPoliciesResponses[keyof ListIamPoliciesResponses];
+
+export type CreateIamPolicyData = {
+    body: PolicyWriteBody;
+    path?: never;
+    query?: never;
+    url: '/api/iam/policies';
+};
+
+export type CreateIamPolicyResponses = {
+    200: PolicyView;
+};
+
+export type CreateIamPolicyResponse = CreateIamPolicyResponses[keyof CreateIamPolicyResponses];
+
+export type DeleteIamPolicyData = {
+    body?: never;
+    path: {
+        name: string;
+    };
+    query?: never;
+    url: '/api/iam/policies/{name}';
+};
+
+export type DeleteIamPolicyResponses = {
+    /**
+     * Custom policy deleted
+     */
+    200: unknown;
+};
+
+export type GetIamPolicyData = {
+    body?: never;
+    path: {
+        name: string;
+    };
+    query?: never;
+    url: '/api/iam/policies/{name}';
+};
+
+export type GetIamPolicyResponses = {
+    200: PolicyView;
+};
+
+export type GetIamPolicyResponse = GetIamPolicyResponses[keyof GetIamPolicyResponses];
+
+export type UpdateIamPolicyData = {
+    body: PolicyUpdateBody;
+    path: {
+        name: string;
+    };
+    query?: never;
+    url: '/api/iam/policies/{name}';
+};
+
+export type UpdateIamPolicyResponses = {
+    200: PolicyView;
+};
+
+export type UpdateIamPolicyResponse = UpdateIamPolicyResponses[keyof UpdateIamPolicyResponses];
+
+export type PreviewIamPolicyData = {
+    body: PreviewBody;
+    path?: never;
+    query?: never;
+    url: '/api/iam/preview';
+};
+
+export type PreviewIamPolicyResponses = {
+    200: DocumentResponse;
+};
+
+export type PreviewIamPolicyResponse = PreviewIamPolicyResponses[keyof PreviewIamPolicyResponses];
+
+export type ListServiceKeysData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/api/iam/service-keys';
+};
+
+export type ListServiceKeysResponses = {
+    200: KeyListResponse;
+};
+
+export type ListServiceKeysResponse = ListServiceKeysResponses[keyof ListServiceKeysResponses];
+
+export type CreateServiceKeyData = {
+    body: ServiceKeyBody;
+    path?: never;
+    query?: never;
+    url: '/api/iam/service-keys';
+};
+
+export type CreateServiceKeyResponses = {
+    200: CreatedKeyResponse;
+};
+
+export type CreateServiceKeyResponse = CreateServiceKeyResponses[keyof CreateServiceKeyResponses];
+
+export type DeleteServiceKeyData = {
+    body?: never;
+    path: {
+        id: string;
+    };
+    query?: never;
+    url: '/api/iam/service-keys/{id}';
+};
+
+export type DeleteServiceKeyResponses = {
+    /**
+     * Service key deleted
+     */
+    200: unknown;
+};
+
+export type SetServiceKeyStatusData = {
+    body: KeyStatusBody;
+    path: {
+        id: string;
+    };
+    query?: never;
+    url: '/api/iam/service-keys/{id}';
+};
+
+export type SetServiceKeyStatusResponses = {
+    200: KeyView;
+};
+
+export type SetServiceKeyStatusResponse = SetServiceKeyStatusResponses[keyof SetServiceKeyStatusResponses];
+
+export type ListIamUsersData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/api/iam/users';
+};
+
+export type ListIamUsersErrors = {
+    403: ErrorBody;
+};
+
+export type ListIamUsersError = ListIamUsersErrors[keyof ListIamUsersErrors];
+
+export type ListIamUsersResponses = {
+    200: UserListResponse;
+};
+
+export type ListIamUsersResponse = ListIamUsersResponses[keyof ListIamUsersResponses];
+
+export type CreateIamUserData = {
+    body: CreateUserBody;
+    path?: never;
+    query?: never;
+    url: '/api/iam/users';
+};
+
+export type CreateIamUserErrors = {
+    409: ErrorBody;
+};
+
+export type CreateIamUserError = CreateIamUserErrors[keyof CreateIamUserErrors];
+
+export type CreateIamUserResponses = {
+    200: UserView;
+};
+
+export type CreateIamUserResponse = CreateIamUserResponses[keyof CreateIamUserResponses];
+
+export type DeleteIamUserData = {
+    body?: never;
+    path: {
+        name: string;
+    };
+    query?: never;
+    url: '/api/iam/users/{name}';
+};
+
+export type DeleteIamUserResponses = {
+    /**
+     * User, keys, and inline policies removed
+     */
+    200: unknown;
+};
+
+export type GetIamUserData = {
+    body?: never;
+    path: {
+        name: string;
+    };
+    query?: never;
+    url: '/api/iam/users/{name}';
+};
+
+export type GetIamUserErrors = {
+    404: ErrorBody;
+};
+
+export type GetIamUserError = GetIamUserErrors[keyof GetIamUserErrors];
+
+export type GetIamUserResponses = {
+    200: UserView;
+};
+
+export type GetIamUserResponse = GetIamUserResponses[keyof GetIamUserResponses];
+
+export type DeleteInlineUserPolicyData = {
+    body?: never;
+    path: {
+        name: string;
+        policy: string;
+    };
+    query?: never;
+    url: '/api/iam/users/{name}/inline/{policy}';
+};
+
+export type DeleteInlineUserPolicyResponses = {
+    /**
+     * Inline policy deleted
+     */
+    200: unknown;
+};
+
+export type PutInlineUserPolicyData = {
+    body: DocumentBody;
+    path: {
+        name: string;
+        policy: string;
+    };
+    query?: never;
+    url: '/api/iam/users/{name}/inline/{policy}';
+};
+
+export type PutInlineUserPolicyResponses = {
+    /**
+     * Inline policy saved
+     */
+    200: unknown;
+};
+
+export type ListAccessKeysData = {
+    body?: never;
+    path: {
+        name: string;
+    };
+    query?: never;
+    url: '/api/iam/users/{name}/keys';
+};
+
+export type ListAccessKeysResponses = {
+    200: KeyListResponse;
+};
+
+export type ListAccessKeysResponse = ListAccessKeysResponses[keyof ListAccessKeysResponses];
+
+export type CreateAccessKeyData = {
+    body: CreateKeyBody;
+    path: {
+        name: string;
+    };
+    query?: never;
+    url: '/api/iam/users/{name}/keys';
+};
+
+export type CreateAccessKeyResponses = {
+    /**
+     * Secret is returned once
+     */
+    200: CreatedKeyResponse;
+};
+
+export type CreateAccessKeyResponse = CreateAccessKeyResponses[keyof CreateAccessKeyResponses];
+
+export type DeleteAccessKeyData = {
+    body?: never;
+    path: {
+        name: string;
+        id: string;
+    };
+    query?: never;
+    url: '/api/iam/users/{name}/keys/{id}';
+};
+
+export type DeleteAccessKeyResponses = {
+    /**
+     * Key deleted
+     */
+    200: unknown;
+};
+
+export type SetAccessKeyStatusData = {
+    body: KeyStatusBody;
+    path: {
+        name: string;
+        id: string;
+    };
+    query?: never;
+    url: '/api/iam/users/{name}/keys/{id}';
+};
+
+export type SetAccessKeyStatusResponses = {
+    200: KeyView;
+};
+
+export type SetAccessKeyStatusResponse = SetAccessKeyStatusResponses[keyof SetAccessKeyStatusResponses];
+
+export type AttachUserPolicyData = {
+    body: AttachBody;
+    path: {
+        name: string;
+    };
+    query?: never;
+    url: '/api/iam/users/{name}/policies';
+};
+
+export type AttachUserPolicyResponses = {
+    /**
+     * Policy attached
+     */
+    200: unknown;
+};
+
+export type DetachUserPolicyData = {
+    body?: never;
+    path: {
+        name: string;
+        policy: string;
+    };
+    query?: never;
+    url: '/api/iam/users/{name}/policies/{policy}';
+};
+
+export type DetachUserPolicyResponses = {
+    /**
+     * Policy detached
+     */
+    200: unknown;
+};
+
+export type SetIamUserStatusData = {
+    body: EnabledBody;
+    path: {
+        name: string;
+    };
+    query?: never;
+    url: '/api/iam/users/{name}/status';
+};
+
+export type SetIamUserStatusResponses = {
+    200: UserView;
+};
+
+export type SetIamUserStatusResponse = SetIamUserStatusResponses[keyof SetIamUserStatusResponses];
+
+export type ValidateIamPolicyData = {
+    body: DocumentBody;
+    path?: never;
+    query?: never;
+    url: '/api/iam/validate';
+};
+
+export type ValidateIamPolicyErrors = {
+    400: ErrorBody;
+};
+
+export type ValidateIamPolicyError = ValidateIamPolicyErrors[keyof ValidateIamPolicyErrors];
+
+export type ValidateIamPolicyResponses = {
+    200: DocumentResponse;
+};
+
+export type ValidateIamPolicyResponse = ValidateIamPolicyResponses[keyof ValidateIamPolicyResponses];

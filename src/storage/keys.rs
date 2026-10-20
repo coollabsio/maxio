@@ -239,6 +239,56 @@ impl Keyring {
         Ok(dek)
     }
 
+    /// Encrypt a small blob with the active master key (AES-256-GCM).
+    ///
+    /// IAM access-key secrets use this: SigV4 needs the raw secret, so it cannot
+    /// be stored as a hash, but it is not written to disk in plaintext.
+    pub fn seal(
+        &self,
+        aad: &[u8],
+        plaintext: &[u8],
+    ) -> anyhow::Result<(String, [u8; 12], Vec<u8>)> {
+        let key_id = self.active_id.clone();
+        let master = self.get_key(&key_id)?;
+        let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(master));
+        let mut nonce_bytes = [0u8; 12];
+        rand::rng().fill(&mut nonce_bytes[..]);
+        let nonce = Nonce::from_slice(&nonce_bytes);
+        let ciphertext = cipher
+            .encrypt(
+                nonce,
+                Payload {
+                    msg: plaintext,
+                    aad,
+                },
+            )
+            .map_err(|_| anyhow::anyhow!("failed to seal blob"))?;
+        Ok((key_id, nonce_bytes, ciphertext))
+    }
+
+    /// Decrypt a blob sealed by [`Keyring::seal`]. `key_id` may be a retired
+    /// master key still held in the ring.
+    pub fn open(
+        &self,
+        aad: &[u8],
+        key_id: &str,
+        nonce: &[u8; 12],
+        ciphertext: &[u8],
+    ) -> anyhow::Result<Vec<u8>> {
+        let master = self.get_key(key_id)?;
+        let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(master));
+        let nonce = Nonce::from_slice(nonce);
+        cipher
+            .decrypt(
+                nonce,
+                Payload {
+                    msg: ciphertext,
+                    aad,
+                },
+            )
+            .map_err(|_| anyhow::anyhow!("failed to open sealed blob"))
+    }
+
     fn get_key(&self, key_id: &str) -> anyhow::Result<&[u8; 32]> {
         self.keys
             .get(key_id)
@@ -712,6 +762,7 @@ pub async fn assess_master_key(
         CheckRead::Parsed(file) => (file.keys, file.source),
     };
     let scan = scan_sse_s3(data_dir).await?;
+    let iam_ids = crate::iam::secrets::sealed_master_key_ids(data_dir).await?;
 
     let mut required: BTreeSet<String> = BTreeSet::new();
     for entry in &check_entries {
@@ -720,6 +771,7 @@ pub async fn assess_master_key(
         }
     }
     required.extend(scan.ids.iter().cloned());
+    required.extend(iam_ids);
 
     if required.is_empty() && scan.unresolved.is_empty() {
         return Ok(MasterKeyAssessment::Satisfied);
@@ -848,16 +900,25 @@ struct Requirement {
     check_ids: BTreeSet<String>,
     /// Key ids found in SSE-S3 object or multipart metadata.
     object_ids: BTreeSet<String>,
+    /// Key ids that sealed IAM access-key secrets in `iam.json`.
+    iam_ids: BTreeSet<String>,
     unresolved: Vec<String>,
 }
 
 impl Requirement {
     fn is_empty(&self) -> bool {
-        self.check_ids.is_empty() && self.object_ids.is_empty() && self.unresolved.is_empty()
+        self.check_ids.is_empty()
+            && self.object_ids.is_empty()
+            && self.iam_ids.is_empty()
+            && self.unresolved.is_empty()
     }
 
     fn has_encrypted_objects(&self) -> bool {
         !self.object_ids.is_empty() || !self.unresolved.is_empty()
+    }
+
+    fn has_iam_secrets(&self) -> bool {
+        !self.iam_ids.is_empty()
     }
 }
 
@@ -893,6 +954,7 @@ async fn collect_requirement(data_dir: &str) -> anyhow::Result<Requirement> {
     let mut req = Requirement {
         check_ids: BTreeSet::new(),
         object_ids: BTreeSet::new(),
+        iam_ids: BTreeSet::new(),
         unresolved: Vec::new(),
     };
     match read_check_file(&check_path(data_dir)).await? {
@@ -908,6 +970,10 @@ async fn collect_requirement(data_dir: &str) -> anyhow::Result<Requirement> {
     let scan = scan_sse_s3(data_dir).await?;
     req.object_ids = scan.ids;
     req.unresolved = scan.unresolved;
+    // A directory that only has iam.json must not bootstrap a new master key.
+    for id in crate::iam::secrets::sealed_master_key_ids(data_dir).await? {
+        req.iam_ids.insert(id);
+    }
     Ok(req)
 }
 
@@ -919,6 +985,8 @@ fn missing_master_key_error(
     let check = check_path(data_dir);
     let lead = if req.has_encrypted_objects() {
         "SSE-S3 master key is missing and this data directory contains encrypted objects."
+    } else if req.has_iam_secrets() {
+        "SSE-S3 master key is missing and iam.json contains sealed access-key secrets."
     } else {
         "SSE-S3 master key is missing. A key check file records key ids for this data directory; no encrypted object metadata was found."
     };
@@ -961,6 +1029,10 @@ fn requirement_details(req: &Requirement) -> String {
             "encrypted object metadata key ids: {}",
             ids.join(", ")
         ));
+    }
+    if !req.iam_ids.is_empty() {
+        let ids: Vec<&str> = req.iam_ids.iter().map(String::as_str).collect();
+        details.push(format!("iam.json sealed with key ids: {}", ids.join(", ")));
     }
     if !req.unresolved.is_empty() {
         let shown: Vec<&str> = req.unresolved.iter().take(5).map(String::as_str).collect();
@@ -1542,6 +1614,26 @@ mod tests {
             "empty data dir must not claim encrypted objects: {msg}"
         );
         assert!(!std::path::Path::new(&keyring_path(&dir)).exists());
+    }
+
+    #[tokio::test]
+    async fn iam_json_without_a_keyring_does_not_bootstrap() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().to_str().unwrap();
+        let iam = r#"{"version":1,"users":[],"keys":[{"secret":{"keyId":"aabbccddeeff0011","nonce":"AA","ciphertext":"AA"}}],"policies":[]}"#;
+        std::fs::write(tmp.path().join("iam.json"), iam).unwrap();
+        let err = Keyring::load(dir, None)
+            .await
+            .err()
+            .expect("iam.json alone must refuse a new keyring");
+        let msg = err.to_string();
+        assert!(msg.contains("iam.json"), "{msg}");
+        assert!(msg.contains("aabbccddeeff0011"), "{msg}");
+        assert!(
+            !msg.contains("contains encrypted objects"),
+            "iam.json alone is not an encrypted object: {msg}"
+        );
+        assert!(!tmp.path().join(".maxio-keys.json").exists());
     }
 
     #[tokio::test]

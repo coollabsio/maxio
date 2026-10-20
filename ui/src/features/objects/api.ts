@@ -2,6 +2,15 @@ import { apiClient } from '@/api/client'
 import * as sdk from '@/api/generated/sdk.gen'
 import type { TagEntry } from '@/api/generated/types.gen'
 
+export async function getCapabilities(bucket: string, prefix: string) {
+  const { data } = await sdk.getCapabilities({
+    client: apiClient,
+    query: { bucket, prefix },
+    throwOnError: true,
+  })
+  return data
+}
+
 export async function listObjects(bucket: string, prefix: string) {
   const { data } = await sdk.listObjects({
     client: apiClient,

@@ -10,14 +10,14 @@ use axum::body::Body;
 use http::{HeaderMap, Response, StatusCode};
 use quick_xml::escape::escape;
 use serde::Deserialize;
-use serde::de::IgnoredAny;
 
 use crate::error::{S3Error, S3ErrorCode};
 use crate::server::AppState;
 use crate::storage::StorageError;
 use crate::storage::lifecycle::{
     AbortIncompleteMultipartUpload, LifecycleExpiration, LifecycleFilter, LifecycleRule,
-    LifecycleStatus, LifecycleTag, NoncurrentVersionExpiration, validate_rules,
+    LifecycleStatus, LifecycleTag, NoncurrentVersionExpiration, parse_lifecycle_date,
+    validate_rules,
 };
 
 const LIFECYCLE_BODY_MAX: usize = 2 * 1024 * 1024;
@@ -48,9 +48,19 @@ struct XmlRule {
     #[serde(rename = "AbortIncompleteMultipartUpload")]
     abort_incomplete_multipart_upload: Option<XmlAbort>,
     #[serde(rename = "Transition", default)]
-    transition: Vec<IgnoredAny>,
+    transition: Vec<XmlTransition>,
     #[serde(rename = "NoncurrentVersionTransition", default)]
-    noncurrent_version_transition: Vec<IgnoredAny>,
+    noncurrent_version_transition: Vec<XmlTransition>,
+}
+
+#[derive(Deserialize)]
+struct XmlTransition {
+    #[serde(rename = "Date")]
+    date: Option<String>,
+    #[serde(rename = "Days")]
+    days: Option<i64>,
+    #[serde(rename = "StorageClass")]
+    storage_class: Option<String>,
 }
 
 #[derive(Deserialize, Default)]
@@ -166,6 +176,7 @@ fn convert_filter(f: XmlFilter) -> Result<LifecycleFilter, S3Error> {
             tags: tags(and.tags),
             object_size_greater_than: size_bound(and.size_gt, "ObjectSizeGreaterThan")?,
             object_size_less_than: size_bound(and.size_lt, "ObjectSizeLessThan")?,
+            legacy_prefix: false,
         });
     }
     if singles > 1 {
@@ -179,6 +190,7 @@ fn convert_filter(f: XmlFilter) -> Result<LifecycleFilter, S3Error> {
         tags: tags(f.tags),
         object_size_greater_than: size_bound(f.size_gt, "ObjectSizeGreaterThan")?,
         object_size_less_than: size_bound(f.size_lt, "ObjectSizeLessThan")?,
+        legacy_prefix: false,
     })
 }
 
@@ -197,6 +209,23 @@ pub fn parse_lifecycle_xml(body: &str) -> Result<Vec<LifecycleRule>, S3Error> {
 
     let mut rules = Vec::with_capacity(config.rules.len());
     for r in config.rules {
+        // A malformed transition is a 400 even though well-formed transitions
+        // are rejected as unsupported. Clients send both in one document.
+        for t in r
+            .transition
+            .iter()
+            .chain(r.noncurrent_version_transition.iter())
+        {
+            if let Some(date) = &t.date {
+                parse_lifecycle_date(date)?;
+            }
+            if t.date.is_none() && t.days.is_none() && t.storage_class.is_none() {
+                return Err(S3Error::new(
+                    S3ErrorCode::MalformedXML,
+                    "Transition requires Days or Date and a StorageClass",
+                ));
+            }
+        }
         if !r.transition.is_empty() || !r.noncurrent_version_transition.is_empty() {
             return Err(S3Error::not_implemented(
                 "Lifecycle transitions are not supported: MaxIO has a single storage class",
@@ -221,6 +250,7 @@ pub fn parse_lifecycle_xml(body: &str) -> Result<Vec<LifecycleRule>, S3Error> {
             }
             (Some(prefix), None) => LifecycleFilter {
                 prefix,
+                legacy_prefix: true,
                 ..Default::default()
             },
             (None, Some(f)) => convert_filter(f)?,
@@ -322,7 +352,15 @@ pub fn render_lifecycle_xml(rules: &[LifecycleRule]) -> String {
         out.push_str("<Rule><ID>");
         out.push_str(&escape(r.id.as_str()));
         out.push_str("</ID>");
-        render_filter(&mut out, &r.filter);
+        if r.filter.legacy_prefix {
+            // Echo a legacy top-level `<Prefix>` only when that is what was
+            // stored. A `<Filter><Prefix>` (AWS CLI, Terraform, mc) stays a Filter.
+            out.push_str("<Prefix>");
+            out.push_str(&escape(r.filter.prefix.as_str()));
+            out.push_str("</Prefix>");
+        } else {
+            render_filter(&mut out, &r.filter);
+        }
         out.push_str(match r.status {
             LifecycleStatus::Enabled => "<Status>Enabled</Status>",
             LifecycleStatus::Disabled => "<Status>Disabled</Status>",

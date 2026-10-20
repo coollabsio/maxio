@@ -215,9 +215,9 @@ export function UsersPage() {
       {showService ? (
         <CreateKeyDialog
           title="Create service key"
-          description="Choose the buckets, prefix, and access this key should have."
+          description="This policy is the only access the key has. It is not attached to a user."
+          submitLabel="Create service key"
           saving={createService.isPending}
-          allowKeyOnly={false}
           requireName
           onClose={() => setShowService(false)}
           onCreate={async (input) => {

@@ -108,6 +108,16 @@ export async function deleteIamPolicy(name: string) {
   return data
 }
 
+export async function putInlineUserPolicy(name: string, policy: string, documentJson: string) {
+  const { data } = await sdk.putInlineUserPolicy({
+    client: apiClient,
+    path: { name, policy },
+    body: { documentJson },
+    throwOnError: true,
+  })
+  return data
+}
+
 export async function attachUserPolicy(name: string, policy: string) {
   const { data } = await sdk.attachUserPolicy({ client: apiClient, path: { name }, body: { name: policy }, throwOnError: true })
   return data

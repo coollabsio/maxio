@@ -21,6 +21,7 @@ import {
   getIamUser,
   listAccessKeys,
   listIamPolicies,
+  putInlineUserPolicy,
   setAccessKeyStatus,
   setIamUserStatus,
 } from './api'
@@ -34,6 +35,7 @@ export function UserDetailPage() {
   const keysQuery = useQuery({ queryKey: iamKeys.keys(name), queryFn: () => listAccessKeys(name), enabled: Boolean(name) })
   const policiesQuery = useQuery({ queryKey: iamKeys.policies(), queryFn: listIamPolicies })
   const [showKey, setShowKey] = useState(false)
+  const [showGrant, setShowGrant] = useState(false)
   const [confirmDelete, setConfirmDelete] = useState(false)
   const [attachName, setAttachName] = useState('')
 
@@ -66,6 +68,14 @@ export function UserDetailPage() {
   const removeKey = useMutation({
     mutationFn: (id: string) => deleteAccessKey(name, id),
     onSuccess: refresh,
+  })
+  const grant = useMutation({
+    mutationFn: ({ policy, documentJson }: { policy: string; documentJson: string }) =>
+      putInlineUserPolicy(name, policy, documentJson),
+    onSuccess: () => {
+      toast.success('Scope granted to the user')
+      refresh()
+    },
   })
   const attach = useMutation({
     mutationFn: (policy: string) => attachUserPolicy(name, policy),
@@ -133,10 +143,16 @@ export function UserDetailPage() {
             <Button variant="outline" disabled={!attachName || attach.isPending} onClick={() => attach.mutate(attachName)}>
               Attach
             </Button>
+            <Button variant="outline" onClick={() => setShowGrant(true)}>
+              Grant scope to user
+            </Button>
           </div>
         </div>
         {user && user.attachedPolicies.length === 0 && user.inlinePolicies.length === 0 ? (
-          <Callout type="info">This user has no policies, so their keys cannot access data until you attach one.</Callout>
+          <Callout type="info">
+            This user has no policies, so a new key cannot access data. Use Grant scope to user to add access.
+            Creating a key only limits that key.
+          </Callout>
         ) : null}
         <div className="flex flex-wrap gap-2">
           {user?.attachedPolicies.map((policy) => (
@@ -208,19 +224,35 @@ export function UserDetailPage() {
       {showKey ? (
         <CreateKeyDialog
           title="Create access key"
-          description="Pick a scope. The generated policy is attached to the user unless you limit it to this key."
+          description="This scope limits only this key. It does not grant the user anything, and the key cannot do more than the user's policies already allow."
+          submitLabel="Create key"
           saving={createKey.isPending}
-          allowKeyOnly
           onClose={() => setShowKey(false)}
           onCreate={async (input) => {
             const created = await createKey.mutateAsync({
               buckets: input.buckets,
               prefix: input.prefix,
               access: input.access,
-              keyOnly: input.keyOnly,
+              keyOnly: true,
             })
             toast.success('Access key created')
             return { accessKeyId: created.accessKeyId, secretAccessKey: created.secretAccessKey }
+          }}
+        />
+      ) : null}
+
+      {showGrant ? (
+        <CreateKeyDialog
+          title="Grant scope to user"
+          description="This adds an inline policy on the user. Every key can use it, except a key whose own policy is tighter. This does not create an access key."
+          submitLabel="Grant scope"
+          saving={grant.isPending}
+          onClose={() => setShowGrant(false)}
+          onCreate={async (input) => {
+            const label = input.buckets[0] ? input.buckets[0] : 'all'
+            const policyName = `grant-${label}-${input.access}`.replace(/[^A-Za-z0-9+=,.@_-]/g, '').slice(0, 64)
+            await grant.mutateAsync({ policy: policyName, documentJson: input.documentJson })
+            setShowGrant(false)
           }}
         />
       ) : null}

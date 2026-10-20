@@ -250,6 +250,22 @@ pub async fn store_for(config: &Config) -> Result<Arc<IamStore>, IamError> {
     IamStore::open(&config.data_dir, config.master_key.as_deref()).await
 }
 
+/// Decrypt every sealed secret with `keyring`, or explain why startup must stop.
+///
+/// A missing `iam.json` is success. A secret sealed by a key this ring does not
+/// have, or a new ring that replaced the original, is a startup failure rather
+/// than a 500 on the first signed request.
+pub async fn ensure_secrets_readable(data_dir: &str, keyring: &Keyring) -> Result<(), String> {
+    let path = Path::new(data_dir).join("iam.json");
+    match load_memory(&path, keyring).await {
+        Ok(_) => Ok(()),
+        Err(err) => Err(format!(
+            "Refusing to start: {err}. IAM access-key secrets in {} are sealed with the SSE-S3 master key in .maxio-keys.json. Restore that keyring from the same backup as iam.json, or pass the original key with --master-key (MAXIO_MASTER_KEY). A missing or new master key makes those access keys permanently unverifiable. Back up both files together.",
+            path.display()
+        )),
+    }
+}
+
 impl IamStore {
     pub async fn open(data_dir: &str, master_key: Option<&str>) -> Result<Arc<Self>, IamError> {
         let cache_key = match master_key {
@@ -1251,6 +1267,23 @@ mod tests {
         }
         let err = store.delete_policy("readonly").await.unwrap_err();
         assert!(matches!(err, IamError::Invalid(_)));
+    }
+
+    #[tokio::test]
+    async fn wrong_master_key_fails_before_a_request_with_a_startup_error() {
+        let (dir, store) = fresh().await;
+        store.create_user("alice").await.unwrap();
+        store.create_access_key("alice", None, true).await.unwrap();
+        let other = tempfile::tempdir().unwrap();
+        let other_keyring = Keyring::load(other.path().to_str().unwrap(), None)
+            .await
+            .unwrap();
+        let err = ensure_secrets_readable(dir.path().to_str().unwrap(), &other_keyring)
+            .await
+            .unwrap_err();
+        assert!(err.contains("Refusing to start"), "{err}");
+        assert!(err.contains("iam.json"), "{err}");
+        assert!(err.contains("master key"), "{err}");
     }
 
     #[tokio::test]

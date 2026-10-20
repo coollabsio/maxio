@@ -90,6 +90,27 @@ mc mb maxio/my-bucket
 mc cp file.txt maxio/my-bucket/
 ```
 
+## Identity and access
+
+The root access key (`MAXIO_ACCESS_KEY` / `MAXIO_SECRET_KEY`) is the administrator. Additional callers are IAM users or standalone service keys. Policies are AWS-style JSON: `Effect`, wildcard actions such as `s3:Get*`, and resource ARNs such as `arn:aws:s3:::bucket` and `arn:aws:s3:::bucket/prefix/*`. An explicit `Deny` wins. Built-in policies are `readonly`, `readwrite`, `writeonly`, and `admin`.
+
+A prefix in the console is a directory. `uploads` and `uploads/` both allow `bucket/uploads/file` and do not allow `bucket/uploads-private` or `bucket/uploadsX`.
+
+Create a user and a key with the AWS CLI (the key secret is printed once):
+
+```bash
+aws --endpoint-url http://localhost:9000 iam create-user --user-name alice
+aws --endpoint-url http://localhost:9000 iam attach-user-policy \
+  --user-name alice --policy-arn arn:aws:iam::000000000000:policy/readonly
+aws --endpoint-url http://localhost:9000 iam create-access-key --user-name alice
+```
+
+A key policy only narrows what that user's policies already allow. Granting access is a separate step: attach a policy, or use **Grant scope to user** in the console. **Create access key** does not add permissions to the user.
+
+The console at `/ui/users` and `/ui/policies` is available to root and to anyone whose policy allows IAM administration. Other IAM users can sign in and see only the buckets their policy allows.
+
+Access-key secrets in `<data-dir>/iam.json` are sealed with the SSE-S3 master key (`.maxio-keys.json`, or `MAXIO_MASTER_KEY`). Back those two files up together. If `iam.json` has secrets and the master key is missing or is a different key, MaxIO refuses to start instead of serving requests that fail later. A new keyring cannot decrypt the old secrets.
+
 ## Benchmarks
 
 MaxIO vs MinIO on a Hetzner CCX13 (`./tests/bench-remote.sh`, MaxIO >= 0.3.2):

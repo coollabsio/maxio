@@ -157,10 +157,20 @@ async fn main() -> anyhow::Result<()> {
 
     tokio::fs::create_dir_all(&config.data_dir).await?;
 
+    // IAM secrets are sealed with the same master key. Refuse before
+    // Keyring::load can mint a replacement file over a missing keyring.
+    // The SSE-S3 missing-key scan (collect_requirement) must include
+    // iam::secrets::sealed_master_key_ids so a data dir that only has iam.json
+    // is treated like one that has encrypted objects.
+    iam::secrets::refuse_missing_keyring(&config.data_dir, config.master_key.is_some()).await?;
+
     // Build the SSE-S3 keyring (bootstrap a random master key on first run).
     let keyring = Arc::new(
         storage::keys::Keyring::load(&config.data_dir, config.master_key.as_deref()).await?,
     );
+    iam::store::ensure_secrets_readable(&config.data_dir, &keyring)
+        .await
+        .map_err(anyhow::Error::msg)?;
     if config.master_key.is_none() {
         tracing::info!(
             "SSE-S3 keyring: active key id {} (file {}/.maxio-keys.json — BACK THIS UP)",

@@ -6,6 +6,7 @@
 //! allow for public read and list.
 
 pub mod policy;
+pub mod secrets;
 pub mod session;
 pub mod store;
 

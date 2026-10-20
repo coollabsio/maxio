@@ -1801,6 +1801,56 @@ $AWS s3 rm "s3://iam-other-$$" --recursive >/dev/null 2>&1 || true
 assert "iam delete scope bucket" $AWS s3 rb "s3://$IAM_BUCKET"
 assert "iam delete other bucket" $AWS s3 rb "s3://iam-other-$$"
 
+# Directory prefix must keep the trailing slash (uploads/* , not uploads*).
+PREFIX_BUCKET="iam-prefix-$$"
+PREFIX_USER="prefix$$"
+assert "prefix bucket" $AWS s3 mb "s3://$PREFIX_BUCKET"
+echo "inside" > "$TMPDIR/prefix-inside.txt"
+echo "sibling" > "$TMPDIR/prefix-sibling.txt"
+echo "glued" > "$TMPDIR/prefix-glued.txt"
+assert "prefix put uploads object" $AWS s3 cp "$TMPDIR/prefix-inside.txt" "s3://$PREFIX_BUCKET/uploads/ok.txt"
+assert "prefix put uploads-private object" $AWS s3 cp "$TMPDIR/prefix-sibling.txt" "s3://$PREFIX_BUCKET/uploads-private/x.txt"
+assert "prefix put uploadsX object" $AWS s3 cp "$TMPDIR/prefix-glued.txt" "s3://$PREFIX_BUCKET/uploadsX.txt"
+curl -sS -c "$TMPDIR/iam.cookies" -H 'content-type: application/json' \
+    -d '{"accessKey":"maxioadmin","secretKey":"maxioadmin"}' \
+    "$ENDPOINT/api/auth/login" > /dev/null
+PREVIEW=$(curl -sS -b "$TMPDIR/iam.cookies" -H 'content-type: application/json' \
+    -d "{\"buckets\":[\"$PREFIX_BUCKET\"],\"prefix\":\"uploads/\",\"access\":\"readwrite\"}" \
+    "$ENDPOINT/api/iam/preview")
+printf '%s' "$PREVIEW" > "$TMPDIR/iam-preview.json"
+python3 - "$TMPDIR/iam-preview.json" "$TMPDIR/iam-prefix-policy.json" <<'PY'
+import json, sys
+preview = json.load(open(sys.argv[1]))
+doc = json.loads(preview["documentJson"])
+blob = json.dumps(doc)
+if "uploads/*" not in blob or "uploads*\"" in blob.replace("uploads/*", ""):
+    raise SystemExit("preview policy is not directory-scoped: " + blob)
+json.dump(doc, open(sys.argv[2], "w"))
+PY
+assert "prefix create-user" $AWS iam create-user --user-name "$PREFIX_USER"
+assert "prefix put-user-policy" $AWS iam put-user-policy --user-name "$PREFIX_USER" \
+    --policy-name uploads --policy-document "file://$TMPDIR/iam-prefix-policy.json"
+PREFIX_KEY_JSON=$($AWS iam create-access-key --user-name "$PREFIX_USER" --output json)
+PREFIX_KEY=$(printf '%s' "$PREFIX_KEY_JSON" | python3 -c 'import json,sys; print(json.load(sys.stdin)["AccessKey"]["AccessKeyId"])')
+PREFIX_SECRET=$(printf '%s' "$PREFIX_KEY_JSON" | python3 -c 'import json,sys; print(json.load(sys.stdin)["AccessKey"]["SecretAccessKey"])')
+export AWS_ACCESS_KEY_ID="$PREFIX_KEY"
+export AWS_SECRET_ACCESS_KEY="$PREFIX_SECRET"
+assert "prefix key reads uploads/ok.txt" $AWS s3 cp "s3://$PREFIX_BUCKET/uploads/ok.txt" "$TMPDIR/prefix-down.txt"
+assert_eq "prefix key object body" "inside" "$(cat "$TMPDIR/prefix-down.txt")"
+assert "prefix key writes under uploads/" $AWS s3 cp "$TMPDIR/prefix-inside.txt" "s3://$PREFIX_BUCKET/uploads/new.txt"
+assert_fail "prefix key cannot write uploads-private" $AWS s3 cp "$TMPDIR/prefix-sibling.txt" "s3://$PREFIX_BUCKET/uploads-private/y.txt"
+assert_fail "prefix key cannot write uploadsX" $AWS s3 cp "$TMPDIR/prefix-glued.txt" "s3://$PREFIX_BUCKET/uploadsX.txt"
+assert_fail "prefix key cannot read uploads-private" $AWS s3 cp "s3://$PREFIX_BUCKET/uploads-private/x.txt" "$TMPDIR/prefix-denied.txt"
+assert "prefix key lists uploads/" $AWS s3api list-objects-v2 --bucket "$PREFIX_BUCKET" --prefix "uploads/"
+assert_fail "prefix key cannot list uploads-private/" $AWS s3api list-objects-v2 --bucket "$PREFIX_BUCKET" --prefix "uploads-private/"
+export AWS_ACCESS_KEY_ID="$ROOT_KEY"
+export AWS_SECRET_ACCESS_KEY="$ROOT_SECRET"
+assert "prefix delete-access-key" $AWS iam delete-access-key --user-name "$PREFIX_USER" --access-key-id "$PREFIX_KEY"
+assert "prefix delete-user-policy" $AWS iam delete-user-policy --user-name "$PREFIX_USER" --policy-name uploads
+assert "prefix delete-user" $AWS iam delete-user --user-name "$PREFIX_USER"
+$AWS s3 rm "s3://$PREFIX_BUCKET" --recursive >/dev/null 2>&1 || true
+assert "prefix delete bucket" $AWS s3 rb "s3://$PREFIX_BUCKET"
+
 # --- Summary ---
 echo ""
 echo "=== Results: $PASS passed, $FAIL failed ==="

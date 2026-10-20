@@ -20,17 +20,16 @@ const accessOptions: { value: ScopeAccess; label: string }[] = [
 export function CreateKeyDialog({
   title,
   description,
+  submitLabel,
   saving,
-  allowKeyOnly,
   requireName = false,
   onClose,
   onCreate,
 }: {
   title: string
   description: string
+  submitLabel: string
   saving: boolean
-  /** User keys can store the scope as a per-key ceiling. Service keys always use it as the grant. */
-  allowKeyOnly: boolean
   onClose: () => void
   requireName?: boolean
   onCreate: (input: {
@@ -38,14 +37,13 @@ export function CreateKeyDialog({
     buckets: string[]
     prefix: string
     access: ScopeAccess
-    keyOnly: boolean
+    documentJson: string
   }) => Promise<{ accessKeyId: string; secretAccessKey: string } | void>
 }) {
   const [name, setName] = useState('')
   const [buckets, setBuckets] = useState('')
   const [prefix, setPrefix] = useState('')
   const [access, setAccess] = useState<ScopeAccess>('read')
-  const [keyOnly, setKeyOnly] = useState(false)
   const [error, setError] = useState('')
   const [secret, setSecret] = useState<{ accessKeyId: string; secretAccessKey: string } | null>(null)
   const [copied, setCopied] = useState(false)
@@ -67,12 +65,17 @@ export function CreateKeyDialog({
         setError('Name is required')
         return
       }
+      const documentJson = preview.data?.documentJson
+      if (!documentJson) {
+        setError('The scope policy is not ready yet')
+        return
+      }
       const created = await onCreate({
         name: name.trim(),
         buckets: bucketList,
         prefix: prefix.trim(),
         access,
-        keyOnly,
+        documentJson,
       })
       if (created) setSecret(created)
     } catch (err) {
@@ -137,8 +140,8 @@ export function CreateKeyDialog({
           <Button variant="ghost" disabled={saving} onClick={onClose}>
             Cancel
           </Button>
-          <Button variant="highlighted" disabled={saving || preview.isError} onClick={() => void submit()}>
-            {saving ? 'Creating...' : 'Create key'}
+          <Button variant="highlighted" disabled={saving || preview.isError || !preview.data} onClick={() => void submit()}>
+            {saving ? 'Saving...' : submitLabel}
           </Button>
         </>
       }
@@ -177,20 +180,6 @@ export function CreateKeyDialog({
             ))}
           </select>
         </label>
-        {allowKeyOnly ? (
-          <label className="flex items-start gap-2 text-[13px] text-neutral-600 dark:text-fg-dim">
-            <input
-              type="checkbox"
-              className="mt-0.5"
-              checked={keyOnly}
-              onChange={(event) => setKeyOnly(event.target.checked)}
-            />
-            <span>
-              Apply only to this key. A key policy never grants more than the user already has. Leave this off to attach the
-              scope to the user so the key can use it.
-            </span>
-          </label>
-        ) : null}
         <div className="flex flex-col gap-1.5">
           <span className="text-[13px] font-medium text-neutral-600 dark:text-fg-dim">Generated policy</span>
           <textarea

@@ -3853,6 +3853,9 @@ impl FilesystemStorage {
         let mut total_size = 0u64;
         let mut etag_hasher = Md5::new();
         let mut stored_hash = Sha256::new();
+        let mut full_object_checksum = (upload_meta.checksum_algorithm
+            == Some(ChecksumAlgorithm::CRC64NVME))
+        .then(|| ChecksumHasher::new(ChecksumAlgorithm::CRC64NVME));
         let mut buf = vec![0u8; IO_BUFFER_SIZE];
         let mut frame_buf: Vec<u8> = Vec::with_capacity(FRAME_CHUNK_SIZE);
         let mut chunk_index: u64 = 0;
@@ -3889,6 +3892,9 @@ impl FilesystemStorage {
                 part_md5.update(&buf[..n]);
                 part_bytes += n as u64;
                 total_size += n as u64;
+                if let Some(hasher) = full_object_checksum.as_mut() {
+                    hasher.update(&buf[..n]);
+                }
                 if let Some(ref cipher) = cipher_opt {
                     frame_buf.extend_from_slice(&buf[..n]);
                     while frame_buf.len() >= FRAME_CHUNK_SIZE {
@@ -3951,9 +3957,15 @@ impl FilesystemStorage {
             selected.len()
         );
 
-        // Compute composite checksum if algorithm was specified
+        // CRC64NVME is a full-object checksum. The other algorithms are a
+        // composite of the per-part checksums (`<digest>-<part count>`).
         let (checksum_algorithm, checksum_value) =
-            if let Some(algo) = upload_meta.checksum_algorithm {
+            if upload_meta.checksum_algorithm == Some(ChecksumAlgorithm::CRC64NVME) {
+                (
+                    Some(ChecksumAlgorithm::CRC64NVME),
+                    full_object_checksum.map(|hasher| hasher.finalize_base64()),
+                )
+            } else if let Some(algo) = upload_meta.checksum_algorithm {
                 let b64 = base64::engine::general_purpose::STANDARD;
                 let mut raw_checksums = Vec::new();
                 for part in &selected {

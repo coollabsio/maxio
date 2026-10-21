@@ -157,6 +157,31 @@ impl Keyring {
         Ok(Self { keys, active_id })
     }
 
+    /// Read keys without creating or rewriting `.maxio-keys.json` or
+    /// `.maxio-key-check.json`. `extra_b64` is added in memory only.
+    pub async fn open_readonly(
+        data_dir: &str,
+        extra_b64: Option<&str>,
+    ) -> anyhow::Result<Option<Self>> {
+        let mut keys = HashMap::new();
+        let mut active_id = match read_keyring_file(&keyring_path(data_dir)).await? {
+            KeyringFileState::Missing => None,
+            KeyringFileState::Parsed(kr) => ingest_keyring_entries(&mut keys, &kr)?,
+        };
+        if let Some(b64) = extra_b64 {
+            let raw = decode_master_key(b64)?;
+            let id = key_id_from_bytes(&raw);
+            keys.insert(id.clone(), raw);
+            if active_id.is_none() {
+                active_id = Some(id);
+            }
+        }
+        let Some(active_id) = active_id else {
+            return Ok(None);
+        };
+        Ok(Some(Self { keys, active_id }))
+    }
+
     /// Id of the currently active wrapping key.
     pub fn active_id(&self) -> &str {
         &self.active_id
@@ -738,6 +763,62 @@ pub enum MasterKeyAssessment {
     ExternalKeyUnverified { ids: Vec<String> },
     /// The key is missing or does not match. `--repair` cannot fix this.
     Unrecoverable { detail: String },
+}
+
+/// How a master key passed to `check` relates to the recorded key check.
+/// `check` never writes a key file; a rejected key is not added to the check file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SuppliedKeyStatus {
+    Absent,
+    /// The supplied key's id is recorded and its check HMAC matches.
+    Verified,
+    /// The key does not match the recorded check, or the tree has no record of it.
+    Rejected {
+        detail: String,
+    },
+}
+
+pub async fn classify_supplied_master_key(
+    data_dir: &str,
+    supplied_b64: Option<&str>,
+) -> anyhow::Result<SuppliedKeyStatus> {
+    let Some(b64) = supplied_b64 else {
+        return Ok(SuppliedKeyStatus::Absent);
+    };
+    let raw = decode_master_key(b64)?;
+    let id = key_id_from_bytes(&raw);
+    let keyring_present = !matches!(
+        read_keyring_file(&keyring_path(data_dir)).await?,
+        KeyringFileState::Missing
+    );
+    let entries = match read_check_file(&check_path(data_dir)).await? {
+        CheckRead::Missing => Vec::new(),
+        CheckRead::Parsed(file) => file.keys,
+    };
+    if let Some(entry) = entries.iter().find(|entry| entry.id == id) {
+        if let Some(stored) = &entry.check {
+            let stored_bytes = B64.decode(stored).unwrap_or_default();
+            let actual = key_check_mac(&raw)?;
+            if !ct_eq(&stored_bytes, &actual) {
+                return Ok(SuppliedKeyStatus::Rejected {
+                    detail: format!(
+                        "supplied master key does not match .maxio-key-check.json for key id {id}. The supplied key was ignored and was not written"
+                    ),
+                });
+            }
+        }
+        return Ok(SuppliedKeyStatus::Verified);
+    }
+    let detail = if keyring_present {
+        "supplied master key is not recorded in .maxio-key-check.json. This data directory uses an on-disk keyring. The supplied key was ignored and was not written".to_string()
+    } else if !entries.is_empty() {
+        format!(
+            "supplied master key id {id} is not recorded in .maxio-key-check.json. The supplied key was ignored and was not written"
+        )
+    } else {
+        "supplied master key was ignored because this data directory has no master-key record. The key was not written".to_string()
+    };
+    Ok(SuppliedKeyStatus::Rejected { detail })
 }
 
 pub async fn assess_master_key(

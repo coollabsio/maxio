@@ -2373,9 +2373,46 @@ PY
             --body "$TMPDIR/sum-c.txt" --checksum-algorithm CRC32 \
             --sse-customer-algorithm AES256 --sse-customer-key "$SSE_C_KEY" \
             --sse-customer-key-md5 "$SSE_C_MD5"
+        # One 5 MiB part plus a tail, so the upload is multipart. CRC32, CRC32C
+        # and SHA256 are composite (-N). CRC64NVME is a full-object checksum.
+        dd if=/dev/urandom of="$TMPDIR/mp-part.bin" bs=1024 count=5120 status=none
+        echo tail > "$TMPDIR/mp-tail.bin"
+        upload_mp_sum() {
+            local key="$1" algo="$2"
+            shift 2
+            local id e1 e2
+            id=$($SUM_AWS s3api create-multipart-upload --bucket sum-bucket --key "$key" \
+                --checksum-algorithm "$algo" "$@" --query UploadId --output text)
+            e1=$($SUM_AWS s3api upload-part --bucket sum-bucket --key "$key" --part-number 1 \
+                --upload-id "$id" --body "$TMPDIR/mp-part.bin" --checksum-algorithm "$algo" \
+                --query ETag --output text)
+            e2=$($SUM_AWS s3api upload-part --bucket sum-bucket --key "$key" --part-number 2 \
+                --upload-id "$id" --body "$TMPDIR/mp-tail.bin" --checksum-algorithm "$algo" \
+                --query ETag --output text)
+            cat > "$TMPDIR/mp-${algo}-${key}.json" <<EOF
+{"Parts":[{"ETag":$e1,"PartNumber":1},{"ETag":$e2,"PartNumber":2}]}
+EOF
+            $SUM_AWS s3api complete-multipart-upload --bucket sum-bucket --key "$key" \
+                --upload-id "$id" --multipart-upload "file://$TMPDIR/mp-${algo}-${key}.json"
+        }
+        assert "multipart CRC32" upload_mp_sum mp-crc32.bin CRC32
+        assert "multipart CRC32C" upload_mp_sum mp-crc32c.bin CRC32C
+        assert "multipart SHA256" upload_mp_sum mp-sha256.bin SHA256
+        assert "multipart CRC64NVME" upload_mp_sum mp-crc64.bin CRC64NVME
+        assert "multipart SSE-S3 CRC32" upload_mp_sum mp-s3-crc32.bin CRC32 --server-side-encryption AES256
     fi
     kill -TERM "$SUM_PID" 2>/dev/null || true
     wait "$SUM_PID" 2>/dev/null || true
+    python3 - "$SUM_DATA" "$TMPDIR/sum-before.txt" <<'PY'
+import hashlib, pathlib, sys
+root = pathlib.Path(sys.argv[1]) / "buckets" / "sum-bucket"
+lines = []
+if root.exists():
+    for path in sorted(p for p in root.rglob("*") if p.is_file()):
+        if path.name.startswith("mp-"):
+            lines.append(path.name + " " + hashlib.sha256(path.read_bytes()).hexdigest())
+pathlib.Path(sys.argv[2]).write_text("\n".join(lines) + "\n")
+PY
     if [ -n "${MAXIO_MASTER_KEY:-}" ]; then
         set +e
         env -u MAXIO_MASTER_KEY "$ROBUST_BIN" check --data-dir "$SUM_DATA" --repair \
@@ -2403,11 +2440,63 @@ PY
         assert_eq "sse-c is unverifiable without key" "true" \
             "$(grep -q 'unverifiable without key' "$TMPDIR/sum-readonly.txt" && echo true || echo false)"
     fi
+    if [ -f "$SUM_DATA/.maxio-key-check.json" ]; then
+        cp "$SUM_DATA/.maxio-key-check.json" "$TMPDIR/keycheck-before.json"
+    fi
+    STRAY_KEY=$(openssl rand -base64 32)
+    set +e
+    MAXIO_MASTER_KEY="$STRAY_KEY" "$ROBUST_BIN" check --data-dir "$SUM_DATA" \
+        >"$TMPDIR/stray-ro.txt" 2>"$TMPDIR/stray-ro.err"
+    STRAY_RO=$?
+    set -e
+    assert_eq "stray master key read-only check exits 0" "0" "$STRAY_RO"
+    assert_eq "stray master key is warned and not written" "true" \
+        "$(grep -q 'was ignored and was not written' "$TMPDIR/stray-ro.err" "$TMPDIR/stray-ro.txt" && echo true || echo false)"
+    if [ -f "$TMPDIR/keycheck-before.json" ]; then
+        assert_eq "stray key did not change the key check" "true" \
+            "$(cmp -s "$SUM_DATA/.maxio-key-check.json" "$TMPDIR/keycheck-before.json" && echo true || echo false)"
+    fi
+    set +e
+    MAXIO_MASTER_KEY="$STRAY_KEY" "$ROBUST_BIN" check --data-dir "$SUM_DATA" --repair \
+        >"$TMPDIR/stray-repair.txt" 2>"$TMPDIR/stray-repair.err"
+    STRAY_RP=$?
+    set -e
+    assert_eq "stray master key repair is refused" "true" \
+        "$([ "$STRAY_RP" -ne 0 ] && grep -q 'refusing to repair' "$TMPDIR/stray-repair.err" && grep -q 'no file was changed' "$TMPDIR/stray-repair.err" && echo true || echo false)"
+    if [ -f "$TMPDIR/keycheck-before.json" ]; then
+        assert_eq "refused repair did not change the key check" "true" \
+            "$(cmp -s "$SUM_DATA/.maxio-key-check.json" "$TMPDIR/keycheck-before.json" && echo true || echo false)"
+    fi
     for name in plain.txt s3.txt c.txt; do
         assert_file_exists "checksum object $name stayed in place" "$SUM_DATA/buckets/sum-bucket/$name"
         assert_file_exists "checksum sidecar $name stayed in place" "$SUM_DATA/buckets/sum-bucket/$name.meta.json"
     done
+    set +e
+    "$ROBUST_BIN" check --data-dir "$SUM_DATA" >"$TMPDIR/mp-check.txt" 2>"$TMPDIR/mp-check.err"
+    MP_RC=$?
+    set -e
+    assert_eq "multipart checksum check exits 0" "0" "$MP_RC"
+    assert_eq "multipart checksum check is not a checksum-mismatch" "false" \
+        "$(grep -q 'checksum-mismatch' "$TMPDIR/mp-check.txt" && echo true || echo false)"
     assert "checksum repair with the key" "$ROBUST_BIN" check --data-dir "$SUM_DATA" --repair
+    python3 - "$SUM_DATA" "$TMPDIR/sum-before.txt" <<'PY'
+import hashlib, pathlib, sys
+root = pathlib.Path(sys.argv[1]) / "buckets" / "sum-bucket"
+before = {}
+for line in pathlib.Path(sys.argv[2]).read_text().splitlines():
+    if not line.strip():
+        continue
+    name, digest = line.split(" ", 1)
+    before[name] = digest
+missing = []
+for name, digest in before.items():
+    path = root / name
+    if not path.is_file() or hashlib.sha256(path.read_bytes()).hexdigest() != digest:
+        missing.append(name)
+pathlib.Path(sys.argv[2]).with_name("sum-after-diff.txt").write_text("\n".join(missing))
+PY
+    assert_eq "multipart objects are byte-identical after repair" "" \
+        "$(cat "$TMPDIR/sum-after-diff.txt")"
     for name in plain.txt s3.txt c.txt; do
         assert_file_exists "checksum object $name stayed after repair" "$SUM_DATA/buckets/sum-bucket/$name"
     done
@@ -2426,6 +2515,12 @@ PY
         --sse-customer-algorithm AES256 --sse-customer-key "$SSE_C_KEY" \
         --sse-customer-key-md5 "$SSE_C_MD5" "$TMPDIR/sum-c-down.txt"
     assert_eq "checksum sse-c body" "sse-c-body" "$(cat "$TMPDIR/sum-c-down.txt")"
+    assert "multipart CRC32 still readable" $SUM_AWS s3 cp s3://sum-bucket/mp-crc32.bin "$TMPDIR/mp-crc32-down.bin"
+    assert "multipart CRC64NVME still readable" $SUM_AWS s3 cp s3://sum-bucket/mp-crc64.bin "$TMPDIR/mp-crc64-down.bin"
+    assert "multipart SSE-S3 CRC32 still readable" $SUM_AWS s3 cp s3://sum-bucket/mp-s3-crc32.bin "$TMPDIR/mp-s3-down.bin"
+    assert_eq "multipart CRC32 size" \
+        "$(( $(wc -c < "$TMPDIR/mp-part.bin") + $(wc -c < "$TMPDIR/mp-tail.bin") ))" \
+        "$(wc -c < "$TMPDIR/mp-crc32-down.bin" | tr -d ' ')"
     kill -TERM "$SUM_PID" 2>/dev/null || true
     wait "$SUM_PID" 2>/dev/null || true
     rm -rf "$SUM_DATA"

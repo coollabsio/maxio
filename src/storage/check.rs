@@ -77,6 +77,8 @@ pub enum IssueKind {
     ContentHashMismatch,
     /// SSE-C, or SSE-S3 without the master key. Informational. Not corruption.
     UnverifiableWithoutKey,
+    /// Multipart composite checksum (`-N`). Informational when part sizes are absent.
+    CompositeChecksum,
 }
 
 impl IssueKind {
@@ -107,6 +109,7 @@ impl IssueKind {
             Self::UnverifiableDivergence => "unverifiable-divergence",
             Self::ContentHashMismatch => "content-hash",
             Self::UnverifiableWithoutKey => "unverifiable-without-key",
+            Self::CompositeChecksum => "composite-checksum",
         }
     }
 }
@@ -301,9 +304,29 @@ pub async fn check_with_opts(
         );
     }
     // An external or missing SSE-S3 key must stop repair before the format
-    // marker, the lock, or any object file is written.
+    // marker, the lock, or any object file is written. A supplied key that
+    // does not match the recorded check is not written into the data directory.
+    let supplied =
+        super::keys::classify_supplied_master_key(&data_dir.to_string_lossy(), master_key_b64)
+            .await?;
+    let mut ignored_key = None;
+    let key_b64 = match supplied {
+        super::keys::SuppliedKeyStatus::Absent => None,
+        super::keys::SuppliedKeyStatus::Verified => master_key_b64,
+        super::keys::SuppliedKeyStatus::Rejected { detail } => {
+            if repair {
+                anyhow::bail!(
+                    "refusing to repair {}: {detail} Repair was not started and no file was changed.",
+                    data_dir.display()
+                );
+            }
+            eprintln!("warning: {detail}");
+            ignored_key = Some(detail);
+            None
+        }
+    };
     if repair {
-        refuse_repair_without_verified_master_key(data_dir, master_key_b64).await?;
+        refuse_repair_without_verified_master_key(data_dir, key_b64).await?;
     }
     let _repair_lock = if repair {
         Some(super::lock::acquire_exclusive(
@@ -319,16 +342,20 @@ pub async fn check_with_opts(
     }
     let mut report = CheckReport::default();
     let mut saw_sse_s3 = false;
-    let keyring_configured = master_key_b64.is_some()
-        || tokio::fs::try_exists(data_dir.join(".maxio-keys.json")).await?;
-    let keyring = if keyring_configured {
-        super::keys::Keyring::load(data_dir.to_str().unwrap_or("."), master_key_b64)
-            .await
-            .ok()
-            .map(Arc::new)
-    } else {
-        None
-    };
+    // Read keys into memory only. check must not create or rewrite
+    // `.maxio-keys.json` or `.maxio-key-check.json`.
+    let keyring = super::keys::Keyring::open_readonly(data_dir.to_str().unwrap_or("."), key_b64)
+        .await
+        .ok()
+        .flatten()
+        .map(Arc::new);
+    if let Some(detail) = ignored_key {
+        report.note(
+            IssueKind::KeyringUnverified,
+            &data_dir.join(".maxio-key-check.json"),
+            detail,
+        );
+    }
     let buckets_dir = data_dir.join("buckets");
     for name in super::filesystem::reserved_buckets_present(&buckets_dir).await {
         report.push(
@@ -370,7 +397,7 @@ pub async fn check_with_opts(
         }
     }
     let _ = saw_sse_s3;
-    note_master_key(data_dir, master_key_b64, &mut report).await?;
+    note_master_key(data_dir, key_b64, &mut report).await?;
     Ok(report)
 }
 
@@ -1101,7 +1128,7 @@ async fn check_meta_pair(
     }
 
     if let (Some(algo), Some(expected)) = (meta.checksum_algorithm, meta.checksum_value.clone()) {
-        match payload_checksum(data_path, &meta, algo, bucket, key, keyring).await {
+        match payload_checksum(data_path, &meta, algo, bucket, key, keyring, &expected).await {
             Ok(actual) if actual == expected => {}
             Ok(actual) if repair && flags.accept_current_checksums => {
                 report.push(
@@ -1154,6 +1181,9 @@ async fn check_meta_pair(
             }
             // A missing customer key or master key is not damage. Authentication
             // failure is: the key unwrapped and the ciphertext did not match.
+            Err(err) if err.starts_with("unverifiable:") => {
+                report.note(IssueKind::CompositeChecksum, data_path, err);
+            }
             Err(err) if !err.contains("authentication failed") => {
                 report.note(
                     IssueKind::UnverifiableWithoutKey,
@@ -2057,7 +2087,7 @@ async fn payload_verdict(
     }
     if let (Some(algo), Some(expected)) = (meta.checksum_algorithm, meta.checksum_value.as_deref())
     {
-        return match payload_checksum(data_path, meta, algo, bucket, key, keyring).await {
+        return match payload_checksum(data_path, meta, algo, bucket, key, keyring, expected).await {
             Ok(actual) if actual == expected => PayloadVerdict::Verified,
             Ok(_) => PayloadVerdict::Failed,
             Err(_) => PayloadVerdict::Unverifiable,
@@ -5482,6 +5512,157 @@ mod tests {
         assert!(std::fs::read(&meta_path).unwrap().is_empty());
         assert_not_served(&storage, "empty.bin").await;
     }
+
+    fn composite_of(parts: &[&[u8]], algo: crate::storage::ChecksumAlgorithm) -> String {
+        let b64 = base64::engine::general_purpose::STANDARD;
+        let mut concat = Vec::new();
+        for part in parts {
+            let mut hasher = crate::storage::ChecksumHasher::new(algo);
+            hasher.update(part);
+            concat.extend(b64.decode(hasher.finalize_base64()).unwrap());
+        }
+        let mut outer = crate::storage::ChecksumHasher::new(algo);
+        outer.update(&concat);
+        format!("{}-{}", outer.finalize_base64(), parts.len())
+    }
+
+    fn full_checksum(body: &[u8], algo: crate::storage::ChecksumAlgorithm) -> String {
+        let mut hasher = crate::storage::ChecksumHasher::new(algo);
+        hasher.update(body);
+        hasher.finalize_base64()
+    }
+
+    #[tokio::test]
+    async fn multipart_composite_checksum_is_not_compared_to_the_full_object() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bucket = tmp.path().join("buckets/bkt");
+        std::fs::create_dir_all(&bucket).unwrap();
+        let algo = crate::storage::ChecksumAlgorithm::CRC32;
+        let p1 = b"part-one-bytes";
+        let p2 = b"part-two-bytes";
+        let body = [p1.as_slice(), p2.as_slice()].concat();
+        let composite = composite_of(&[p1, p2], algo);
+        let full = full_checksum(&body, algo);
+        assert_ne!(composite, full);
+        std::fs::write(bucket.join("multi.bin"), &body).unwrap();
+        let meta = ObjectMeta {
+            key: "multi.bin".into(),
+            size: body.len() as u64,
+            etag: "\"0123456789abcdef0123456789abcdef-2\"".into(),
+            content_type: "application/octet-stream".into(),
+            last_modified: "2024-04-01T00:00:00.000Z".into(),
+            checksum_algorithm: Some(algo),
+            checksum_value: Some(composite.clone()),
+            content_sha256: Some(hex::encode(sha2::Sha256::digest(&body))),
+            part_sizes: Some(vec![p1.len() as u64, p2.len() as u64]),
+            ..ObjectMeta::default()
+        };
+        std::fs::write(
+            bucket.join("multi.bin.meta.json"),
+            serde_json::to_vec_pretty(&meta).unwrap(),
+        )
+        .unwrap();
+        // No part sizes: the composite cannot be recomputed, so it is not a mismatch.
+        std::fs::write(bucket.join("legacy.bin"), &body).unwrap();
+        let mut legacy = meta.clone();
+        legacy.key = "legacy.bin".into();
+        legacy.part_sizes = None;
+        std::fs::write(
+            bucket.join("legacy.bin.meta.json"),
+            serde_json::to_vec_pretty(&legacy).unwrap(),
+        )
+        .unwrap();
+        // CRC64NVME multipart checksums are of the full object and have no -N suffix.
+        let nvme = crate::storage::ChecksumAlgorithm::CRC64NVME;
+        std::fs::write(bucket.join("full.bin"), &body).unwrap();
+        let mut full_meta = meta.clone();
+        full_meta.key = "full.bin".into();
+        full_meta.checksum_algorithm = Some(nvme);
+        full_meta.checksum_value = Some(full_checksum(&body, nvme));
+        std::fs::write(
+            bucket.join("full.bin.meta.json"),
+            serde_json::to_vec_pretty(&full_meta).unwrap(),
+        )
+        .unwrap();
+
+        let before = std::fs::read(bucket.join("multi.bin")).unwrap();
+        let repaired = check(tmp.path(), true).await.unwrap();
+        assert_eq!(repaired.unresolved(), 0, "{:?}", repaired.issues);
+        assert!(
+            repaired
+                .issues
+                .iter()
+                .all(|issue| issue.kind != IssueKind::ChecksumMismatch),
+            "{:?}",
+            repaired.issues
+        );
+        assert_eq!(std::fs::read(bucket.join("multi.bin")).unwrap(), before);
+        assert_eq!(std::fs::read(bucket.join("legacy.bin")).unwrap(), body);
+        let kept: ObjectMeta =
+            serde_json::from_slice(&std::fs::read(bucket.join("multi.bin.meta.json")).unwrap())
+                .unwrap();
+        assert_eq!(kept.checksum_value.as_deref(), Some(composite.as_str()));
+        assert_eq!(kept.content_sha256, meta.content_sha256);
+        let legacy_kept: ObjectMeta =
+            serde_json::from_slice(&std::fs::read(bucket.join("legacy.bin.meta.json")).unwrap())
+                .unwrap();
+        assert_eq!(
+            legacy_kept.checksum_value.as_deref(),
+            Some(composite.as_str())
+        );
+        assert!(
+            repaired.issues.iter().any(|issue| {
+                issue.advisory
+                    && issue.kind == IssueKind::CompositeChecksum
+                    && issue.path.ends_with("legacy.bin")
+            }),
+            "{:?}",
+            repaired.issues
+        );
+    }
+
+    #[tokio::test]
+    async fn stray_master_key_is_not_written_into_the_key_check() {
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = storage_at(tmp.path()).await;
+        storage.create_bucket(&bucket_meta("bkt")).await.unwrap();
+        put_bytes(&storage, "s3.txt", b"sse-s3-body", true).await;
+        drop(storage);
+        let check_path = tmp.path().join(".maxio-key-check.json");
+        let before = std::fs::read(&check_path).unwrap();
+        let stray = base64::engine::general_purpose::STANDARD.encode([7u8; 32]);
+        let readonly = check_with(tmp.path(), false, Some(&stray)).await.unwrap();
+        assert_eq!(readonly.unresolved(), 0, "{:?}", readonly.issues);
+        assert!(
+            readonly.issues.iter().any(|issue| {
+                issue.advisory && issue.detail.contains("was ignored and was not written")
+            }),
+            "{:?}",
+            readonly.issues
+        );
+        assert_eq!(std::fs::read(&check_path).unwrap(), before);
+        let refused = check_with(tmp.path(), true, Some(&stray))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            refused.contains("refusing to repair") && refused.contains("no file was changed"),
+            "{refused}"
+        );
+        assert_eq!(std::fs::read(&check_path).unwrap(), before);
+        assert!(tmp.path().join("buckets/bkt/s3.txt").is_file());
+        let storage = storage_at(tmp.path()).await;
+        assert_eq!(read_key(&storage, "s3.txt").await, b"sse-s3-body");
+    }
+}
+
+fn composite_part_count(value: &str) -> Option<u32> {
+    let (body, count) = value.rsplit_once('-')?;
+    if body.is_empty() {
+        return None;
+    }
+    let n = count.parse::<u32>().ok()?;
+    if n >= 1 { Some(n) } else { None }
 }
 
 async fn payload_checksum(
@@ -5491,7 +5672,11 @@ async fn payload_checksum(
     bucket: &str,
     key: &str,
     keyring: Option<&Arc<super::keys::Keyring>>,
+    expected: &str,
 ) -> Result<String, String> {
+    if composite_part_count(expected).is_some() {
+        return composite_checksum(data_path, meta, algo, bucket, key, keyring).await;
+    }
     if let Some(enc) = &meta.encryption {
         if enc.mode != EncryptionMode::SseS3 {
             return Err(
@@ -5502,11 +5687,101 @@ async fn payload_checksum(
         let Some(keyring) = keyring else {
             return Err("SSE-S3 master key is not loaded; the payload was left in place".into());
         };
-        return checksum_sse_s3(data_path, meta, enc, algo, bucket, key, keyring).await;
+        return checksum_sse_s3(data_path, meta, enc, algo, bucket, key, keyring, None).await;
     }
     file_checksum(data_path, algo)
         .await
         .map_err(|err| err.to_string())
+}
+
+async fn composite_checksum(
+    data_path: &Path,
+    meta: &ObjectMeta,
+    algo: ChecksumAlgorithm,
+    bucket: &str,
+    key: &str,
+    keyring: Option<&Arc<super::keys::Keyring>>,
+) -> Result<String, String> {
+    let Some(parts) = meta.part_sizes.as_deref().filter(|parts| !parts.is_empty()) else {
+        return Err(
+            "unverifiable: multipart composite checksum cannot be verified from the full object; per-part sizes are not stored"
+                .into(),
+        );
+    };
+    let covered: u64 = parts.iter().copied().sum();
+    if let Some(enc) = &meta.encryption {
+        if enc.mode != EncryptionMode::SseS3 {
+            return Err(
+                "SSE-C payload cannot be checked without the customer key; it was left in place"
+                    .into(),
+            );
+        }
+        let Some(keyring) = keyring else {
+            return Err("SSE-S3 master key is not loaded; the payload was left in place".into());
+        };
+        if covered != meta.size {
+            return Err("unverifiable: multipart part sizes do not cover the plaintext".into());
+        }
+        return checksum_sse_s3(
+            data_path,
+            meta,
+            enc,
+            algo,
+            bucket,
+            key,
+            keyring,
+            Some(parts),
+        )
+        .await;
+    }
+    let file_len = tokio::fs::metadata(data_path)
+        .await
+        .map(|m| m.len())
+        .map_err(|err| err.to_string())?;
+    if file_len != covered {
+        return Err("unverifiable: multipart part sizes do not cover the object".into());
+    }
+    let file = tokio::fs::File::open(data_path)
+        .await
+        .map_err(|err| err.to_string())?;
+    checksum_parts(file, algo, parts, false).await
+}
+
+async fn checksum_parts(
+    mut reader: impl tokio::io::AsyncRead + Unpin,
+    algo: ChecksumAlgorithm,
+    part_sizes: &[u64],
+    decrypting: bool,
+) -> Result<String, String> {
+    let b64 = base64::engine::general_purpose::STANDARD;
+    let mut concat = Vec::new();
+    let mut buf = vec![0u8; 64 * 1024];
+    for &size in part_sizes {
+        let mut hasher = ChecksumHasher::new(algo);
+        let mut left = size;
+        while left > 0 {
+            let want = std::cmp::min(buf.len() as u64, left) as usize;
+            let n = reader.read(&mut buf[..want]).await.map_err(|err| {
+                if decrypting {
+                    format!("authentication failed ({err})")
+                } else {
+                    err.to_string()
+                }
+            })?;
+            if n == 0 {
+                return Err("unverifiable: multipart part ended before its recorded size".into());
+            }
+            hasher.update(&buf[..n]);
+            left -= n as u64;
+        }
+        let raw = b64
+            .decode(hasher.finalize_base64())
+            .map_err(|err| err.to_string())?;
+        concat.extend(raw);
+    }
+    let mut outer = ChecksumHasher::new(algo);
+    outer.update(&concat);
+    Ok(format!("{}-{}", outer.finalize_base64(), part_sizes.len()))
 }
 
 async fn checksum_sse_s3(
@@ -5517,6 +5792,7 @@ async fn checksum_sse_s3(
     bucket: &str,
     key: &str,
     keyring: &super::keys::Keyring,
+    part_sizes: Option<&[u64]>,
 ) -> Result<String, String> {
     let b64 = base64::engine::general_purpose::STANDARD;
     let key_id = enc.key_id.as_deref().ok_or("missing key_id")?;
@@ -5545,6 +5821,9 @@ async fn checksum_sse_s3(
         enc.chunk_size.max(1) as usize,
         aad,
     );
+    if let Some(parts) = part_sizes {
+        return checksum_parts(dec, algo, parts, true).await;
+    }
     let mut hasher = ChecksumHasher::new(algo);
     let mut buf = vec![0u8; 64 * 1024];
     loop {
@@ -5749,19 +6028,33 @@ mod master_key_tests {
             .await
             .unwrap()
             .unwrap();
+        let before = std::fs::read(tmp.path().join(".maxio-key-check.json")).unwrap();
         let report = check_with(tmp.path(), false, Some(&resolved))
             .await
             .unwrap();
-        assert!(report.unresolved() >= 1, "{:?}", report.issues);
-        let issues = keyring_issues(&report);
+        assert_eq!(report.unresolved(), 0, "{:?}", report.issues);
         assert!(
-            issues.iter().any(|issue| {
-                issue.kind == IssueKind::KeyringMissing
-                    && !issue.advisory
-                    && issue.detail.contains("does not match")
+            report.issues.iter().any(|issue| {
+                issue.advisory && issue.detail.contains("was ignored and was not written")
             }),
             "{:?}",
             report.issues
+        );
+        assert_eq!(
+            std::fs::read(tmp.path().join(".maxio-key-check.json")).unwrap(),
+            before
+        );
+        let err = check_with(tmp.path(), true, Some(&resolved))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("refusing to repair") && err.contains("no file was changed"),
+            "{err}"
+        );
+        assert_eq!(
+            std::fs::read(tmp.path().join(".maxio-key-check.json")).unwrap(),
+            before
         );
     }
 

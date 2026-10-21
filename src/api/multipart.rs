@@ -39,9 +39,7 @@ pub async fn create_multipart_upload(
     let checksum_algorithm = headers
         .get("x-amz-checksum-algorithm")
         .and_then(|v| v.to_str().ok())
-        .and_then(ChecksumAlgorithm::from_header_str)
-        // CRC64NVME is full-object only; composite-of-parts would be wrong.
-        .filter(|algo| *algo != ChecksumAlgorithm::CRC64NVME);
+        .and_then(ChecksumAlgorithm::from_header_str);
 
     // Resolve encryption spec at upload-create time (explicit > bucket default).
     let mut encryption = extract_sse_request(&headers)?;

@@ -75,6 +75,8 @@ pub enum IssueKind {
     UnverifiableDivergence,
     /// Stored content hash does not match the file.
     ContentHashMismatch,
+    /// SSE-C, or SSE-S3 without the master key. Informational. Not corruption.
+    UnverifiableWithoutKey,
 }
 
 impl IssueKind {
@@ -104,6 +106,7 @@ impl IssueKind {
             Self::MultipartEtag => "multipart-etag",
             Self::UnverifiableDivergence => "unverifiable-divergence",
             Self::ContentHashMismatch => "content-hash",
+            Self::UnverifiableWithoutKey => "unverifiable-without-key",
         }
     }
 }
@@ -297,6 +300,11 @@ pub async fn check_with_opts(
             data_dir.display()
         );
     }
+    // An external or missing SSE-S3 key must stop repair before the format
+    // marker, the lock, or any object file is written.
+    if repair {
+        refuse_repair_without_verified_master_key(data_dir, master_key_b64).await?;
+    }
     let _repair_lock = if repair {
         Some(super::lock::acquire_exclusive(
             data_dir,
@@ -364,6 +372,29 @@ pub async fn check_with_opts(
     let _ = saw_sse_s3;
     note_master_key(data_dir, master_key_b64, &mut report).await?;
     Ok(report)
+}
+
+async fn refuse_repair_without_verified_master_key(
+    data_dir: &Path,
+    master_key_b64: Option<&str>,
+) -> anyhow::Result<()> {
+    let data_dir_str = data_dir.to_string_lossy();
+    match super::keys::assess_master_key(&data_dir_str, master_key_b64).await? {
+        super::keys::MasterKeyAssessment::Satisfied => Ok(()),
+        super::keys::MasterKeyAssessment::ExternalKeyUnverified { ids } => {
+            anyhow::bail!(
+                "refusing to repair {}: SSE-S3 uses an external master key (key ids: {}). Pass --master-key, --master-key-file, MAXIO_MASTER_KEY, or MAXIO_MASTER_KEY_FILE. The key must match .maxio-key-check.json. Repair was not started and no file was changed.",
+                data_dir.display(),
+                ids.join(", ")
+            );
+        }
+        super::keys::MasterKeyAssessment::Unrecoverable { detail } => {
+            anyhow::bail!(
+                "refusing to repair {}: {detail} Repair was not started and no file was changed.",
+                data_dir.display()
+            );
+        }
+    }
 }
 
 async fn note_master_key(
@@ -1084,14 +1115,9 @@ async fn check_meta_pair(
                 meta.checksum_value = Some(actual);
                 dirty = true;
             }
-            outcome => {
-                let why = match outcome {
-                    Ok(actual) => format!("sidecar checksum is {expected}, payload is {actual}"),
-                    Err(err) => format!(
-                        "sidecar checksum is {expected}, payload could not be verified: {err}"
-                    ),
-                };
-                if repair && !flags.accept_current_checksums {
+            Ok(actual) => {
+                let why = format!("sidecar checksum is {expected}, payload is {actual}");
+                if repair {
                     match quarantine_payload(data_dir, bucket, bucket_dir, data_path, meta_path)
                         .await
                     {
@@ -1111,6 +1137,53 @@ async fn check_meta_pair(
                                 IssueKind::ChecksumMismatch,
                                 data_path,
                                 format!("{why}. Quarantine failed: {err}. The object was left in place and the checksum was not rewritten."),
+                                false,
+                            );
+                        }
+                    }
+                    return Ok(());
+                }
+                report.push(
+                    IssueKind::ChecksumMismatch,
+                    data_path,
+                    format!(
+                        "{why}. The checksum was not rewritten. --repair moves the object under .maxio-quarantine. --accept-current-checksums with --repair records the payload checksum instead."
+                    ),
+                    false,
+                );
+            }
+            // A missing customer key or master key is not damage. Authentication
+            // failure is: the key unwrapped and the ciphertext did not match.
+            Err(err) if !err.contains("authentication failed") => {
+                report.note(
+                    IssueKind::UnverifiableWithoutKey,
+                    data_path,
+                    format!("unverifiable without key: {err}"),
+                );
+            }
+            Err(err) => {
+                let why =
+                    format!("sidecar checksum is {expected}, payload authentication failed: {err}");
+                if repair {
+                    match quarantine_payload(data_dir, bucket, bucket_dir, data_path, meta_path)
+                        .await
+                    {
+                        Ok(dest) => {
+                            report.push(
+                                IssueKind::ChecksumMismatch,
+                                data_path,
+                                format!(
+                                    "{why}. Quarantined at {} without deleting the bytes and without adopting the payload checksum.",
+                                    dest.display()
+                                ),
+                                true,
+                            );
+                        }
+                        Err(qerr) => {
+                            report.push(
+                                IssueKind::ChecksumMismatch,
+                                data_path,
+                                format!("{why}. Quarantine failed: {qerr}. The object was left in place and the checksum was not rewritten."),
                                 false,
                             );
                         }
@@ -2601,6 +2674,11 @@ async fn payload_might_be_sse(path: &Path) -> anyhow::Result<bool> {
     const OVERHEAD: u64 = 28;
     const FULL: u64 = PLAINTEXT + OVERHEAD;
     let len = tokio::fs::metadata(path).await?.len();
+    // An empty SSE-S3 object writes no frame, so 0 bytes is also valid ciphertext.
+    // It cannot be told apart from an empty plain object. Leave it alone.
+    if len == 0 {
+        return Ok(true);
+    }
     if len < OVERHEAD {
         return Ok(false);
     }
@@ -5025,26 +5103,24 @@ mod tests {
             };
             std::fs::write(&meta_path, &damaged).unwrap();
             let ciphertext = std::fs::read(&data_path).unwrap();
-            let repaired = check(tmp.path(), true).await.unwrap();
+            let refused = check(tmp.path(), true).await.unwrap_err();
+            let refused = refused.to_string();
             assert!(
-                repaired.issues.iter().any(|issue| {
+                refused.contains("refusing to repair") && refused.contains("no file was changed"),
+                "{refused}"
+            );
+            assert_eq!(std::fs::read(&meta_path).unwrap(), damaged);
+            assert_eq!(std::fs::read(&data_path).unwrap(), ciphertext);
+            let reported = check(tmp.path(), false).await.unwrap();
+            assert!(
+                reported.issues.iter().any(|issue| {
                     issue.kind == IssueKind::KeyringUnverified
                         || issue.kind == IssueKind::KeyringMissing
                 }),
                 "check must notice the external key: {:?}",
-                repaired.issues
-            );
-            assert!(
-                repaired.issues.iter().any(|issue| {
-                    issue.kind == IssueKind::CorruptMetadata
-                        && !issue.repaired
-                        && issue.detail.contains("not rebuilt")
-                }),
-                "multipart={multipart} keep={keep}: {:?}",
-                repaired.issues
+                reported.issues
             );
             assert_eq!(std::fs::read(&meta_path).unwrap(), damaged);
-            assert_eq!(std::fs::read(&data_path).unwrap(), ciphertext);
             let reopened = Arc::new(
                 Keyring::load(tmp.path().to_str().unwrap(), Some(&b64))
                     .await
@@ -5188,6 +5264,223 @@ mod tests {
         );
         let storage = storage_at(tmp.path()).await;
         assert_eq!(read_key(&storage, "multi.bin").await, good);
+    }
+
+    async fn put_checked(
+        storage: &FilesystemStorage,
+        key: &str,
+        body: &'static [u8],
+        encryption: Option<crate::storage::EncryptionRequest>,
+    ) {
+        storage
+            .put_object(
+                "bkt",
+                key,
+                "text/plain",
+                Box::pin(body),
+                Some((crate::storage::ChecksumAlgorithm::CRC32, None)),
+                encryption,
+            )
+            .await
+            .unwrap();
+    }
+
+    fn object_still_in_place(dir: &std::path::Path, key: &str) {
+        let bucket = dir.join("buckets/bkt");
+        assert!(bucket.join(key).is_file(), "{key} data was moved");
+        assert!(
+            bucket.join(format!("{key}.meta.json")).is_file(),
+            "{key} sidecar was moved"
+        );
+        let quarantine = dir.join(".maxio-quarantine");
+        if quarantine.exists() {
+            let hit = files_under(&quarantine).into_iter().any(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name == key || name == format!("{key}.meta.json"))
+            });
+            assert!(!hit, "{key} was quarantined");
+        }
+    }
+
+    #[tokio::test]
+    async fn healthy_checksummed_sse_is_not_quarantined() {
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = storage_at(tmp.path()).await;
+        storage.create_bucket(&bucket_meta("bkt")).await.unwrap();
+        let customer = [5u8; 32];
+        put_checked(&storage, "plain.txt", b"plain-body", None).await;
+        put_checked(
+            &storage,
+            "s3.txt",
+            b"sse-s3-body",
+            Some(crate::storage::EncryptionRequest::sse_s3()),
+        )
+        .await;
+        put_checked(
+            &storage,
+            "c.txt",
+            b"sse-c-body",
+            Some(crate::storage::EncryptionRequest::sse_c(customer)),
+        )
+        .await;
+        for repair in [false, true] {
+            let report = check(tmp.path(), repair).await.unwrap();
+            assert_eq!(
+                report.unresolved(),
+                0,
+                "repair={repair} {:?}",
+                report.issues
+            );
+            assert!(
+                report.issues.iter().any(|issue| {
+                    issue.advisory
+                        && issue.kind == IssueKind::UnverifiableWithoutKey
+                        && issue.detail.contains("unverifiable without key")
+                        && issue.path.ends_with("c.txt")
+                }),
+                "repair={repair} {:?}",
+                report.issues
+            );
+            assert!(
+                report
+                    .issues
+                    .iter()
+                    .all(|issue| issue.kind != IssueKind::ChecksumMismatch),
+                "repair={repair} {:?}",
+                report.issues
+            );
+        }
+        object_still_in_place(tmp.path(), "plain.txt");
+        object_still_in_place(tmp.path(), "s3.txt");
+        object_still_in_place(tmp.path(), "c.txt");
+        assert_eq!(read_key(&storage, "plain.txt").await, b"plain-body");
+        assert_eq!(read_key(&storage, "s3.txt").await, b"sse-s3-body");
+        let (mut reader, _) = storage
+            .get_object("bkt", "c.txt", Some(customer))
+            .await
+            .unwrap();
+        let mut buf = Vec::new();
+        tokio::io::AsyncReadExt::read_to_end(&mut reader, &mut buf)
+            .await
+            .unwrap();
+        assert_eq!(buf, b"sse-c-body");
+    }
+
+    #[tokio::test]
+    async fn external_key_repair_is_refused_until_the_key_is_supplied() {
+        let tmp = tempfile::tempdir().unwrap();
+        let key = [9u8; 32];
+        let b64 = base64::engine::general_purpose::STANDARD.encode(key);
+        let keyring = Arc::new(
+            Keyring::load(tmp.path().to_str().unwrap(), Some(&b64))
+                .await
+                .unwrap(),
+        );
+        let storage =
+            FilesystemStorage::new(tmp.path().to_str().unwrap(), false, 1024 * 1024, 0, keyring)
+                .await
+                .unwrap();
+        storage.create_bucket(&bucket_meta("bkt")).await.unwrap();
+        let customer = [6u8; 32];
+        put_checked(&storage, "plain.txt", b"plain-body", None).await;
+        put_checked(
+            &storage,
+            "s3.txt",
+            b"sse-s3-body",
+            Some(crate::storage::EncryptionRequest::sse_s3()),
+        )
+        .await;
+        put_checked(
+            &storage,
+            "c.txt",
+            b"sse-c-body",
+            Some(crate::storage::EncryptionRequest::sse_c(customer)),
+        )
+        .await;
+        drop(storage);
+        let refused = check(tmp.path(), true).await.unwrap_err().to_string();
+        assert!(
+            refused.contains("refusing to repair") && refused.contains("no file was changed"),
+            "{refused}"
+        );
+        object_still_in_place(tmp.path(), "plain.txt");
+        object_still_in_place(tmp.path(), "s3.txt");
+        object_still_in_place(tmp.path(), "c.txt");
+        let readonly = check(tmp.path(), false).await.unwrap();
+        assert_eq!(readonly.unresolved(), 0, "{:?}", readonly.issues);
+        for name in ["s3.txt", "c.txt"] {
+            assert!(
+                readonly.issues.iter().any(|issue| {
+                    issue.advisory
+                        && issue.kind == IssueKind::UnverifiableWithoutKey
+                        && issue.detail.contains("unverifiable without key")
+                        && issue.path.ends_with(name)
+                }),
+                "{name} {:?}",
+                readonly.issues
+            );
+        }
+        let repaired = check_with(tmp.path(), true, Some(&b64)).await.unwrap();
+        assert_eq!(repaired.unresolved(), 0, "{:?}", repaired.issues);
+        assert!(
+            repaired
+                .issues
+                .iter()
+                .all(|issue| !issue.path.ends_with("s3.txt") || issue.advisory),
+            "{:?}",
+            repaired.issues
+        );
+        object_still_in_place(tmp.path(), "s3.txt");
+        let reopened = Arc::new(
+            Keyring::load(tmp.path().to_str().unwrap(), Some(&b64))
+                .await
+                .unwrap(),
+        );
+        let storage = FilesystemStorage::new(
+            tmp.path().to_str().unwrap(),
+            false,
+            1024 * 1024,
+            0,
+            reopened,
+        )
+        .await
+        .unwrap();
+        assert_eq!(read_key(&storage, "plain.txt").await, b"plain-body");
+        assert_eq!(read_key(&storage, "s3.txt").await, b"sse-s3-body");
+        let (mut reader, _) = storage
+            .get_object("bkt", "c.txt", Some(customer))
+            .await
+            .unwrap();
+        let mut buf = Vec::new();
+        tokio::io::AsyncReadExt::read_to_end(&mut reader, &mut buf)
+            .await
+            .unwrap();
+        assert_eq!(buf, b"sse-c-body");
+    }
+
+    #[tokio::test]
+    async fn empty_sse_s3_sidecar_is_not_rebuilt_as_plaintext() {
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = storage_at(tmp.path()).await;
+        storage.create_bucket(&bucket_meta("bkt")).await.unwrap();
+        put_bytes(&storage, "empty.bin", b"", true).await;
+        let meta_path = tmp.path().join("buckets/bkt/empty.bin.meta.json");
+        let original = std::fs::read(&meta_path).unwrap();
+        assert!(String::from_utf8_lossy(&original).contains("wrapped_dek"));
+        std::fs::write(&meta_path, b"").unwrap();
+        let repaired = check(tmp.path(), true).await.unwrap();
+        assert!(
+            repaired.issues.iter().any(|issue| {
+                issue.kind == IssueKind::CorruptMetadata
+                    && !issue.repaired
+                    && issue.detail.contains("not rebuilt")
+            }),
+            "{:?}",
+            repaired.issues
+        );
+        assert!(std::fs::read(&meta_path).unwrap().is_empty());
+        assert_not_served(&storage, "empty.bin").await;
     }
 }
 

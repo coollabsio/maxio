@@ -24,5 +24,8 @@ cargo test --lib -- \
     binary_sidecar_does_not_abort_the_check \
     rebuilt_plain_sidecar_keeps_multipart_etag \
     restore_unverifiable_from_archive_replaces_corrupt_current \
+    healthy_checksummed_sse_is_not_quarantined \
+    external_key_repair_is_refused_until_the_key_is_supplied \
+    empty_sse_s3_sidecar_is_not_rebuilt_as_plaintext \
     hashed_multipart_etag_is_not_reported_unverifiable \
     -- --test-threads=8

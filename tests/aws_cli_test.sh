@@ -2336,6 +2336,100 @@ PY
     wait "$META_PID" 2>/dev/null || true
     rm -rf "$META_DATA"
 
+    # Healthy objects with checksums must stay in place. Repair without an
+    # external master key refuses before it changes a file. SSE-C is never
+    # quarantined, because the server does not have the customer key.
+    SUM_DATA=$(mktemp -d)
+    SUM_PORT=$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1]); s.close()')
+    SUM_EP="http://127.0.0.1:$SUM_PORT"
+    SUM_AWS="aws --endpoint-url $SUM_EP"
+    RUST_LOG=warn "$ROBUST_BIN" --data-dir "$SUM_DATA" --port "$SUM_PORT" \
+        --address 127.0.0.1 "${SUB_CREDS[@]}" >"$SUM_DATA/server.log" 2>&1 &
+    SUM_PID=$!
+    SUM_UP=0
+    for _ in $(seq 1 50); do
+        if curl -sf "$SUM_EP/maxio/health/live" >/dev/null 2>&1; then
+            SUM_UP=1
+            break
+        fi
+        sleep 0.1
+    done
+    if [ "$SUM_UP" != 1 ]; then
+        echo "checksum server failed to start; log:"
+        cat "$SUM_DATA/server.log" || true
+        FAIL=$((FAIL + 1))
+    else
+        assert "checksum create bucket" $SUM_AWS s3 mb s3://sum-bucket
+        echo plain-body > "$TMPDIR/sum-plain.txt"
+        echo sse-s3-body > "$TMPDIR/sum-s3.txt"
+        echo sse-c-body > "$TMPDIR/sum-c.txt"
+        SSE_C_KEY=$(openssl rand 32 | base64)
+        SSE_C_MD5=$(printf '%s' "$SSE_C_KEY" | base64 -d | openssl dgst -md5 -binary | base64)
+        assert "checksum put plain" $SUM_AWS s3api put-object --bucket sum-bucket --key plain.txt \
+            --body "$TMPDIR/sum-plain.txt" --checksum-algorithm CRC32
+        assert "checksum put sse-s3" $SUM_AWS s3api put-object --bucket sum-bucket --key s3.txt \
+            --body "$TMPDIR/sum-s3.txt" --checksum-algorithm CRC32 --server-side-encryption AES256
+        assert "checksum put sse-c" $SUM_AWS s3api put-object --bucket sum-bucket --key c.txt \
+            --body "$TMPDIR/sum-c.txt" --checksum-algorithm CRC32 \
+            --sse-customer-algorithm AES256 --sse-customer-key "$SSE_C_KEY" \
+            --sse-customer-key-md5 "$SSE_C_MD5"
+    fi
+    kill -TERM "$SUM_PID" 2>/dev/null || true
+    wait "$SUM_PID" 2>/dev/null || true
+    if [ -n "${MAXIO_MASTER_KEY:-}" ]; then
+        set +e
+        env -u MAXIO_MASTER_KEY "$ROBUST_BIN" check --data-dir "$SUM_DATA" --repair \
+            >"$TMPDIR/sum-repair-nokey.txt" 2>"$TMPDIR/sum-repair-nokey.err"
+        SUM_REFUSE=$?
+        set -e
+        assert_eq "repair without external master key is refused" "true" \
+            "$([ "$SUM_REFUSE" -ne 0 ] && grep -q 'refusing to repair' "$TMPDIR/sum-repair-nokey.err" && echo true || echo false)"
+        assert_eq "refused repair says nothing was changed" "true" \
+            "$(grep -q 'no file was changed' "$TMPDIR/sum-repair-nokey.err" && echo true || echo false)"
+        set +e
+        env -u MAXIO_MASTER_KEY "$ROBUST_BIN" check --data-dir "$SUM_DATA" \
+            >"$TMPDIR/sum-readonly.txt" 2>"$TMPDIR/sum-readonly.err"
+        SUM_RO=$?
+        set -e
+        assert_eq "read-only check without the key exits 0" "0" "$SUM_RO"
+        assert_eq "read-only check notes unverifiable without key" "true" \
+            "$(grep -q 'unverifiable without key' "$TMPDIR/sum-readonly.txt" && echo true || echo false)"
+    else
+        set +e
+        "$ROBUST_BIN" check --data-dir "$SUM_DATA" >"$TMPDIR/sum-readonly.txt" 2>"$TMPDIR/sum-readonly.err"
+        SUM_RO=$?
+        set -e
+        assert_eq "read-only check of healthy sse exits 0" "0" "$SUM_RO"
+        assert_eq "sse-c is unverifiable without key" "true" \
+            "$(grep -q 'unverifiable without key' "$TMPDIR/sum-readonly.txt" && echo true || echo false)"
+    fi
+    for name in plain.txt s3.txt c.txt; do
+        assert_file_exists "checksum object $name stayed in place" "$SUM_DATA/buckets/sum-bucket/$name"
+        assert_file_exists "checksum sidecar $name stayed in place" "$SUM_DATA/buckets/sum-bucket/$name.meta.json"
+    done
+    assert "checksum repair with the key" "$ROBUST_BIN" check --data-dir "$SUM_DATA" --repair
+    for name in plain.txt s3.txt c.txt; do
+        assert_file_exists "checksum object $name stayed after repair" "$SUM_DATA/buckets/sum-bucket/$name"
+    done
+    RUST_LOG=warn "$ROBUST_BIN" --data-dir "$SUM_DATA" --port "$SUM_PORT" \
+        --address 127.0.0.1 "${SUB_CREDS[@]}" >"$SUM_DATA/server.log" 2>&1 &
+    SUM_PID=$!
+    for _ in $(seq 1 50); do
+        curl -sf "$SUM_EP/maxio/health/live" >/dev/null 2>&1 && break
+        sleep 0.1
+    done
+    assert "checksum get plain" $SUM_AWS s3 cp s3://sum-bucket/plain.txt "$TMPDIR/sum-plain-down.txt"
+    assert_eq "checksum plain body" "plain-body" "$(cat "$TMPDIR/sum-plain-down.txt")"
+    assert "checksum get sse-s3" $SUM_AWS s3 cp s3://sum-bucket/s3.txt "$TMPDIR/sum-s3-down.txt"
+    assert_eq "checksum sse-s3 body" "sse-s3-body" "$(cat "$TMPDIR/sum-s3-down.txt")"
+    assert "checksum get sse-c" $SUM_AWS s3api get-object --bucket sum-bucket --key c.txt \
+        --sse-customer-algorithm AES256 --sse-customer-key "$SSE_C_KEY" \
+        --sse-customer-key-md5 "$SSE_C_MD5" "$TMPDIR/sum-c-down.txt"
+    assert_eq "checksum sse-c body" "sse-c-body" "$(cat "$TMPDIR/sum-c-down.txt")"
+    kill -TERM "$SUM_PID" 2>/dev/null || true
+    wait "$SUM_PID" 2>/dev/null || true
+    rm -rf "$SUM_DATA"
+
     LIMIT_DATA=$(mktemp -d)
     LIMIT_PORT=$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1]); s.close()')
     RUST_LOG=warn "$ROBUST_BIN" --data-dir "$LIMIT_DATA" --port "$LIMIT_PORT" \

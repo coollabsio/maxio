@@ -13,7 +13,7 @@
     "version": "maxio-console-v1"
   },
   "paths": {
-    "/api/auth/capabilities": {
+    "/maxio/api/auth/capabilities": {
       "get": {
         "tags": [
           "auth"
@@ -52,7 +52,7 @@
         }
       }
     },
-    "/api/auth/check": {
+    "/maxio/api/auth/check": {
       "get": {
         "tags": [
           "auth"
@@ -85,7 +85,7 @@
         ]
       }
     },
-    "/api/auth/login": {
+    "/maxio/api/auth/login": {
       "post": {
         "tags": [
           "auth"
@@ -148,7 +148,7 @@
         ]
       }
     },
-    "/api/auth/logout": {
+    "/maxio/api/auth/logout": {
       "post": {
         "tags": [
           "auth"
@@ -164,11 +164,21 @@
                 }
               }
             }
+          },
+          "500": {
+            "description": "The session was revoked in memory but could not be saved",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
           }
         }
       }
     },
-    "/api/buckets": {
+    "/maxio/api/buckets": {
       "get": {
         "tags": [
           "buckets"
@@ -246,7 +256,7 @@
         }
       }
     },
-    "/api/buckets/{bucket}": {
+    "/maxio/api/buckets/{bucket}": {
       "delete": {
         "tags": [
           "buckets"
@@ -296,7 +306,7 @@
         }
       }
     },
-    "/api/buckets/{bucket}/download/{key}": {
+    "/maxio/api/buckets/{bucket}/download/{key}": {
       "get": {
         "tags": [
           "objects"
@@ -345,7 +355,7 @@
         }
       }
     },
-    "/api/buckets/{bucket}/encryption": {
+    "/maxio/api/buckets/{bucket}/encryption": {
       "get": {
         "tags": [
           "settings"
@@ -413,7 +423,7 @@
         }
       }
     },
-    "/api/buckets/{bucket}/folders": {
+    "/maxio/api/buckets/{bucket}/folders": {
       "post": {
         "tags": [
           "objects"
@@ -463,7 +473,7 @@
         }
       }
     },
-    "/api/buckets/{bucket}/lifecycle": {
+    "/maxio/api/buckets/{bucket}/lifecycle": {
       "get": {
         "tags": [
           "settings"
@@ -561,7 +571,7 @@
         }
       }
     },
-    "/api/buckets/{bucket}/object-info/{key}": {
+    "/maxio/api/buckets/{bucket}/object-info/{key}": {
       "get": {
         "tags": [
           "objects"
@@ -629,7 +639,7 @@
         }
       }
     },
-    "/api/buckets/{bucket}/object-tags/{key}": {
+    "/maxio/api/buckets/{bucket}/object-tags/{key}": {
       "get": {
         "tags": [
           "objects"
@@ -773,7 +783,7 @@
         }
       }
     },
-    "/api/buckets/{bucket}/objects": {
+    "/maxio/api/buckets/{bucket}/objects": {
       "get": {
         "tags": [
           "objects"
@@ -830,7 +840,7 @@
         }
       }
     },
-    "/api/buckets/{bucket}/objects/{key}": {
+    "/maxio/api/buckets/{bucket}/objects/{key}": {
       "delete": {
         "tags": [
           "objects"
@@ -879,7 +889,7 @@
         }
       }
     },
-    "/api/buckets/{bucket}/policy": {
+    "/maxio/api/buckets/{bucket}/policy": {
       "get": {
         "tags": [
           "settings"
@@ -919,7 +929,7 @@
         }
       }
     },
-    "/api/buckets/{bucket}/presign/{key}": {
+    "/maxio/api/buckets/{bucket}/presign/{key}": {
       "get": {
         "tags": [
           "objects"
@@ -979,7 +989,7 @@
         }
       }
     },
-    "/api/buckets/{bucket}/public": {
+    "/maxio/api/buckets/{bucket}/public": {
       "get": {
         "tags": [
           "settings"
@@ -1047,7 +1057,7 @@
         }
       }
     },
-    "/api/buckets/{bucket}/tags": {
+    "/maxio/api/buckets/{bucket}/tags": {
       "get": {
         "tags": [
           "settings"
@@ -1145,7 +1155,7 @@
         }
       }
     },
-    "/api/buckets/{bucket}/upload/{key}": {
+    "/maxio/api/buckets/{bucket}/upload/{key}": {
       "put": {
         "tags": [
           "objects"
@@ -1204,7 +1214,7 @@
         }
       }
     },
-    "/api/buckets/{bucket}/versioning": {
+    "/maxio/api/buckets/{bucket}/versioning": {
       "get": {
         "tags": [
           "settings"
@@ -1272,7 +1282,7 @@
         }
       }
     },
-    "/api/buckets/{bucket}/versions": {
+    "/maxio/api/buckets/{bucket}/versions": {
       "get": {
         "tags": [
           "versions"
@@ -1310,7 +1320,7 @@
         }
       }
     },
-    "/api/buckets/{bucket}/versions/{versionId}/download/{key}": {
+    "/maxio/api/buckets/{bucket}/versions/{versionId}/download/{key}": {
       "get": {
         "tags": [
           "versions"
@@ -1367,7 +1377,7 @@
         }
       }
     },
-    "/api/buckets/{bucket}/versions/{versionId}/objects/{key}": {
+    "/maxio/api/buckets/{bucket}/versions/{versionId}/objects/{key}": {
       "delete": {
         "tags": [
           "versions"
@@ -1414,7 +1424,7 @@
         }
       }
     },
-    "/api/buckets/{bucket}/versions/{versionId}/restore/{key}": {
+    "/maxio/api/buckets/{bucket}/versions/{versionId}/restore/{key}": {
       "post": {
         "tags": [
           "versions"
@@ -1481,7 +1491,7 @@
         }
       }
     },
-    "/api/iam/policies": {
+    "/maxio/api/iam/policies": {
       "get": {
         "tags": [
           "iam"
@@ -1529,7 +1539,7 @@
         }
       }
     },
-    "/api/iam/policies/{name}": {
+    "/maxio/api/iam/policies/{name}": {
       "get": {
         "tags": [
           "iam"
@@ -1618,7 +1628,7 @@
         }
       }
     },
-    "/api/iam/preview": {
+    "/maxio/api/iam/preview": {
       "post": {
         "tags": [
           "iam"
@@ -1648,7 +1658,7 @@
         }
       }
     },
-    "/api/iam/service-keys": {
+    "/maxio/api/iam/service-keys": {
       "get": {
         "tags": [
           "iam"
@@ -1696,7 +1706,7 @@
         }
       }
     },
-    "/api/iam/service-keys/{id}": {
+    "/maxio/api/iam/service-keys/{id}": {
       "put": {
         "tags": [
           "iam"
@@ -1757,7 +1767,7 @@
         }
       }
     },
-    "/api/iam/users": {
+    "/maxio/api/iam/users": {
       "get": {
         "tags": [
           "iam"
@@ -1825,7 +1835,7 @@
         }
       }
     },
-    "/api/iam/users/{name}": {
+    "/maxio/api/iam/users/{name}": {
       "get": {
         "tags": [
           "iam"
@@ -1886,7 +1896,7 @@
         }
       }
     },
-    "/api/iam/users/{name}/inline/{policy}": {
+    "/maxio/api/iam/users/{name}/inline/{policy}": {
       "put": {
         "tags": [
           "iam"
@@ -1956,7 +1966,7 @@
         }
       }
     },
-    "/api/iam/users/{name}/keys": {
+    "/maxio/api/iam/users/{name}/keys": {
       "get": {
         "tags": [
           "iam"
@@ -2024,7 +2034,7 @@
         }
       }
     },
-    "/api/iam/users/{name}/keys/{id}": {
+    "/maxio/api/iam/users/{name}/keys/{id}": {
       "put": {
         "tags": [
           "iam"
@@ -2101,7 +2111,7 @@
         }
       }
     },
-    "/api/iam/users/{name}/policies": {
+    "/maxio/api/iam/users/{name}/policies": {
       "post": {
         "tags": [
           "iam"
@@ -2134,7 +2144,7 @@
         }
       }
     },
-    "/api/iam/users/{name}/policies/{policy}": {
+    "/maxio/api/iam/users/{name}/policies/{policy}": {
       "delete": {
         "tags": [
           "iam"
@@ -2165,7 +2175,7 @@
         }
       }
     },
-    "/api/iam/users/{name}/status": {
+    "/maxio/api/iam/users/{name}/status": {
       "put": {
         "tags": [
           "iam"
@@ -2205,7 +2215,7 @@
         }
       }
     },
-    "/api/iam/validate": {
+    "/maxio/api/iam/validate": {
       "post": {
         "tags": [
           "iam"
@@ -2238,6 +2248,36 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/maxio/api/version": {
+      "get": {
+        "tags": [
+          "meta"
+        ],
+        "operationId": "getServerVersion",
+        "responses": {
+          "200": {
+            "description": "Running server version",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ServerVersion"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Not authenticated",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
                 }
               }
             }
@@ -3254,6 +3294,17 @@
               "null"
             ],
             "description": "Version id of the new current version (`null` when versioning is off)."
+          }
+        }
+      },
+      "ServerVersion": {
+        "type": "object",
+        "required": [
+          "version"
+        ],
+        "properties": {
+          "version": {
+            "type": "string"
           }
         }
       },

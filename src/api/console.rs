@@ -1,5 +1,6 @@
 use std::collections::{BTreeSet, HashMap};
 use std::net::SocketAddr;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use axum::{
@@ -23,87 +24,602 @@ use crate::storage::filesystem::FilesystemStorage;
 type HmacSha256 = Hmac<Sha256>;
 
 const COOKIE_NAME: &str = "maxio_session";
-const TOKEN_MAX_AGE_SECS: i64 = 7 * 24 * 60 * 60; // 7 days
 
-const RATE_LIMIT_MAX: u32 = 10;
-const RATE_LIMIT_WINDOW_SECS: u64 = 300; // 5 minutes
-
-struct Bucket {
-    count: u32,
-    window_start: Instant,
+/// Sessions logout has already accepted. The set is written to the data
+/// directory so a restart does not make a revoked cookie valid again.
+///
+/// `{data_dir}/.maxio-revoked-sessions.ready` is created with the revocation
+/// file on first start. A later process that finds the marker but no readable
+/// revocation file treats every session issued at or before that start as
+/// revoked. A data directory that has neither file has no prior revocations.
+#[derive(Clone)]
+pub struct RevokedSessions {
+    path: Option<std::path::PathBuf>,
+    /// jti → unix expiry. Expired entries are dropped on load and on revoke.
+    entries: Arc<Mutex<HashMap<String, i64>>>,
+    /// Sessions with `issued_at <= not_before` are rejected. Set when the
+    /// revocation file is missing after first start, or is unreadable or corrupt.
+    not_before: Arc<Mutex<Option<i64>>>,
 }
 
-pub struct LoginRateLimiter {
-    buckets: std::sync::Mutex<HashMap<String, Bucket>>,
+#[derive(serde::Serialize, serde::Deserialize)]
+struct RevocationFile {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    not_before: Option<i64>,
+    #[serde(default)]
+    entries: Vec<RevocationEntry>,
 }
 
-impl LoginRateLimiter {
+#[derive(serde::Serialize, serde::Deserialize)]
+struct RevocationEntry {
+    jti: String,
+    expires_at: i64,
+}
+
+const REVOKED_SESSIONS_FILE: &str = ".maxio-revoked-sessions.json";
+const REVOKED_SESSIONS_MARKER: &str = ".maxio-revoked-sessions.ready";
+
+enum LoadedRevocations {
+    Missing,
+    Unreadable(String),
+    Corrupt(String),
+    Ready(RevocationFile),
+}
+
+impl RevokedSessions {
+    #[allow(dead_code)]
     pub fn new() -> Self {
         Self {
-            buckets: std::sync::Mutex::new(HashMap::new()),
+            path: None,
+            entries: Arc::new(Mutex::new(HashMap::new())),
+            not_before: Arc::new(Mutex::new(None)),
         }
     }
 
-    /// Returns `Some(retry_after_secs)` if the IP is rate-limited, `None` if allowed.
-    /// Increments the counter on every call (success and failure both count).
-    pub fn check_and_increment(&self, ip: &str) -> Option<u64> {
-        let mut map = self.buckets.lock().unwrap();
-        let now = Instant::now();
+    /// Load `{data_dir}/.maxio-revoked-sessions.json`, dropping expired rows.
+    ///
+    /// The first successful open writes an empty revocation file and a marker.
+    /// A missing, unreadable, or corrupt file after that marker exists fails
+    /// closed: `not_before` is this process's start time.
+    pub async fn open(data_dir: &std::path::Path) -> Self {
+        let path = data_dir.join(REVOKED_SESSIONS_FILE);
+        let marker = data_dir.join(REVOKED_SESSIONS_MARKER);
+        let now = chrono::Utc::now().timestamp();
+        let loaded = load_revocation_file(&path).await;
+        let marker_exists = tokio::fs::try_exists(&marker).await.unwrap_or(false);
 
-        // Prune expired entries to prevent unbounded memory growth
-        map.retain(|_, b| {
-            now.duration_since(b.window_start).as_secs() < RATE_LIMIT_WINDOW_SECS * 2
-        });
+        let (map, not_before, write, failed_closed) = match loaded {
+            LoadedRevocations::Ready(file) => {
+                let mut map: HashMap<String, i64> = file
+                    .entries
+                    .into_iter()
+                    .map(|entry| (entry.jti, entry.expires_at))
+                    .collect();
+                let before = map.len();
+                map.retain(|_, exp| *exp > now);
+                let pruned = map.len() != before;
+                (map, file.not_before, pruned || !marker_exists, false)
+            }
+            LoadedRevocations::Missing if !marker_exists => (HashMap::new(), None, true, false),
+            LoadedRevocations::Missing => {
+                tracing::warn!("{}", revocation_deleted_warning(&path, &marker));
+                (HashMap::new(), Some(now), true, true)
+            }
+            LoadedRevocations::Unreadable(err) => {
+                tracing::warn!(
+                    "{}",
+                    revocation_fail_closed_warning(&path, &format!("unreadable ({err})"))
+                );
+                (HashMap::new(), Some(now), true, true)
+            }
+            LoadedRevocations::Corrupt(err) => {
+                tracing::warn!(
+                    "{}",
+                    revocation_fail_closed_warning(&path, &format!("corrupt ({err})"))
+                );
+                (HashMap::new(), Some(now), true, true)
+            }
+        };
 
-        let bucket = map.entry(ip.to_string()).or_insert(Bucket {
-            count: 0,
-            window_start: now,
-        });
-
-        if now.duration_since(bucket.window_start).as_secs() >= RATE_LIMIT_WINDOW_SECS {
-            bucket.count = 0;
-            bucket.window_start = now;
+        let store = Self {
+            path: Some(path),
+            entries: Arc::new(Mutex::new(map)),
+            not_before: Arc::new(Mutex::new(not_before)),
+        };
+        if write {
+            if let Err(err) = store.persist().await {
+                if failed_closed {
+                    tracing::error!(
+                        "failed to record the session epoch in {}: {err}. Sessions issued at or before this process start stay revoked until the process exits.",
+                        store
+                            .path
+                            .as_ref()
+                            .map(|p| p.display().to_string())
+                            .unwrap_or_default()
+                    );
+                } else {
+                    tracing::error!(
+                        "failed to create the revoked-sessions file {}: {err}. A later logout cannot be saved until this path is writable.",
+                        store
+                            .path
+                            .as_ref()
+                            .map(|p| p.display().to_string())
+                            .unwrap_or_default()
+                    );
+                }
+            }
         }
+        store
+    }
 
-        bucket.count += 1;
+    /// Unix time at or before which issued sessions are rejected.
+    pub fn session_epoch(&self) -> Option<i64> {
+        match self.not_before.lock() {
+            Ok(guard) => *guard,
+            Err(poisoned) => *poisoned.into_inner(),
+        }
+    }
 
-        if bucket.count > RATE_LIMIT_MAX {
-            let remaining = RATE_LIMIT_WINDOW_SECS
-                .saturating_sub(now.duration_since(bucket.window_start).as_secs());
-            Some(remaining.max(1))
+    /// Record a logout. The session is revoked in memory even when the file
+    /// cannot be replaced. The error is the write failure.
+    pub async fn revoke(&self, jti: &str, expires_at: i64) -> Result<(), String> {
+        let now = chrono::Utc::now().timestamp();
+        {
+            let mut guard = match self.entries.lock() {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            guard.retain(|_, exp| *exp > now);
+            guard.insert(jti.to_string(), expires_at);
+        }
+        if let Err(err) = self.persist().await {
+            let where_ = self
+                .path
+                .as_ref()
+                .map(|path| path.display().to_string())
+                .unwrap_or_else(|| REVOKED_SESSIONS_FILE.to_string());
+            tracing::error!(
+                "failed to write revoked sessions to {where_}: {err}. The session is revoked in this process only."
+            );
+            return Err(err);
+        }
+        Ok(())
+    }
+
+    pub fn contains(&self, jti: &str) -> bool {
+        let now = chrono::Utc::now().timestamp();
+        let guard = match self.entries.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        guard.get(jti).is_some_and(|exp| *exp > now)
+    }
+
+    /// True when this cookie was logged out or was issued at or before a
+    /// fail-closed session epoch.
+    pub fn rejects(&self, issued_at: i64, jti: &str) -> bool {
+        if self.session_epoch().is_some_and(|cut| issued_at <= cut) {
+            return true;
+        }
+        self.contains(jti)
+    }
+
+    async fn persist(&self) -> Result<(), String> {
+        let Some(path) = &self.path else {
+            return Ok(());
+        };
+        let (entries, not_before) = {
+            let guard = match self.entries.lock() {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            let not_before = match self.not_before.lock() {
+                Ok(guard) => *guard,
+                Err(poisoned) => *poisoned.into_inner(),
+            };
+            let entries = guard
+                .iter()
+                .map(|(jti, expires_at)| RevocationEntry {
+                    jti: jti.clone(),
+                    expires_at: *expires_at,
+                })
+                .collect();
+            (entries, not_before)
+        };
+        let body = serde_json::to_vec_pretty(&RevocationFile {
+            not_before,
+            entries,
+        })
+        .map_err(|err| err.to_string())?;
+        if let Some(parent) = path.parent() {
+            tokio::fs::create_dir_all(parent)
+                .await
+                .map_err(|err| err.to_string())?;
+        }
+        let tmp = path.with_extension("json.tmp");
+        let mut opts = tokio::fs::OpenOptions::new();
+        opts.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        {
+            opts.mode(0o600);
+        }
+        {
+            use tokio::io::AsyncWriteExt;
+            let mut file = opts
+                .open(&tmp)
+                .await
+                .map_err(|err| format!("cannot write {}: {err}", tmp.display()))?;
+            file.write_all(&body)
+                .await
+                .map_err(|err| format!("cannot write {}: {err}", tmp.display()))?;
+            file.sync_all()
+                .await
+                .map_err(|err| format!("cannot sync {}: {err}", tmp.display()))?;
+        }
+        tokio::fs::rename(&tmp, path).await.map_err(|err| {
+            let _ = std::fs::remove_file(&tmp);
+            format!("cannot replace {}: {err}", path.display())
+        })?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+                .map_err(|err| format!("cannot set permissions on {}: {err}", path.display()))?;
+        }
+        let marker = path.with_file_name(REVOKED_SESSIONS_MARKER);
+        if !tokio::fs::try_exists(&marker).await.unwrap_or(false) {
+            let mut marker_opts = tokio::fs::OpenOptions::new();
+            marker_opts.write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                marker_opts.mode(0o600);
+            }
+            marker_opts.open(&marker).await.map_err(|err| {
+                format!(
+                    "cannot write session-store marker {}: {err}",
+                    marker.display()
+                )
+            })?;
+        }
+        Ok(())
+    }
+}
+
+fn revocation_fail_closed_warning(path: &std::path::Path, reason: &str) -> String {
+    format!(
+        "revoked-sessions file {} is {reason}. Failing closed: every console session issued at or before this process start is revoked",
+        path.display()
+    )
+}
+
+fn revocation_deleted_warning(path: &std::path::Path, marker: &std::path::Path) -> String {
+    format!(
+        "revoked-sessions file {} is missing, but {} shows this data directory already had a session store. Failing closed: every console session issued at or before this process start is revoked",
+        path.display(),
+        marker.display()
+    )
+}
+
+async fn load_revocation_file(path: &std::path::Path) -> LoadedRevocations {
+    match tokio::fs::metadata(path).await {
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => LoadedRevocations::Missing,
+        Err(err) => LoadedRevocations::Unreadable(err.to_string()),
+        Ok(meta) if meta.is_dir() => {
+            LoadedRevocations::Unreadable("path is a directory".to_string())
+        }
+        Ok(_) => match tokio::fs::read_to_string(path).await {
+            Err(err) => LoadedRevocations::Unreadable(err.to_string()),
+            Ok(raw) => match serde_json::from_str::<RevocationFile>(&raw) {
+                Ok(file) => LoadedRevocations::Ready(file),
+                Err(err) => LoadedRevocations::Corrupt(err.to_string()),
+            },
+        },
+    }
+}
+const TOKEN_MAX_AGE_SECS: i64 = 7 * 24 * 60 * 60; // 7 days
+
+const RATE_LIMIT_MAX: u32 = 10;
+const RATE_LIMIT_IP_MAX: u32 = 50;
+const RATE_LIMIT_MAX_ENTRIES: usize = 4096;
+const RATE_LIMIT_WINDOW_SECS: u64 = 300; // 5 minutes
+
+struct AttemptWindow {
+    failures: u32,
+    window_start: Instant,
+    last_used: Instant,
+}
+
+/// Failed console logins, keyed by client IP and access key.
+///
+/// Successful logins are not counted. `X-Forwarded-For` is used only when the
+/// TCP peer is in `trusted` (see `MAXIO_TRUSTED_PROXY`). The default is empty,
+/// so the header is ignored.
+pub struct LoginRateLimiter {
+    windows: std::sync::Mutex<HashMap<String, AttemptWindow>>,
+    trusted: Vec<TrustedNet>,
+}
+
+impl LoginRateLimiter {
+    #[allow(dead_code)] // integration tests construct a limiter with no trusted proxies
+    pub fn new() -> Self {
+        Self::from_trusted("").expect("empty proxy list")
+    }
+
+    pub fn from_trusted(spec: &str) -> Result<Self, String> {
+        Ok(Self {
+            windows: std::sync::Mutex::new(HashMap::new()),
+            trusted: parse_trusted_proxies(spec)?,
+        })
+    }
+
+    /// Client address for the login limit. The peer address wins unless that
+    /// peer is a trusted proxy, in which case the rightmost `X-Forwarded-For`
+    /// hop that is not itself a trusted proxy is the client.
+    pub fn client_ip(&self, headers: &HeaderMap, addr: &SocketAddr) -> String {
+        let peer = addr.ip();
+        if !self.trusted.iter().any(|net| net.contains(peer)) {
+            return peer.to_string();
+        }
+        let forwarded = headers
+            .get("x-forwarded-for")
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("");
+        let mut client = peer.to_string();
+        for hop in forwarded.split(',').rev() {
+            let hop = hop.trim();
+            if hop.is_empty() {
+                continue;
+            }
+            let Ok(ip) = hop.parse::<std::net::IpAddr>() else {
+                continue;
+            };
+            if self.trusted.iter().any(|net| net.contains(ip)) {
+                continue;
+            }
+            client = ip.to_string();
+            break;
+        }
+        client
+    }
+
+    fn user_key(ip: &str, access_key: &str) -> String {
+        use sha2::Digest;
+        let digest = hex::encode(Sha256::digest(access_key.as_bytes()));
+        format!("k\n{ip}\n{digest}")
+    }
+
+    fn ip_key(ip: &str) -> String {
+        format!("i\n{ip}")
+    }
+
+    fn touch(window: &mut AttemptWindow, now: Instant) {
+        window.last_used = now;
+        if now.duration_since(window.window_start).as_secs() >= RATE_LIMIT_WINDOW_SECS {
+            window.failures = 0;
+            window.window_start = now;
+        }
+    }
+
+    fn prune_and_window<'a>(
+        map: &'a mut HashMap<String, AttemptWindow>,
+        key: &str,
+    ) -> &'a mut AttemptWindow {
+        let now = Instant::now();
+        map.retain(|_, window| {
+            now.duration_since(window.window_start).as_secs() < RATE_LIMIT_WINDOW_SECS * 2
+        });
+        while map.len() >= RATE_LIMIT_MAX_ENTRIES && !map.contains_key(key) {
+            let oldest = map
+                .iter()
+                .min_by_key(|(_, window)| window.last_used)
+                .map(|(key, _)| key.clone());
+            match oldest {
+                Some(old) => {
+                    map.remove(&old);
+                }
+                None => break,
+            }
+        }
+        let window = map.entry(key.to_string()).or_insert(AttemptWindow {
+            failures: 0,
+            window_start: now,
+            last_used: now,
+        });
+        Self::touch(window, now);
+        window
+    }
+
+    fn retry_after(window: &AttemptWindow) -> u64 {
+        RATE_LIMIT_WINDOW_SECS
+            .saturating_sub(Instant::now().duration_since(window.window_start).as_secs())
+            .max(1)
+    }
+
+    /// `Some(retry_after)` when this access key or this IP has failed too many times.
+    pub fn is_blocked(&self, ip: &str, access_key: &str) -> Option<u64> {
+        let mut map = self.windows.lock().unwrap();
+        let ip_retry = {
+            let ip_window = Self::prune_and_window(&mut map, &Self::ip_key(ip));
+            if ip_window.failures >= RATE_LIMIT_IP_MAX {
+                Some(Self::retry_after(ip_window))
+            } else {
+                None
+            }
+        };
+        if ip_retry.is_some() {
+            return ip_retry;
+        }
+        let window = Self::prune_and_window(&mut map, &Self::user_key(ip, access_key));
+        if window.failures >= RATE_LIMIT_MAX {
+            Some(Self::retry_after(window))
         } else {
             None
         }
     }
+
+    pub fn record_failure(&self, ip: &str, access_key: &str) {
+        let mut map = self.windows.lock().unwrap();
+        {
+            let ip_window = Self::prune_and_window(&mut map, &Self::ip_key(ip));
+            ip_window.failures = ip_window.failures.saturating_add(1);
+        }
+        let window = Self::prune_and_window(&mut map, &Self::user_key(ip, access_key));
+        window.failures = window.failures.saturating_add(1);
+    }
+
+    pub fn clear(&self, ip: &str, access_key: &str) {
+        let mut map = self.windows.lock().unwrap();
+        map.remove(&Self::user_key(ip, access_key));
+    }
+
+    #[cfg(test)]
+    fn entry_count(&self) -> usize {
+        self.windows.lock().unwrap().len()
+    }
+
+    #[cfg(test)]
+    fn stores_raw_access_key(&self, raw: &str) -> bool {
+        self.windows
+            .lock()
+            .unwrap()
+            .keys()
+            .any(|key| key.contains(raw))
+    }
 }
 
-fn extract_client_ip(headers: &HeaderMap, addr: &SocketAddr) -> String {
-    let _ = headers;
-    // Public console: do not trust spoofable X-Forwarded-For unless/until a
-    // trusted-proxy allowlist is configured. Use the connected peer IP.
-    addr.ip().to_string()
+#[derive(Clone)]
+enum TrustedNet {
+    V4 { addr: u32, prefix: u8 },
+    V6 { addr: u128, prefix: u8 },
 }
 
-fn extract_cookie(headers: &HeaderMap) -> Option<String> {
-    headers
-        .get("cookie")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|cookies| {
-            cookies
-                .split(';')
-                .map(|c| c.trim())
-                .find(|c| c.starts_with(&format!("{}=", COOKIE_NAME)))
-                .map(|c| c[COOKIE_NAME.len() + 1..].to_string())
+impl TrustedNet {
+    fn contains(&self, ip: std::net::IpAddr) -> bool {
+        match (self, ip) {
+            (Self::V4 { addr, prefix }, std::net::IpAddr::V4(ip)) => {
+                let mask = ipv4_mask(*prefix);
+                (u32::from(ip) & mask) == (*addr & mask)
+            }
+            (Self::V6 { addr, prefix }, std::net::IpAddr::V6(ip)) => {
+                let mask = ipv6_mask(*prefix);
+                (u128::from(ip) & mask) == (*addr & mask)
+            }
+            _ => false,
+        }
+    }
+}
+
+fn ipv4_mask(prefix: u8) -> u32 {
+    if prefix == 0 {
+        0
+    } else {
+        u32::MAX << (32 - prefix)
+    }
+}
+
+fn ipv6_mask(prefix: u8) -> u128 {
+    if prefix == 0 {
+        0
+    } else {
+        u128::MAX << (128 - prefix)
+    }
+}
+
+fn parse_trusted_proxies(spec: &str) -> Result<Vec<TrustedNet>, String> {
+    let mut nets = Vec::new();
+    for part in spec.split(',') {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+        nets.push(parse_trusted_net(part)?);
+    }
+    Ok(nets)
+}
+
+fn parse_trusted_net(part: &str) -> Result<TrustedNet, String> {
+    let (addr, prefix) = match part.split_once('/') {
+        Some((addr, prefix)) => (addr, Some(prefix)),
+        None => (part, None),
+    };
+    if let Ok(ip) = addr.parse::<std::net::Ipv4Addr>() {
+        let prefix = match prefix {
+            Some(raw) => raw
+                .parse::<u8>()
+                .map_err(|_| format!("invalid trusted proxy prefix in {part}"))?,
+            None => 32,
+        };
+        if prefix > 32 {
+            return Err(format!("IPv4 trusted proxy prefix is too large in {part}"));
+        }
+        return Ok(TrustedNet::V4 {
+            addr: u32::from(ip),
+            prefix,
+        });
+    }
+    if let Ok(ip) = addr.parse::<std::net::Ipv6Addr>() {
+        let prefix = match prefix {
+            Some(raw) => raw
+                .parse::<u8>()
+                .map_err(|_| format!("invalid trusted proxy prefix in {part}"))?,
+            None => 128,
+        };
+        if prefix > 128 {
+            return Err(format!("IPv6 trusted proxy prefix is too large in {part}"));
+        }
+        return Ok(TrustedNet::V6 {
+            addr: u128::from(ip),
+            prefix,
+        });
+    }
+    Err(format!("trusted proxy {part} is not an IP address or CIDR"))
+}
+
+fn extract_session_cookies(headers: &HeaderMap) -> Vec<String> {
+    let mut values = Vec::new();
+    for header in headers.get_all("cookie") {
+        let Ok(cookies) = header.to_str() else {
+            continue;
+        };
+        for cookie in cookies.split(';') {
+            let cookie = cookie.trim();
+            let Some(value) = cookie.strip_prefix(&format!("{COOKIE_NAME}=")) else {
+                continue;
+            };
+            if !value.is_empty() {
+                values.push(value.to_string());
+            }
+        }
+    }
+    values
+}
+
+fn any_session_revoked(state: &crate::server::AppState, cookies: &[String]) -> bool {
+    cookies.iter().any(|token| {
+        crate::iam::session::parse_token(token).is_some_and(|parsed| {
+            state
+                .revoked_sessions
+                .rejects(parsed.issued_at, parsed.revocation_id())
         })
+    })
 }
 
-fn make_cookie(value: &str, max_age: i64, secure: bool) -> String {
+fn make_cookie(value: &str, max_age: i64, secure: bool, path: &str) -> String {
     let secure_flag = if secure { "; Secure" } else { "" };
 
     format!(
-        "{}={}; Path=/; HttpOnly; SameSite=Strict; Max-Age={}{}",
-        COOKIE_NAME, value, max_age, secure_flag
+        "{}={}; Path={}; HttpOnly; SameSite=Strict; Max-Age={}{}",
+        COOKIE_NAME, value, path, max_age, secure_flag
     )
+}
+
+fn append_cleared_session_cookies(headers: &mut HeaderMap, secure: bool) {
+    for path in ["/maxio", "/"] {
+        let cookie = make_cookie("", 0, secure, path);
+        if let Ok(value) = cookie.parse() {
+            headers.append(axum::http::header::SET_COOKIE, value);
+        }
+    }
 }
 
 #[derive(Serialize, ToSchema)]
@@ -170,10 +686,7 @@ async fn console_auth_middleware(
     request: Request,
     next: Next,
 ) -> Response {
-    let Some(token) = extract_cookie(request.headers()) else {
-        return error(StatusCode::UNAUTHORIZED, "Not authenticated");
-    };
-    let identity = match crate::iam::console_from_token(&state.config, &token).await {
+    let identity = match session_identity(&state, request.headers()).await {
         Ok(identity) => identity,
         Err(()) => return error(StatusCode::UNAUTHORIZED, "Not authenticated"),
     };
@@ -199,6 +712,27 @@ async fn console_auth_middleware(
     next.run(request).await
 }
 
+#[derive(Serialize, ToSchema)]
+pub struct ServerVersion {
+    version: &'static str,
+}
+
+#[utoipa::path(
+    get,
+    path = "/maxio/api/version",
+    operation_id = "getServerVersion",
+    tag = "meta",
+    responses(
+        (status = 200, description = "Running server version", body = ServerVersion),
+        (status = 401, description = "Not authenticated", body = ErrorResponse),
+    )
+)]
+pub async fn server_version() -> Json<ServerVersion> {
+    Json(ServerVersion {
+        version: env!("CARGO_PKG_VERSION"),
+    })
+}
+
 #[derive(Deserialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct LoginRequest {
@@ -208,7 +742,7 @@ pub struct LoginRequest {
 
 #[utoipa::path(
     post,
-    path = "/api/auth/login",
+    path = "/maxio/api/auth/login",
     operation_id = "login",
     tag = "auth",
     security(()),
@@ -226,9 +760,9 @@ pub async fn login(
     headers: HeaderMap,
     Json(body): Json<LoginRequest>,
 ) -> Response {
-    let ip = extract_client_ip(&headers, &addr);
+    let ip = state.login_rate_limiter.client_ip(&headers, &addr);
 
-    if let Some(retry_after) = state.login_rate_limiter.check_and_increment(&ip) {
+    if let Some(retry_after) = state.login_rate_limiter.is_blocked(&ip, &body.access_key) {
         return (
             [(axum::http::header::RETRY_AFTER, retry_after.to_string())],
             error(
@@ -242,16 +776,22 @@ pub async fn login(
     let identity = match crate::iam::login(&state.config, &body.access_key, &body.secret_key).await
     {
         Ok(identity) => identity,
-        Err(crate::iam::LoginError::Disabled) => {
-            return error(
-                StatusCode::FORBIDDEN,
-                "This access key is inactive or the user is disabled",
-            );
-        }
-        Err(crate::iam::LoginError::Invalid) => {
-            return error(StatusCode::UNAUTHORIZED, "Invalid credentials");
+        Err(err) => {
+            state
+                .login_rate_limiter
+                .record_failure(&ip, &body.access_key);
+            return match err {
+                crate::iam::LoginError::Disabled => error(
+                    StatusCode::FORBIDDEN,
+                    "This access key is inactive or the user is disabled",
+                ),
+                crate::iam::LoginError::Invalid => {
+                    error(StatusCode::UNAUTHORIZED, "Invalid credentials")
+                }
+            };
         }
     };
+    state.login_rate_limiter.clear(&ip, &body.access_key);
     let token = match crate::iam::issue_session_token(&state.config, &identity).await {
         Ok(token) => token,
         Err(()) => return error(StatusCode::INTERNAL_SERVER_ERROR, "Could not start session"),
@@ -260,10 +800,18 @@ pub async fn login(
         &token,
         TOKEN_MAX_AGE_SECS,
         console_cookie_secure(&state.config, &headers),
+        "/maxio",
     );
 
     let mut resp_headers = HeaderMap::new();
-    resp_headers.insert("Set-Cookie", cookie.parse().unwrap());
+    let secure = console_cookie_secure(&state.config, &headers);
+    resp_headers.append(axum::http::header::SET_COOKIE, cookie.parse().unwrap());
+    // A revoked Path=/ cookie from a pre-upgrade build is still sent to
+    // /maxio and would reject this new session. Clear it as we sign in.
+    // The session cookie is first so clients that read one Set-Cookie keep it.
+    if let Ok(clear) = make_cookie("", 0, secure, "/").parse() {
+        resp_headers.append(axum::http::header::SET_COOKIE, clear);
+    }
     (resp_headers, Json(session_response(&identity))).into_response()
 }
 
@@ -286,7 +834,7 @@ pub struct Capabilities {
 
 #[utoipa::path(
     get,
-    path = "/api/auth/capabilities",
+    path = "/maxio/api/auth/capabilities",
     operation_id = "getCapabilities",
     tag = "auth",
     params(CapabilityParams),
@@ -324,7 +872,7 @@ pub async fn capabilities(
 
 #[utoipa::path(
     get,
-    path = "/api/auth/check",
+    path = "/maxio/api/auth/check",
     operation_id = "checkAuth",
     tag = "auth",
     security(()),
@@ -334,27 +882,68 @@ pub async fn capabilities(
     )
 )]
 pub async fn check(State(state): State<AppState>, headers: HeaderMap) -> Response {
-    let Some(token) = extract_cookie(&headers) else {
-        return error(StatusCode::UNAUTHORIZED, "Not authenticated");
-    };
-    match crate::iam::console_from_token(&state.config, &token).await {
+    match session_identity(&state, &headers).await {
         Ok(identity) => (StatusCode::OK, Json(session_response(&identity))).into_response(),
         Err(()) => error(StatusCode::UNAUTHORIZED, "Not authenticated"),
     }
 }
 
+async fn session_identity(
+    state: &crate::server::AppState,
+    headers: &HeaderMap,
+) -> Result<crate::iam::ConsoleIdentity, ()> {
+    let cookies = extract_session_cookies(headers);
+    if cookies.is_empty() || any_session_revoked(state, &cookies) {
+        return Err(());
+    }
+    for token in &cookies {
+        if let Ok(identity) = crate::iam::console_from_token(&state.config, token).await {
+            return Ok(identity);
+        }
+    }
+    Err(())
+}
+
 #[utoipa::path(
     post,
-    path = "/api/auth/logout",
+    path = "/maxio/api/auth/logout",
     operation_id = "logout",
     tag = "auth",
-    responses((status = 200, body = OkResponse))
+    responses(
+        (status = 200, body = OkResponse),
+        (status = 500, description = "The session was revoked in memory but could not be saved", body = ErrorResponse)
+    )
 )]
 pub async fn logout(State(state): State<AppState>, headers: HeaderMap) -> Response {
-    let cookie = make_cookie("", 0, console_cookie_secure(&state.config, &headers));
-    let mut resp_headers = HeaderMap::new();
-    resp_headers.insert("Set-Cookie", cookie.parse().unwrap());
-    (resp_headers, ok()).into_response()
+    let mut saved = true;
+    for token in extract_session_cookies(&headers) {
+        let Some(parsed) = crate::iam::session::parse_token(&token) else {
+            continue;
+        };
+        let expires_at = parsed
+            .issued_at
+            .saturating_add(crate::iam::session::TOKEN_MAX_AGE_SECS);
+        if let Err(err) = state
+            .revoked_sessions
+            .revoke(parsed.revocation_id(), expires_at)
+            .await
+        {
+            tracing::error!("logout revoked the session in memory but could not save it: {err}");
+            saved = false;
+        }
+    }
+    let secure = console_cookie_secure(&state.config, &headers);
+    if saved {
+        let mut resp_headers = HeaderMap::new();
+        append_cleared_session_cookies(&mut resp_headers, secure);
+        return (resp_headers, ok()).into_response();
+    }
+    let mut resp = error(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "session was revoked in memory but could not be saved",
+    );
+    append_cleared_session_cookies(resp.headers_mut(), secure);
+    resp
 }
 
 async fn console_csrf_middleware(
@@ -490,7 +1079,7 @@ pub struct BucketListResponse {
 
 #[utoipa::path(
     get,
-    path = "/api/buckets",
+    path = "/maxio/api/buckets",
     operation_id = "listBuckets",
     tag = "buckets",
     responses(
@@ -568,7 +1157,7 @@ pub struct CreateBucketRequest {
 
 #[utoipa::path(
     post,
-    path = "/api/buckets",
+    path = "/maxio/api/buckets",
     operation_id = "createBucket",
     tag = "buckets",
     request_body = CreateBucketRequest,
@@ -627,7 +1216,7 @@ pub async fn create_bucket(
 
 #[utoipa::path(
     delete,
-    path = "/api/buckets/{bucket}",
+    path = "/maxio/api/buckets/{bucket}",
     operation_id = "deleteBucket",
     tag = "buckets",
     params(("bucket" = String, Path)),
@@ -689,7 +1278,7 @@ pub struct ObjectListResponse {
 
 #[utoipa::path(
     get,
-    path = "/api/buckets/{bucket}/objects",
+    path = "/maxio/api/buckets/{bucket}/objects",
     operation_id = "listObjects",
     tag = "objects",
     params(("bucket" = String, Path), ListObjectsParams),
@@ -765,7 +1354,7 @@ pub struct UploadResponse {
 
 #[utoipa::path(
     put,
-    path = "/api/buckets/{bucket}/upload/{key}",
+    path = "/maxio/api/buckets/{bucket}/upload/{key}",
     operation_id = "uploadObject",
     tag = "objects",
     params(
@@ -851,7 +1440,7 @@ async fn bucket_default_encryption(
 
 #[utoipa::path(
     delete,
-    path = "/api/buckets/{bucket}/objects/{key}",
+    path = "/maxio/api/buckets/{bucket}/objects/{key}",
     operation_id = "deleteObject",
     tag = "objects",
     params(
@@ -930,7 +1519,7 @@ async fn preserve_empty_parent_folder_after_object_delete(
 
 #[utoipa::path(
     get,
-    path = "/api/buckets/{bucket}/download/{key}",
+    path = "/maxio/api/buckets/{bucket}/download/{key}",
     operation_id = "downloadObject",
     tag = "objects",
     params(
@@ -1025,7 +1614,7 @@ async fn signing_credentials(
 
 #[utoipa::path(
     get,
-    path = "/api/buckets/{bucket}/presign/{key}",
+    path = "/maxio/api/buckets/{bucket}/presign/{key}",
     operation_id = "presignObject",
     tag = "objects",
     params(
@@ -1158,7 +1747,7 @@ pub struct CreateFolderRequest {
 
 #[utoipa::path(
     post,
-    path = "/api/buckets/{bucket}/folders",
+    path = "/maxio/api/buckets/{bucket}/folders",
     operation_id = "createFolder",
     tag = "objects",
     params(("bucket" = String, Path)),
@@ -1228,7 +1817,7 @@ pub struct SetEnabledRequest {
 
 #[utoipa::path(
     get,
-    path = "/api/buckets/{bucket}/versioning",
+    path = "/maxio/api/buckets/{bucket}/versioning",
     operation_id = "getVersioning",
     tag = "settings",
     params(("bucket" = String, Path)),
@@ -1243,7 +1832,7 @@ pub async fn get_versioning(State(state): State<AppState>, Path(bucket): Path<St
 
 #[utoipa::path(
     put,
-    path = "/api/buckets/{bucket}/versioning",
+    path = "/maxio/api/buckets/{bucket}/versioning",
     operation_id = "setVersioning",
     tag = "settings",
     params(("bucket" = String, Path)),
@@ -1270,7 +1859,7 @@ pub struct EncryptionResponse {
 
 #[utoipa::path(
     get,
-    path = "/api/buckets/{bucket}/encryption",
+    path = "/maxio/api/buckets/{bucket}/encryption",
     operation_id = "getEncryption",
     tag = "settings",
     params(("bucket" = String, Path)),
@@ -1292,7 +1881,7 @@ pub async fn get_encryption(State(state): State<AppState>, Path(bucket): Path<St
 
 #[utoipa::path(
     put,
-    path = "/api/buckets/{bucket}/encryption",
+    path = "/maxio/api/buckets/{bucket}/encryption",
     operation_id = "setEncryption",
     tag = "settings",
     params(("bucket" = String, Path)),
@@ -1326,7 +1915,7 @@ pub struct PublicAccess {
 
 #[utoipa::path(
     get,
-    path = "/api/buckets/{bucket}/public",
+    path = "/maxio/api/buckets/{bucket}/public",
     operation_id = "getPublicAccess",
     tag = "settings",
     params(("bucket" = String, Path)),
@@ -1341,7 +1930,7 @@ pub async fn get_public(State(state): State<AppState>, Path(bucket): Path<String
 
 #[utoipa::path(
     put,
-    path = "/api/buckets/{bucket}/public",
+    path = "/maxio/api/buckets/{bucket}/public",
     operation_id = "setPublicAccess",
     tag = "settings",
     params(("bucket" = String, Path)),
@@ -1387,7 +1976,7 @@ pub struct VersionListResponse {
 
 #[utoipa::path(
     get,
-    path = "/api/buckets/{bucket}/versions",
+    path = "/maxio/api/buckets/{bucket}/versions",
     operation_id = "listVersions",
     tag = "versions",
     params(("bucket" = String, Path), ListVersionsParams),
@@ -1425,7 +2014,7 @@ pub async fn list_versions(
 
 #[utoipa::path(
     delete,
-    path = "/api/buckets/{bucket}/versions/{versionId}/objects/{key}",
+    path = "/maxio/api/buckets/{bucket}/versions/{versionId}/objects/{key}",
     operation_id = "deleteVersion",
     tag = "versions",
     params(
@@ -1452,7 +2041,7 @@ pub async fn delete_version(
 
 #[utoipa::path(
     get,
-    path = "/api/buckets/{bucket}/versions/{versionId}/download/{key}",
+    path = "/maxio/api/buckets/{bucket}/versions/{versionId}/download/{key}",
     operation_id = "downloadVersion",
     tag = "versions",
     params(
@@ -1672,7 +2261,7 @@ async fn resolve_object_meta(
 
 #[utoipa::path(
     get,
-    path = "/api/buckets/{bucket}/object-info/{key}",
+    path = "/maxio/api/buckets/{bucket}/object-info/{key}",
     operation_id = "getObjectInfo",
     tag = "objects",
     params(
@@ -1724,7 +2313,7 @@ const BUCKET_TAGS_MAX: usize = 50;
 
 #[utoipa::path(
     get,
-    path = "/api/buckets/{bucket}/object-tags/{key}",
+    path = "/maxio/api/buckets/{bucket}/object-tags/{key}",
     operation_id = "getObjectTags",
     tag = "objects",
     params(
@@ -1760,7 +2349,7 @@ pub async fn get_object_tags(
 
 #[utoipa::path(
     put,
-    path = "/api/buckets/{bucket}/object-tags/{key}",
+    path = "/maxio/api/buckets/{bucket}/object-tags/{key}",
     operation_id = "setObjectTags",
     tag = "objects",
     params(
@@ -1811,7 +2400,7 @@ pub async fn set_object_tags(
 
 #[utoipa::path(
     get,
-    path = "/api/buckets/{bucket}/tags",
+    path = "/maxio/api/buckets/{bucket}/tags",
     operation_id = "getBucketTags",
     tag = "settings",
     params(("bucket" = String, Path)),
@@ -1844,7 +2433,7 @@ pub async fn get_bucket_tags(
 
 #[utoipa::path(
     put,
-    path = "/api/buckets/{bucket}/tags",
+    path = "/maxio/api/buckets/{bucket}/tags",
     operation_id = "setBucketTags",
     tag = "settings",
     params(("bucket" = String, Path)),
@@ -1888,7 +2477,7 @@ pub struct BucketPolicyResponse {
 
 #[utoipa::path(
     get,
-    path = "/api/buckets/{bucket}/policy",
+    path = "/maxio/api/buckets/{bucket}/policy",
     operation_id = "getBucketPolicy",
     tag = "settings",
     params(("bucket" = String, Path)),
@@ -1928,7 +2517,7 @@ pub struct RestoreVersionResponse {
 
 #[utoipa::path(
     post,
-    path = "/api/buckets/{bucket}/versions/{versionId}/restore/{key}",
+    path = "/maxio/api/buckets/{bucket}/versions/{versionId}/restore/{key}",
     operation_id = "restoreVersion",
     tag = "versions",
     params(
@@ -2019,7 +2608,7 @@ pub struct LifecycleConfigBody {
 
 #[utoipa::path(
     get,
-    path = "/api/buckets/{bucket}/lifecycle",
+    path = "/maxio/api/buckets/{bucket}/lifecycle",
     operation_id = "getBucketLifecycle",
     tag = "settings",
     params(("bucket" = String, Path)),
@@ -2052,7 +2641,7 @@ pub async fn get_bucket_lifecycle_api(
 
 #[utoipa::path(
     put,
-    path = "/api/buckets/{bucket}/lifecycle",
+    path = "/maxio/api/buckets/{bucket}/lifecycle",
     operation_id = "setBucketLifecycle",
     tag = "settings",
     params(("bucket" = String, Path)),
@@ -2099,6 +2688,7 @@ pub fn console_router(state: AppState) -> Router<AppState> {
         .layer(json_body_limit);
 
     let protected_limited = Router::new()
+        .route("/version", get(server_version))
         .route("/auth/logout", post(logout))
         .route("/auth/capabilities", get(capabilities))
         .route("/buckets", get(list_buckets))
@@ -2162,7 +2752,18 @@ pub fn console_router(state: AppState) -> Router<AppState> {
             console_auth_middleware,
         ));
 
-    public.merge(protected)
+    public
+        .merge(protected)
+        .layer(axum::middleware::from_fn(console_no_store))
+}
+
+async fn console_no_store(request: Request, next: Next) -> Response {
+    let mut response = next.run(request).await;
+    response.headers_mut().insert(
+        axum::http::header::CACHE_CONTROL,
+        axum::http::HeaderValue::from_static("no-store"),
+    );
+    response
 }
 
 #[cfg(test)]
@@ -2348,5 +2949,202 @@ mod tests {
         let public_host = header_map(&[("host", "storage.example.com")]);
         assert!(!console_cookie_secure(&insecure, &public_host));
         assert!(!console_cookie_secure(&opted_out, &public_host));
+    }
+
+    fn revocation_path(dir: &std::path::Path) -> std::path::PathBuf {
+        dir.join(".maxio-revoked-sessions.json")
+    }
+
+    fn marker_path(dir: &std::path::Path) -> std::path::PathBuf {
+        dir.join(".maxio-revoked-sessions.ready")
+    }
+
+    #[test]
+    fn revocation_warnings_name_the_fail_closed_epoch() {
+        let path = std::path::Path::new("/data/.maxio-revoked-sessions.json");
+        let marker = std::path::Path::new("/data/.maxio-revoked-sessions.ready");
+        let corrupt = revocation_fail_closed_warning(path, "corrupt (expected value)");
+        assert!(corrupt.contains("Failing closed"), "{corrupt}");
+        assert!(corrupt.contains("issued at or before"), "{corrupt}");
+        assert!(corrupt.contains(path.to_str().unwrap()), "{corrupt}");
+        let deleted = revocation_deleted_warning(path, marker);
+        assert!(deleted.contains("Failing closed"), "{deleted}");
+        assert!(deleted.contains("already had a session store"), "{deleted}");
+        assert!(deleted.contains(marker.to_str().unwrap()), "{deleted}");
+    }
+
+    #[tokio::test]
+    async fn first_open_writes_an_empty_store_and_does_not_revoke() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = RevokedSessions::open(temp.path()).await;
+        assert!(store.session_epoch().is_none());
+        assert!(revocation_path(temp.path()).is_file());
+        assert!(marker_path(temp.path()).is_file());
+        let raw = std::fs::read_to_string(revocation_path(temp.path())).unwrap();
+        let file: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert!(file["entries"].as_array().unwrap().is_empty(), "{raw}");
+        assert!(file.get("not_before").is_none(), "{raw}");
+        let now = chrono::Utc::now().timestamp();
+        assert!(!store.rejects(now - 60, "never-issued"));
+
+        let again = RevokedSessions::open(temp.path()).await;
+        assert!(again.session_epoch().is_none());
+        assert!(!again.rejects(now - 60, "never-issued"));
+    }
+
+    #[tokio::test]
+    async fn deleted_revocation_file_fails_closed_and_keeps_the_epoch() {
+        let temp = tempfile::tempdir().unwrap();
+        RevokedSessions::open(temp.path()).await;
+        std::fs::remove_file(revocation_path(temp.path())).unwrap();
+        assert!(marker_path(temp.path()).is_file());
+
+        let closed = RevokedSessions::open(temp.path()).await;
+        let epoch = closed
+            .session_epoch()
+            .expect("deleted file must set an epoch");
+        assert!(closed.rejects(epoch, "old-session"));
+        assert!(closed.rejects(epoch - 10, "older-session"));
+        assert!(!closed.rejects(epoch + 2, "fresh-session"));
+        let saved: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(revocation_path(temp.path())).unwrap())
+                .unwrap();
+        assert_eq!(saved["not_before"], epoch);
+
+        let reloaded = RevokedSessions::open(temp.path()).await;
+        assert_eq!(reloaded.session_epoch(), Some(epoch));
+        assert!(reloaded.rejects(epoch, "old-session"));
+        assert!(!reloaded.rejects(epoch + 2, "fresh-session"));
+    }
+
+    #[tokio::test]
+    async fn corrupt_or_directory_revocation_file_fails_closed() {
+        let temp = tempfile::tempdir().unwrap();
+        RevokedSessions::open(temp.path()).await;
+        std::fs::write(revocation_path(temp.path()), b"{not-json").unwrap();
+        let corrupt = RevokedSessions::open(temp.path()).await;
+        let epoch = corrupt
+            .session_epoch()
+            .expect("corrupt file must set an epoch");
+        assert!(corrupt.rejects(epoch, "any"));
+        assert!(!corrupt.rejects(epoch + 5, "later"));
+
+        let blocked = tempfile::tempdir().unwrap();
+        RevokedSessions::open(blocked.path()).await;
+        std::fs::remove_file(revocation_path(blocked.path())).unwrap();
+        std::fs::create_dir(revocation_path(blocked.path())).unwrap();
+        let dir_store = RevokedSessions::open(blocked.path()).await;
+        let dir_epoch = dir_store
+            .session_epoch()
+            .expect("directory must set an epoch");
+        assert!(dir_store.rejects(dir_epoch, "any"));
+        let err = dir_store.revoke("logged-out", dir_epoch + 10_000).await;
+        assert!(err.is_err(), "replacing a directory must fail the write");
+        assert!(
+            dir_store.rejects(dir_epoch + 5, "logged-out"),
+            "the logout stays revoked in memory"
+        );
+        assert!(!dir_store.rejects(dir_epoch + 5, "other-session"));
+    }
+
+    #[tokio::test]
+    async fn legacy_revocation_file_without_epoch_still_loads() {
+        let temp = tempfile::tempdir().unwrap();
+        let future = chrono::Utc::now().timestamp() + 86_400;
+        std::fs::write(
+            revocation_path(temp.path()),
+            format!(r#"{{"entries":[{{"jti":"old","expires_at":{future}}}]}}"#),
+        )
+        .unwrap();
+        let store = RevokedSessions::open(temp.path()).await;
+        assert!(store.session_epoch().is_none());
+        assert!(store.rejects(1, "old"));
+        assert!(!store.rejects(1, "new"));
+        assert!(marker_path(temp.path()).is_file());
+    }
+
+    #[test]
+    fn session_cookies_are_all_collected() {
+        let headers = header_map(&[(
+            "cookie",
+            "maxio_session=old-path; other=1; maxio_session=new-path",
+        )]);
+        assert_eq!(
+            extract_session_cookies(&headers),
+            vec!["old-path".to_string(), "new-path".to_string()]
+        );
+    }
+
+    #[test]
+    fn cleared_cookies_cover_the_legacy_root_path() {
+        let mut headers = HeaderMap::new();
+        append_cleared_session_cookies(&mut headers, false);
+        let values: Vec<String> = headers
+            .get_all("set-cookie")
+            .iter()
+            .map(|value| value.to_str().unwrap().to_string())
+            .collect();
+        let path = |header: &str| {
+            header
+                .split(';')
+                .map(str::trim)
+                .find_map(|part| part.strip_prefix("Path="))
+                .unwrap()
+                .to_string()
+        };
+        assert!(values.iter().any(|header| path(header) == "/maxio"));
+        assert!(values.iter().any(|header| path(header) == "/"));
+        assert!(values.iter().all(|header| header.contains("Max-Age=0")));
+    }
+
+    #[test]
+    fn login_limit_counts_failures_per_access_key_and_ignores_untrusted_forwarding() {
+        let limiter = LoginRateLimiter::new();
+        let peer: std::net::SocketAddr = "203.0.113.8:443".parse().unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert("x-forwarded-for", "198.51.100.4".parse().unwrap());
+        assert_eq!(limiter.client_ip(&headers, &peer), "203.0.113.8");
+        for _ in 0..10 {
+            limiter.record_failure("203.0.113.8", "alice");
+        }
+        assert!(limiter.is_blocked("203.0.113.8", "alice").is_some());
+        assert!(limiter.is_blocked("203.0.113.8", "bob").is_none());
+        limiter.clear("203.0.113.8", "alice");
+        assert!(limiter.is_blocked("203.0.113.8", "alice").is_none());
+        let long_key = "k".repeat(1000);
+        limiter.record_failure("203.0.113.8", &long_key);
+        assert!(
+            !limiter.stores_raw_access_key(&long_key),
+            "the access key must be hashed before it is stored"
+        );
+        for n in 0..RATE_LIMIT_MAX_ENTRIES + 50 {
+            limiter.record_failure("203.0.113.9", &format!("user-{n}"));
+        }
+        assert!(limiter.entry_count() <= RATE_LIMIT_MAX_ENTRIES);
+        let ip_cap = LoginRateLimiter::new();
+        for n in 0..5 {
+            for _ in 0..10 {
+                ip_cap.record_failure("198.51.100.9", &format!("rotating-{n}"));
+            }
+        }
+        assert!(
+            ip_cap.is_blocked("198.51.100.9", "brand-new").is_some(),
+            "rotating access keys must not reset the per-IP failure cap"
+        );
+
+        let trusted = LoginRateLimiter::from_trusted("10.0.0.0/8,127.0.0.1").unwrap();
+        let proxy: std::net::SocketAddr = "10.1.2.3:9000".parse().unwrap();
+        let mut forwarded = HeaderMap::new();
+        forwarded.insert(
+            "x-forwarded-for",
+            "9.9.9.9, 198.51.100.7, 10.1.2.3".parse().unwrap(),
+        );
+        assert_eq!(
+            trusted.client_ip(&forwarded, &proxy),
+            "198.51.100.7",
+            "the rightmost hop that is not a trusted proxy is the client"
+        );
+        let outsider: std::net::SocketAddr = "192.0.2.9:1".parse().unwrap();
+        assert_eq!(trusted.client_ip(&forwarded, &outsider), "192.0.2.9");
     }
 }

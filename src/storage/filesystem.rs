@@ -254,7 +254,7 @@ fn build_frame_aad(bucket: &str, key: &str, version_id: Option<&str>, chunk_inde
 
 /// Build an `AadBuilder` closure for object frames. Captures the identifiers so
 /// the frame writer/reader can produce per-chunk AAD on demand.
-fn object_aad_builder(bucket: &str, key: &str, version_id: Option<&str>) -> AadBuilder {
+pub(crate) fn object_aad_builder(bucket: &str, key: &str, version_id: Option<&str>) -> AadBuilder {
     let bucket = bucket.to_string();
     let key = key.to_string();
     let version_id = version_id.map(|v| v.to_string());
@@ -356,6 +356,12 @@ fn compute_sidecar_mac(dek: &[u8; 32], meta: &ObjectMeta) -> Result<String, Stor
 
 /// Verify the stored `sidecar_mac` against a freshly computed MAC. Used by the
 /// read path before any ciphertext is decrypted.
+pub(crate) fn sidecar_mac_error(meta: &ObjectMeta, dek: &[u8; 32]) -> Option<String> {
+    verify_sidecar_mac(meta, dek)
+        .err()
+        .map(|err| err.to_string())
+}
+
 fn verify_sidecar_mac(meta: &ObjectMeta, dek: &[u8; 32]) -> Result<(), StorageError> {
     let enc = meta
         .encryption
@@ -432,6 +438,10 @@ impl FilesystemStorage {
         let legacy = find_legacy_reserved_keys(&storage.buckets_dir).await;
         if !legacy.is_empty() {
             return Err(anyhow::anyhow!(format_legacy_reserved_error(&legacy)));
+        }
+        let reserved = reserved_buckets_present(&storage.buckets_dir).await;
+        if !reserved.is_empty() {
+            return Err(anyhow::anyhow!(reserved_bucket_error(&reserved)));
         }
         // Nothing is in flight during construction, so crash leftovers (temp
         // files, stranded EC backups, half-finished key promotions, upload
@@ -864,6 +874,7 @@ impl FilesystemStorage {
         let file = fs::File::create(&tmp_obj_path).await?;
         let mut writer = BufWriter::with_capacity(IO_BUFFER_SIZE, file);
         let mut hasher = Md5::new();
+        let mut stored_hash = Sha256::new();
         let mut checksum_hasher = checksum
             .as_ref()
             .map(|(algo, _)| ChecksumHasher::new(*algo));
@@ -886,6 +897,7 @@ impl FilesystemStorage {
                             chunk_index,
                             &frame_buf,
                             &aad,
+                            &mut stored_hash,
                         )
                         .await?;
                     }
@@ -910,11 +922,13 @@ impl FilesystemStorage {
                         chunk_index,
                         &frame_data,
                         &aad,
+                        &mut stored_hash,
                     )
                     .await?;
                     chunk_index += 1;
                 }
             } else {
+                stored_hash.update(&buf[..n]);
                 writer.write_all(&buf[..n]).await?;
             }
         }
@@ -957,6 +971,7 @@ impl FilesystemStorage {
             storage_format: None,
             checksum_algorithm,
             checksum_value: checksum_value.clone(),
+            content_sha256: Some(hex::encode(stored_hash.finalize())),
             tags: None,
             part_sizes: None,
             encryption: enc_meta_opt.take(),
@@ -1864,6 +1879,44 @@ pub(crate) async fn find_legacy_reserved_keys(buckets_dir: &Path) -> Vec<LegacyR
     found.sort_by(|a, b| (&a.bucket, &a.key).cmp(&(&b.bucket, &b.key)));
     found.dedup();
     found
+}
+
+/// Bucket directories whose names this version reserves (`maxio`, `ui`).
+pub(crate) async fn reserved_buckets_present(buckets_dir: &Path) -> Vec<&'static str> {
+    let mut found = Vec::new();
+    for name in ["maxio", "ui"] {
+        let path = buckets_dir.join(name);
+        if matches!(tokio::fs::metadata(&path).await, Ok(meta) if meta.is_dir()) {
+            found.push(name);
+        }
+    }
+    found
+}
+
+pub(crate) fn reserved_bucket_error(names: &[&str]) -> String {
+    let listed = match names {
+        [name] => format!("a bucket named \"{name}\""),
+        _ => {
+            let quoted: Vec<String> = names.iter().map(|name| format!("\"{name}\"")).collect();
+            format!("buckets named {}", join_or(&quoted))
+        }
+    };
+    format!(
+        "refusing to start: this data directory contains {listed}, which this version of MaxIO reserves.\n\
+         Start the previous MaxIO version on this data directory, move the objects out, and remove the bucket (for example `aws s3 rb`), then start this version."
+    )
+}
+
+fn join_or(items: &[String]) -> String {
+    match items {
+        [] => String::new(),
+        [one] => one.clone(),
+        [first, second] => format!("{first} or {second}"),
+        _ => {
+            let (last, rest) = items.split_last().unwrap();
+            format!("{} or {last}", rest.join(", "))
+        }
+    }
 }
 
 pub(crate) fn format_legacy_reserved_error(keys: &[LegacyReservedKey]) -> String {
@@ -3067,7 +3120,7 @@ impl FilesystemStorage {
         // The lock is released when this method returns; streaming continues
         // on the already-open handle.
         let _key_guard = self.key_lock(bucket, key).await;
-        let meta = self.read_object_meta(bucket, key).await?;
+        let mut meta = self.read_object_meta(bucket, key).await?;
         reject_sse_c_on_plaintext(&meta, customer_key.is_some())?;
         let ec_dir = self.ec_dir(bucket, key);
         if Self::is_chunked_path(&ec_dir).await {
@@ -3114,6 +3167,13 @@ impl FilesystemStorage {
                 aad_builder,
             );
             return Ok((Box::pin(decryptor), meta));
+        }
+        // A sidecar size smaller than the file makes GET advertise a short
+        // Content-Length and drop the tail. The file is the plain object.
+        if let Ok(len) = fs::metadata(&obj_path).await.map(|m| m.len()) {
+            if len > meta.size {
+                meta.size = len;
+            }
         }
         if meta.size <= SMALL_OBJECT_THRESHOLD {
             let data = fs::read(&obj_path).await.map_err(|e| {
@@ -3476,6 +3536,7 @@ impl FilesystemStorage {
         let file = fs::File::create(&tmp_part_path).await?;
         let mut writer = BufWriter::with_capacity(IO_BUFFER_SIZE, file);
         let mut hasher = Md5::new();
+        let mut stored_hash = Sha256::new();
         let mut checksum_hasher = checksum
             .as_ref()
             .map(|(algo, _)| ChecksumHasher::new(*algo));
@@ -3497,6 +3558,7 @@ impl FilesystemStorage {
                             chunk_index,
                             &frame_buf,
                             &aad,
+                            &mut stored_hash,
                         )
                         .await?;
                     }
@@ -3521,6 +3583,7 @@ impl FilesystemStorage {
                         chunk_index,
                         &frame_data,
                         &aad,
+                        &mut stored_hash,
                     )
                     .await?;
                     chunk_index += 1;
@@ -3802,6 +3865,10 @@ impl FilesystemStorage {
         let mut writer = BufWriter::with_capacity(IO_BUFFER_SIZE, out);
         let mut total_size = 0u64;
         let mut etag_hasher = Md5::new();
+        let mut stored_hash = Sha256::new();
+        let mut full_object_checksum = (upload_meta.checksum_algorithm
+            == Some(ChecksumAlgorithm::CRC64NVME))
+        .then(|| ChecksumHasher::new(ChecksumAlgorithm::CRC64NVME));
         let mut buf = vec![0u8; IO_BUFFER_SIZE];
         let mut frame_buf: Vec<u8> = Vec::with_capacity(FRAME_CHUNK_SIZE);
         let mut chunk_index: u64 = 0;
@@ -3838,6 +3905,9 @@ impl FilesystemStorage {
                 part_md5.update(&buf[..n]);
                 part_bytes += n as u64;
                 total_size += n as u64;
+                if let Some(hasher) = full_object_checksum.as_mut() {
+                    hasher.update(&buf[..n]);
+                }
                 if let Some(ref cipher) = cipher_opt {
                     frame_buf.extend_from_slice(&buf[..n]);
                     while frame_buf.len() >= FRAME_CHUNK_SIZE {
@@ -3855,11 +3925,13 @@ impl FilesystemStorage {
                             chunk_index,
                             &frame_data,
                             &aad,
+                            &mut stored_hash,
                         )
                         .await?;
                         chunk_index += 1;
                     }
                 } else {
+                    stored_hash.update(&buf[..n]);
                     writer.write_all(&buf[..n]).await?;
                 }
             }
@@ -3885,6 +3957,7 @@ impl FilesystemStorage {
                     chunk_index,
                     &frame_buf,
                     &aad,
+                    &mut stored_hash,
                 )
                 .await?;
             }
@@ -3897,9 +3970,15 @@ impl FilesystemStorage {
             selected.len()
         );
 
-        // Compute composite checksum if algorithm was specified
+        // CRC64NVME is a full-object checksum. The other algorithms are a
+        // composite of the per-part checksums (`<digest>-<part count>`).
         let (checksum_algorithm, checksum_value) =
-            if let Some(algo) = upload_meta.checksum_algorithm {
+            if upload_meta.checksum_algorithm == Some(ChecksumAlgorithm::CRC64NVME) {
+                (
+                    Some(ChecksumAlgorithm::CRC64NVME),
+                    full_object_checksum.map(|hasher| hasher.finalize_base64()),
+                )
+            } else if let Some(algo) = upload_meta.checksum_algorithm {
                 let b64 = base64::engine::general_purpose::STANDARD;
                 let mut raw_checksums = Vec::new();
                 for part in &selected {
@@ -3936,10 +4015,12 @@ impl FilesystemStorage {
             storage_format: None,
             checksum_algorithm,
             checksum_value: checksum_value.clone(),
+            content_sha256: Some(hex::encode(stored_hash.finalize())),
             tags: upload_meta.tags,
             part_sizes: Some(part_sizes),
             encryption: enc_meta_opt,
             metadata: upload_meta.object_metadata,
+            rebuilt_from_bytes: false,
         };
         if let (Some(dek), Some(em)) = (dek_opt.as_ref(), object_meta.encryption.as_mut()) {
             em.sidecar_mac = String::new();
@@ -5507,7 +5588,7 @@ impl FilesystemStorage {
                 StorageError::Io(e)
             }
         })?;
-        let meta: ObjectMeta = serde_json::from_str(&data)?;
+        let mut meta: ObjectMeta = serde_json::from_str(&data)?;
 
         if meta.is_delete_marker {
             return Err(StorageError::NotFound(key.to_string()));
@@ -5583,6 +5664,11 @@ impl FilesystemStorage {
                 StorageError::Io(e)
             }
         })?;
+        if let Ok(len) = file.metadata().await.map(|m| m.len()) {
+            if len > meta.size {
+                meta.size = len;
+            }
+        }
         Ok((
             Box::pin(BufReader::with_capacity(IO_BUFFER_SIZE, file)),
             meta,
@@ -5760,6 +5846,7 @@ async fn write_encrypted_frame(
     chunk_index: u64,
     plaintext: &[u8],
     aad: &[u8],
+    stored_hash: &mut Sha256,
 ) -> Result<(), StorageError> {
     let nonce_bytes = make_frame_nonce(nonce_prefix, chunk_index)?;
     let nonce = Nonce::from_slice(&nonce_bytes);
@@ -5772,6 +5859,8 @@ async fn write_encrypted_frame(
             },
         )
         .map_err(|_| StorageError::EncryptionError("frame encryption failed".into()))?;
+    stored_hash.update(&nonce_bytes);
+    stored_hash.update(&ciphertext);
     writer.write_all(&nonce_bytes).await?;
     writer.write_all(&ciphertext).await?;
     Ok(())

@@ -1,4 +1,4 @@
-//! JSON admin API for the web console (`/api/iam/*`).
+//! JSON admin API for the web console (`/maxio/api/iam/*`).
 //!
 //! Root, and any principal whose policies allow the matching `iam:*` action,
 //! may call these routes. Secrets are returned only from the create-key
@@ -281,7 +281,7 @@ fn scope_or_document(
 
 #[utoipa::path(
     get,
-    path = "/api/iam/users",
+    path = "/maxio/api/iam/users",
     operation_id = "listIamUsers",
     tag = "iam",
     responses((status = 200, body = UserListResponse), (status = 403, body = ErrorBody))
@@ -305,7 +305,7 @@ pub async fn list_users(State(state): State<AppState>) -> Response {
 
 #[utoipa::path(
     post,
-    path = "/api/iam/users",
+    path = "/maxio/api/iam/users",
     operation_id = "createIamUser",
     tag = "iam",
     request_body = CreateUserBody,
@@ -330,7 +330,7 @@ pub async fn create_user(
 
 #[utoipa::path(
     get,
-    path = "/api/iam/users/{name}",
+    path = "/maxio/api/iam/users/{name}",
     operation_id = "getIamUser",
     tag = "iam",
     params(("name" = String, Path)),
@@ -349,7 +349,7 @@ pub async fn get_user(State(state): State<AppState>, Path(name): Path<String>) -
 
 #[utoipa::path(
     delete,
-    path = "/api/iam/users/{name}",
+    path = "/maxio/api/iam/users/{name}",
     operation_id = "deleteIamUser",
     tag = "iam",
     params(("name" = String, Path)),
@@ -368,7 +368,7 @@ pub async fn delete_user(State(state): State<AppState>, Path(name): Path<String>
 
 #[utoipa::path(
     put,
-    path = "/api/iam/users/{name}/status",
+    path = "/maxio/api/iam/users/{name}/status",
     operation_id = "setIamUserStatus",
     tag = "iam",
     params(("name" = String, Path)),
@@ -396,7 +396,7 @@ pub async fn set_user_status(
 
 #[utoipa::path(
     get,
-    path = "/api/iam/users/{name}/keys",
+    path = "/maxio/api/iam/users/{name}/keys",
     operation_id = "listAccessKeys",
     tag = "iam",
     params(("name" = String, Path)),
@@ -421,7 +421,7 @@ pub async fn list_keys(State(state): State<AppState>, Path(name): Path<String>) 
 
 #[utoipa::path(
     post,
-    path = "/api/iam/users/{name}/keys",
+    path = "/maxio/api/iam/users/{name}/keys",
     operation_id = "createAccessKey",
     tag = "iam",
     params(("name" = String, Path)),
@@ -471,7 +471,7 @@ pub async fn create_key(
 
 #[utoipa::path(
     put,
-    path = "/api/iam/users/{name}/keys/{id}",
+    path = "/maxio/api/iam/users/{name}/keys/{id}",
     operation_id = "setAccessKeyStatus",
     tag = "iam",
     params(("name" = String, Path), ("id" = String, Path)),
@@ -499,7 +499,7 @@ pub async fn set_key_status(
 
 #[utoipa::path(
     delete,
-    path = "/api/iam/users/{name}/keys/{id}",
+    path = "/maxio/api/iam/users/{name}/keys/{id}",
     operation_id = "deleteAccessKey",
     tag = "iam",
     params(("name" = String, Path), ("id" = String, Path)),
@@ -521,7 +521,7 @@ pub async fn delete_key(
 
 #[utoipa::path(
     get,
-    path = "/api/iam/service-keys",
+    path = "/maxio/api/iam/service-keys",
     operation_id = "listServiceKeys",
     tag = "iam",
     responses((status = 200, body = KeyListResponse))
@@ -543,7 +543,7 @@ pub async fn list_service_keys(State(state): State<AppState>) -> Response {
 
 #[utoipa::path(
     post,
-    path = "/api/iam/service-keys",
+    path = "/maxio/api/iam/service-keys",
     operation_id = "createServiceKey",
     tag = "iam",
     request_body = ServiceKeyBody,
@@ -591,7 +591,7 @@ pub async fn create_service_key(
 
 #[utoipa::path(
     put,
-    path = "/api/iam/service-keys/{id}",
+    path = "/maxio/api/iam/service-keys/{id}",
     operation_id = "setServiceKeyStatus",
     tag = "iam",
     params(("id" = String, Path)),
@@ -619,7 +619,7 @@ pub async fn set_service_key_status(
 
 #[utoipa::path(
     delete,
-    path = "/api/iam/service-keys/{id}",
+    path = "/maxio/api/iam/service-keys/{id}",
     operation_id = "deleteServiceKey",
     tag = "iam",
     params(("id" = String, Path)),
@@ -638,7 +638,7 @@ pub async fn delete_service_key(State(state): State<AppState>, Path(id): Path<St
 
 #[utoipa::path(
     get,
-    path = "/api/iam/policies",
+    path = "/maxio/api/iam/policies",
     operation_id = "listIamPolicies",
     tag = "iam",
     responses((status = 200, body = PolicyListResponse))
@@ -662,7 +662,7 @@ pub async fn list_policies(State(state): State<AppState>) -> Response {
 
 #[utoipa::path(
     post,
-    path = "/api/iam/policies",
+    path = "/maxio/api/iam/policies",
     operation_id = "createIamPolicy",
     tag = "iam",
     request_body = PolicyWriteBody,
@@ -692,7 +692,7 @@ pub async fn create_policy(
 
 #[utoipa::path(
     get,
-    path = "/api/iam/policies/{name}",
+    path = "/maxio/api/iam/policies/{name}",
     operation_id = "getIamPolicy",
     tag = "iam",
     params(("name" = String, Path)),
@@ -711,7 +711,7 @@ pub async fn get_policy(State(state): State<AppState>, Path(name): Path<String>)
 
 #[utoipa::path(
     put,
-    path = "/api/iam/policies/{name}",
+    path = "/maxio/api/iam/policies/{name}",
     operation_id = "updateIamPolicy",
     tag = "iam",
     params(("name" = String, Path)),
@@ -743,7 +743,7 @@ pub async fn update_policy(
 
 #[utoipa::path(
     delete,
-    path = "/api/iam/policies/{name}",
+    path = "/maxio/api/iam/policies/{name}",
     operation_id = "deleteIamPolicy",
     tag = "iam",
     params(("name" = String, Path)),
@@ -762,7 +762,7 @@ pub async fn delete_policy(State(state): State<AppState>, Path(name): Path<Strin
 
 #[utoipa::path(
     post,
-    path = "/api/iam/users/{name}/policies",
+    path = "/maxio/api/iam/users/{name}/policies",
     operation_id = "attachUserPolicy",
     tag = "iam",
     params(("name" = String, Path)),
@@ -786,7 +786,7 @@ pub async fn attach_policy(
 
 #[utoipa::path(
     delete,
-    path = "/api/iam/users/{name}/policies/{policy}",
+    path = "/maxio/api/iam/users/{name}/policies/{policy}",
     operation_id = "detachUserPolicy",
     tag = "iam",
     params(("name" = String, Path), ("policy" = String, Path)),
@@ -808,7 +808,7 @@ pub async fn detach_policy(
 
 #[utoipa::path(
     put,
-    path = "/api/iam/users/{name}/inline/{policy}",
+    path = "/maxio/api/iam/users/{name}/inline/{policy}",
     operation_id = "putInlineUserPolicy",
     tag = "iam",
     params(("name" = String, Path), ("policy" = String, Path)),
@@ -836,7 +836,7 @@ pub async fn put_inline(
 
 #[utoipa::path(
     delete,
-    path = "/api/iam/users/{name}/inline/{policy}",
+    path = "/maxio/api/iam/users/{name}/inline/{policy}",
     operation_id = "deleteInlineUserPolicy",
     tag = "iam",
     params(("name" = String, Path), ("policy" = String, Path)),
@@ -858,7 +858,7 @@ pub async fn delete_inline(
 
 #[utoipa::path(
     post,
-    path = "/api/iam/preview",
+    path = "/maxio/api/iam/preview",
     operation_id = "previewIamPolicy",
     tag = "iam",
     request_body = PreviewBody,
@@ -888,7 +888,7 @@ pub async fn preview_policy(
 
 #[utoipa::path(
     post,
-    path = "/api/iam/validate",
+    path = "/maxio/api/iam/validate",
     operation_id = "validateIamPolicy",
     tag = "iam",
     request_body = DocumentBody,

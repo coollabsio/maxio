@@ -3,15 +3,15 @@ use http::{HeaderMap, HeaderValue, Method, StatusCode};
 
 use crate::{server::AppState, storage::CorsRule};
 
-/// Extract bucket name from the request path.
-/// Returns None for /api/*, /ui/*, and root /.
+/// Extract bucket name from an S3 request path.
+/// Returns None for `/` and an empty first segment. `api` and `ui` are buckets.
 fn extract_bucket_from_path(path: &str) -> Option<&str> {
     let path = path.strip_prefix('/')?;
     if path.is_empty() {
         return None;
     }
     let bucket = path.split('/').next()?;
-    if bucket.is_empty() || bucket == "api" || bucket == "ui" {
+    if bucket.is_empty() {
         return None;
     }
     Some(bucket)
@@ -187,8 +187,12 @@ mod tests {
             Some("my-bucket")
         );
         assert_eq!(extract_bucket_from_path("/"), None);
-        assert_eq!(extract_bucket_from_path("/api/buckets"), None);
-        assert_eq!(extract_bucket_from_path("/ui/index.html"), None);
+        assert_eq!(extract_bucket_from_path("/api/note.txt"), Some("api"));
+        assert_eq!(extract_bucket_from_path("/ui/index.html"), Some("ui"));
+        assert_eq!(
+            extract_bucket_from_path("/maxio/api/version"),
+            Some("maxio")
+        );
     }
 
     #[test]

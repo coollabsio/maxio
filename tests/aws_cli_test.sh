@@ -134,6 +134,136 @@ echo "Server: localhost:$PORT"
 echo "Data dir: $DATA_DIR"
 echo ""
 
+json_field() {
+    local json="$1" field="$2"
+    printf '%s' "$json" | python3 -c 'import json,sys
+raw = sys.stdin.read()
+try:
+    value = json.loads(raw).get(sys.argv[1], "")
+except Exception:
+    value = ""
+print(value)
+' "$field"
+}
+
+# Quick image/binary smoke: version endpoints, on-disk format marker, and one
+# aws + mc round trip. Set MAXIO_SMOKE=1. The full suite below is unchanged.
+if [ "${MAXIO_SMOKE:-0}" = "1" ]; then
+    echo "=== smoke mode ==="
+    HEALTH=$(curl -fsS "$ENDPOINT/maxio/health/live" || true)
+    HEALTH_STATUS=$(json_field "$HEALTH" status)
+    HEALTH_VERSION=$(json_field "$HEALTH" version)
+    assert_eq "live health status is ok" "ok" "$HEALTH_STATUS"
+    assert_eq "live health has no version" "" "$HEALTH_VERSION"
+    VER_CODE=$(curl -sS -o "$TMPDIR/api-version" -w '%{http_code}' "$ENDPOINT/maxio/api/version" || echo "000")
+    assert_eq "unauthenticated /maxio/api/version is denied" "401" "$VER_CODE"
+
+    if [ -n "${MAXIO_BIN:-}" ] && [ -x "${MAXIO_BIN}" ]; then
+        BIN_VERSION=$("${MAXIO_BIN}" --version | awk '{print $NF}')
+        assert_eq "maxio --version is not empty" "true" "$([ -n "$BIN_VERSION" ] && echo true || echo false)"
+    fi
+
+    FORMAT_VERSION=$(python3 -c 'import json,sys
+try:
+    with open(sys.argv[1]) as fh:
+        print(json.load(fh).get("version", ""))
+except Exception:
+    print("")
+' "$DATA_DIR/.maxio-format")
+    assert_eq "on-disk format marker is version 2" "2" "$FORMAT_VERSION"
+
+    SMOKE_BUCKET="smoke-bucket-$$"
+    echo "hello maxio" > "$TMPDIR/smoke.txt"
+    assert "smoke create bucket" $AWS s3 mb "s3://$SMOKE_BUCKET"
+    assert "smoke upload object" $AWS s3 cp "$TMPDIR/smoke.txt" "s3://$SMOKE_BUCKET/smoke.txt"
+    assert "smoke download object" $AWS s3 cp "s3://$SMOKE_BUCKET/smoke.txt" "$TMPDIR/smoke-down.txt"
+    assert_eq "smoke object body" "hello maxio" "$(cat "$TMPDIR/smoke-down.txt")"
+
+    MC_ALIAS="maxiosmoke$$"
+    assert "smoke mc alias" mc alias set "$MC_ALIAS" "$ENDPOINT" "$AWS_ACCESS_KEY_ID" "$AWS_SECRET_ACCESS_KEY"
+    MC_BODY=$(mc cat "$MC_ALIAS/$SMOKE_BUCKET/smoke.txt" 2>/dev/null || true)
+    assert_eq "smoke mc cat" "hello maxio" "$MC_BODY"
+    mc alias rm "$MC_ALIAS" > /dev/null 2>&1 || true
+    $AWS s3 rm "s3://$SMOKE_BUCKET/smoke.txt" > /dev/null 2>&1 || true
+    $AWS s3 rb "s3://$SMOKE_BUCKET" > /dev/null 2>&1 || true
+
+    echo ""
+    echo "=== Results: $PASS passed, $FAIL failed ==="
+    [ "$FAIL" -eq 0 ] && exit 0 || exit 1
+fi
+
+# Service health does not use /healthz or /version, so those names are buckets.
+echo ""
+echo "--- Buckets named version, healthz, api, and ui (path-style) ---"
+LIVE_BODY=$(curl -fsS "$ENDPOINT/maxio/health/live" || true)
+assert_eq "GET /maxio/health/live status" "ok" "$(json_field "$LIVE_BODY" status)"
+assert_eq "GET /maxio/health/live has no version" "" "$(json_field "$LIVE_BODY" version)"
+LIVE_HEAD=$(curl -sS -o /dev/null -X HEAD -w '%{http_code}' "$ENDPOINT/maxio/health/live" || true)
+assert_eq "HEAD /maxio/health/live is 200" "200" "$LIVE_HEAD"
+READY_BODY=$(curl -fsS "$ENDPOINT/maxio/health/ready" || true)
+assert_eq "GET /maxio/health/ready status" "ok" "$(json_field "$READY_BODY" status)"
+assert_eq "GET /maxio/health/ready has no version" "" "$(json_field "$READY_BODY" version)"
+VER_CODE=$(curl -sS -o "$TMPDIR/unauth-version" -w '%{http_code}' "$ENDPOINT/maxio/api/version" || echo "000")
+assert_eq "unauthenticated /maxio/api/version is denied" "401" "$VER_CODE"
+curl -sS -c "$TMPDIR/version.cookies" -H 'content-type: application/json' \
+    -d "{\"accessKey\":\"$MAXIO_TEST_ACCESS_KEY\",\"secretKey\":\"$MAXIO_TEST_SECRET_KEY\"}" \
+    -D "$TMPDIR/version.headers" \
+    "$ENDPOINT/maxio/api/auth/login" > /dev/null
+assert_eq "session cookie path is /maxio" "true" \
+    "$(grep -q 'Path=/maxio' "$TMPDIR/version.headers" && echo true || echo false)"
+AUTH_VER=$(curl -sS -b "$TMPDIR/version.cookies" "$ENDPOINT/maxio/api/version" || true)
+assert_eq "authenticated /maxio/api/version" "true" \
+    "$([ -n "$(json_field "$AUTH_VER" version)" ] && echo true || echo false)"
+OLD_API=$(curl -sS -o "$TMPDIR/old-api-version" -w '%{http_code}' "$ENDPOINT/api/version" || echo "000")
+assert_eq "old /api/version is not the console" "true" \
+    "$([ "$OLD_API" != "401" ] && ! grep -q 'Not authenticated' "$TMPDIR/old-api-version" && echo true || echo false)"
+MAXIO_CREATE=$($AWS s3api create-bucket --bucket maxio 2>&1 || true)
+assert_eq "create bucket maxio is InvalidBucketName" "true" \
+    "$(echo "$MAXIO_CREATE" | grep -q InvalidBucketName && echo true || echo false)"
+UI_CREATE=$($AWS s3api create-bucket --bucket ui 2>&1 || true)
+assert_eq "create bucket ui is InvalidBucketName" "true" \
+    "$(echo "$UI_CREATE" | grep -q InvalidBucketName && echo true || echo false)"
+UI_PAGE=$(curl -sS -o "$TMPDIR/ui-page" -w '%{http_code}' "$ENDPOINT/ui/" || true)
+UI_PAGE_OK=false
+if { [ "$UI_PAGE" = "200" ] || [ "$UI_PAGE" = "503" ]; } \
+    && ! grep -q '<Code>' "$TMPDIR/ui-page"; then
+    UI_PAGE_OK=true
+fi
+assert_eq "unsigned GET /ui/ is the console" "true" "$UI_PAGE_OK"
+UI_DEEP=$(curl -sS -o "$TMPDIR/ui-deep" -w '%{http_code}' "$ENDPOINT/ui/buckets/photos?prefix=2026%2F" || true)
+UI_DEEP_OK=false
+if { [ "$UI_DEEP" = "200" ] || [ "$UI_DEEP" = "503" ]; } \
+    && ! grep -q '<Code>' "$TMPDIR/ui-deep" \
+    && ! grep -q 'Missing Authorization' "$TMPDIR/ui-deep"; then
+    UI_DEEP_OK=true
+fi
+assert_eq "unsigned GET /ui/buckets/photos?prefix= is the console" "true" "$UI_DEEP_OK"
+if [ "$UI_PAGE" = "200" ]; then
+    assert_eq "console html references the favicon under /ui/" "true" \
+        "$(grep -q '/ui/favicon-32.png' "$TMPDIR/ui-page" && ! grep -q 'href="/favicon' "$TMPDIR/ui-page" && echo true || echo false)"
+    curl -sS -D "$TMPDIR/ui-headers" -o /dev/null "$ENDPOINT/ui/" || true
+    assert_eq "console html is not cached" "true" \
+        "$(grep -qi 'cache-control: no-store' "$TMPDIR/ui-headers" && echo true || echo false)"
+fi
+for PROBE_BUCKET in version healthz api readyz; do
+    echo "probe-$PROBE_BUCKET" > "$TMPDIR/probe.txt"
+    assert "create bucket $PROBE_BUCKET" $AWS s3 mb "s3://$PROBE_BUCKET"
+    LIST_OUT=$($AWS s3 ls 2>&1 || true)
+    assert_eq "list-buckets contains $PROBE_BUCKET" "true" \
+        "$(echo "$LIST_OUT" | grep -q "$PROBE_BUCKET" && echo true || echo false)"
+    assert "put object in $PROBE_BUCKET" $AWS s3 cp "$TMPDIR/probe.txt" "s3://$PROBE_BUCKET/note.txt"
+    assert "get object from $PROBE_BUCKET" $AWS s3 cp "s3://$PROBE_BUCKET/note.txt" "$TMPDIR/probe-down.txt"
+    assert_eq "$PROBE_BUCKET object body" "probe-$PROBE_BUCKET" "$(cat "$TMPDIR/probe-down.txt")"
+    OBJ_LIST=$($AWS s3 ls "s3://$PROBE_BUCKET/" 2>&1 || true)
+    assert_eq "list objects in $PROBE_BUCKET" "true" \
+        "$(echo "$OBJ_LIST" | grep -q note.txt && echo true || echo false)"
+    VERS=$($AWS s3api get-bucket-versioning --bucket "$PROBE_BUCKET" 2>&1 || true)
+    assert_eq "$PROBE_BUCKET get-bucket-versioning is not the probe" "true" \
+        "$(echo "$VERS" | grep -q '"status":"ok"' && echo false || echo true)"
+    assert "delete object in $PROBE_BUCKET" $AWS s3 rm "s3://$PROBE_BUCKET/note.txt"
+    assert "delete bucket $PROBE_BUCKET" $AWS s3 rb "s3://$PROBE_BUCKET"
+done
+
 # --- Bucket operations ---
 assert "create bucket" $AWS s3 mb "s3://$BUCKET"
 assert_file_exists "bucket dir exists on disk" "$DATA_DIR/buckets/$BUCKET"
@@ -994,61 +1124,32 @@ else
     YES_COUNT_BEFORE=$(echo "$LIST_BEFORE" | awk 'NR>1 && $3=="yes"{n++} END{print n+0}')
     assert_eq "pre-rotate: exactly 1 active key" "1" "$YES_COUNT_BEFORE"
 
-    # Run the rotate CLI.
+    # The live server holds the data-directory lock, so rotate must refuse
+    # and must not rewrite the keyring.
+    set +e
     ROTATE_OUT=$("$MAXIO_BIN" keyring rotate --data-dir "$DATA_DIR" 2>&1)
-    if echo "$ROTATE_OUT" | grep -q "keyring rotated"; then
-        green "PASS: rotate CLI output contains 'keyring rotated'"
+    ROTATE_STATUS=$?
+    set -e
+    if [ "$ROTATE_STATUS" -ne 0 ] && printf '%s' "$ROTATE_OUT" | grep -q "rotating the keyring"; then
+        green "PASS: rotate refuses while the server holds the data-dir lock"
         PASS=$((PASS + 1))
     else
-        red "FAIL: rotate CLI output missing 'keyring rotated' — got: $ROTATE_OUT"
+        red "FAIL: rotate should refuse while the server is running — status $ROTATE_STATUS: $ROTATE_OUT"
         FAIL=$((FAIL + 1))
     fi
-
-    NEW_KEY_ID=$(echo "$ROTATE_OUT" | grep "new active key id:" | awk '{print $NF}')
-    if [ -n "$NEW_KEY_ID" ] && [ "$NEW_KEY_ID" != "$PRE_KEY_ID" ]; then
-        green "PASS: rotate produced a new distinct key_id $NEW_KEY_ID"
-        PASS=$((PASS + 1))
-    else
-        red "FAIL: rotate key_id=$NEW_KEY_ID vs pre=$PRE_KEY_ID"
-        FAIL=$((FAIL + 1))
-    fi
-
-    # File perms 0600 (Unix only).
-    if [ "$(uname)" != "MINGW"* ] && [ "$(uname)" != "CYGWIN"* ]; then
-        PERMS=$(stat -c '%a' "$KEYRING_FILE" 2>/dev/null || stat -f '%Lp' "$KEYRING_FILE")
-        assert_eq "keyring file perms are 600 after rotate" "600" "$PERMS"
-    fi
-
-    # `keyring list` after: still exactly 1 active, total count is 2.
     LIST_AFTER=$("$MAXIO_BIN" keyring list --data-dir "$DATA_DIR" 2>&1)
     YES_COUNT_AFTER=$(echo "$LIST_AFTER" | awk 'NR>1 && $3=="yes"{n++} END{print n+0}')
-    NO_COUNT_AFTER=$(echo "$LIST_AFTER" | awk 'NR>1 && $3=="no"{n++} END{print n+0}')
-    assert_eq "post-rotate: exactly 1 active key" "1" "$YES_COUNT_AFTER"
-    assert_eq "post-rotate: previous key demoted (1 inactive)" "1" "$NO_COUNT_AFTER"
+    assert_eq "refused rotate leaves exactly 1 active key" "1" "$YES_COUNT_AFTER"
 
-    # Old object remains decryptable via the live server (its in-memory ring
-    # still has the old active key). This verifies that writing a new key to
-    # disk does NOT break the currently-running server's reads.
     $AWS s3api get-object --bucket "$ROT_BUCKET" --key pre.txt \
         "$TMPDIR/pre-out.txt" > /dev/null
     if cmp -s "$TMPDIR/pre.txt" "$TMPDIR/pre-out.txt"; then
-        green "PASS: pre-rotation object still readable from live server after rotate"
+        green "PASS: object still readable after refused rotate"
         PASS=$((PASS + 1))
     else
-        red "FAIL: pre-rotation object corrupted after rotate"
+        red "FAIL: object unreadable after refused rotate"
         FAIL=$((FAIL + 1))
     fi
-
-    # Second rotate → 3 keys total, 1 active.
-    "$MAXIO_BIN" keyring rotate --data-dir "$DATA_DIR" > /dev/null
-    LIST_FINAL=$("$MAXIO_BIN" keyring list --data-dir "$DATA_DIR" 2>&1)
-    TOTAL_FINAL=$(echo "$LIST_FINAL" | awk 'NR>1' | wc -l | tr -d ' ')
-    assert_eq "second rotate: 3 keys total" "3" "$TOTAL_FINAL"
-
-    # NOTE: verifying decryption AFTER a full restart (so the new key becomes
-    # the in-memory active key while the old keys remain for unwrap) is covered
-    # by the Rust integration test `test_keyring_rotate_preserves_old_objects`.
-    # This shell test cannot restart the caller-owned server process.
 
     $AWS s3 rm "s3://$ROT_BUCKET/pre.txt" > /dev/null || true
     assert "delete rotate bucket" $AWS s3api delete-bucket --bucket "$ROT_BUCKET"
@@ -1865,10 +1966,10 @@ assert "prefix put uploads-private object" $AWS s3 cp "$TMPDIR/prefix-sibling.tx
 assert "prefix put uploadsX object" $AWS s3 cp "$TMPDIR/prefix-glued.txt" "s3://$PREFIX_BUCKET/uploadsX.txt"
 curl -sS -c "$TMPDIR/iam.cookies" -H 'content-type: application/json' \
     -d "{\"accessKey\":\"$MAXIO_TEST_ACCESS_KEY\",\"secretKey\":\"$MAXIO_TEST_SECRET_KEY\"}" \
-    "$ENDPOINT/api/auth/login" > /dev/null
+    "$ENDPOINT/maxio/api/auth/login" > /dev/null
 PREVIEW=$(curl -sS -b "$TMPDIR/iam.cookies" -H 'content-type: application/json' \
     -d "{\"buckets\":[\"$PREFIX_BUCKET\"],\"prefix\":\"uploads/\",\"access\":\"readwrite\"}" \
-    "$ENDPOINT/api/iam/preview")
+    "$ENDPOINT/maxio/api/iam/preview")
 printf '%s' "$PREVIEW" > "$TMPDIR/iam-preview.json"
 python3 - "$TMPDIR/iam-preview.json" "$TMPDIR/iam-prefix-policy.json" <<'PY'
 import json, sys
@@ -1921,7 +2022,7 @@ NOGRANT_SECRET=$(printf '%s' "$NOGRANT_FIRST" | python3 -c 'import json,sys; pri
 NOGRANT_STATUS=$(curl -sS -o "$TMPDIR/nogrant-key.json" -w '%{http_code}' -b "$TMPDIR/iam.cookies" \
     -H 'content-type: application/json' \
     -d "{\"buckets\":[\"$NOGRANT_BUCKET\"],\"prefix\":\"uploads/\",\"access\":\"write\"}" \
-    "$ENDPOINT/api/iam/users/$NOGRANT_USER/keys")
+    "$ENDPOINT/maxio/api/iam/users/$NOGRANT_USER/keys")
 assert_eq "nogrant create key without keyOnly" "200" "$NOGRANT_STATUS"
 assert "nogrant key document is directory scoped" python3 -c \
     'import json,sys; doc=json.load(open(sys.argv[1])).get("documentJson") or ""; rest=doc.replace("uploads/*",""); raise SystemExit(0 if "uploads/*" in doc and "uploads*" not in rest else 1)' \
@@ -1939,7 +2040,7 @@ export AWS_SECRET_ACCESS_KEY="$ROOT_SECRET"
 NOGRANT_FALSE=$(curl -sS -o "$TMPDIR/nogrant-false.json" -w '%{http_code}' -b "$TMPDIR/iam.cookies" \
     -H 'content-type: application/json' \
     -d "{\"buckets\":[\"$NOGRANT_BUCKET\"],\"prefix\":\"uploads/\",\"access\":\"read\",\"keyOnly\":false}" \
-    "$ENDPOINT/api/iam/users/$NOGRANT_USER/keys")
+    "$ENDPOINT/maxio/api/iam/users/$NOGRANT_USER/keys")
 assert_eq "nogrant keyOnly false is rejected" "400" "$NOGRANT_FALSE"
 NOGRANT_POLICIES=$($AWS iam list-user-policies --user-name "$NOGRANT_USER" --output json)
 assert_eq "nogrant user policies after rejection" "read" \
@@ -1985,7 +2086,7 @@ else
             --address 127.0.0.1 "${cred_args[@]}" >"$ROBUST_DATA/server.log" 2>&1 &
         ROBUST_PID=$!
         for _ in $(seq 1 50); do
-            if curl -sf "$ROBUST_EP/healthz" >/dev/null 2>&1; then
+            if curl -sf "$ROBUST_EP/maxio/health/live" >/dev/null 2>&1; then
                 return 0
             fi
             sleep 0.1
@@ -2061,6 +2162,28 @@ EOF
     start_robust
     assert "get still works after check --repair" $ROBUST_AWS s3 cp "s3://$ROBUST_BUCKET/restart.txt" "$TMPDIR/restart-down2.txt"
     assert_eq "body intact after repair" "across-restart" "$(cat "$TMPDIR/restart-down2.txt")"
+
+    # An unreadable older version sidecar must not become the latest object.
+    assert "versioned rollback bucket" $ROBUST_AWS s3api put-bucket-versioning --bucket "$ROBUST_BUCKET" --versioning-configuration Status=Enabled
+    echo v1-body > "$TMPDIR/ver-body.txt"
+    V1_ID=$($ROBUST_AWS s3api put-object --bucket "$ROBUST_BUCKET" --key ver.bin --body "$TMPDIR/ver-body.txt" --query VersionId --output text)
+    echo v2-body > "$TMPDIR/ver-body.txt"
+    V2_ID=$($ROBUST_AWS s3api put-object --bucket "$ROBUST_BUCKET" --key ver.bin --body "$TMPDIR/ver-body.txt" --query VersionId --output text)
+    stop_robust
+    python3 - "$ROBUST_DATA" "$ROBUST_BUCKET" "$V1_ID" <<'PY'
+import pathlib, sys
+data, bucket, older = sys.argv[1:]
+meta = pathlib.Path(data, "buckets", bucket, ".versions", "ver.bin", f"{older}.meta.json")
+meta.write_text("{", encoding="utf-8")
+PY
+    # The bytes are plain text, so repair rebuilds the sidecar even though the
+    # server created a keyring. The current object stays v2.
+    assert "repair after older version meta is corrupt" "$ROBUST_BIN" check --data-dir "$ROBUST_DATA" --repair
+    start_robust
+    assert "latest stays v2 after repair" $ROBUST_AWS s3 cp "s3://$ROBUST_BUCKET/ver.bin" "$TMPDIR/ver-latest.txt"
+    assert_eq "latest body is v2" "v2-body" "$(cat "$TMPDIR/ver-latest.txt")"
+    assert "older version still readable" $ROBUST_AWS s3api get-object --bucket "$ROBUST_BUCKET" --key ver.bin --version-id "$V1_ID" "$TMPDIR/ver-old.txt"
+    assert_eq "older version body is v1" "v1-body" "$(cat "$TMPDIR/ver-old.txt")"
     stop_robust
     mc alias rm "$MC_ROBUST" >/dev/null 2>&1 || true
     rm -rf "$ROBUST_DATA"
@@ -2070,6 +2193,373 @@ EOF
     if [ "$MAXIO_TEST_ACCESS_KEY" = "maxioadmin" ] && [ "$MAXIO_TEST_SECRET_KEY" = "maxioadmin" ]; then
         SUB_CREDS+=(--allow-insecure-dev)
     fi
+
+    # Truncated SSE metadata must not be served as ciphertext. A binary sidecar
+    # must not abort the scan. Restoring an unverifiable archive is opt-in.
+    META_DATA=$(mktemp -d)
+    META_PORT=$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1]); s.close()')
+    META_EP="http://127.0.0.1:$META_PORT"
+    META_AWS="aws --endpoint-url $META_EP"
+    RUST_LOG=warn "$ROBUST_BIN" --data-dir "$META_DATA" --port "$META_PORT" \
+        --address 127.0.0.1 "${SUB_CREDS[@]}" >"$META_DATA/server.log" 2>&1 &
+    META_PID=$!
+    META_UP=0
+    for _ in $(seq 1 50); do
+        if curl -sf "$META_EP/maxio/health/live" >/dev/null 2>&1; then
+            META_UP=1
+            break
+        fi
+        sleep 0.1
+    done
+    if [ "$META_UP" != 1 ]; then
+        echo "metadata server failed to start; log:"
+        cat "$META_DATA/server.log" || true
+        FAIL=$((FAIL + 1))
+    else
+        assert "meta create plain bucket" $META_AWS s3 mb s3://plain-meta
+        echo keep-body > "$TMPDIR/keep.txt"
+        echo sse-body > "$TMPDIR/sse.txt"
+        echo noise-body > "$TMPDIR/noise.txt"
+        assert "meta put keep" $META_AWS s3 cp "$TMPDIR/keep.txt" s3://plain-meta/keep.txt
+        assert "meta put sse" $META_AWS s3api put-object --bucket plain-meta --key sse.txt \
+            --body "$TMPDIR/sse.txt" --server-side-encryption AES256
+        assert "meta put noise" $META_AWS s3 cp "$TMPDIR/noise.txt" s3://plain-meta/noise.txt
+        dd if=/dev/zero of="$TMPDIR/sse-mp-1.txt" bs=1024 count=5120 status=none
+        echo mp2 > "$TMPDIR/sse-mp-2.txt"
+        SSE_MP=$($META_AWS s3api create-multipart-upload --bucket plain-meta --key sse-mp.bin \
+            --server-side-encryption AES256 --query UploadId --output text)
+        SSE_E1=$($META_AWS s3api upload-part --bucket plain-meta --key sse-mp.bin --part-number 1 \
+            --body "$TMPDIR/sse-mp-1.txt" --upload-id "$SSE_MP" --query ETag --output text)
+        SSE_E2=$($META_AWS s3api upload-part --bucket plain-meta --key sse-mp.bin --part-number 2 \
+            --body "$TMPDIR/sse-mp-2.txt" --upload-id "$SSE_MP" --query ETag --output text)
+        cat > "$TMPDIR/sse-mp-complete.json" <<EOF
+{"Parts":[{"ETag":$SSE_E1,"PartNumber":1},{"ETag":$SSE_E2,"PartNumber":2}]}
+EOF
+        assert "meta complete sse multipart" $META_AWS s3api complete-multipart-upload \
+            --bucket plain-meta --key sse-mp.bin --upload-id "$SSE_MP" \
+            --multipart-upload "file://$TMPDIR/sse-mp-complete.json"
+        assert "meta create versioned bucket" $META_AWS s3 mb s3://div-bucket
+        assert "meta enable versioning" $META_AWS s3api put-bucket-versioning --bucket div-bucket \
+            --versioning-configuration Status=Enabled
+        dd if=/dev/zero of="$TMPDIR/div-a.txt" bs=1024 count=5120 status=none
+        echo part-b > "$TMPDIR/div-b.txt"
+        DIV_MP=$($META_AWS s3api create-multipart-upload --bucket div-bucket --key div.bin \
+            --query UploadId --output text)
+        DIV_E1=$($META_AWS s3api upload-part --bucket div-bucket --key div.bin --part-number 1 \
+            --body "$TMPDIR/div-a.txt" --upload-id "$DIV_MP" --query ETag --output text)
+        DIV_E2=$($META_AWS s3api upload-part --bucket div-bucket --key div.bin --part-number 2 \
+            --body "$TMPDIR/div-b.txt" --upload-id "$DIV_MP" --query ETag --output text)
+        cat > "$TMPDIR/div-complete.json" <<EOF
+{"Parts":[{"ETag":$DIV_E1,"PartNumber":1},{"ETag":$DIV_E2,"PartNumber":2}]}
+EOF
+        assert "meta complete divergence multipart" $META_AWS s3api complete-multipart-upload \
+            --bucket div-bucket --key div.bin --upload-id "$DIV_MP" \
+            --multipart-upload "file://$TMPDIR/div-complete.json"
+        assert "meta get div before damage" $META_AWS s3 cp s3://div-bucket/div.bin "$TMPDIR/div-good.bin"
+    fi
+    kill -TERM "$META_PID" 2>/dev/null || true
+    wait "$META_PID" 2>/dev/null || true
+    python3 - "$META_DATA" "$TMPDIR/div-good.bin" "$TMPDIR/div-corrupt.bin" <<'PY'
+import json, pathlib, sys
+data, good_path, corrupt_path = sys.argv[1:]
+root = pathlib.Path(data)
+plain = root / "buckets" / "plain-meta"
+for name in ("sse.txt.meta.json", "sse-mp.bin.meta.json"):
+    path = plain / name
+    raw = path.read_bytes()
+    path.write_bytes(raw[:20])
+plain.joinpath("noise.txt.meta.json").write_bytes(bytes([0xFF, 0xFE, 0x00, 0x80]))
+plain.joinpath(".maxio-tmp-crash").write_text("temp", encoding="utf-8")
+div = root / "buckets" / "div-bucket"
+current_meta = div / "div.bin.meta.json"
+meta = json.loads(current_meta.read_text())
+vid = meta["version_id"]
+archive_meta = div / ".versions" / "div.bin" / f"{vid}.meta.json"
+archive_data = div / ".versions" / "div.bin" / f"{vid}.data"
+current_data = div / "div.bin"
+for path in (current_meta, archive_meta):
+    obj = json.loads(path.read_text())
+    obj.pop("content_sha256", None)
+    path.write_text(json.dumps(obj), encoding="utf-8")
+raw = bytearray(current_data.read_bytes())
+raw[0] ^= 0xFF
+current_data.write_bytes(raw)
+pathlib.Path(corrupt_path).write_bytes(raw)
+pathlib.Path(good_path).write_bytes(archive_data.read_bytes())
+PY
+    set +e
+    "$ROBUST_BIN" check --data-dir "$META_DATA" --repair >"$TMPDIR/meta-check.txt" 2>"$TMPDIR/meta-check.err"
+    META_RC=$?
+    set -e
+    assert_eq "binary sidecar does not abort check" "false" \
+        "$(grep -q 'may record an SSE-S3 key id' "$TMPDIR/meta-check.err" && echo true || echo false)"
+    assert_eq "check still repairs another object" "true" \
+        "$(grep -q 'stale-temp' "$TMPDIR/meta-check.txt" && echo true || echo false)"
+    assert_eq "truncated sse is corrupt-metadata" "true" \
+        "$(grep -q 'sse.txt.meta.json' "$TMPDIR/meta-check.txt" && grep -q 'not rebuilt' "$TMPDIR/meta-check.txt" && echo true || echo false)"
+    assert_eq "check exits non-zero while metadata is unrecoverable" "true" \
+        "$([ "$META_RC" -ne 0 ] && echo true || echo false)"
+    assert_eq "sse sidecar stays truncated" "20" \
+        "$(wc -c < "$META_DATA/buckets/plain-meta/sse.txt.meta.json" | tr -d ' ')"
+    assert_eq "sse multipart sidecar stays truncated" "20" \
+        "$(wc -c < "$META_DATA/buckets/plain-meta/sse-mp.bin.meta.json" | tr -d ' ')"
+    assert_eq "divergence is not repaired by default" "true" \
+        "$(cmp -s "$META_DATA/buckets/div-bucket/div.bin" "$TMPDIR/div-corrupt.bin" && echo true || echo false)"
+    set +e
+    "$ROBUST_BIN" check --data-dir "$META_DATA" --repair --restore-unverifiable-from-archive \
+        >"$TMPDIR/meta-restore.txt" 2>"$TMPDIR/meta-restore.err"
+    set -e
+    assert_eq "restore flag puts the archive back" "true" \
+        "$(cmp -s "$META_DATA/buckets/div-bucket/div.bin" "$TMPDIR/div-good.bin" && echo true || echo false)"
+    RUST_LOG=warn "$ROBUST_BIN" --data-dir "$META_DATA" --port "$META_PORT" \
+        --address 127.0.0.1 "${SUB_CREDS[@]}" >"$META_DATA/server.log" 2>&1 &
+    META_PID=$!
+    for _ in $(seq 1 50); do
+        curl -sf "$META_EP/maxio/health/live" >/dev/null 2>&1 && break
+        sleep 0.1
+    done
+    assert_fail "truncated sse GET fails" $META_AWS s3 cp s3://plain-meta/sse.txt "$TMPDIR/sse-down.txt"
+    assert_fail "truncated sse multipart GET fails" $META_AWS s3 cp s3://plain-meta/sse-mp.bin "$TMPDIR/sse-mp-down.bin"
+    SSE_DISK=$(wc -c < "$META_DATA/buckets/plain-meta/sse.txt" | tr -d ' ')
+    if [ -f "$TMPDIR/sse-down.txt" ]; then SSE_DOWN=$(wc -c < "$TMPDIR/sse-down.txt" | tr -d ' '); else SSE_DOWN=0; fi
+    assert_eq "truncated sse GET is not the ciphertext" "true" \
+        "$([ "$SSE_DOWN" != "$SSE_DISK" ] && echo true || echo false)"
+    MP_DISK=$(wc -c < "$META_DATA/buckets/plain-meta/sse-mp.bin" | tr -d ' ')
+    if [ -f "$TMPDIR/sse-mp-down.bin" ]; then MP_DOWN=$(wc -c < "$TMPDIR/sse-mp-down.bin" | tr -d ' '); else MP_DOWN=0; fi
+    assert_eq "truncated sse multipart GET is not the ciphertext" "true" \
+        "$([ "$MP_DOWN" != "$MP_DISK" ] && echo true || echo false)"
+    assert "keep object still downloads" $META_AWS s3 cp s3://plain-meta/keep.txt "$TMPDIR/keep-down.txt"
+    assert_eq "keep object body" "keep-body" "$(cat "$TMPDIR/keep-down.txt")"
+    assert "restored divergence downloads" $META_AWS s3 cp s3://div-bucket/div.bin "$TMPDIR/div-down.bin"
+    assert_eq "restored divergence matches the archive" "true" \
+        "$(cmp -s "$TMPDIR/div-down.bin" "$TMPDIR/div-good.bin" && echo true || echo false)"
+    kill -TERM "$META_PID" 2>/dev/null || true
+    wait "$META_PID" 2>/dev/null || true
+    rm -rf "$META_DATA"
+
+    # Healthy objects with checksums must stay in place. Repair without an
+    # external master key refuses before it changes a file. SSE-C is never
+    # quarantined, because the server does not have the customer key.
+    SUM_DATA=$(mktemp -d)
+    SUM_PORT=$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1]); s.close()')
+    SUM_EP="http://127.0.0.1:$SUM_PORT"
+    SUM_AWS="aws --endpoint-url $SUM_EP"
+    RUST_LOG=warn "$ROBUST_BIN" --data-dir "$SUM_DATA" --port "$SUM_PORT" \
+        --address 127.0.0.1 "${SUB_CREDS[@]}" >"$SUM_DATA/server.log" 2>&1 &
+    SUM_PID=$!
+    SUM_UP=0
+    for _ in $(seq 1 50); do
+        if curl -sf "$SUM_EP/maxio/health/live" >/dev/null 2>&1; then
+            SUM_UP=1
+            break
+        fi
+        sleep 0.1
+    done
+    if [ "$SUM_UP" != 1 ]; then
+        echo "checksum server failed to start; log:"
+        cat "$SUM_DATA/server.log" || true
+        FAIL=$((FAIL + 1))
+    else
+        assert "checksum create bucket" $SUM_AWS s3 mb s3://sum-bucket
+        echo plain-body > "$TMPDIR/sum-plain.txt"
+        echo sse-s3-body > "$TMPDIR/sum-s3.txt"
+        echo sse-c-body > "$TMPDIR/sum-c.txt"
+        SSE_C_KEY=$(openssl rand 32 | base64)
+        SSE_C_MD5=$(printf '%s' "$SSE_C_KEY" | base64 -d | openssl dgst -md5 -binary | base64)
+        assert "checksum put plain" $SUM_AWS s3api put-object --bucket sum-bucket --key plain.txt \
+            --body "$TMPDIR/sum-plain.txt" --checksum-algorithm CRC32
+        assert "checksum put sse-s3" $SUM_AWS s3api put-object --bucket sum-bucket --key s3.txt \
+            --body "$TMPDIR/sum-s3.txt" --checksum-algorithm CRC32 --server-side-encryption AES256
+        assert "checksum put sse-c" $SUM_AWS s3api put-object --bucket sum-bucket --key c.txt \
+            --body "$TMPDIR/sum-c.txt" --checksum-algorithm CRC32 \
+            --sse-customer-algorithm AES256 --sse-customer-key "$SSE_C_KEY" \
+            --sse-customer-key-md5 "$SSE_C_MD5"
+        # One 5 MiB part plus a tail, so the upload is multipart. CRC32, CRC32C
+        # and SHA256 are composite (-N). CRC64NVME is a full-object checksum.
+        dd if=/dev/urandom of="$TMPDIR/mp-part.bin" bs=1024 count=5120 status=none
+        echo tail > "$TMPDIR/mp-tail.bin"
+        upload_mp_sum() {
+            local key="$1" algo="$2"
+            shift 2
+            local id e1 e2
+            id=$($SUM_AWS s3api create-multipart-upload --bucket sum-bucket --key "$key" \
+                --checksum-algorithm "$algo" "$@" --query UploadId --output text)
+            e1=$($SUM_AWS s3api upload-part --bucket sum-bucket --key "$key" --part-number 1 \
+                --upload-id "$id" --body "$TMPDIR/mp-part.bin" --checksum-algorithm "$algo" \
+                --query ETag --output text)
+            e2=$($SUM_AWS s3api upload-part --bucket sum-bucket --key "$key" --part-number 2 \
+                --upload-id "$id" --body "$TMPDIR/mp-tail.bin" --checksum-algorithm "$algo" \
+                --query ETag --output text)
+            cat > "$TMPDIR/mp-${algo}-${key}.json" <<EOF
+{"Parts":[{"ETag":$e1,"PartNumber":1},{"ETag":$e2,"PartNumber":2}]}
+EOF
+            $SUM_AWS s3api complete-multipart-upload --bucket sum-bucket --key "$key" \
+                --upload-id "$id" --multipart-upload "file://$TMPDIR/mp-${algo}-${key}.json"
+        }
+        assert "multipart CRC32" upload_mp_sum mp-crc32.bin CRC32
+        assert "multipart CRC32C" upload_mp_sum mp-crc32c.bin CRC32C
+        assert "multipart SHA256" upload_mp_sum mp-sha256.bin SHA256
+        assert "multipart CRC64NVME" upload_mp_sum mp-crc64.bin CRC64NVME
+        assert "multipart SSE-S3 CRC32" upload_mp_sum mp-s3-crc32.bin CRC32 --server-side-encryption AES256
+    fi
+    kill -TERM "$SUM_PID" 2>/dev/null || true
+    wait "$SUM_PID" 2>/dev/null || true
+    python3 - "$SUM_DATA" "$TMPDIR/sum-before.txt" <<'PY'
+import hashlib, pathlib, sys
+root = pathlib.Path(sys.argv[1]) / "buckets" / "sum-bucket"
+lines = []
+if root.exists():
+    for path in sorted(p for p in root.rglob("*") if p.is_file()):
+        if path.name.startswith("mp-"):
+            lines.append(path.name + " " + hashlib.sha256(path.read_bytes()).hexdigest())
+pathlib.Path(sys.argv[2]).write_text("\n".join(lines) + "\n")
+PY
+    if [ -n "${MAXIO_MASTER_KEY:-}" ]; then
+        set +e
+        env -u MAXIO_MASTER_KEY "$ROBUST_BIN" check --data-dir "$SUM_DATA" --repair \
+            >"$TMPDIR/sum-repair-nokey.txt" 2>"$TMPDIR/sum-repair-nokey.err"
+        SUM_REFUSE=$?
+        set -e
+        assert_eq "repair without external master key is refused" "true" \
+            "$([ "$SUM_REFUSE" -ne 0 ] && grep -q 'refusing to repair' "$TMPDIR/sum-repair-nokey.err" && echo true || echo false)"
+        assert_eq "refused repair says nothing was changed" "true" \
+            "$(grep -q 'no file was changed' "$TMPDIR/sum-repair-nokey.err" && echo true || echo false)"
+        set +e
+        env -u MAXIO_MASTER_KEY "$ROBUST_BIN" check --data-dir "$SUM_DATA" \
+            >"$TMPDIR/sum-readonly.txt" 2>"$TMPDIR/sum-readonly.err"
+        SUM_RO=$?
+        set -e
+        assert_eq "read-only check without the key exits 0" "0" "$SUM_RO"
+        assert_eq "read-only check notes unverifiable without key" "true" \
+            "$(grep -q 'unverifiable without key' "$TMPDIR/sum-readonly.txt" && echo true || echo false)"
+    else
+        set +e
+        "$ROBUST_BIN" check --data-dir "$SUM_DATA" >"$TMPDIR/sum-readonly.txt" 2>"$TMPDIR/sum-readonly.err"
+        SUM_RO=$?
+        set -e
+        assert_eq "read-only check of healthy sse exits 0" "0" "$SUM_RO"
+        assert_eq "sse-c is unverifiable without key" "true" \
+            "$(grep -q 'unverifiable without key' "$TMPDIR/sum-readonly.txt" && echo true || echo false)"
+    fi
+    if [ -f "$SUM_DATA/.maxio-key-check.json" ]; then
+        cp "$SUM_DATA/.maxio-key-check.json" "$TMPDIR/keycheck-before.json"
+    fi
+    STRAY_KEY=$(openssl rand -base64 32)
+    set +e
+    MAXIO_MASTER_KEY="$STRAY_KEY" "$ROBUST_BIN" check --data-dir "$SUM_DATA" \
+        >"$TMPDIR/stray-ro.txt" 2>"$TMPDIR/stray-ro.err"
+    STRAY_RO=$?
+    set -e
+    assert_eq "stray master key read-only check exits 0" "0" "$STRAY_RO"
+    assert_eq "stray master key is warned and not written" "true" \
+        "$(grep -q 'was ignored and was not written' "$TMPDIR/stray-ro.err" "$TMPDIR/stray-ro.txt" && echo true || echo false)"
+    if [ -f "$TMPDIR/keycheck-before.json" ]; then
+        assert_eq "stray key did not change the key check" "true" \
+            "$(cmp -s "$SUM_DATA/.maxio-key-check.json" "$TMPDIR/keycheck-before.json" && echo true || echo false)"
+    fi
+    set +e
+    MAXIO_MASTER_KEY="$STRAY_KEY" "$ROBUST_BIN" check --data-dir "$SUM_DATA" --repair \
+        >"$TMPDIR/stray-repair.txt" 2>"$TMPDIR/stray-repair.err"
+    STRAY_RP=$?
+    set -e
+    assert_eq "stray master key repair is refused" "true" \
+        "$([ "$STRAY_RP" -ne 0 ] && grep -q 'refusing to repair' "$TMPDIR/stray-repair.err" && grep -q 'no file was changed' "$TMPDIR/stray-repair.err" && echo true || echo false)"
+    if [ -f "$TMPDIR/keycheck-before.json" ]; then
+        assert_eq "refused repair did not change the key check" "true" \
+            "$(cmp -s "$SUM_DATA/.maxio-key-check.json" "$TMPDIR/keycheck-before.json" && echo true || echo false)"
+    fi
+    for name in plain.txt s3.txt c.txt; do
+        assert_file_exists "checksum object $name stayed in place" "$SUM_DATA/buckets/sum-bucket/$name"
+        assert_file_exists "checksum sidecar $name stayed in place" "$SUM_DATA/buckets/sum-bucket/$name.meta.json"
+    done
+    set +e
+    "$ROBUST_BIN" check --data-dir "$SUM_DATA" >"$TMPDIR/mp-check.txt" 2>"$TMPDIR/mp-check.err"
+    MP_RC=$?
+    set -e
+    assert_eq "multipart checksum check exits 0" "0" "$MP_RC"
+    assert_eq "multipart checksum check is not a checksum-mismatch" "false" \
+        "$(grep -q 'checksum-mismatch' "$TMPDIR/mp-check.txt" && echo true || echo false)"
+    assert "checksum repair with the key" "$ROBUST_BIN" check --data-dir "$SUM_DATA" --repair
+    python3 - "$SUM_DATA" "$TMPDIR/sum-before.txt" <<'PY'
+import hashlib, pathlib, sys
+root = pathlib.Path(sys.argv[1]) / "buckets" / "sum-bucket"
+before = {}
+for line in pathlib.Path(sys.argv[2]).read_text().splitlines():
+    if not line.strip():
+        continue
+    name, digest = line.split(" ", 1)
+    before[name] = digest
+missing = []
+for name, digest in before.items():
+    path = root / name
+    if not path.is_file() or hashlib.sha256(path.read_bytes()).hexdigest() != digest:
+        missing.append(name)
+pathlib.Path(sys.argv[2]).with_name("sum-after-diff.txt").write_text("\n".join(missing))
+PY
+    assert_eq "multipart objects are byte-identical after repair" "" \
+        "$(cat "$TMPDIR/sum-after-diff.txt")"
+    for name in plain.txt s3.txt c.txt; do
+        assert_file_exists "checksum object $name stayed after repair" "$SUM_DATA/buckets/sum-bucket/$name"
+    done
+    RUST_LOG=warn "$ROBUST_BIN" --data-dir "$SUM_DATA" --port "$SUM_PORT" \
+        --address 127.0.0.1 "${SUB_CREDS[@]}" >"$SUM_DATA/server.log" 2>&1 &
+    SUM_PID=$!
+    for _ in $(seq 1 50); do
+        curl -sf "$SUM_EP/maxio/health/live" >/dev/null 2>&1 && break
+        sleep 0.1
+    done
+    assert "checksum get plain" $SUM_AWS s3 cp s3://sum-bucket/plain.txt "$TMPDIR/sum-plain-down.txt"
+    assert_eq "checksum plain body" "plain-body" "$(cat "$TMPDIR/sum-plain-down.txt")"
+    assert "checksum get sse-s3" $SUM_AWS s3 cp s3://sum-bucket/s3.txt "$TMPDIR/sum-s3-down.txt"
+    assert_eq "checksum sse-s3 body" "sse-s3-body" "$(cat "$TMPDIR/sum-s3-down.txt")"
+    assert "checksum get sse-c" $SUM_AWS s3api get-object --bucket sum-bucket --key c.txt \
+        --sse-customer-algorithm AES256 --sse-customer-key "$SSE_C_KEY" \
+        --sse-customer-key-md5 "$SSE_C_MD5" "$TMPDIR/sum-c-down.txt"
+    assert_eq "checksum sse-c body" "sse-c-body" "$(cat "$TMPDIR/sum-c-down.txt")"
+    assert "multipart CRC32 still readable" $SUM_AWS s3 cp s3://sum-bucket/mp-crc32.bin "$TMPDIR/mp-crc32-down.bin"
+    assert "multipart CRC64NVME still readable" $SUM_AWS s3 cp s3://sum-bucket/mp-crc64.bin "$TMPDIR/mp-crc64-down.bin"
+    assert "multipart SSE-S3 CRC32 still readable" $SUM_AWS s3 cp s3://sum-bucket/mp-s3-crc32.bin "$TMPDIR/mp-s3-down.bin"
+    assert_eq "multipart CRC32 size" \
+        "$(( $(wc -c < "$TMPDIR/mp-part.bin") + $(wc -c < "$TMPDIR/mp-tail.bin") ))" \
+        "$(wc -c < "$TMPDIR/mp-crc32-down.bin" | tr -d ' ')"
+    kill -TERM "$SUM_PID" 2>/dev/null || true
+    wait "$SUM_PID" 2>/dev/null || true
+    python3 - "$SUM_DATA" <<'PY'
+import pathlib, sys
+root = pathlib.Path(sys.argv[1]) / "buckets" / "sum-bucket"
+plain = root / "mp-crc32.bin.meta.json"
+text = plain.read_text()
+plain.write_text(text.replace('"size": ', '"size": 0', 1), encoding="utf-8")
+sse = root / "mp-s3-crc32.bin.meta.json"
+body = sse.read_text()
+sse.write_text(body.replace('"size": ', '"size": 1', 1), encoding="utf-8")
+PY
+    set +e
+    "$ROBUST_BIN" check --data-dir "$SUM_DATA" --repair >"$TMPDIR/sse-mac-repair.txt" 2>"$TMPDIR/sse-mac-repair.err"
+    "$ROBUST_BIN" check --data-dir "$SUM_DATA" >"$TMPDIR/sse-mac-check.txt" 2>"$TMPDIR/sse-mac-check.err"
+    SSE_MAC_RC=$?
+    set -e
+    assert_eq "tampered sse sidecar is an issue" "true" \
+        "$([ "$SSE_MAC_RC" -ne 0 ] && grep -E -q 'sidecar_mac|part sizes do not cover' "$TMPDIR/sse-mac-check.txt" && echo true || echo false)"
+    assert_eq "tampered sse sidecar was not rebuilt as plaintext" "true" \
+        "$(grep -q wrapped_dek "$SUM_DATA/buckets/sum-bucket/mp-s3-crc32.bin.meta.json" && echo true || echo false)"
+    assert_file_exists "tampered sse bytes stayed in place" "$SUM_DATA/buckets/sum-bucket/mp-s3-crc32.bin"
+    RUST_LOG=warn "$ROBUST_BIN" --data-dir "$SUM_DATA" --port "$SUM_PORT" \
+        --address 127.0.0.1 "${SUB_CREDS[@]}" >"$SUM_DATA/server.log" 2>&1 &
+    SUM_PID=$!
+    for _ in $(seq 1 50); do
+        curl -sf "$SUM_EP/maxio/health/live" >/dev/null 2>&1 && break
+        sleep 0.1
+    done
+    assert "rebuilt plain multipart still downloads" $SUM_AWS s3 cp s3://sum-bucket/mp-crc32.bin "$TMPDIR/mp-crc32-again.bin"
+    assert_eq "rebuilt plain multipart size" \
+        "$(( $(wc -c < "$TMPDIR/mp-part.bin") + $(wc -c < "$TMPDIR/mp-tail.bin") ))" \
+        "$(wc -c < "$TMPDIR/mp-crc32-again.bin" | tr -d ' ')"
+    assert_fail "tampered sse multipart GET fails" $SUM_AWS s3 cp s3://sum-bucket/mp-s3-crc32.bin "$TMPDIR/mp-s3-fail.bin"
+    kill -TERM "$SUM_PID" 2>/dev/null || true
+    wait "$SUM_PID" 2>/dev/null || true
+    rm -rf "$SUM_DATA"
+
     LIMIT_DATA=$(mktemp -d)
     LIMIT_PORT=$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1]); s.close()')
     RUST_LOG=warn "$ROBUST_BIN" --data-dir "$LIMIT_DATA" --port "$LIMIT_PORT" \
@@ -2078,7 +2568,7 @@ EOF
     LIMIT_PID=$!
     LIMIT_EP="http://127.0.0.1:$LIMIT_PORT"
     for _ in $(seq 1 50); do
-        curl -sf "$LIMIT_EP/healthz" >/dev/null 2>&1 && break
+        curl -sf "$LIMIT_EP/maxio/health/live" >/dev/null 2>&1 && break
         sleep 0.1
     done
     dd if=/dev/zero of="$TMPDIR/too-big.bin" bs=1024 count=2 status=none
@@ -2119,7 +2609,7 @@ EOF
     PART_EP="http://127.0.0.1:$PART_PORT"
     PART_AWS="aws --endpoint-url $PART_EP"
     for _ in $(seq 1 50); do
-        curl -sf "$PART_EP/healthz" >/dev/null 2>&1 && break
+        curl -sf "$PART_EP/maxio/health/live" >/dev/null 2>&1 && break
         sleep 0.1
     done
     assert "part-limit create bucket" $PART_AWS s3 mb s3://part-limit
@@ -2196,7 +2686,7 @@ else
         KEY_PID=$!
         local attempt
         for attempt in $(seq 1 50); do
-            if curl -sf "$KEY_ENDPOINT/healthz" >/dev/null 2>&1; then
+            if curl -sf "$KEY_ENDPOINT/maxio/health/live" >/dev/null 2>&1; then
                 return 0
             fi
             if ! kill -0 "$KEY_PID" 2>/dev/null; then
@@ -2412,9 +2902,9 @@ fi
 echo ""
 echo "--- Virtual-hosted-style (aws + mc) ---"
 VHOST_PROBE=$(curl -sS -o /dev/null -w '%{http_code}' \
-    -H "Host: hprobe.localhost:${PORT}" "http://127.0.0.1:${PORT}/healthz" || echo "000")
+    -H "Host: hprobe.localhost:${PORT}" "http://127.0.0.1:${PORT}/maxio/health/live" || echo "000")
 if [ "$VHOST_PROBE" != "403" ]; then
-    red "FAIL: virtual-hosted-style is off (GET /healthz with Host hprobe.localhost returned ${VHOST_PROBE}, expected 403). Start maxio with --domain localhost."
+    red "FAIL: virtual-hosted-style is off (GET /maxio/health/live with Host hprobe.localhost returned ${VHOST_PROBE}, expected 403). Start maxio with --domain localhost."
     FAIL=$((FAIL + 1))
 else
     green "PASS: virtual-hosted-style enabled"
@@ -2436,6 +2926,34 @@ EOF
     vaws() {
         AWS_CONFIG_FILE="$AWS_VCONF" "${VAWS[@]}" "$@"
     }
+
+    for PROBE_BUCKET in version healthz api readyz; do
+        pin_vhost "${PROBE_BUCKET}.localhost"
+        echo "vhost-$PROBE_BUCKET" > "$TMPDIR/vprobe.txt"
+        assert "virtual create bucket $PROBE_BUCKET" vaws s3 mb "s3://$PROBE_BUCKET"
+        assert "virtual put object in $PROBE_BUCKET" \
+            vaws s3 cp "$TMPDIR/vprobe.txt" "s3://$PROBE_BUCKET/note.txt"
+        assert "virtual get object from $PROBE_BUCKET" \
+            vaws s3 cp "s3://$PROBE_BUCKET/note.txt" "$TMPDIR/vprobe-down.txt"
+        assert_eq "virtual $PROBE_BUCKET object body" "vhost-$PROBE_BUCKET" \
+            "$(cat "$TMPDIR/vprobe-down.txt")"
+        VLIST=$(vaws s3api list-objects-v2 --bucket "$PROBE_BUCKET" 2>&1 || true)
+        assert_eq "virtual list $PROBE_BUCKET" "true" \
+            "$(echo "$VLIST" | grep -q note.txt && echo true || echo false)"
+        VVERS=$(vaws s3api get-bucket-versioning --bucket "$PROBE_BUCKET" 2>&1 || true)
+        assert_eq "virtual $PROBE_BUCKET versioning is not the probe" "true" \
+            "$(echo "$VVERS" | grep -q '"status":"ok"' && echo false || echo true)"
+        assert "virtual delete object in $PROBE_BUCKET" vaws s3 rm "s3://$PROBE_BUCKET/note.txt"
+        assert "virtual delete bucket $PROBE_BUCKET" vaws s3 rb "s3://$PROBE_BUCKET"
+    done
+    pin_vhost "maxio.localhost"
+    VMAXIO=$(vaws s3api create-bucket --bucket maxio 2>&1 || true)
+    assert_eq "virtual create bucket maxio is InvalidBucketName" "true" \
+        "$(echo "$VMAXIO" | grep -q InvalidBucketName && echo true || echo false)"
+    pin_vhost "ui.localhost"
+    VUI=$(vaws s3api create-bucket --bucket ui 2>&1 || true)
+    assert_eq "virtual create bucket ui is InvalidBucketName" "true" \
+        "$(echo "$VUI" | grep -q InvalidBucketName && echo true || echo false)"
 
     assert "virtual create bucket" vaws s3 mb "s3://${VBUCKET}"
     assert "virtual head bucket" vaws s3api head-bucket --bucket "$VBUCKET"
@@ -2543,11 +3061,11 @@ EOF
         --policy-name broad --policy-document "file://$TMPDIR/viam-user.json"
     curl -sS -c "$TMPDIR/viam.cookies" -H 'content-type: application/json' \
         -d "{\"accessKey\":\"$MAXIO_TEST_ACCESS_KEY\",\"secretKey\":\"$MAXIO_TEST_SECRET_KEY\"}" \
-        "$ENDPOINT/api/auth/login" > /dev/null
+        "$ENDPOINT/maxio/api/auth/login" > /dev/null
     VIAM_STATUS=$(curl -sS -o "$TMPDIR/viam-key.json" -w '%{http_code}' -b "$TMPDIR/viam.cookies" \
         -H 'content-type: application/json' \
         -d "{\"buckets\":[\"$VIAM_BUCKET\"],\"prefix\":\"photos/\",\"access\":\"read\"}" \
-        "$ENDPOINT/api/iam/users/$VIAM_USER/keys")
+        "$ENDPOINT/maxio/api/iam/users/$VIAM_USER/keys")
     assert_eq "viam create narrowed key" "200" "$VIAM_STATUS"
     VIAM_KEY=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["accessKeyId"])' "$TMPDIR/viam-key.json")
     VIAM_SECRET=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["secretAccessKey"])' "$TMPDIR/viam-key.json")
@@ -2655,7 +3173,7 @@ if [ -n "$PREFIX_BIN" ]; then
         --address 127.0.0.1 "${PFX_CREDS[@]}" >"$PFX_DATA/server.log" 2>&1 &
     PFX_PID=$!
     for _ in $(seq 1 50); do
-        curl -sf "$PFX_EP/healthz" >/dev/null 2>&1 && break
+        curl -sf "$PFX_EP/maxio/health/live" >/dev/null 2>&1 && break
         sleep 0.1
     done
     PFX_AWS="aws --endpoint-url $PFX_EP"

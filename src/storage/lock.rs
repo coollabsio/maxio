@@ -2,8 +2,8 @@
 //!
 //! The server holds `<data-dir>/.maxio.lock` for its whole process lifetime.
 //! `flock` is released when the file is closed, including when the process
-//! crashes, so a restart is not blocked by a stale lock. `check --repair` and
-//! `keyring merge` refuse to write while the lock is held.
+//! crashes, so a restart is not blocked by a stale lock. `check --repair`,
+//! `keyring rotate`, and `keyring merge` refuse to write while the lock is held.
 
 use std::fs::OpenOptions;
 use std::path::{Path, PathBuf};
@@ -33,23 +33,44 @@ pub enum LockReason {
     Serve,
     /// `check --repair` is about to rewrite the data directory.
     Repair,
+    /// `keyring rotate` is about to replace `.maxio-keys.json`.
+    RotateKeyring,
     /// `keyring merge` is about to write `.maxio-keys.json`.
     MergeKeyring,
 }
+
+/// Shown when the first write into the data directory is denied.
+pub const DATA_DIR_PERMISSION_HINT: &str = "The data directory is not writable by this process. In Docker the image runs as uid 999. Use a named volume (-v maxio-data:/data). For a bind mount, chown 999:999 <host-path>, or start the container with --user matching the directory owner.";
 
 impl LockReason {
     fn refusal(self) -> &'static str {
         match self {
             Self::Serve => "Stop that server before starting another one on this data directory.",
             Self::Repair => "Stop that server before repairing.",
+            Self::RotateKeyring => "Stop that server before rotating the keyring.",
             Self::MergeKeyring => "Stop that server before merging the keyring.",
         }
     }
 }
 
+fn explain_lock_io(data_dir: &Path, err: std::io::Error) -> anyhow::Error {
+    if err.kind() == std::io::ErrorKind::PermissionDenied {
+        anyhow::anyhow!(
+            "failed to create the data-directory lock {}: {err}. {}",
+            lock_path(data_dir).display(),
+            DATA_DIR_PERMISSION_HINT
+        )
+    } else {
+        anyhow::Error::from(err)
+    }
+}
+
 /// Non-blocking exclusive lock. Fails if another live process already holds it.
 pub fn acquire_exclusive(data_dir: &Path, reason: LockReason) -> anyhow::Result<DataDirLock> {
-    let file = open_lock_file(data_dir)?;
+    let file = match open_lock_file(data_dir) {
+        Ok(file) => file,
+        Err(err) => return Err(explain_lock_io(data_dir, err)),
+    };
     match file.try_lock() {
         Ok(()) => Ok(DataDirLock { _file: file }),
         Err(std::fs::TryLockError::WouldBlock) => anyhow::bail!(
@@ -58,7 +79,7 @@ pub fn acquire_exclusive(data_dir: &Path, reason: LockReason) -> anyhow::Result<
             lock_path(data_dir).display(),
             reason.refusal()
         ),
-        Err(std::fs::TryLockError::Error(err)) => Err(err.into()),
+        Err(std::fs::TryLockError::Error(err)) => Err(explain_lock_io(data_dir, err)),
     }
 }
 
@@ -120,5 +141,34 @@ mod tests {
         };
         assert!(merge.contains("before merging the keyring"), "{merge}");
         assert!(!merge.contains("starting another"), "{merge}");
+        let rotate = match acquire_exclusive(tmp.path(), LockReason::RotateKeyring) {
+            Err(err) => err.to_string(),
+            Ok(_) => panic!("rotate acquire should fail while the lock is held"),
+        };
+        assert!(rotate.contains("rotating the keyring"), "{rotate}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn permission_denied_explains_data_dir_ownership() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("data");
+        std::fs::create_dir(&dir).unwrap();
+        let mut perms = std::fs::metadata(&dir).unwrap().permissions();
+        perms.set_mode(0o555);
+        std::fs::set_permissions(&dir, perms).unwrap();
+        let err = match acquire_exclusive(&dir, LockReason::Serve) {
+            Err(err) => err.to_string(),
+            Ok(_) => panic!("a read-only data directory must not accept the lock file"),
+        };
+        let mut restore = std::fs::metadata(&dir).unwrap().permissions();
+        restore.set_mode(0o755);
+        std::fs::set_permissions(&dir, restore).unwrap();
+        assert!(err.contains("Permission denied"), "{err}");
+        assert!(err.contains("uid 999"), "{err}");
+        assert!(err.contains("chown 999:999"), "{err}");
+        assert!(err.contains("--user"), "{err}");
+        assert!(err.contains(".maxio.lock"), "{err}");
     }
 }

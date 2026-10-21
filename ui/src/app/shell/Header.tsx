@@ -3,6 +3,8 @@ import { Fragment, type ReactNode } from 'react'
 import { useMatch, useNavigate, useSearchParams } from 'react-router'
 import { bucketPath, buildBreadcrumbs, normalizePrefix } from '@/lib/paths'
 import { cn } from '@/lib/utils'
+import { AppVersion } from './AppVersion'
+import { useAppVersion } from './useAppVersion'
 
 const crumbClass =
   'inline-flex h-7 min-w-0 shrink-0 items-center rounded-md px-1.5 text-neutral-600 transition-colors hover:bg-black/[0.04] hover:text-black focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring dark:text-fg-dim dark:hover:bg-white/[0.06] dark:hover:text-fg'
@@ -118,15 +120,21 @@ export function Breadcrumbs({ className }: { className?: string }) {
 
 function Brand({ collapsed = false }: { collapsed?: boolean }) {
   const navigate = useNavigate()
+  const version = useAppVersion()
   return (
     <button
       type="button"
       onClick={() => navigate('/')}
-      title="MaxIO"
+      title={version ? `MaxIO v${version}` : 'MaxIO'}
       className="flex min-w-0 items-center gap-2 rounded-md transition-opacity hover:opacity-80 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
     >
       <img src={`${import.meta.env.BASE_URL}logo.svg`} alt="" className="size-5 shrink-0" />
-      {collapsed ? null : <span className="text-[15px] font-semibold tracking-tight text-black dark:text-white">MaxIO</span>}
+      {collapsed ? null : (
+        <span className="flex min-w-0 items-baseline gap-1.5">
+          <span className="text-[15px] font-semibold tracking-tight text-black dark:text-white">MaxIO</span>
+          <AppVersion version={version} />
+        </span>
+      )}
     </button>
   )
 }

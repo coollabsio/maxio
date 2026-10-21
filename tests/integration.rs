@@ -9,6 +9,7 @@ use maxio::config::Config;
 use maxio::server::{self, AppState};
 use maxio::storage::filesystem::FilesystemStorage;
 use maxio::storage::keys::Keyring;
+use std::os::unix::fs::PermissionsExt;
 use std::sync::Arc;
 use tempfile::TempDir;
 
@@ -52,10 +53,14 @@ async fn start_server() -> (String, TempDir) {
         ..Config::default()
     };
 
+    let revoked_sessions = Arc::new(
+        maxio::api::console::RevokedSessions::open(std::path::Path::new(&config.data_dir)).await,
+    );
     let state = AppState {
         storage: Arc::new(storage),
         config: Arc::new(config),
         login_rate_limiter: Arc::new(maxio::api::console::LoginRateLimiter::new()),
+        revoked_sessions,
     };
 
     let app = server::build_router(state);
@@ -111,10 +116,14 @@ async fn start_server_with_keys(
         ..Config::default()
     };
 
+    let revoked_sessions = Arc::new(
+        maxio::api::console::RevokedSessions::open(std::path::Path::new(&config.data_dir)).await,
+    );
     let state = AppState {
         storage: Arc::new(storage),
         config: Arc::new(config),
         login_rate_limiter: Arc::new(maxio::api::console::LoginRateLimiter::new()),
+        revoked_sessions,
     };
 
     let app = server::build_router(state);
@@ -166,10 +175,14 @@ async fn start_server_with_size_limits(max_object: u64, max_part: u64) -> (Strin
         ..Config::default()
     };
 
+    let revoked_sessions = Arc::new(
+        maxio::api::console::RevokedSessions::open(std::path::Path::new(&config.data_dir)).await,
+    );
     let state = AppState {
         storage: Arc::new(storage),
         config: Arc::new(config),
         login_rate_limiter: Arc::new(maxio::api::console::LoginRateLimiter::new()),
+        revoked_sessions,
     };
 
     let app = server::build_router(state);
@@ -313,10 +326,14 @@ async fn start_server_with_default_buckets(default_buckets: &str) -> (String, Te
         ..Config::default()
     };
 
+    let revoked_sessions = Arc::new(
+        maxio::api::console::RevokedSessions::open(std::path::Path::new(&config.data_dir)).await,
+    );
     let state = AppState {
         storage: Arc::new(storage),
         config: Arc::new(config),
         login_rate_limiter: Arc::new(maxio::api::console::LoginRateLimiter::new()),
+        revoked_sessions,
     };
 
     let app = server::build_router(state);
@@ -391,10 +408,14 @@ async fn test_default_buckets_skip_existing() {
         max_console_body_bytes: 1024 * 1024,
         ..Config::default()
     };
+    let revoked_sessions = Arc::new(
+        maxio::api::console::RevokedSessions::open(std::path::Path::new(&config.data_dir)).await,
+    );
     let state = AppState {
         storage: Arc::new(storage),
         config: Arc::new(config),
         login_rate_limiter: Arc::new(maxio::api::console::LoginRateLimiter::new()),
+        revoked_sessions,
     };
     let app = server::build_router(state);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -779,33 +800,867 @@ fn extract_xml_tag(body: &str, tag: &str) -> Option<String> {
 
 // ---- Tests ----
 
+fn body_has_no_version(body: &str) {
+    assert!(
+        !body.contains("\"version\""),
+        "health body must not name a version: {body}"
+    );
+    assert!(
+        !body.contains(env!("CARGO_PKG_VERSION")),
+        "health body must not leak the release version: {body}"
+    );
+}
+
 #[tokio::test]
 async fn test_healthz_is_public_and_returns_ok() {
     let (base_url, _tmp) = start_server().await;
     let resp = client()
-        .get(format!("{}/healthz", base_url))
+        .get(format!("{base_url}/maxio/health/live"))
         .send()
         .await
         .unwrap();
     assert_eq!(resp.status(), 200);
+    assert!(resp.headers().get("server").is_none());
+    let body = resp.text().await.unwrap();
+    assert!(body.contains("\"status\":\"ok\""), "{body}");
+    body_has_no_version(&body);
+
+    let head = client()
+        .head(format!("{base_url}/maxio/health/live"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(head.status(), 200);
+    assert!(head.headers().get("server").is_none());
 }
 
 #[tokio::test]
-async fn test_readyz_is_public_and_returns_ok() {
+async fn test_version_endpoint_reports_package_version() {
     let (base_url, _tmp) = start_server().await;
+    let denied = client()
+        .get(format!("{base_url}/maxio/api/version"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(denied.status(), 401);
+    body_has_no_version(&denied.text().await.unwrap());
+
+    let login = client()
+        .post(format!("{base_url}/maxio/api/auth/login"))
+        .json(&serde_json::json!({
+            "accessKey": ACCESS_KEY,
+            "secretKey": SECRET_KEY
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(login.status(), 200, "root login");
+    let set_cookie = login.headers().get("set-cookie").unwrap().to_str().unwrap();
+    assert!(
+        set_cookie.contains("Path=/maxio"),
+        "session cookie is limited to the console API: {set_cookie}"
+    );
+    let session = set_cookie
+        .strip_prefix("maxio_session=")
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap()
+        .to_string();
     let resp = client()
-        .get(format!("{}/readyz", base_url))
+        .get(format!("{base_url}/maxio/api/version"))
+        .header("cookie", format!("maxio_session={session}"))
         .send()
         .await
         .unwrap();
     assert_eq!(resp.status(), 200);
+    assert!(resp.headers().get("server").is_none());
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["version"], env!("CARGO_PKG_VERSION"));
+}
+
+#[tokio::test]
+async fn logout_rejects_the_old_session_cookie() {
+    let (base_url, _tmp) = start_server().await;
+    let login = client()
+        .post(format!("{base_url}/maxio/api/auth/login"))
+        .json(&serde_json::json!({
+            "accessKey": ACCESS_KEY,
+            "secretKey": SECRET_KEY
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(login.status(), 200);
+    let session = login
+        .headers()
+        .get("set-cookie")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .strip_prefix("maxio_session=")
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap()
+        .to_string();
+    let cookie = format!("maxio_session={session}");
+    let before = client()
+        .get(format!("{base_url}/maxio/api/version"))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(before.status(), 200);
+    let logout = client()
+        .post(format!("{base_url}/maxio/api/auth/logout"))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(logout.status(), 200, "{}", logout.text().await.unwrap());
+    let after = client()
+        .get(format!("{base_url}/maxio/api/version"))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(after.status(), 401, "{}", after.text().await.unwrap());
+    let check = client()
+        .get(format!("{base_url}/maxio/api/auth/check"))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(check.status(), 401);
+    let cache = logout
+        .headers()
+        .get("cache-control")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    assert!(cache.contains("no-store"), "{cache}");
+}
+
+#[tokio::test]
+async fn logout_stays_revoked_after_restart_and_sessions_are_distinct() {
+    let tmp = TempDir::new().unwrap();
+    let data_dir = tmp.path().to_str().unwrap();
+    let first = spawn_console(data_dir).await;
+    let login = |base: &str| {
+        let base = base.to_string();
+        async move {
+            client()
+                .post(format!("{base}/maxio/api/auth/login"))
+                .json(&serde_json::json!({
+                    "accessKey": ACCESS_KEY,
+                    "secretKey": SECRET_KEY
+                }))
+                .send()
+                .await
+                .unwrap()
+        }
+    };
+    let a = login(&first).await;
+    let b = login(&first).await;
+    assert_eq!(a.status(), 200);
+    assert_eq!(b.status(), 200);
+    let cookie_of = |resp: reqwest::Response| {
+        resp.headers()
+            .get("set-cookie")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string()
+    };
+    let cookie_a = cookie_of(a);
+    let cookie_b = cookie_of(b);
+    assert_ne!(cookie_a, cookie_b, "two logins must not share a cookie");
+    let session_a = cookie_a
+        .strip_prefix("maxio_session=")
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap()
+        .to_string();
+    let session_b = cookie_b
+        .strip_prefix("maxio_session=")
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap()
+        .to_string();
+    let logout = client()
+        .post(format!("{first}/maxio/api/auth/logout"))
+        .header("cookie", format!("maxio_session={session_a}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(logout.status(), 200);
+    let still = client()
+        .get(format!("{first}/maxio/api/version"))
+        .header("cookie", format!("maxio_session={session_b}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(still.status(), 200, "the other session stays signed in");
+    let mode = std::fs::metadata(tmp.path().join(".maxio-revoked-sessions.json"))
+        .unwrap()
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(mode, 0o600, "revocation file must be owner-only");
+
+    let second = spawn_console(data_dir).await;
+    let after = client()
+        .get(format!("{second}/maxio/api/version"))
+        .header("cookie", format!("maxio_session={session_a}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(after.status(), 401, "revocation survives a restart");
+    let other = client()
+        .get(format!("{second}/maxio/api/version"))
+        .header("cookie", format!("maxio_session={session_b}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(other.status(), 200, "the live session survives a restart");
+}
+
+#[tokio::test]
+async fn corrupt_revocation_file_fails_closed_and_logout_write_failure_is_500() {
+    let tmp = TempDir::new().unwrap();
+    let data_dir = tmp.path().to_str().unwrap();
+    let first = spawn_console(data_dir).await;
+    let login = client()
+        .post(format!("{first}/maxio/api/auth/login"))
+        .json(&serde_json::json!({
+            "accessKey": ACCESS_KEY,
+            "secretKey": SECRET_KEY
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(login.status(), 200);
+    let session = login
+        .headers()
+        .get("set-cookie")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap()
+        .to_string();
+    assert!(tmp.path().join(".maxio-revoked-sessions.json").is_file());
+    assert!(
+        tmp.path().join(".maxio-revoked-sessions.ready").is_file(),
+        "first start writes a marker so a later deletion is not a first start"
+    );
+
+    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    std::fs::write(tmp.path().join(".maxio-revoked-sessions.json"), b"{").unwrap();
+    let second = spawn_console(data_dir).await;
+    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    let rejected = client()
+        .get(format!("{second}/maxio/api/version"))
+        .header("cookie", &session)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        rejected.status(),
+        401,
+        "a corrupt revocation file revokes sessions issued before this process: {}",
+        rejected.text().await.unwrap()
+    );
+    let fresh_login = client()
+        .post(format!("{second}/maxio/api/auth/login"))
+        .json(&serde_json::json!({
+            "accessKey": ACCESS_KEY,
+            "secretKey": SECRET_KEY
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        fresh_login.status(),
+        200,
+        "a login after the epoch still works"
+    );
+    let fresh = fresh_login
+        .headers()
+        .get("set-cookie")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap()
+        .to_string();
+    let alive = client()
+        .get(format!("{second}/maxio/api/version"))
+        .header("cookie", &fresh)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(alive.status(), 200, "{}", alive.text().await.unwrap());
+
+    let path = tmp.path().join(".maxio-revoked-sessions.json");
+    std::fs::remove_file(&path).unwrap();
+    std::fs::create_dir(&path).unwrap();
+    let logout = client()
+        .post(format!("{second}/maxio/api/auth/logout"))
+        .header("cookie", &fresh)
+        .send()
+        .await
+        .unwrap();
+    let status = logout.status();
+    let body = logout.text().await.unwrap();
+    assert_eq!(status, 500, "{body}");
+    assert!(
+        body.contains("could not be saved"),
+        "logout must not pretend the revocation was saved: {body}"
+    );
+    let after = client()
+        .get(format!("{second}/maxio/api/version"))
+        .header("cookie", &fresh)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        after.status(),
+        401,
+        "the session is revoked in memory even when the write fails: {}",
+        after.text().await.unwrap()
+    );
+}
+
+fn session_token(response: &reqwest::Response) -> String {
+    response
+        .headers()
+        .get("set-cookie")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap()
+        .trim_start_matches("maxio_session=")
+        .to_string()
+}
+
+fn cookie_path(header: &str) -> &str {
+    header
+        .split(';')
+        .map(str::trim)
+        .find_map(|part| part.strip_prefix("Path="))
+        .unwrap_or("")
+}
+
+#[tokio::test]
+async fn logout_revokes_every_session_cookie_and_clears_the_legacy_path() {
+    let (base_url, _tmp) = start_server().await;
+    let login = client()
+        .post(format!("{base_url}/maxio/api/auth/login"))
+        .json(&serde_json::json!({
+            "accessKey": ACCESS_KEY,
+            "secretKey": SECRET_KEY
+        }));
+    let first = login.try_clone().unwrap().send().await.unwrap();
+    let second = login.send().await.unwrap();
+    assert_eq!(first.status(), 200);
+    assert_eq!(second.status(), 200);
+    let token_a = session_token(&first);
+    let token_b = session_token(&second);
+    assert_ne!(token_a, token_b);
+    let both = format!("maxio_session={token_a}; maxio_session={token_b}");
+    let alive = client()
+        .get(format!("{base_url}/maxio/api/version"))
+        .header("cookie", &both)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(alive.status(), 200, "two live cookies still authenticate");
+
+    let logout = client()
+        .post(format!("{base_url}/maxio/api/auth/logout"))
+        .header("cookie", &both)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(logout.status(), 200, "{}", logout.text().await.unwrap());
+    let clears: Vec<String> = logout
+        .headers()
+        .get_all("set-cookie")
+        .iter()
+        .map(|value| value.to_str().unwrap().to_string())
+        .collect();
+    assert!(
+        clears.iter().any(|header| cookie_path(header) == "/maxio"),
+        "missing Path=/maxio clear: {clears:?}"
+    );
+    assert!(
+        clears
+            .iter()
+            .any(|header| cookie_path(header) == "/" && header.contains("Max-Age=0")),
+        "missing Path=/ clear for pre-upgrade cookies: {clears:?}"
+    );
+    for token in [&token_a, &token_b] {
+        let rejected = client()
+            .get(format!("{base_url}/maxio/api/version"))
+            .header("cookie", format!("maxio_session={token}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(rejected.status(), 401, "each cookie must be revoked");
+    }
+}
+
+#[tokio::test]
+async fn one_revoked_cookie_rejects_the_request_even_if_another_is_live() {
+    let (base_url, _tmp) = start_server().await;
+    let login = || {
+        client()
+            .post(format!("{base_url}/maxio/api/auth/login"))
+            .json(&serde_json::json!({
+                "accessKey": ACCESS_KEY,
+                "secretKey": SECRET_KEY
+            }))
+    };
+    let first = login().send().await.unwrap();
+    let second = login().send().await.unwrap();
+    let token_a = session_token(&first);
+    let token_b = session_token(&second);
+    let logout = client()
+        .post(format!("{base_url}/maxio/api/auth/logout"))
+        .header("cookie", format!("maxio_session={token_a}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(logout.status(), 200);
+    let mixed = client()
+        .get(format!("{base_url}/maxio/api/version"))
+        .header(
+            "cookie",
+            format!("maxio_session={token_a}; maxio_session={token_b}"),
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        mixed.status(),
+        401,
+        "a revoked cookie in the same request must not be ignored"
+    );
+    let live = client()
+        .get(format!("{base_url}/maxio/api/version"))
+        .header("cookie", format!("maxio_session={token_b}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(live.status(), 200, "the other session stays signed in");
+}
+
+#[tokio::test]
+async fn login_rate_limit_counts_only_failures_for_that_access_key() {
+    let (base_url, _tmp) = start_server().await;
+    let attempt = |key: &'static str, secret: &'static str| {
+        let base_url = base_url.clone();
+        async move {
+            client()
+                .post(format!("{base_url}/maxio/api/auth/login"))
+                .json(&serde_json::json!({
+                    "accessKey": key,
+                    "secretKey": secret
+                }))
+                .send()
+                .await
+                .unwrap()
+                .status()
+        }
+    };
+    for _ in 0..9 {
+        assert_eq!(attempt(ACCESS_KEY, "wrong-secret").await, 401);
+    }
+    assert_eq!(
+        attempt(ACCESS_KEY, SECRET_KEY).await,
+        200,
+        "a successful login is not counted and clears earlier failures"
+    );
+    for _ in 0..10 {
+        assert_eq!(attempt(ACCESS_KEY, "wrong-secret").await, 401);
+    }
+    assert_eq!(attempt(ACCESS_KEY, "wrong-secret").await, 429);
+    assert_eq!(
+        attempt("other-user", "wrong-secret").await,
+        401,
+        "a different access key has its own failure window"
+    );
+}
+
+#[tokio::test]
+async fn login_clears_a_legacy_root_path_cookie() {
+    let (base_url, _tmp) = start_server().await;
+    let login = client()
+        .post(format!("{base_url}/maxio/api/auth/login"))
+        .json(&serde_json::json!({
+            "accessKey": ACCESS_KEY,
+            "secretKey": SECRET_KEY
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(login.status(), 200);
+    let headers: Vec<String> = login
+        .headers()
+        .get_all("set-cookie")
+        .iter()
+        .map(|value| value.to_str().unwrap().to_string())
+        .collect();
+    assert!(
+        headers
+            .iter()
+            .any(|header| cookie_path(header) == "/" && header.contains("Max-Age=0")),
+        "login must clear a stale Path=/ session cookie: {headers:?}"
+    );
+    assert_eq!(
+        cookie_path(&headers[0]),
+        "/maxio",
+        "the session cookie is the first Set-Cookie so existing clients keep it"
+    );
+    assert!(
+        headers
+            .iter()
+            .any(|header| { cookie_path(header) == "/maxio" && !header.contains("Max-Age=0") }),
+        "login must still set the new session: {headers:?}"
+    );
+}
+
+async fn spawn_console(data_dir: &str) -> String {
+    let keyring = Arc::new(Keyring::load(data_dir, None).await.unwrap());
+    let storage = FilesystemStorage::new(data_dir, false, 10 * 1024 * 1024, 0, keyring)
+        .await
+        .unwrap();
+    let config = Config {
+        port: 0,
+        address: "127.0.0.1".to_string(),
+        data_dir: data_dir.to_string(),
+        access_key: ACCESS_KEY.to_string(),
+        secret_key: SECRET_KEY.to_string(),
+        region: REGION.to_string(),
+        master_key: None,
+        allow_insecure_dev: true,
+        secure_cookies: false,
+        erasure_coding: false,
+        chunk_size: 10 * 1024 * 1024,
+        parity_shards: 0,
+        default_buckets: String::new(),
+        max_console_body_bytes: 1024 * 1024,
+        ..Config::default()
+    };
+    let state = AppState {
+        storage: Arc::new(storage),
+        config: Arc::new(config),
+        login_rate_limiter: Arc::new(maxio::api::console::LoginRateLimiter::new()),
+        revoked_sessions: Arc::new(
+            maxio::api::console::RevokedSessions::open(std::path::Path::new(data_dir)).await,
+        ),
+    };
+    let app = server::build_router(state);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base_url = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move {
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await
+        .unwrap();
+    });
+    base_url
+}
+
+#[tokio::test]
+async fn health_ready_is_503_when_the_data_dir_cannot_be_read() {
+    let (base_url, tmp) = start_server().await;
+    let ready = client()
+        .get(format!("{base_url}/maxio/health/ready"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(ready.status(), 200);
+    body_has_no_version(&ready.text().await.unwrap());
+
+    let mut perms = std::fs::metadata(tmp.path()).unwrap().permissions();
+    perms.set_mode(0o0);
+    std::fs::set_permissions(tmp.path(), perms).unwrap();
+    let denied = client()
+        .get(format!("{base_url}/maxio/health/ready"))
+        .send()
+        .await
+        .unwrap();
+    let status = denied.status();
+    let body = denied.text().await.unwrap();
+    let mut restore = std::fs::metadata(tmp.path()).unwrap().permissions();
+    restore.set_mode(0o755);
+    std::fs::set_permissions(tmp.path(), restore).unwrap();
+    assert_eq!(status, 503, "{body}");
+    body_has_no_version(&body);
+
+    let live = client()
+        .get(format!("{base_url}/maxio/health/live"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(live.status(), 200);
+    body_has_no_version(&live.text().await.unwrap());
+}
+
+#[tokio::test]
+async fn create_bucket_named_maxio_is_rejected() {
+    let (base_url, _tmp) = start_server().await;
+    let resp = signed("PUT", &format!("{base_url}/maxio"), b"").await;
+    let status = resp.status();
+    let body = resp.text().await.unwrap();
+    assert_eq!(status, 400, "{body}");
+    assert!(body.contains("InvalidBucketName"), "{body}");
+}
+
+async fn signed(method: &str, url: &str, body: &[u8]) -> reqwest::Response {
+    let mut headers = Vec::new();
+    sign_request(method, url, &mut headers, body);
+    let method = method.parse::<reqwest::Method>().unwrap();
+    let mut req = client().request(method, url);
+    for (name, value) in headers {
+        req = req.header(name, value);
+    }
+    if !body.is_empty() {
+        req = req.body(body.to_vec());
+    }
+    req.send().await.unwrap()
+}
+
+/// Buckets named `version` and `healthz` are S3 buckets. `/maxio/health/live`
+/// is the unauthenticated probe and does not include the version.
+#[tokio::test]
+async fn probe_names_are_buckets_and_unsigned_healthz_stays_a_probe() {
+    let (base_url, _tmp) = start_server().await;
+
+    let live = client()
+        .get(format!("{base_url}/maxio/health/live"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(live.status(), 200);
+    let live_body = live.text().await.unwrap();
+    assert!(live_body.contains("\"status\":\"ok\""), "{live_body}");
+    body_has_no_version(&live_body);
+
+    let denied = client()
+        .get(format!("{base_url}/maxio/api/version"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(denied.status(), 401);
+    let denied_body = denied.text().await.unwrap();
+    body_has_no_version(&denied_body);
+
+    let old = client()
+        .get(format!("{base_url}/healthz"))
+        .send()
+        .await
+        .unwrap();
+    let old_status = old.status();
+    let old_body = old.text().await.unwrap();
+    assert_ne!(old_status, 200, "{old_body}");
+    body_has_no_version(&old_body);
+
+    let old_api = client()
+        .get(format!("{base_url}/api/version"))
+        .send()
+        .await
+        .unwrap();
+    let old_api_status = old_api.status();
+    let old_api_body = old_api.text().await.unwrap();
+    assert_ne!(
+        old_api_status, 401,
+        "old /api/version must not be the console: {old_api_body}"
+    );
+    assert!(
+        !old_api_body.contains("Not authenticated"),
+        "{old_api_body}"
+    );
+
+    for bucket in ["version", "healthz", "api", "readyz"] {
+        let root = format!("{base_url}/{bucket}");
+        let created = signed("PUT", &root, b"").await;
+        assert_eq!(
+            created.status(),
+            200,
+            "{bucket} create {}",
+            created.text().await.unwrap()
+        );
+
+        let listed = signed("GET", &root, b"").await;
+        let listed_status = listed.status();
+        let listed_body = listed.text().await.unwrap();
+        assert_eq!(listed_status, 200, "{listed_body}");
+        assert!(
+            !listed_body.contains("\"status\":\"ok\""),
+            "signed list must not be the version probe: {listed_body}"
+        );
+
+        let versioning = signed("GET", &format!("{root}?versioning"), b"").await;
+        let versioning_status = versioning.status();
+        let versioning_body = versioning.text().await.unwrap();
+        assert_eq!(versioning_status, 200, "{versioning_body}");
+        assert!(
+            versioning_body.contains("VersioningConfiguration"),
+            "{versioning_body}"
+        );
+
+        let object = format!("{root}/note.txt");
+        let put = signed("PUT", &object, b"probe-body").await;
+        assert_eq!(
+            put.status(),
+            200,
+            "{bucket} put {}",
+            put.text().await.unwrap()
+        );
+        let got = signed("GET", &object, b"").await;
+        let got_status = got.status();
+        let got_body = got.text().await.unwrap();
+        assert_eq!(got_status, 200, "{got_body}");
+        assert_eq!(got_body, "probe-body");
+
+        let deleted = signed("DELETE", &object, b"").await;
+        assert_eq!(deleted.status(), 204, "{bucket} delete object");
+        let removed = signed("DELETE", &root, b"").await;
+        assert_eq!(removed.status(), 204, "{bucket} delete bucket");
+    }
+}
+
+/// `ui` is not a bucket: the name is shorter than S3 allows and it is the console path.
+/// Browser GET/HEAD of `/ui` is the console. A signed or query-selected request is S3.
+#[tokio::test]
+async fn bucket_ui_is_reserved_and_browser_get_is_the_console() {
+    let (base_url, _tmp) = start_server().await;
+    let root = format!("{base_url}/ui");
+    let created = signed("PUT", &root, b"").await;
+    let created_status = created.status();
+    let created_body = created.text().await.unwrap();
+    assert_eq!(created_status, 400, "{created_body}");
+    assert!(created_body.contains("InvalidBucketName"), "{created_body}");
+
+    let presigned = client()
+        .get(presign_url(&base_url, "GET", "/ui/note.txt", 300))
+        .send()
+        .await
+        .unwrap();
+    let presigned_status = presigned.status();
+    let presigned_body = presigned.text().await.unwrap();
+    assert_eq!(presigned_status, 400, "{presigned_body}");
+    assert!(
+        presigned_body.contains("InvalidBucketName"),
+        "{presigned_body}"
+    );
+
+    let browser = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap();
+    for path in [
+        "/ui/buckets/photos?prefix=2026%2F",
+        "/ui/buckets/photos/settings?prefix=2026%2F",
+        "/ui?versioning",
+    ] {
+        let page = browser
+            .get(format!("{base_url}{path}"))
+            .send()
+            .await
+            .unwrap();
+        let status = page.status().as_u16();
+        let location = page
+            .headers()
+            .get("location")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+        let cache = page
+            .headers()
+            .get("cache-control")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+        let body = page.text().await.unwrap();
+        if status == 308 {
+            assert!(
+                location.starts_with("/ui/"),
+                "{path} redirected to {location}"
+            );
+            assert!(!body.contains("<Code>"), "{path}: {body}");
+            continue;
+        }
+        assert!(
+            status == 200 || status == 503,
+            "{path} returned {status}: {body}"
+        );
+        assert!(!body.contains("<Code>"), "{path}: {body}");
+        assert!(!body.contains("Missing Authorization"), "{path}: {body}");
+        if status == 200 {
+            assert!(
+                cache.contains("no-store"),
+                "{path} html cache-control is {cache}"
+            );
+            assert!(
+                body.contains("/ui/favicon-32.png"),
+                "favicon must live under /ui/: {body}"
+            );
+            assert!(
+                !body.contains("href=\"/favicon"),
+                "root favicon path must not be claimed: {body}"
+            );
+        }
+    }
+
+    let page = browser.get(format!("{root}/")).send().await.unwrap();
+    let page_status = page.status().as_u16();
+    let page_body = page.text().await.unwrap();
+    assert!(
+        page_status == 200 || page_status == 503,
+        "browser /ui/ returned {page_status}: {page_body}"
+    );
+    assert!(!page_body.contains("<Code>"), "{page_body}");
+}
+
+#[tokio::test]
+async fn legacy_health_aliases_are_not_probes() {
+    let (base_url, _tmp) = start_server().await;
+    for path in [
+        "/readyz",
+        "/minio/health/live",
+        "/minio/health/ready",
+        "/minio/health/cluster",
+    ] {
+        let resp = client()
+            .get(format!("{base_url}{path}"))
+            .send()
+            .await
+            .unwrap();
+        let status = resp.status();
+        let body = resp.text().await.unwrap();
+        assert_ne!(status, 200, "{path} must not be a health probe: {body}");
+        assert!(body.contains("<Code>"), "{path}: {body}");
+        body_has_no_version(&body);
+    }
 }
 
 #[tokio::test]
 async fn test_security_headers_are_applied() {
     let (base_url, _tmp) = start_server().await;
     let resp = client()
-        .get(format!("{}/healthz", base_url))
+        .get(format!("{}/maxio/health/live", base_url))
         .send()
         .await
         .unwrap();
@@ -837,7 +1692,7 @@ async fn console_login_on_loopback_http_omits_secure_and_authenticates() {
     let (base_url, _tmp) =
         start_server_with_keys("test-access", "test-credential", true, false).await;
     let resp = client()
-        .post(format!("{base_url}/api/auth/login"))
+        .post(format!("{base_url}/maxio/api/auth/login"))
         .json(&serde_json::json!({
             "accessKey": "test-access",
             "secretKey": "test-credential"
@@ -864,7 +1719,7 @@ async fn console_login_on_loopback_http_omits_secure_and_authenticates() {
         .next()
         .unwrap();
     let check = client()
-        .get(format!("{base_url}/api/auth/check"))
+        .get(format!("{base_url}/maxio/api/auth/check"))
         .header("cookie", format!("maxio_session={session}"))
         .send()
         .await
@@ -877,7 +1732,7 @@ async fn console_login_marks_cookie_secure_for_https_and_public_hosts() {
     let (base_url, _tmp) =
         start_server_with_keys("test-access", "test-credential", true, false).await;
     let https = client()
-        .post(format!("{base_url}/api/auth/login"))
+        .post(format!("{base_url}/maxio/api/auth/login"))
         .header("x-forwarded-proto", "https")
         .json(&serde_json::json!({
             "accessKey": "test-access",
@@ -894,7 +1749,7 @@ async fn console_login_marks_cookie_secure_for_https_and_public_hosts() {
     );
 
     let public_host = client()
-        .post(format!("{base_url}/api/auth/login"))
+        .post(format!("{base_url}/maxio/api/auth/login"))
         .header("host", "storage.example.com")
         .json(&serde_json::json!({
             "accessKey": "test-access",
@@ -933,10 +1788,7 @@ async fn test_ui_deep_link_uses_spa_fallback() {
             .unwrap()
             .contains("text/html")
     );
-    assert_eq!(
-        resp.headers().get("cache-control").unwrap(),
-        "no-store, must-revalidate"
-    );
+    assert_eq!(resp.headers().get("cache-control").unwrap(), "no-store");
     let body = resp.text().await.unwrap();
     assert!(body.contains("MaxIO"));
 }
@@ -2727,7 +3579,7 @@ async fn test_presigned_bad_signature() {
 /// Helper: login via console API and return the session cookie value.
 async fn console_login(base_url: &str) -> String {
     let resp = client()
-        .post(&format!("{}/api/auth/login", base_url))
+        .post(&format!("{}/maxio/api/auth/login", base_url))
         .json(&serde_json::json!({"accessKey": ACCESS_KEY, "secretKey": SECRET_KEY}))
         .send()
         .await
@@ -2760,7 +3612,7 @@ async fn test_console_mutation_allows_dev_loopback_origin_via_vite_proxy() {
     let session = console_login(&base_url).await;
 
     let resp = client()
-        .post(format!("{}/api/buckets", base_url))
+        .post(format!("{}/maxio/api/buckets", base_url))
         .header("cookie", format!("maxio_session={}", session))
         .header("origin", "http://127.0.0.1:5173")
         .json(&serde_json::json!({ "name": "dev-origin-bucket" }))
@@ -2777,7 +3629,7 @@ async fn test_console_mutation_rejects_cross_site_origin() {
     let session = console_login(&base_url).await;
 
     let resp = client()
-        .post(format!("{}/api/buckets", base_url))
+        .post(format!("{}/maxio/api/buckets", base_url))
         .header("cookie", format!("maxio_session={}", session))
         .header("origin", "http://evil.example")
         .json(&serde_json::json!({ "name": "evil-origin-bucket" }))
@@ -2795,7 +3647,7 @@ async fn test_console_delete_object_missing_bucket_returns_404() {
 
     let resp = client()
         .delete(&format!(
-            "{}/api/buckets/missing-bucket/objects/file.txt",
+            "{}/maxio/api/buckets/missing-bucket/objects/file.txt",
             base_url
         ))
         .header("cookie", format!("maxio_session={}", session))
@@ -2828,7 +3680,7 @@ async fn test_console_presign_simple_key() {
     // Generate presigned URL via console endpoint
     let resp = client()
         .get(&format!(
-            "{}/api/buckets/cpresign-bucket/presign/test.txt?expires=300",
+            "{}/maxio/api/buckets/cpresign-bucket/presign/test.txt?expires=300",
             base_url
         ))
         .header("Cookie", format!("maxio_session={}", session))
@@ -2871,7 +3723,7 @@ async fn test_console_presign_key_with_spaces() {
     // Request presigned URL for the key with spaces (URL-encoded in the API path)
     let resp = client()
         .get(&format!(
-            "{}/api/buckets/cpresign-space/presign/my%20file.txt?expires=300",
+            "{}/maxio/api/buckets/cpresign-space/presign/my%20file.txt?expires=300",
             base_url
         ))
         .header("Cookie", format!("maxio_session={}", session))
@@ -2911,7 +3763,7 @@ async fn test_console_presign_nested_key() {
 
     let resp = client()
         .get(&format!(
-            "{}/api/buckets/cpresign-nested/presign/folder/sub/file.txt?expires=300",
+            "{}/maxio/api/buckets/cpresign-nested/presign/folder/sub/file.txt?expires=300",
             base_url
         ))
         .header("Cookie", format!("maxio_session={}", session))
@@ -3320,10 +4172,14 @@ async fn start_server_ec() -> (String, TempDir) {
         ..Config::default()
     };
 
+    let revoked_sessions = Arc::new(
+        maxio::api::console::RevokedSessions::open(std::path::Path::new(&config.data_dir)).await,
+    );
     let state = AppState {
         storage: Arc::new(storage),
         config: Arc::new(config),
         login_rate_limiter: Arc::new(maxio::api::console::LoginRateLimiter::new()),
+        revoked_sessions,
     };
 
     let app = server::build_router(state);
@@ -3845,10 +4701,14 @@ async fn start_server_parity(parity_shards: u32) -> (String, TempDir) {
         ..Config::default()
     };
 
+    let revoked_sessions = Arc::new(
+        maxio::api::console::RevokedSessions::open(std::path::Path::new(&config.data_dir)).await,
+    );
     let state = AppState {
         storage: Arc::new(storage),
         config: Arc::new(config),
         login_rate_limiter: Arc::new(maxio::api::console::LoginRateLimiter::new()),
+        revoked_sessions,
     };
 
     let app = server::build_router(state);
@@ -5360,7 +6220,7 @@ async fn test_console_upload_fails_when_bucket_encryption_unreadable() {
     let session = console_login(&base_url).await;
     let resp = client()
         .put(&format!(
-            "{}/api/buckets/console-corrupt/upload/safe.txt",
+            "{}/maxio/api/buckets/console-corrupt/upload/safe.txt",
             base_url
         ))
         .header("cookie", format!("maxio_session={}", session))
@@ -5405,7 +6265,7 @@ async fn test_console_create_folder_fails_when_bucket_encryption_unreadable() {
     let session = console_login(&base_url).await;
     let resp = client()
         .post(&format!(
-            "{}/api/buckets/console-corrupt-folder/folders",
+            "{}/maxio/api/buckets/console-corrupt-folder/folders",
             base_url
         ))
         .header("cookie", format!("maxio_session={}", session))
@@ -5430,7 +6290,7 @@ async fn test_console_create_folder_fails_when_bucket_encryption_unreadable() {
     );
 }
 
-/// Console API GET/PUT /api/buckets/{b}/encryption round-trips bucket default
+/// Console API GET/PUT /maxio/api/buckets/{b}/encryption round-trips bucket default
 /// encryption config. Toggles enable → disable and verifies both the response
 /// body and the on-disk `.bucket.json` state.
 #[tokio::test]
@@ -5441,7 +6301,7 @@ async fn test_console_bucket_encryption_endpoint_roundtrip() {
 
     // Initial GET → disabled
     let resp = client()
-        .get(&format!("{}/api/buckets/cenc-1/encryption", base_url))
+        .get(&format!("{}/maxio/api/buckets/cenc-1/encryption", base_url))
         .header("cookie", format!("maxio_session={}", session))
         .send()
         .await
@@ -5454,7 +6314,7 @@ async fn test_console_bucket_encryption_endpoint_roundtrip() {
 
     // PUT {enabled: true}
     let resp = client()
-        .put(&format!("{}/api/buckets/cenc-1/encryption", base_url))
+        .put(&format!("{}/maxio/api/buckets/cenc-1/encryption", base_url))
         .header("cookie", format!("maxio_session={}", session))
         .json(&serde_json::json!({"enabled": true}))
         .send()
@@ -5466,7 +6326,7 @@ async fn test_console_bucket_encryption_endpoint_roundtrip() {
 
     // GET → enabled + AES256
     let resp = client()
-        .get(&format!("{}/api/buckets/cenc-1/encryption", base_url))
+        .get(&format!("{}/maxio/api/buckets/cenc-1/encryption", base_url))
         .header("cookie", format!("maxio_session={}", session))
         .send()
         .await
@@ -5487,7 +6347,7 @@ async fn test_console_bucket_encryption_endpoint_roundtrip() {
 
     // PUT {enabled: false}
     let resp = client()
-        .put(&format!("{}/api/buckets/cenc-1/encryption", base_url))
+        .put(&format!("{}/maxio/api/buckets/cenc-1/encryption", base_url))
         .header("cookie", format!("maxio_session={}", session))
         .json(&serde_json::json!({"enabled": false}))
         .send()
@@ -5497,7 +6357,7 @@ async fn test_console_bucket_encryption_endpoint_roundtrip() {
 
     // GET → disabled again
     let resp = client()
-        .get(&format!("{}/api/buckets/cenc-1/encryption", base_url))
+        .get(&format!("{}/maxio/api/buckets/cenc-1/encryption", base_url))
         .header("cookie", format!("maxio_session={}", session))
         .send()
         .await
@@ -5514,7 +6374,7 @@ async fn test_console_bucket_encryption_endpoint_roundtrip() {
     );
 }
 
-/// Console API upload (`PUT /api/buckets/{b}/upload/{key}`) honors the
+/// Console API upload (`PUT /maxio/api/buckets/{b}/upload/{key}`) honors the
 /// bucket's default encryption config. Previously the handler passed `None`
 /// to `put_object`, bypassing the bucket default and writing plaintext.
 #[tokio::test]
@@ -5525,7 +6385,10 @@ async fn test_console_upload_honors_bucket_default_encryption() {
 
     // Enable default encryption via console API
     let resp = client()
-        .put(&format!("{}/api/buckets/cenc-up/encryption", base_url))
+        .put(&format!(
+            "{}/maxio/api/buckets/cenc-up/encryption",
+            base_url
+        ))
         .header("cookie", format!("maxio_session={}", session))
         .json(&serde_json::json!({"enabled": true}))
         .send()
@@ -5537,7 +6400,7 @@ async fn test_console_upload_honors_bucket_default_encryption() {
     let marker = b"plaintext-marker-AAAA".to_vec();
     let resp = client()
         .put(&format!(
-            "{}/api/buckets/cenc-up/upload/hello.txt",
+            "{}/maxio/api/buckets/cenc-up/upload/hello.txt",
             base_url
         ))
         .header("cookie", format!("maxio_session={}", session))
@@ -5568,7 +6431,7 @@ async fn test_console_upload_honors_bucket_default_encryption() {
     // Download via console API returns plaintext
     let resp = client()
         .get(&format!(
-            "{}/api/buckets/cenc-up/download/hello.txt",
+            "{}/maxio/api/buckets/cenc-up/download/hello.txt",
             base_url
         ))
         .header("cookie", format!("maxio_session={}", session))
@@ -5580,7 +6443,7 @@ async fn test_console_upload_honors_bucket_default_encryption() {
     assert_eq!(downloaded.as_ref(), marker.as_slice());
 }
 
-/// Console API `POST /api/buckets/{b}/folders` resolves bucket default
+/// Console API `POST /maxio/api/buckets/{b}/folders` resolves bucket default
 /// encryption without crashing when encryption is enabled. Folder markers
 /// are zero-byte objects so no ciphertext assertion is possible; this is a
 /// regression guard for the `create_folder` encryption-lookup fix.
@@ -5592,7 +6455,10 @@ async fn test_console_create_folder_succeeds_with_bucket_default_encryption() {
 
     // Enable default encryption
     let resp = client()
-        .put(&format!("{}/api/buckets/cenc-fold/encryption", base_url))
+        .put(&format!(
+            "{}/maxio/api/buckets/cenc-fold/encryption",
+            base_url
+        ))
         .header("cookie", format!("maxio_session={}", session))
         .json(&serde_json::json!({"enabled": true}))
         .send()
@@ -5602,7 +6468,7 @@ async fn test_console_create_folder_succeeds_with_bucket_default_encryption() {
 
     // Create folder
     let resp = client()
-        .post(&format!("{}/api/buckets/cenc-fold/folders", base_url))
+        .post(&format!("{}/maxio/api/buckets/cenc-fold/folders", base_url))
         .header("cookie", format!("maxio_session={}", session))
         .json(&serde_json::json!({"name": "sub"}))
         .send()
@@ -6706,10 +7572,14 @@ async fn start_server_ec_parity(chunk_size: u64, parity_shards: u32) -> (String,
         ..Config::default()
     };
 
+    let revoked_sessions = Arc::new(
+        maxio::api::console::RevokedSessions::open(std::path::Path::new(&config.data_dir)).await,
+    );
     let state = AppState {
         storage: Arc::new(storage),
         config: Arc::new(config),
         login_rate_limiter: Arc::new(maxio::api::console::LoginRateLimiter::new()),
+        revoked_sessions,
     };
 
     let app = server::build_router(state);
@@ -8807,25 +9677,18 @@ async fn test_a_list_encoding_type_and_fetch_owner() {
 }
 
 #[tokio::test]
-async fn test_a_minio_health_endpoints() {
+async fn test_a_minio_health_endpoints_are_not_aliases() {
     let (base, _tmp) = start_server().await;
     for path in [
         "/minio/health/live",
         "/minio/health/ready",
         "/minio/health/cluster",
     ] {
-        let resp = client()
-            .get(format!("{}{}", base, path))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), 200, "GET {}", path);
-        let resp = client()
-            .head(format!("{}{}", base, path))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), 200, "HEAD {}", path);
+        let resp = client().get(format!("{base}{path}")).send().await.unwrap();
+        let status = resp.status();
+        let body = resp.text().await.unwrap();
+        assert_eq!(status, 403, "GET {path}: {body}");
+        assert!(body.contains("<Code>"), "{path}: {body}");
     }
 }
 
@@ -10503,7 +11366,7 @@ async fn test_version_id_traversal_rejected_console() {
     let cookie = console_login(&base).await;
     let r = client()
         .delete(&format!(
-            "{}/api/buckets/vtravc/versions/..%2F..%2Fvictim/objects/a",
+            "{}/maxio/api/buckets/vtravc/versions/..%2F..%2Fvictim/objects/a",
             base
         ))
         .header("cookie", format!("maxio_session={}", cookie))
@@ -10513,7 +11376,7 @@ async fn test_version_id_traversal_rejected_console() {
     assert_eq!(r.status(), 400);
     let r = client()
         .get(&format!(
-            "{}/api/buckets/vtravc/versions/..%2F..%2Fvictim/download/a",
+            "{}/maxio/api/buckets/vtravc/versions/..%2F..%2Fvictim/download/a",
             base
         ))
         .header("cookie", format!("maxio_session={}", cookie))
@@ -10679,7 +11542,7 @@ async fn test_console_new_endpoints_require_auth() {
         let r = client()
             .request(
                 method.parse().unwrap(),
-                format!("{}/api/buckets/kauth/{}", base, path),
+                format!("{}/maxio/api/buckets/kauth/{}", base, path),
             )
             .json(&serde_json::json!({ "tags": [], "rules": [] }))
             .send()
@@ -10713,7 +11576,7 @@ async fn test_console_object_info_returns_metadata() {
     let (status, info) = console_json(
         "GET",
         &base,
-        "/api/buckets/kinfo/object-info/dir/report.txt",
+        "/maxio/api/buckets/kinfo/object-info/dir/report.txt",
         &session,
         None,
     )
@@ -10751,7 +11614,7 @@ async fn test_console_object_info_returns_metadata() {
     let (status, body) = console_json(
         "GET",
         &base,
-        "/api/buckets/kinfo/object-info/nope.txt",
+        "/maxio/api/buckets/kinfo/object-info/nope.txt",
         &session,
         None,
     )
@@ -10763,7 +11626,7 @@ async fn test_console_object_info_returns_metadata() {
     let (status, _) = console_json(
         "GET",
         &base,
-        "/api/buckets/kinfo-missing/object-info/a",
+        "/maxio/api/buckets/kinfo-missing/object-info/a",
         &session,
         None,
     )
@@ -10789,7 +11652,7 @@ async fn test_console_object_info_encryption_and_versions() {
     let (status, info) = console_json(
         "GET",
         &base,
-        "/api/buckets/kenc/object-info/s3.txt",
+        "/maxio/api/buckets/kenc/object-info/s3.txt",
         &session,
         None,
     )
@@ -10820,7 +11683,7 @@ async fn test_console_object_info_encryption_and_versions() {
     let (status, info) = console_json(
         "GET",
         &base,
-        "/api/buckets/kenc/object-info/c.txt",
+        "/maxio/api/buckets/kenc/object-info/c.txt",
         &session,
         None,
     )
@@ -10838,7 +11701,7 @@ async fn test_console_object_info_encryption_and_versions() {
     let (status, info) = console_json(
         "GET",
         &base,
-        &format!("/api/buckets/kver/object-info/f?versionId={}", v1),
+        &format!("/maxio/api/buckets/kver/object-info/f?versionId={}", v1),
         &session,
         None,
     )
@@ -10849,7 +11712,7 @@ async fn test_console_object_info_encryption_and_versions() {
     let (status, info) = console_json(
         "GET",
         &base,
-        "/api/buckets/kver/object-info/f",
+        "/maxio/api/buckets/kver/object-info/f",
         &session,
         None,
     )
@@ -10861,7 +11724,7 @@ async fn test_console_object_info_encryption_and_versions() {
     let (status, _) = console_json(
         "GET",
         &base,
-        "/api/buckets/kver/object-info/f?versionId=../x",
+        "/maxio/api/buckets/kver/object-info/f?versionId=../x",
         &session,
         None,
     )
@@ -10870,7 +11733,7 @@ async fn test_console_object_info_encryption_and_versions() {
     let (status, _) = console_json(
         "GET",
         &base,
-        "/api/buckets/kver/object-info/f?versionId=123-abc",
+        "/maxio/api/buckets/kver/object-info/f?versionId=123-abc",
         &session,
         None,
     )
@@ -10884,7 +11747,7 @@ async fn test_console_object_tags_roundtrip_and_validation() {
     let session = console_login(&base).await;
     s3_request("PUT", &format!("{}/ktags", base), vec![]).await;
     s3_request("PUT", &format!("{}/ktags/a/b.txt", base), b"x".to_vec()).await;
-    let path = "/api/buckets/ktags/object-tags/a/b.txt";
+    let path = "/maxio/api/buckets/ktags/object-tags/a/b.txt";
 
     let (status, body) = console_json("GET", &base, path, &session, None).await;
     assert_eq!(status, 200, "{}", body);
@@ -10959,7 +11822,7 @@ async fn test_console_object_tags_roundtrip_and_validation() {
     let (status, _) = console_json(
         "GET",
         &base,
-        "/api/buckets/ktags/object-tags/missing",
+        "/maxio/api/buckets/ktags/object-tags/missing",
         &session,
         None,
     )
@@ -10968,7 +11831,7 @@ async fn test_console_object_tags_roundtrip_and_validation() {
     let (status, _) = console_json(
         "PUT",
         &base,
-        "/api/buckets/ktags/object-tags/missing",
+        "/maxio/api/buckets/ktags/object-tags/missing",
         &session,
         Some(serde_json::json!({ "tags": [] })),
     )
@@ -10986,7 +11849,7 @@ async fn test_console_object_tags_on_versions() {
     let v1 = c_header(&r, "x-amz-version-id").unwrap();
     s3_request("PUT", &format!("{}/kvtags/f", base), b"two".to_vec()).await;
 
-    let v1_path = format!("/api/buckets/kvtags/object-tags/f?versionId={}", v1);
+    let v1_path = format!("/maxio/api/buckets/kvtags/object-tags/f?versionId={}", v1);
     let (status, body) = console_json(
         "PUT",
         &base,
@@ -11005,7 +11868,7 @@ async fn test_console_object_tags_on_versions() {
     let (_, body) = console_json(
         "GET",
         &base,
-        "/api/buckets/kvtags/object-tags/f",
+        "/maxio/api/buckets/kvtags/object-tags/f",
         &session,
         None,
     )
@@ -11016,7 +11879,7 @@ async fn test_console_object_tags_on_versions() {
     let (status, _) = console_json(
         "PUT",
         &base,
-        "/api/buckets/kvtags/object-tags/f",
+        "/maxio/api/buckets/kvtags/object-tags/f",
         &session,
         Some(serde_json::json!({ "tags": [{ "key": "cur", "value": "1" }] })),
     )
@@ -11025,7 +11888,7 @@ async fn test_console_object_tags_on_versions() {
     let (_, info) = console_json(
         "GET",
         &base,
-        "/api/buckets/kvtags/object-info/f",
+        "/maxio/api/buckets/kvtags/object-info/f",
         &session,
         None,
     )
@@ -11034,7 +11897,7 @@ async fn test_console_object_tags_on_versions() {
     let (_, body) = console_json(
         "GET",
         &base,
-        &format!("/api/buckets/kvtags/object-tags/f?versionId={}", cur),
+        &format!("/maxio/api/buckets/kvtags/object-tags/f?versionId={}", cur),
         &session,
         None,
     )
@@ -11044,7 +11907,7 @@ async fn test_console_object_tags_on_versions() {
     let (status, _) = console_json(
         "PUT",
         &base,
-        "/api/buckets/kvtags/object-tags/f?versionId=bad/id",
+        "/maxio/api/buckets/kvtags/object-tags/f?versionId=bad/id",
         &session,
         Some(serde_json::json!({ "tags": [] })),
     )
@@ -11057,7 +11920,7 @@ async fn test_console_bucket_tags_roundtrip_and_validation() {
     let (base, _tmp) = start_server().await;
     let session = console_login(&base).await;
     s3_request("PUT", &format!("{}/kbtags", base), vec![]).await;
-    let path = "/api/buckets/kbtags/tags";
+    let path = "/maxio/api/buckets/kbtags/tags";
 
     let (status, body) = console_json("GET", &base, path, &session, None).await;
     assert_eq!(status, 200, "{}", body);
@@ -11091,7 +11954,7 @@ async fn test_console_bucket_tags_roundtrip_and_validation() {
     assert!(xml.contains("<Key>cost-center</Key>"), "{}", xml);
 
     // Bucket list carries tagCount
-    let (_, list) = console_json("GET", &base, "/api/buckets", &session, None).await;
+    let (_, list) = console_json("GET", &base, "/maxio/api/buckets", &session, None).await;
     let b = list["buckets"]
         .as_array()
         .unwrap()
@@ -11141,7 +12004,7 @@ async fn test_console_bucket_tags_roundtrip_and_validation() {
     let (status, _) = console_json(
         "GET",
         &base,
-        "/api/buckets/kbtags-missing/tags",
+        "/maxio/api/buckets/kbtags-missing/tags",
         &session,
         None,
     )
@@ -11155,23 +12018,35 @@ async fn test_console_bucket_policy_view_and_bucket_summary_flags() {
     let session = console_login(&base).await;
     s3_request("PUT", &format!("{}/kpolicy", base), vec![]).await;
 
-    let (status, body) =
-        console_json("GET", &base, "/api/buckets/kpolicy/policy", &session, None).await;
+    let (status, body) = console_json(
+        "GET",
+        &base,
+        "/maxio/api/buckets/kpolicy/policy",
+        &session,
+        None,
+    )
+    .await;
     assert_eq!(status, 200, "{}", body);
     assert!(body["policy"].is_null(), "{}", body);
 
     let (status, _) = console_json(
         "PUT",
         &base,
-        "/api/buckets/kpolicy/public",
+        "/maxio/api/buckets/kpolicy/public",
         &session,
         Some(serde_json::json!({ "read": true, "list": false })),
     )
     .await;
     assert_eq!(status, 200);
 
-    let (status, body) =
-        console_json("GET", &base, "/api/buckets/kpolicy/policy", &session, None).await;
+    let (status, body) = console_json(
+        "GET",
+        &base,
+        "/maxio/api/buckets/kpolicy/policy",
+        &session,
+        None,
+    )
+    .await;
     assert_eq!(status, 200);
     let policy_str = body["policy"].as_str().expect("policy string");
     let s3_policy = s3_request("GET", &format!("{}/kpolicy?policy", base), vec![])
@@ -11184,7 +12059,7 @@ async fn test_console_bucket_policy_view_and_bucket_summary_flags() {
     assert!(policy.to_string().contains("s3:GetObject"));
     assert!(!policy.to_string().contains("s3:ListBucket"));
 
-    let (_, list) = console_json("GET", &base, "/api/buckets", &session, None).await;
+    let (_, list) = console_json("GET", &base, "/maxio/api/buckets", &session, None).await;
     let b = list["buckets"]
         .as_array()
         .unwrap()
@@ -11198,7 +12073,7 @@ async fn test_console_bucket_policy_view_and_bucket_summary_flags() {
     let (status, _) = console_json(
         "GET",
         &base,
-        "/api/buckets/kpolicy-missing/policy",
+        "/maxio/api/buckets/kpolicy-missing/policy",
         &session,
         None,
     )
@@ -11218,8 +12093,14 @@ async fn test_console_list_objects_includes_content_type() {
         vec![("content-type", "text/html")],
     )
     .await;
-    let (status, body) =
-        console_json("GET", &base, "/api/buckets/kctype/objects", &session, None).await;
+    let (status, body) = console_json(
+        "GET",
+        &base,
+        "/maxio/api/buckets/kctype/objects",
+        &session,
+        None,
+    )
+    .await;
     assert_eq!(status, 200);
     assert_eq!(body["files"][0]["contentType"], "text/html");
 }
@@ -11255,7 +12136,10 @@ async fn test_console_restore_version_roundtrip() {
     let (status, body) = console_json(
         "POST",
         &base,
-        &format!("/api/buckets/krestore/versions/{}/restore/docs/f.txt", v1),
+        &format!(
+            "/maxio/api/buckets/krestore/versions/{}/restore/docs/f.txt",
+            v1
+        ),
         &session,
         None,
     )
@@ -11278,7 +12162,7 @@ async fn test_console_restore_version_roundtrip() {
     let (_, info) = console_json(
         "GET",
         &base,
-        "/api/buckets/krestore/object-info/docs/f.txt",
+        "/maxio/api/buckets/krestore/object-info/docs/f.txt",
         &session,
         None,
     )
@@ -11288,7 +12172,7 @@ async fn test_console_restore_version_roundtrip() {
     let (_, versions) = console_json(
         "GET",
         &base,
-        "/api/buckets/krestore/versions?key=docs/f.txt",
+        "/maxio/api/buckets/krestore/versions?key=docs/f.txt",
         &session,
         None,
     )
@@ -11304,7 +12188,7 @@ async fn test_console_restore_version_roundtrip() {
     let (status, _) = console_json(
         "POST",
         &base,
-        "/api/buckets/krestore/versions/not-a-version/restore/docs/f.txt",
+        "/maxio/api/buckets/krestore/versions/not-a-version/restore/docs/f.txt",
         &session,
         None,
     )
@@ -11313,7 +12197,7 @@ async fn test_console_restore_version_roundtrip() {
     let (status, _) = console_json(
         "POST",
         &base,
-        "/api/buckets/krestore/versions/1-abc/restore/docs/f.txt",
+        "/maxio/api/buckets/krestore/versions/1-abc/restore/docs/f.txt",
         &session,
         None,
     )
@@ -11327,7 +12211,7 @@ async fn test_console_restore_version_roundtrip() {
         "POST",
         &base,
         &format!(
-            "/api/buckets/krestore/versions/{}/restore/docs/f.txt",
+            "/maxio/api/buckets/krestore/versions/{}/restore/docs/f.txt",
             marker
         ),
         &session,
@@ -11339,7 +12223,10 @@ async fn test_console_restore_version_roundtrip() {
     let (status, _) = console_json(
         "POST",
         &base,
-        &format!("/api/buckets/krestore/versions/{}/restore/docs/f.txt", v2),
+        &format!(
+            "/maxio/api/buckets/krestore/versions/{}/restore/docs/f.txt",
+            v2
+        ),
         &session,
         None,
     )
@@ -11368,7 +12255,7 @@ async fn test_console_restore_version_encryption() {
     let (status, body) = console_json(
         "POST",
         &base,
-        &format!("/api/buckets/krenc/versions/{}/restore/s3", v1),
+        &format!("/maxio/api/buckets/krenc/versions/{}/restore/s3", v1),
         &session,
         None,
     )
@@ -11400,7 +12287,7 @@ async fn test_console_restore_version_encryption() {
     let (status, body) = console_json(
         "POST",
         &base,
-        &format!("/api/buckets/krenc/versions/{}/restore/c", vc),
+        &format!("/maxio/api/buckets/krenc/versions/{}/restore/c", vc),
         &session,
         None,
     )
@@ -12309,7 +13196,7 @@ async fn test_console_lifecycle_roundtrip() {
     let (base, _tmp) = start_server().await;
     let session = console_login(&base).await;
     s3_request("PUT", &format!("{}/ulc", base), vec![]).await;
-    let path = "/api/buckets/ulc/lifecycle";
+    let path = "/maxio/api/buckets/ulc/lifecycle";
 
     let (status, body) = console_json("GET", &base, path, &session, None).await;
     assert_eq!(status, 200, "{}", body);
@@ -12363,7 +13250,7 @@ async fn test_console_lifecycle_roundtrip() {
     let (status, _) = console_json(
         "GET",
         &base,
-        "/api/buckets/ulc-missing/lifecycle",
+        "/maxio/api/buckets/ulc-missing/lifecycle",
         &session,
         None,
     )
@@ -12376,7 +13263,7 @@ async fn test_console_lifecycle_validation_error() {
     let (base, _tmp) = start_server().await;
     let session = console_login(&base).await;
     s3_request("PUT", &format!("{}/ulcval", base), vec![]).await;
-    let path = "/api/buckets/ulcval/lifecycle";
+    let path = "/maxio/api/buckets/ulcval/lifecycle";
     for rules in [
         // no action
         serde_json::json!([{ "status": "Enabled" }]),
@@ -12410,7 +13297,7 @@ async fn test_console_lifecycle_validation_error() {
     let (status, _) = console_json(
         "PUT",
         &base,
-        "/api/buckets/ulcval-missing/lifecycle",
+        "/maxio/api/buckets/ulcval-missing/lifecycle",
         &session,
         Some(serde_json::json!({ "rules": [] })),
     )
@@ -12423,7 +13310,7 @@ async fn test_console_lifecycle_empty_deletes() {
     let (base, _tmp) = start_server().await;
     let session = console_login(&base).await;
     s3_request("PUT", &format!("{}/ulcdel", base), vec![]).await;
-    let path = "/api/buckets/ulcdel/lifecycle";
+    let path = "/maxio/api/buckets/ulcdel/lifecycle";
     let (status, _) = console_json(
         "PUT",
         &base,

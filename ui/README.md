@@ -1,6 +1,6 @@
 # MaxIO web console
 
-React single-page app served by the MaxIO binary at `/ui/`. It talks to the console API under `/api/`
+React single-page app served by the MaxIO binary at `/ui/`. It talks to the console API under `/maxio/api/`
 (cookie session, not SigV4). The release build embeds the files from `dist/` into the binary.
 
 ## Stack

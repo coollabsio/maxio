@@ -4,7 +4,7 @@
 //! form fields. Supported actions: users, access keys, inline policies, and
 //! managed policies. Groups, roles, and account aliases are not implemented.
 //! Enable and disable of a user is console-only (`iam:UpdateUser` on
-//! `/api/iam/users/{name}/status`); AWS IAM has no DisableUser action.
+//! `/maxio/api/iam/users/{name}/status`); AWS IAM has no DisableUser action.
 
 use std::collections::HashMap;
 

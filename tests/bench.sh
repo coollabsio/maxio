@@ -240,7 +240,7 @@ start_maxio() {
     bold "Starting MaxIO on port $MAXIO_PORT..."
     "$MAXIO_BIN" --data-dir "$MAXIO_DATA" --port "$MAXIO_PORT" &>/dev/null &
     MAXIO_PID=$!
-    wait_for_health "http://localhost:$MAXIO_PORT/healthz" "MaxIO"
+    wait_for_health "http://localhost:$MAXIO_PORT/maxio/health/live" "MaxIO"
 }
 
 start_minio() {

@@ -153,6 +153,12 @@ pub struct Config {
     #[arg(long, env = "MAXIO_IDLE_TIMEOUT_SECS", default_value_t = 60)]
     pub idle_timeout_secs: u64,
 
+    /// Comma-separated proxy addresses allowed to set `X-Forwarded-For` for the
+    /// console login limit. Each entry is an IP or a CIDR. Empty (the default)
+    /// ignores the header and uses the TCP peer address.
+    #[arg(long, env = "MAXIO_TRUSTED_PROXY", default_value = "")]
+    pub trusted_proxy: String,
+
     /// Comma-separated base domains for virtual-hosted-style addressing.
     /// A request to `<bucket>.<domain>` is served from that bucket. Unset leaves every host on path-style.
     /// `MINIO_DOMAIN` is accepted when `MAXIO_DOMAIN` is unset.
@@ -188,6 +194,7 @@ impl Default for Config {
             max_concurrent_requests: 256,
             request_timeout_secs: 3600,
             idle_timeout_secs: 60,
+            trusted_proxy: String::new(),
             domain: String::new(),
         }
     }

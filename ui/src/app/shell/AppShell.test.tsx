@@ -59,4 +59,5 @@ test('on desktop the sidebar is always visible and there is no burger button', (
   const screen = renderShell()
   expect(screen.getByRole('navigation', { name: 'Main' }).hasAttribute('inert')).toBe(false)
   expect(screen.queryByRole('button', { name: 'Open menu' })).toBeNull()
+  expect(screen.queryByText(/^v\d/)).toBeNull()
 })

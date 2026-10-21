@@ -12,6 +12,8 @@ Always spell the product name **MaxIO** (capital M, capital I, capital O). Never
 
 ## Build & Run
 
+`Cargo.toml` `rust-version` is the MSRV (1.89). `rust-toolchain.toml` pins 1.97.1 for local builds, CI, the release workflow, and the Docker builder.
+
 ```bash
 # bun 1.4.2 is required; build.rs runs `bun run build` and embeds ui/dist
 export MAXIO_ACCESS_KEY="local-admin"
@@ -71,7 +73,7 @@ just dev   # or: bun run dev
 
 This runs both processes concurrently (Ctrl+C kills both):
 - `cargo watch` — rebuilds and restarts the Rust server on backend changes
-- Vite dev server — serves the UI with HMR at `http://127.0.0.1:5190/ui/` (override with `MAXIO_DEV_WEB_PORT`) and proxies `/api` to the Rust server
+- Vite dev server — serves the UI with HMR at `http://127.0.0.1:5190/ui/` (override with `MAXIO_DEV_WEB_PORT`) and proxies `/maxio` to the Rust server
 
 **Tailnet access**: Vite binds to `127.0.0.1` and accepts `*.ts.net` hosts. Expose it to the tailnet (HTTPS, tailnet only) once with `tailscale serve --bg --https=5190 http://127.0.0.1:5190`, then open `https://<machine>.<tailnet>.ts.net:5190/ui/`.
 
@@ -100,12 +102,14 @@ This runs both processes concurrently (Ctrl+C kills both):
 - **Path-style and virtual-hosted-style**: `/{bucket}/{key}` always. With `--domain` / `MAXIO_DOMAIN`, a `Host` of `<bucket>.<domain>` is rewritten to that path before routing; SigV4 still verifies the original path and `Host`. Unset domain keeps path-style only
 - **UNSIGNED-PAYLOAD accepted**: Skips body hashing for PutObject (AWS CLI default)
 - **Embedded UI assets**: Frontend is compiled into the binary via `rust-embed`. `build.rs` runs `bun run build` into `ui/dist/` (skip with `SKIP_FRONTEND=1`); `index.html` is the SPA fallback. Dev uses Vite HMR. In release builds, assets are baked in — single binary, no external files needed
-- **Web console**: React SPA at `/ui/`, API at `/api/` (OpenAPI via utoipa, typed client generated with hey-api). Cookie-based auth (HMAC tokens, not SigV4). Presigned URL generation with configurable expiry (1h/6h/24h/7d picker in UI)
+- **Web console**: React SPA at `/ui/`, API at `/maxio/api/` (OpenAPI via utoipa, typed client generated with hey-api). Cookie-based auth (HMAC tokens, `Path=/maxio`, not SigV4). An unauthenticated browser GET/HEAD of `/ui` is the console. The bucket name `ui` is reserved (S3 names are at least 3 characters). Presigned URL generation with configurable expiry (1h/6h/24h/7d picker in UI)
 
 ### Data Layout
 
 ```
 {data_dir}/
+├── .maxio-format       # { "version": 2 } — written on startup; format 3+ refuses to open
+├── .maxio-keys.json    # SSE-S3 keyring (when MAXIO_MASTER_KEY is unset)
 └── buckets/
     └── my-bucket/
         ├── .bucket.json                    # bucket metadata
@@ -163,38 +167,38 @@ This runs both processes concurrently (Ctrl+C kills both):
 | Get/Put/DeleteBucketLifecycle | GET/PUT/DELETE | `/{bucket}?lifecycle` (expiration, noncurrent expiration, abort MPU; no transitions) |
 | Get/PutBucketAcl, Get/PutObjectAcl | GET/PUT | `?acl` (owner FULL_CONTROL; PUT `private` only) |
 | GetObjectAttributes | GET | `/{bucket}/{key}?attributes` |
-| Health (MinIO-compatible) | GET/HEAD | `/minio/health/live`, `/ready`, `/cluster` (no auth) |
+| Health | GET/HEAD | `/maxio/health/live`, `/maxio/health/ready` (no auth, status only) |
 
 Unknown or unsupported subresources return `501 NotImplemented` (never the default action). Unconfigured object-lock, website, replication, ownership controls and public access block return their S3 "not found" errors. Streaming uploads (`STREAMING-AWS4-HMAC-SHA256-PAYLOAD[-TRAILER]`, `STREAMING-UNSIGNED-PAYLOAD-TRAILER`) are decoded in `src/api/chunked.rs` with chunk / trailer signature and checksum checks. See `COMPATIBILITY.md` for details.
 
-### Console API (`/api/`)
+### Console API (`/maxio/api/`)
 
 | Endpoint | Method | Auth | Description |
 |---|---|---|---|
-| `/api/auth/login` | POST | none | Login with accessKey/secretKey, sets session cookie |
-| `/api/auth/check` | GET | none | Check if session cookie is valid |
-| `/api/auth/logout` | POST | cookie | Clear session cookie |
-| `/api/buckets` | GET | cookie | List all buckets |
-| `/api/buckets` | POST | cookie | Create bucket (`{ name }`) |
-| `/api/buckets/{bucket}` | DELETE | cookie | Delete bucket |
-| `/api/buckets/{bucket}/objects` | GET | cookie | List objects (`?prefix=&delimiter=`) |
-| `/api/buckets/{bucket}/objects/{key}` | DELETE | cookie | Delete object |
-| `/api/buckets/{bucket}/upload/{key}` | PUT | cookie | Upload object |
-| `/api/buckets/{bucket}/download/{key}` | GET | cookie | Download object |
-| `/api/buckets/{bucket}/presign/{key}` | GET | cookie | Generate presigned URL (`?expires=SECONDS`, default 3600, max 604800) |
-| `/api/buckets/{bucket}/folders` | POST | cookie | Create folder marker (`{ name }`) |
-| `/api/buckets/{bucket}/versioning` | GET/PUT | cookie | Bucket versioning (`{ enabled }`) |
-| `/api/buckets/{bucket}/encryption` | GET/PUT | cookie | Bucket default SSE-S3 (`{ enabled }`) |
-| `/api/buckets/{bucket}/public` | GET/PUT | cookie | Anonymous read/list (`{ read, list }`) |
-| `/api/buckets/{bucket}/versions` | GET | cookie | List versions of one key (`?key=`) |
-| `/api/buckets/{bucket}/versions/{versionId}/objects/{key}` | DELETE | cookie | Delete a version |
-| `/api/buckets/{bucket}/versions/{versionId}/download/{key}` | GET | cookie | Download a version |
-| `/api/buckets/{bucket}/versions/{versionId}/restore/{key}` | POST | cookie | Restore a version as the new current version |
-| `/api/buckets/{bucket}/object-info/{key}` | GET | cookie | Object details: metadata, headers, tags, checksum, encryption (`?versionId=`) |
-| `/api/buckets/{bucket}/object-tags/{key}` | GET/PUT | cookie | Object tags (`{ tags: [{ key, value }] }`, `?versionId=`) |
-| `/api/buckets/{bucket}/tags` | GET/PUT | cookie | Bucket tags (empty list deletes) |
-| `/api/buckets/{bucket}/policy` | GET | cookie | Bucket policy JSON (read-only; set by the public toggles) |
-| `/api/buckets/{bucket}/lifecycle` | GET/PUT | cookie | Lifecycle rules (`{ rules }`; empty list deletes) |
+| `/maxio/api/auth/login` | POST | none | Login with accessKey/secretKey, sets session cookie |
+| `/maxio/api/auth/check` | GET | none | Check if session cookie is valid |
+| `/maxio/api/auth/logout` | POST | cookie | Clear session cookie |
+| `/maxio/api/buckets` | GET | cookie | List all buckets |
+| `/maxio/api/buckets` | POST | cookie | Create bucket (`{ name }`) |
+| `/maxio/api/buckets/{bucket}` | DELETE | cookie | Delete bucket |
+| `/maxio/api/buckets/{bucket}/objects` | GET | cookie | List objects (`?prefix=&delimiter=`) |
+| `/maxio/api/buckets/{bucket}/objects/{key}` | DELETE | cookie | Delete object |
+| `/maxio/api/buckets/{bucket}/upload/{key}` | PUT | cookie | Upload object |
+| `/maxio/api/buckets/{bucket}/download/{key}` | GET | cookie | Download object |
+| `/maxio/api/buckets/{bucket}/presign/{key}` | GET | cookie | Generate presigned URL (`?expires=SECONDS`, default 3600, max 604800) |
+| `/maxio/api/buckets/{bucket}/folders` | POST | cookie | Create folder marker (`{ name }`) |
+| `/maxio/api/buckets/{bucket}/versioning` | GET/PUT | cookie | Bucket versioning (`{ enabled }`) |
+| `/maxio/api/buckets/{bucket}/encryption` | GET/PUT | cookie | Bucket default SSE-S3 (`{ enabled }`) |
+| `/maxio/api/buckets/{bucket}/public` | GET/PUT | cookie | Anonymous read/list (`{ read, list }`) |
+| `/maxio/api/buckets/{bucket}/versions` | GET | cookie | List versions of one key (`?key=`) |
+| `/maxio/api/buckets/{bucket}/versions/{versionId}/objects/{key}` | DELETE | cookie | Delete a version |
+| `/maxio/api/buckets/{bucket}/versions/{versionId}/download/{key}` | GET | cookie | Download a version |
+| `/maxio/api/buckets/{bucket}/versions/{versionId}/restore/{key}` | POST | cookie | Restore a version as the new current version |
+| `/maxio/api/buckets/{bucket}/object-info/{key}` | GET | cookie | Object details: metadata, headers, tags, checksum, encryption (`?versionId=`) |
+| `/maxio/api/buckets/{bucket}/object-tags/{key}` | GET/PUT | cookie | Object tags (`{ tags: [{ key, value }] }`, `?versionId=`) |
+| `/maxio/api/buckets/{bucket}/tags` | GET/PUT | cookie | Bucket tags (empty list deletes) |
+| `/maxio/api/buckets/{bucket}/policy` | GET | cookie | Bucket policy JSON (read-only; set by the public toggles) |
+| `/maxio/api/buckets/{bucket}/lifecycle` | GET/PUT | cookie | Lifecycle rules (`{ rules }`; empty list deletes) |
 
 The full contract is `ui/src/api/generated/openapi.json` (generated — do not edit).
 
@@ -226,7 +230,7 @@ MaxIO supports **SSE-S3** (server-managed keys) and **SSE-C** (customer-supplied
 
 ### Frontend Error Logging
 
-API calls go through the generated client configured in `ui/src/api/client.ts`. Non-2xx responses become an `ApiError` (`status`, `message` from `{ "error": ... }`); a 401 outside `/api/auth/` sends the user to `/ui/login`. Failed mutations show a toast. Check the browser DevTools console and network tab for debugging.
+API calls go through the generated client configured in `ui/src/api/client.ts`. Non-2xx responses become an `ApiError` (`status`, `message` from `{ "error": ... }`); a 401 outside `/maxio/api/auth/` sends the user to `/ui/login`. Failed mutations show a toast. Check the browser DevTools console and network tab for debugging.
 
 ### Testing with MinIO Client (mc)
 

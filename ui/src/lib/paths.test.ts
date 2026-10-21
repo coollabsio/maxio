@@ -62,6 +62,6 @@ test('app and download paths', () => {
   expect(bucketPath('media')).toBe('/buckets/media')
   expect(bucketPath('media', 'a b/')).toBe('/buckets/media?prefix=a+b%2F')
   expect(bucketSettingsPath('media')).toBe('/buckets/media/settings')
-  expect(downloadUrl('media', 'a b/c.txt')).toBe('/api/buckets/media/download/a%20b/c.txt')
-  expect(versionDownloadUrl('media', 'a/c.txt', 'v/1')).toBe('/api/buckets/media/versions/v%2F1/download/a/c.txt')
+  expect(downloadUrl('media', 'a b/c.txt')).toBe('/maxio/api/buckets/media/download/a%20b/c.txt')
+  expect(versionDownloadUrl('media', 'a/c.txt', 'v/1')).toBe('/maxio/api/buckets/media/versions/v%2F1/download/a/c.txt')
 })

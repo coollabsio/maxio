@@ -6,6 +6,7 @@ RUN bun install --frozen-lockfile
 COPY ui/ ./
 RUN bun run build
 
+# Pinned toolchain (rust-toolchain.toml, CI). Cargo.toml rust-version 1.89 is the MSRV.
 FROM rust:1.97.1-bookworm AS builder
 WORKDIR /app
 COPY Cargo.toml Cargo.lock build.rs rust-toolchain.toml ./
@@ -30,7 +31,7 @@ EXPOSE 9000
 VOLUME ["/data"]
 USER maxio:maxio
 HEALTHCHECK --interval=30s --timeout=3s --start-period=10s --retries=3 \
-  CMD ["maxio", "healthcheck", "--url", "http://127.0.0.1:9000/healthz", "--timeout-ms", "2000"]
+  CMD ["maxio", "healthcheck", "--url", "http://127.0.0.1:9000/maxio/health/live", "--timeout-ms", "2000"]
 
 # SIGTERM starts a drain of in-flight requests (MAXIO_SHUTDOWN_TIMEOUT_SECS,
 # default 8). Docker then sends SIGKILL after its stop timeout, which defaults

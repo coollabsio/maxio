@@ -44,9 +44,7 @@ export default defineConfig({
     allowedHosts: ['.ts.net'],
     // Keep the browser's Host header: the console CSRF check compares it with Origin.
     proxy: {
-      '/api': { target: backendTarget, changeOrigin: false },
-      '/healthz': { target: backendTarget, changeOrigin: false },
-      '/readyz': { target: backendTarget, changeOrigin: false },
+      '/maxio': { target: backendTarget, changeOrigin: false },
     },
   },
 })

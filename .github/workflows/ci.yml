@@ -19,6 +19,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Matches rust-toolchain.toml. Cargo.toml rust-version (1.89) is the MSRV.
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@1.97.1
         with:
@@ -42,12 +43,18 @@ jobs:
       - name: fmt
         run: cargo fmt --all -- --check
 
+      - name: actionlint
+        uses: rhysd/actionlint@03d0035246f3e81f36aed592ffb4bebf33a03106 # v1.7.7
+
       - name: clippy
         run: cargo clippy --all-targets --all-features -- -D warnings
 
       - name: Frontend build
         run: bun run build
         working-directory: ui
+
+      - name: Console bundle has no version
+        run: just dist-version-check
 
       - name: Frontend lint
         run: bun run lint

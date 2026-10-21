@@ -48,7 +48,7 @@ test('submits the credentials and navigates to the bucket list', async () => {
   await user.click(screen.getByRole('button', { name: 'Login' }))
 
   await screen.findByText('Bucket list')
-  expect(new URL(requests[0].url).pathname).toBe('/api/auth/login')
+  expect(new URL(requests[0].url).pathname).toBe('/maxio/api/auth/login')
   expect(await requests[0].json()).toEqual({ accessKey: 'maxioadmin', secretKey: 'secret' })
 })
 

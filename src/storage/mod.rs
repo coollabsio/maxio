@@ -2,6 +2,7 @@ pub mod check;
 pub mod chunk_reader;
 pub mod crypto;
 pub mod filesystem;
+pub mod format;
 pub mod keys;
 pub mod lifecycle;
 pub mod lock;
@@ -253,6 +254,17 @@ pub struct ObjectMeta {
     pub checksum_algorithm: Option<ChecksumAlgorithm>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub checksum_value: Option<String>,
+    /// SHA-256 (hex) of the stored object bytes. Written for every flat object
+    /// this version stores, including multipart uploads and SSE ciphertext.
+    /// Older objects omit it and stay unverifiable when the etag is not a
+    /// single-part MD5 and no S3 checksum was stored.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_sha256: Option<String>,
+    /// This sidecar was synthesized from payload bytes because the original
+    /// JSON was unreadable. It is not a verified copy and must not be used as
+    /// a restore source.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub rebuilt_from_bytes: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tags: Option<HashMap<String, String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -502,6 +514,15 @@ pub fn is_valid_bucket_name(name: &str) -> bool {
 
 /// Explains why `name` is not a valid S3 bucket name, or `None` when it is valid.
 pub fn bucket_name_error(name: &str) -> Option<&'static str> {
+    // Checked before the length rule so `ui` is reserved, not merely too short.
+    // The console lives at `/ui`, and S3 bucket names are at least 3 characters,
+    // so a working bucket with that name is not possible.
+    if name == "maxio" {
+        return Some("Bucket name maxio is reserved.");
+    }
+    if name == "ui" {
+        return Some("Bucket name ui is reserved.");
+    }
     if name.len() < 3 || name.len() > 63 {
         return Some("Bucket name must be 3-63 characters long.");
     }
@@ -623,6 +644,8 @@ mod validation_tests {
             "a.-b",
             "a-.b",
             "192.168.0.1",
+            "maxio",
+            "ui",
         ] {
             assert!(
                 validate_bucket_name(name).is_err(),
@@ -642,6 +665,8 @@ mod validation_tests {
         assert_eq!(bucket_name_error("prod-logs.2026"), None);
         for (name, expected) in [
             ("ab", "must be 3-63 characters long"),
+            ("maxio", "Bucket name maxio is reserved."),
+            ("ui", "Bucket name ui is reserved."),
             ("My-Bucket", "may only contain lowercase letters"),
             ("-bucket", "must start and end with a letter or number"),
             ("evil..bucket", "must not contain two dots in a row"),

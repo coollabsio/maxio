@@ -100,6 +100,25 @@ enum Commands {
         /// When omitted, MAXIO_MASTER_KEY_FILE from the environment is used.
         #[arg(long)]
         master_key_file: Option<std::path::PathBuf>,
+
+        /// With `--repair`, record a mismatched checksum or single-part etag
+        /// from the payload instead of quarantining the object.
+        #[arg(long)]
+        accept_current_checksums: bool,
+
+        /// With `--repair`, when two copies differ and neither can be verified,
+        /// record a content hash of the current bytes and rebuild the archive
+        /// from them. Without this flag those copies are left unchanged.
+        #[arg(long)]
+        accept_unverifiable_current: bool,
+
+        /// With `--repair`, when two copies differ and neither can be verified,
+        /// quarantine the current object and restore it from the archived copy
+        /// of the same version id. Off unless this flag is set. When both this
+        /// flag and `--accept-unverifiable-current` are set, the archive is
+        /// restored and the current bytes are quarantined.
+        #[arg(long)]
+        restore_unverifiable_from_archive: bool,
     },
 
     /// Write the web console OpenAPI document (used to generate the UI API client)
@@ -149,7 +168,7 @@ fn default_healthcheck_url() -> String {
         .ok()
         .and_then(|v| v.parse::<u16>().ok())
         .unwrap_or(9000);
-    format!("http://127.0.0.1:{}/healthz", port)
+    format!("http://127.0.0.1:{}/maxio/health/live", port)
 }
 
 #[tokio::main]
@@ -177,13 +196,28 @@ async fn main() -> anyhow::Result<()> {
             repair,
             ref master_key,
             ref master_key_file,
+            accept_current_checksums,
+            accept_unverifiable_current,
+            restore_unverifiable_from_archive,
         }) => {
+            // Read-only check must not stamp a marker. --repair writes it
+            // only after the data-directory lock is held (see check_with).
+            // A newer format is refused here, before any rewrite.
+            storage::format::ensure_readable(data_dir).await?;
             let inline = master_key.as_deref().or(cli.config.master_key.as_deref());
             let file = master_key_file
                 .as_deref()
                 .or(cli.config.master_key_file.as_deref());
             let resolved = storage::keys::resolve_master_key(inline, file).await?;
-            return run_check(data_dir, repair, resolved.as_deref()).await;
+            return run_check(
+                data_dir,
+                repair,
+                accept_current_checksums,
+                accept_unverifiable_current,
+                restore_unverifiable_from_archive,
+                resolved.as_deref(),
+            )
+            .await;
         }
         Some(Commands::Openapi { ref output }) => {
             let json = openapi::openapi_json();
@@ -221,13 +255,15 @@ async fn main() -> anyhow::Result<()> {
         );
     }
 
-    tokio::fs::create_dir_all(&config.data_dir).await?;
-    // Held until this process exits, including after a graceful shutdown.
-    // A crash closes the fd and the OS drops the flock, so restart is not blocked.
+    // Lock first, then stamp the format marker, so two processes cannot
+    // migrate the same directory. Held until exit, including a graceful
+    // shutdown. A crash closes the fd and the OS drops the flock.
     let _data_lock = storage::lock::acquire_exclusive(
         std::path::Path::new(&config.data_dir),
         storage::lock::LockReason::Serve,
     )?;
+    let format_version = storage::format::ensure_current(&config.data_dir).await?;
+    tracing::info!("on-disk format version {format_version}");
 
     // Resolve the external key before any keyring file is created. IAM secrets
     // use the same key, so a missing keyring must not be replaced while
@@ -310,7 +346,13 @@ async fn main() -> anyhow::Result<()> {
     let state = server::AppState {
         storage: Arc::new(storage),
         config: Arc::new(config.clone()),
-        login_rate_limiter: Arc::new(api::console::LoginRateLimiter::new()),
+        login_rate_limiter: Arc::new(
+            api::console::LoginRateLimiter::from_trusted(&config.trusted_proxy)
+                .map_err(|err| anyhow::anyhow!(err))?,
+        ),
+        revoked_sessions: Arc::new(
+            api::console::RevokedSessions::open(std::path::Path::new(&config.data_dir)).await,
+        ),
     };
 
     // Background housekeeping: abort stale multipart uploads (>7 days),
@@ -440,27 +482,23 @@ async fn main() -> anyhow::Result<()> {
 async fn run_check(
     data_dir: &str,
     repair: bool,
+    accept_current_checksums: bool,
+    accept_unverifiable_current: bool,
+    restore_unverifiable_from_archive: bool,
     master_key_b64: Option<&str>,
 ) -> anyhow::Result<()> {
-    let report =
-        storage::check::check_with(std::path::Path::new(data_dir), repair, master_key_b64).await?;
+    let report = storage::check::check_with_opts(
+        std::path::Path::new(data_dir),
+        repair,
+        master_key_b64,
+        accept_current_checksums,
+        accept_unverifiable_current,
+        restore_unverifiable_from_archive,
+    )
+    .await?;
     report.print();
     if report.unresolved() > 0 {
-        let key_only = report.issues.iter().all(|issue| {
-            issue.advisory
-                || issue.repaired
-                || issue.kind == storage::check::IssueKind::KeyringMissing
-        });
-        if key_only {
-            anyhow::bail!(
-                "{} unresolved issue(s). A missing or mismatched SSE-S3 master key cannot be cleared with --repair; pass the original key with --master-key, --master-key-file, MAXIO_MASTER_KEY, or MAXIO_MASTER_KEY_FILE.",
-                report.unresolved()
-            );
-        }
-        anyhow::bail!(
-            "{} unresolved issue(s); rerun with --repair for the cases MaxIO can fix safely",
-            report.unresolved()
-        );
+        anyhow::bail!(report.failure_message(repair));
     }
     Ok(())
 }
@@ -517,6 +555,13 @@ async fn run_healthcheck(url: &str, timeout_ms: u64) -> anyhow::Result<()> {
 }
 
 async fn run_keyring_rotate(data_dir: &str) -> anyhow::Result<()> {
+    // The lock is taken before the format marker or the keyring file is written,
+    // and a running server already holds it.
+    let _lock = storage::lock::acquire_exclusive(
+        std::path::Path::new(data_dir),
+        storage::lock::LockReason::RotateKeyring,
+    )?;
+    storage::format::ensure_current(data_dir).await?;
     let result = storage::keys::rotate(data_dir).await?;
     println!("✓ keyring rotated at {}/.maxio-keys.json", data_dir);
     println!("  new active key id: {}", result.new_active_id);
@@ -534,10 +579,12 @@ async fn run_keyring_rotate(data_dir: &str) -> anyhow::Result<()> {
 }
 
 async fn run_keyring_merge(data_dir: &str, from: &std::path::Path) -> anyhow::Result<()> {
+    // Lock before the format marker. A held lock must not stamp `.maxio-format`.
     let _lock = storage::lock::acquire_exclusive(
         std::path::Path::new(data_dir),
         storage::lock::LockReason::MergeKeyring,
     )?;
+    storage::format::ensure_current(data_dir).await?;
     let result = storage::keys::merge_keyring(data_dir, from).await?;
     println!("✓ keyring merged into {data_dir}/.maxio-keys.json");
     if result.added_ids.is_empty() {
@@ -606,5 +653,47 @@ async fn shutdown_signal() {
         _ = terminate => {
             tracing::info!("SIGTERM received, draining connections...");
         }
+    }
+}
+
+#[cfg(test)]
+mod keyring_lock_tests {
+    use super::{run_keyring_merge, run_keyring_rotate};
+    use crate::storage::lock::{LockReason, acquire_exclusive};
+
+    #[tokio::test]
+    async fn rotate_and_merge_take_the_lock_before_the_format_marker() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let _held = acquire_exclusive(dir, LockReason::Serve).unwrap();
+
+        let rotate = run_keyring_rotate(dir.to_str().unwrap())
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            rotate.contains("rotating the keyring"),
+            "rotate must refuse while a server holds the lock: {rotate}"
+        );
+        assert!(
+            !dir.join(".maxio-format").exists(),
+            "rotate wrote the format marker without the lock"
+        );
+
+        let merge = run_keyring_merge(
+            dir.to_str().unwrap(),
+            std::path::Path::new("/no/such/keyring.json"),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(
+            merge.contains("merging the keyring"),
+            "merge must refuse while a server holds the lock: {merge}"
+        );
+        assert!(
+            !dir.join(".maxio-format").exists(),
+            "merge wrote the format marker without the lock"
+        );
     }
 }

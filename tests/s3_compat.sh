@@ -52,12 +52,12 @@ mkdir -p "$DATA_DIR" "$(dirname "$RESULTS")"
     >"${DATA_DIR}/maxio.log" 2>&1 &
 SERVER_PID=$!
 for _ in $(seq 1 50); do
-    if curl -fsS "http://127.0.0.1:${PORT}/healthz" >/dev/null 2>&1; then
+    if curl -fsS "http://127.0.0.1:${PORT}/maxio/health/live" >/dev/null 2>&1; then
         break
     fi
     sleep 0.2
 done
-curl -fsS "http://127.0.0.1:${PORT}/healthz" >/dev/null
+curl -fsS "http://127.0.0.1:${PORT}/maxio/health/live" >/dev/null
 
 if [[ ! -d "$CACHE/.git" ]]; then
     mkdir -p "$CACHE"

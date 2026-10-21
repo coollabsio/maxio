@@ -93,6 +93,32 @@ enum HostClass {
 /// replaced `Host` with an internal address). In that case the forwarded value
 /// becomes the `Host` header so signature verification uses the host the
 /// client signed, which is the same host used to choose the bucket.
+/// Bucket label when `Host` is `maxio.<domain>` or `ui.<domain>`.
+///
+/// `maxio` is the service prefix. `ui` is the console path and is not a legal
+/// S3 bucket name. Neither host is rewritten into an S3 bucket route.
+pub(crate) fn reserved_service_bucket(request: &Request, domains: &[String]) -> Option<String> {
+    if domains.is_empty() {
+        return None;
+    }
+    let name = hostname(&request_host(request));
+    domains.iter().find_map(|domain| {
+        let label = name
+            .strip_suffix(domain.as_str())
+            .and_then(|prefix| prefix.strip_suffix('.'))?;
+        if label.contains('.') {
+            return None;
+        }
+        if label.eq_ignore_ascii_case("maxio") {
+            Some("maxio".to_string())
+        } else if label.eq_ignore_ascii_case("ui") {
+            Some("ui".to_string())
+        } else {
+            None
+        }
+    })
+}
+
 pub(crate) fn apply(request: &mut Request, domains: &[String]) {
     if domains.is_empty() {
         return;

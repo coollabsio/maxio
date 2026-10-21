@@ -2,7 +2,7 @@
 
 import type { Client, ClientMeta, Options as Options2, RequestResult, TDataShape } from './client';
 import { client } from './client.gen';
-import type { AttachUserPolicyData, AttachUserPolicyResponses, CheckAuthData, CheckAuthErrors, CheckAuthResponses, CreateAccessKeyData, CreateAccessKeyResponses, CreateBucketData, CreateBucketErrors, CreateBucketResponses, CreateFolderData, CreateFolderErrors, CreateFolderResponses, CreateIamPolicyData, CreateIamPolicyResponses, CreateIamUserData, CreateIamUserErrors, CreateIamUserResponses, CreateServiceKeyData, CreateServiceKeyResponses, DeleteAccessKeyData, DeleteAccessKeyResponses, DeleteBucketData, DeleteBucketErrors, DeleteBucketResponses, DeleteIamPolicyData, DeleteIamPolicyResponses, DeleteIamUserData, DeleteIamUserResponses, DeleteInlineUserPolicyData, DeleteInlineUserPolicyResponses, DeleteObjectData, DeleteObjectErrors, DeleteObjectResponses, DeleteServiceKeyData, DeleteServiceKeyResponses, DeleteVersionData, DeleteVersionResponses, DetachUserPolicyData, DetachUserPolicyResponses, DownloadObjectData, DownloadObjectErrors, DownloadObjectResponses, DownloadVersionData, DownloadVersionErrors, DownloadVersionResponses, GetBucketLifecycleData, GetBucketLifecycleErrors, GetBucketLifecycleResponses, GetBucketPolicyData, GetBucketPolicyErrors, GetBucketPolicyResponses, GetBucketTagsData, GetBucketTagsErrors, GetBucketTagsResponses, GetCapabilitiesData, GetCapabilitiesResponses, GetEncryptionData, GetEncryptionResponses, GetIamPolicyData, GetIamPolicyResponses, GetIamUserData, GetIamUserErrors, GetIamUserResponses, GetObjectInfoData, GetObjectInfoErrors, GetObjectInfoResponses, GetObjectTagsData, GetObjectTagsErrors, GetObjectTagsResponses, GetPublicAccessData, GetPublicAccessResponses, GetVersioningData, GetVersioningResponses, ListAccessKeysData, ListAccessKeysResponses, ListBucketsData, ListBucketsErrors, ListBucketsResponses, ListIamPoliciesData, ListIamPoliciesResponses, ListIamUsersData, ListIamUsersErrors, ListIamUsersResponses, ListObjectsData, ListObjectsErrors, ListObjectsResponses, ListServiceKeysData, ListServiceKeysResponses, ListVersionsData, ListVersionsResponses, LoginData, LoginErrors, LoginResponses, LogoutData, LogoutResponses, PresignObjectData, PresignObjectErrors, PresignObjectResponses, PreviewIamPolicyData, PreviewIamPolicyResponses, PutInlineUserPolicyData, PutInlineUserPolicyResponses, RestoreVersionData, RestoreVersionErrors, RestoreVersionResponses, SetAccessKeyStatusData, SetAccessKeyStatusResponses, SetBucketLifecycleData, SetBucketLifecycleErrors, SetBucketLifecycleResponses, SetBucketTagsData, SetBucketTagsErrors, SetBucketTagsResponses, SetEncryptionData, SetEncryptionResponses, SetIamUserStatusData, SetIamUserStatusResponses, SetObjectTagsData, SetObjectTagsErrors, SetObjectTagsResponses, SetPublicAccessData, SetPublicAccessResponses, SetServiceKeyStatusData, SetServiceKeyStatusResponses, SetVersioningData, SetVersioningResponses, UpdateIamPolicyData, UpdateIamPolicyResponses, UploadObjectData, UploadObjectErrors, UploadObjectResponses, ValidateIamPolicyData, ValidateIamPolicyErrors, ValidateIamPolicyResponses } from './types.gen';
+import type { AttachUserPolicyData, AttachUserPolicyResponses, CheckAuthData, CheckAuthErrors, CheckAuthResponses, CreateAccessKeyData, CreateAccessKeyResponses, CreateBucketData, CreateBucketErrors, CreateBucketResponses, CreateFolderData, CreateFolderErrors, CreateFolderResponses, CreateIamPolicyData, CreateIamPolicyResponses, CreateIamUserData, CreateIamUserErrors, CreateIamUserResponses, CreateServiceKeyData, CreateServiceKeyResponses, DeleteAccessKeyData, DeleteAccessKeyResponses, DeleteBucketData, DeleteBucketErrors, DeleteBucketResponses, DeleteIamPolicyData, DeleteIamPolicyResponses, DeleteIamUserData, DeleteIamUserResponses, DeleteInlineUserPolicyData, DeleteInlineUserPolicyResponses, DeleteObjectData, DeleteObjectErrors, DeleteObjectResponses, DeleteServiceKeyData, DeleteServiceKeyResponses, DeleteVersionData, DeleteVersionResponses, DetachUserPolicyData, DetachUserPolicyResponses, DownloadObjectData, DownloadObjectErrors, DownloadObjectResponses, DownloadVersionData, DownloadVersionErrors, DownloadVersionResponses, GetBucketLifecycleData, GetBucketLifecycleErrors, GetBucketLifecycleResponses, GetBucketPolicyData, GetBucketPolicyErrors, GetBucketPolicyResponses, GetBucketTagsData, GetBucketTagsErrors, GetBucketTagsResponses, GetCapabilitiesData, GetCapabilitiesResponses, GetEncryptionData, GetEncryptionResponses, GetIamPolicyData, GetIamPolicyResponses, GetIamUserData, GetIamUserErrors, GetIamUserResponses, GetObjectInfoData, GetObjectInfoErrors, GetObjectInfoResponses, GetObjectTagsData, GetObjectTagsErrors, GetObjectTagsResponses, GetPublicAccessData, GetPublicAccessResponses, GetServerVersionData, GetServerVersionErrors, GetServerVersionResponses, GetVersioningData, GetVersioningResponses, ListAccessKeysData, ListAccessKeysResponses, ListBucketsData, ListBucketsErrors, ListBucketsResponses, ListIamPoliciesData, ListIamPoliciesResponses, ListIamUsersData, ListIamUsersErrors, ListIamUsersResponses, ListObjectsData, ListObjectsErrors, ListObjectsResponses, ListServiceKeysData, ListServiceKeysResponses, ListVersionsData, ListVersionsResponses, LoginData, LoginErrors, LoginResponses, LogoutData, LogoutErrors, LogoutResponses, PresignObjectData, PresignObjectErrors, PresignObjectResponses, PreviewIamPolicyData, PreviewIamPolicyResponses, PutInlineUserPolicyData, PutInlineUserPolicyResponses, RestoreVersionData, RestoreVersionErrors, RestoreVersionResponses, SetAccessKeyStatusData, SetAccessKeyStatusResponses, SetBucketLifecycleData, SetBucketLifecycleErrors, SetBucketLifecycleResponses, SetBucketTagsData, SetBucketTagsErrors, SetBucketTagsResponses, SetEncryptionData, SetEncryptionResponses, SetIamUserStatusData, SetIamUserStatusResponses, SetObjectTagsData, SetObjectTagsErrors, SetObjectTagsResponses, SetPublicAccessData, SetPublicAccessResponses, SetServiceKeyStatusData, SetServiceKeyStatusResponses, SetVersioningData, SetVersioningResponses, UpdateIamPolicyData, UpdateIamPolicyResponses, UploadObjectData, UploadObjectErrors, UploadObjectResponses, ValidateIamPolicyData, ValidateIamPolicyErrors, ValidateIamPolicyResponses } from './types.gen';
 
 export type Options<TData extends TDataShape = TDataShape, ThrowOnError extends boolean = boolean, TResponse = unknown> = Options2<TData, ThrowOnError, TResponse> & {
     /**
@@ -24,14 +24,14 @@ export const getCapabilities = <ThrowOnError extends boolean = false>(options?: 
             name: 'maxio_session',
             type: 'apiKey'
         }],
-    url: '/api/auth/capabilities',
+    url: '/maxio/api/auth/capabilities',
     ...options
 });
 
-export const checkAuth = <ThrowOnError extends boolean = false>(options?: Options<CheckAuthData, ThrowOnError>): RequestResult<CheckAuthResponses, CheckAuthErrors, ThrowOnError> => (options?.client ?? client).get<CheckAuthResponses, CheckAuthErrors, ThrowOnError>({ url: '/api/auth/check', ...options });
+export const checkAuth = <ThrowOnError extends boolean = false>(options?: Options<CheckAuthData, ThrowOnError>): RequestResult<CheckAuthResponses, CheckAuthErrors, ThrowOnError> => (options?.client ?? client).get<CheckAuthResponses, CheckAuthErrors, ThrowOnError>({ url: '/maxio/api/auth/check', ...options });
 
 export const login = <ThrowOnError extends boolean = false>(options: Options<LoginData, ThrowOnError>): RequestResult<LoginResponses, LoginErrors, ThrowOnError> => (options.client ?? client).post<LoginResponses, LoginErrors, ThrowOnError>({
-    url: '/api/auth/login',
+    url: '/maxio/api/auth/login',
     ...options,
     headers: {
         'Content-Type': 'application/json',
@@ -39,13 +39,13 @@ export const login = <ThrowOnError extends boolean = false>(options: Options<Log
     }
 });
 
-export const logout = <ThrowOnError extends boolean = false>(options?: Options<LogoutData, ThrowOnError>): RequestResult<LogoutResponses, unknown, ThrowOnError> => (options?.client ?? client).post<LogoutResponses, unknown, ThrowOnError>({
+export const logout = <ThrowOnError extends boolean = false>(options?: Options<LogoutData, ThrowOnError>): RequestResult<LogoutResponses, LogoutErrors, ThrowOnError> => (options?.client ?? client).post<LogoutResponses, LogoutErrors, ThrowOnError>({
     security: [{
             in: 'cookie',
             name: 'maxio_session',
             type: 'apiKey'
         }],
-    url: '/api/auth/logout',
+    url: '/maxio/api/auth/logout',
     ...options
 });
 
@@ -55,7 +55,7 @@ export const listBuckets = <ThrowOnError extends boolean = false>(options?: Opti
             name: 'maxio_session',
             type: 'apiKey'
         }],
-    url: '/api/buckets',
+    url: '/maxio/api/buckets',
     ...options
 });
 
@@ -65,7 +65,7 @@ export const createBucket = <ThrowOnError extends boolean = false>(options: Opti
             name: 'maxio_session',
             type: 'apiKey'
         }],
-    url: '/api/buckets',
+    url: '/maxio/api/buckets',
     ...options,
     headers: {
         'Content-Type': 'application/json',
@@ -79,7 +79,7 @@ export const deleteBucket = <ThrowOnError extends boolean = false>(options: Opti
             name: 'maxio_session',
             type: 'apiKey'
         }],
-    url: '/api/buckets/{bucket}',
+    url: '/maxio/api/buckets/{bucket}',
     ...options
 });
 
@@ -89,7 +89,7 @@ export const downloadObject = <ThrowOnError extends boolean = false>(options: Op
             name: 'maxio_session',
             type: 'apiKey'
         }],
-    url: '/api/buckets/{bucket}/download/{key}',
+    url: '/maxio/api/buckets/{bucket}/download/{key}',
     ...options
 });
 
@@ -99,7 +99,7 @@ export const getEncryption = <ThrowOnError extends boolean = false>(options: Opt
             name: 'maxio_session',
             type: 'apiKey'
         }],
-    url: '/api/buckets/{bucket}/encryption',
+    url: '/maxio/api/buckets/{bucket}/encryption',
     ...options
 });
 
@@ -109,7 +109,7 @@ export const setEncryption = <ThrowOnError extends boolean = false>(options: Opt
             name: 'maxio_session',
             type: 'apiKey'
         }],
-    url: '/api/buckets/{bucket}/encryption',
+    url: '/maxio/api/buckets/{bucket}/encryption',
     ...options,
     headers: {
         'Content-Type': 'application/json',
@@ -123,7 +123,7 @@ export const createFolder = <ThrowOnError extends boolean = false>(options: Opti
             name: 'maxio_session',
             type: 'apiKey'
         }],
-    url: '/api/buckets/{bucket}/folders',
+    url: '/maxio/api/buckets/{bucket}/folders',
     ...options,
     headers: {
         'Content-Type': 'application/json',
@@ -137,7 +137,7 @@ export const getBucketLifecycle = <ThrowOnError extends boolean = false>(options
             name: 'maxio_session',
             type: 'apiKey'
         }],
-    url: '/api/buckets/{bucket}/lifecycle',
+    url: '/maxio/api/buckets/{bucket}/lifecycle',
     ...options
 });
 
@@ -147,7 +147,7 @@ export const setBucketLifecycle = <ThrowOnError extends boolean = false>(options
             name: 'maxio_session',
             type: 'apiKey'
         }],
-    url: '/api/buckets/{bucket}/lifecycle',
+    url: '/maxio/api/buckets/{bucket}/lifecycle',
     ...options,
     headers: {
         'Content-Type': 'application/json',
@@ -161,7 +161,7 @@ export const getObjectInfo = <ThrowOnError extends boolean = false>(options: Opt
             name: 'maxio_session',
             type: 'apiKey'
         }],
-    url: '/api/buckets/{bucket}/object-info/{key}',
+    url: '/maxio/api/buckets/{bucket}/object-info/{key}',
     ...options
 });
 
@@ -171,7 +171,7 @@ export const getObjectTags = <ThrowOnError extends boolean = false>(options: Opt
             name: 'maxio_session',
             type: 'apiKey'
         }],
-    url: '/api/buckets/{bucket}/object-tags/{key}',
+    url: '/maxio/api/buckets/{bucket}/object-tags/{key}',
     ...options
 });
 
@@ -181,7 +181,7 @@ export const setObjectTags = <ThrowOnError extends boolean = false>(options: Opt
             name: 'maxio_session',
             type: 'apiKey'
         }],
-    url: '/api/buckets/{bucket}/object-tags/{key}',
+    url: '/maxio/api/buckets/{bucket}/object-tags/{key}',
     ...options,
     headers: {
         'Content-Type': 'application/json',
@@ -195,7 +195,7 @@ export const listObjects = <ThrowOnError extends boolean = false>(options: Optio
             name: 'maxio_session',
             type: 'apiKey'
         }],
-    url: '/api/buckets/{bucket}/objects',
+    url: '/maxio/api/buckets/{bucket}/objects',
     ...options
 });
 
@@ -205,7 +205,7 @@ export const deleteObject = <ThrowOnError extends boolean = false>(options: Opti
             name: 'maxio_session',
             type: 'apiKey'
         }],
-    url: '/api/buckets/{bucket}/objects/{key}',
+    url: '/maxio/api/buckets/{bucket}/objects/{key}',
     ...options
 });
 
@@ -215,7 +215,7 @@ export const getBucketPolicy = <ThrowOnError extends boolean = false>(options: O
             name: 'maxio_session',
             type: 'apiKey'
         }],
-    url: '/api/buckets/{bucket}/policy',
+    url: '/maxio/api/buckets/{bucket}/policy',
     ...options
 });
 
@@ -225,7 +225,7 @@ export const presignObject = <ThrowOnError extends boolean = false>(options: Opt
             name: 'maxio_session',
             type: 'apiKey'
         }],
-    url: '/api/buckets/{bucket}/presign/{key}',
+    url: '/maxio/api/buckets/{bucket}/presign/{key}',
     ...options
 });
 
@@ -235,7 +235,7 @@ export const getPublicAccess = <ThrowOnError extends boolean = false>(options: O
             name: 'maxio_session',
             type: 'apiKey'
         }],
-    url: '/api/buckets/{bucket}/public',
+    url: '/maxio/api/buckets/{bucket}/public',
     ...options
 });
 
@@ -245,7 +245,7 @@ export const setPublicAccess = <ThrowOnError extends boolean = false>(options: O
             name: 'maxio_session',
             type: 'apiKey'
         }],
-    url: '/api/buckets/{bucket}/public',
+    url: '/maxio/api/buckets/{bucket}/public',
     ...options,
     headers: {
         'Content-Type': 'application/json',
@@ -259,7 +259,7 @@ export const getBucketTags = <ThrowOnError extends boolean = false>(options: Opt
             name: 'maxio_session',
             type: 'apiKey'
         }],
-    url: '/api/buckets/{bucket}/tags',
+    url: '/maxio/api/buckets/{bucket}/tags',
     ...options
 });
 
@@ -269,7 +269,7 @@ export const setBucketTags = <ThrowOnError extends boolean = false>(options: Opt
             name: 'maxio_session',
             type: 'apiKey'
         }],
-    url: '/api/buckets/{bucket}/tags',
+    url: '/maxio/api/buckets/{bucket}/tags',
     ...options,
     headers: {
         'Content-Type': 'application/json',
@@ -284,7 +284,7 @@ export const uploadObject = <ThrowOnError extends boolean = false>(options: Opti
             name: 'maxio_session',
             type: 'apiKey'
         }],
-    url: '/api/buckets/{bucket}/upload/{key}',
+    url: '/maxio/api/buckets/{bucket}/upload/{key}',
     ...options,
     headers: {
         'Content-Type': 'application/octet-stream',
@@ -298,7 +298,7 @@ export const getVersioning = <ThrowOnError extends boolean = false>(options: Opt
             name: 'maxio_session',
             type: 'apiKey'
         }],
-    url: '/api/buckets/{bucket}/versioning',
+    url: '/maxio/api/buckets/{bucket}/versioning',
     ...options
 });
 
@@ -308,7 +308,7 @@ export const setVersioning = <ThrowOnError extends boolean = false>(options: Opt
             name: 'maxio_session',
             type: 'apiKey'
         }],
-    url: '/api/buckets/{bucket}/versioning',
+    url: '/maxio/api/buckets/{bucket}/versioning',
     ...options,
     headers: {
         'Content-Type': 'application/json',
@@ -322,7 +322,7 @@ export const listVersions = <ThrowOnError extends boolean = false>(options: Opti
             name: 'maxio_session',
             type: 'apiKey'
         }],
-    url: '/api/buckets/{bucket}/versions',
+    url: '/maxio/api/buckets/{bucket}/versions',
     ...options
 });
 
@@ -332,7 +332,7 @@ export const downloadVersion = <ThrowOnError extends boolean = false>(options: O
             name: 'maxio_session',
             type: 'apiKey'
         }],
-    url: '/api/buckets/{bucket}/versions/{versionId}/download/{key}',
+    url: '/maxio/api/buckets/{bucket}/versions/{versionId}/download/{key}',
     ...options
 });
 
@@ -342,7 +342,7 @@ export const deleteVersion = <ThrowOnError extends boolean = false>(options: Opt
             name: 'maxio_session',
             type: 'apiKey'
         }],
-    url: '/api/buckets/{bucket}/versions/{versionId}/objects/{key}',
+    url: '/maxio/api/buckets/{bucket}/versions/{versionId}/objects/{key}',
     ...options
 });
 
@@ -352,7 +352,7 @@ export const restoreVersion = <ThrowOnError extends boolean = false>(options: Op
             name: 'maxio_session',
             type: 'apiKey'
         }],
-    url: '/api/buckets/{bucket}/versions/{versionId}/restore/{key}',
+    url: '/maxio/api/buckets/{bucket}/versions/{versionId}/restore/{key}',
     ...options
 });
 
@@ -362,7 +362,7 @@ export const listIamPolicies = <ThrowOnError extends boolean = false>(options?: 
             name: 'maxio_session',
             type: 'apiKey'
         }],
-    url: '/api/iam/policies',
+    url: '/maxio/api/iam/policies',
     ...options
 });
 
@@ -372,7 +372,7 @@ export const createIamPolicy = <ThrowOnError extends boolean = false>(options: O
             name: 'maxio_session',
             type: 'apiKey'
         }],
-    url: '/api/iam/policies',
+    url: '/maxio/api/iam/policies',
     ...options,
     headers: {
         'Content-Type': 'application/json',
@@ -386,7 +386,7 @@ export const deleteIamPolicy = <ThrowOnError extends boolean = false>(options: O
             name: 'maxio_session',
             type: 'apiKey'
         }],
-    url: '/api/iam/policies/{name}',
+    url: '/maxio/api/iam/policies/{name}',
     ...options
 });
 
@@ -396,7 +396,7 @@ export const getIamPolicy = <ThrowOnError extends boolean = false>(options: Opti
             name: 'maxio_session',
             type: 'apiKey'
         }],
-    url: '/api/iam/policies/{name}',
+    url: '/maxio/api/iam/policies/{name}',
     ...options
 });
 
@@ -406,7 +406,7 @@ export const updateIamPolicy = <ThrowOnError extends boolean = false>(options: O
             name: 'maxio_session',
             type: 'apiKey'
         }],
-    url: '/api/iam/policies/{name}',
+    url: '/maxio/api/iam/policies/{name}',
     ...options,
     headers: {
         'Content-Type': 'application/json',
@@ -420,7 +420,7 @@ export const previewIamPolicy = <ThrowOnError extends boolean = false>(options: 
             name: 'maxio_session',
             type: 'apiKey'
         }],
-    url: '/api/iam/preview',
+    url: '/maxio/api/iam/preview',
     ...options,
     headers: {
         'Content-Type': 'application/json',
@@ -434,7 +434,7 @@ export const listServiceKeys = <ThrowOnError extends boolean = false>(options?: 
             name: 'maxio_session',
             type: 'apiKey'
         }],
-    url: '/api/iam/service-keys',
+    url: '/maxio/api/iam/service-keys',
     ...options
 });
 
@@ -444,7 +444,7 @@ export const createServiceKey = <ThrowOnError extends boolean = false>(options: 
             name: 'maxio_session',
             type: 'apiKey'
         }],
-    url: '/api/iam/service-keys',
+    url: '/maxio/api/iam/service-keys',
     ...options,
     headers: {
         'Content-Type': 'application/json',
@@ -458,7 +458,7 @@ export const deleteServiceKey = <ThrowOnError extends boolean = false>(options: 
             name: 'maxio_session',
             type: 'apiKey'
         }],
-    url: '/api/iam/service-keys/{id}',
+    url: '/maxio/api/iam/service-keys/{id}',
     ...options
 });
 
@@ -468,7 +468,7 @@ export const setServiceKeyStatus = <ThrowOnError extends boolean = false>(option
             name: 'maxio_session',
             type: 'apiKey'
         }],
-    url: '/api/iam/service-keys/{id}',
+    url: '/maxio/api/iam/service-keys/{id}',
     ...options,
     headers: {
         'Content-Type': 'application/json',
@@ -482,7 +482,7 @@ export const listIamUsers = <ThrowOnError extends boolean = false>(options?: Opt
             name: 'maxio_session',
             type: 'apiKey'
         }],
-    url: '/api/iam/users',
+    url: '/maxio/api/iam/users',
     ...options
 });
 
@@ -492,7 +492,7 @@ export const createIamUser = <ThrowOnError extends boolean = false>(options: Opt
             name: 'maxio_session',
             type: 'apiKey'
         }],
-    url: '/api/iam/users',
+    url: '/maxio/api/iam/users',
     ...options,
     headers: {
         'Content-Type': 'application/json',
@@ -506,7 +506,7 @@ export const deleteIamUser = <ThrowOnError extends boolean = false>(options: Opt
             name: 'maxio_session',
             type: 'apiKey'
         }],
-    url: '/api/iam/users/{name}',
+    url: '/maxio/api/iam/users/{name}',
     ...options
 });
 
@@ -516,7 +516,7 @@ export const getIamUser = <ThrowOnError extends boolean = false>(options: Option
             name: 'maxio_session',
             type: 'apiKey'
         }],
-    url: '/api/iam/users/{name}',
+    url: '/maxio/api/iam/users/{name}',
     ...options
 });
 
@@ -526,7 +526,7 @@ export const deleteInlineUserPolicy = <ThrowOnError extends boolean = false>(opt
             name: 'maxio_session',
             type: 'apiKey'
         }],
-    url: '/api/iam/users/{name}/inline/{policy}',
+    url: '/maxio/api/iam/users/{name}/inline/{policy}',
     ...options
 });
 
@@ -536,7 +536,7 @@ export const putInlineUserPolicy = <ThrowOnError extends boolean = false>(option
             name: 'maxio_session',
             type: 'apiKey'
         }],
-    url: '/api/iam/users/{name}/inline/{policy}',
+    url: '/maxio/api/iam/users/{name}/inline/{policy}',
     ...options,
     headers: {
         'Content-Type': 'application/json',
@@ -550,7 +550,7 @@ export const listAccessKeys = <ThrowOnError extends boolean = false>(options: Op
             name: 'maxio_session',
             type: 'apiKey'
         }],
-    url: '/api/iam/users/{name}/keys',
+    url: '/maxio/api/iam/users/{name}/keys',
     ...options
 });
 
@@ -560,7 +560,7 @@ export const createAccessKey = <ThrowOnError extends boolean = false>(options: O
             name: 'maxio_session',
             type: 'apiKey'
         }],
-    url: '/api/iam/users/{name}/keys',
+    url: '/maxio/api/iam/users/{name}/keys',
     ...options,
     headers: {
         'Content-Type': 'application/json',
@@ -574,7 +574,7 @@ export const deleteAccessKey = <ThrowOnError extends boolean = false>(options: O
             name: 'maxio_session',
             type: 'apiKey'
         }],
-    url: '/api/iam/users/{name}/keys/{id}',
+    url: '/maxio/api/iam/users/{name}/keys/{id}',
     ...options
 });
 
@@ -584,7 +584,7 @@ export const setAccessKeyStatus = <ThrowOnError extends boolean = false>(options
             name: 'maxio_session',
             type: 'apiKey'
         }],
-    url: '/api/iam/users/{name}/keys/{id}',
+    url: '/maxio/api/iam/users/{name}/keys/{id}',
     ...options,
     headers: {
         'Content-Type': 'application/json',
@@ -598,7 +598,7 @@ export const attachUserPolicy = <ThrowOnError extends boolean = false>(options: 
             name: 'maxio_session',
             type: 'apiKey'
         }],
-    url: '/api/iam/users/{name}/policies',
+    url: '/maxio/api/iam/users/{name}/policies',
     ...options,
     headers: {
         'Content-Type': 'application/json',
@@ -612,7 +612,7 @@ export const detachUserPolicy = <ThrowOnError extends boolean = false>(options: 
             name: 'maxio_session',
             type: 'apiKey'
         }],
-    url: '/api/iam/users/{name}/policies/{policy}',
+    url: '/maxio/api/iam/users/{name}/policies/{policy}',
     ...options
 });
 
@@ -622,7 +622,7 @@ export const setIamUserStatus = <ThrowOnError extends boolean = false>(options: 
             name: 'maxio_session',
             type: 'apiKey'
         }],
-    url: '/api/iam/users/{name}/status',
+    url: '/maxio/api/iam/users/{name}/status',
     ...options,
     headers: {
         'Content-Type': 'application/json',
@@ -636,10 +636,20 @@ export const validateIamPolicy = <ThrowOnError extends boolean = false>(options:
             name: 'maxio_session',
             type: 'apiKey'
         }],
-    url: '/api/iam/validate',
+    url: '/maxio/api/iam/validate',
     ...options,
     headers: {
         'Content-Type': 'application/json',
         ...options.headers
     }
+});
+
+export const getServerVersion = <ThrowOnError extends boolean = false>(options?: Options<GetServerVersionData, ThrowOnError>): RequestResult<GetServerVersionResponses, GetServerVersionErrors, ThrowOnError> => (options?.client ?? client).get<GetServerVersionResponses, GetServerVersionErrors, ThrowOnError>({
+    security: [{
+            in: 'cookie',
+            name: 'maxio_session',
+            type: 'apiKey'
+        }],
+    url: '/maxio/api/version',
+    ...options
 });

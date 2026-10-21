@@ -6,7 +6,7 @@ S3-compatible object storage server — single-binary replacement for MinIO.
 
 </div>
 
-> **Warning:** MaxIO is under active development. Do not use it in production yet.
+Version 1.0.0 is the first release intended for production. Read the [production checklist](docs/PRODUCTION.md) before storing data you need to keep: TLS, your own credentials, and backups of the data directory together with the SSE-S3 key file.
 
 MaxIO is a lightweight S3-compatible object storage server written in Rust. One binary, one data directory, no database. Buckets are directories and objects are files, so a backup is a copy of the data dir.
 
@@ -17,11 +17,18 @@ MaxIO is a lightweight S3-compatible object storage server written in Rust. One 
 
 See [COMPATIBILITY.md](COMPATIBILITY.md) for the full list of supported S3 and MinIO features.
 
+- [Supported platforms](docs/PLATFORMS.md)
+- [Upgrade and rollback](docs/UPGRADE.md)
+- [Production checklist](docs/PRODUCTION.md)
+- [Cutting a release](docs/RELEASING.md)
+
 ## Quick Start
 
 The web console is at `http://localhost:9000/ui/`.
 
 Sign-in sticks on plain `http://localhost`, `http://127.0.0.1`, and `http://[::1]`. The session cookie is marked `Secure` when the request is HTTPS (`X-Forwarded-Proto: https`) or the host is anything else, so a public HTTP listener does not store a console session. A TLS proxy must forward `X-Forwarded-Proto: https`. To allow the console over plain HTTP on a non-loopback host, set `MAXIO_SECURE_COOKIES=false` (anyone on that network can read the session).
+
+Failed console logins are limited to 10 per 5 minutes for each client IP and access key. A successful login is not counted and clears that key's failures. The limit uses the TCP peer address. `X-Forwarded-For` is ignored unless `MAXIO_TRUSTED_PROXY` (or `--trusted-proxy`) lists that peer as an IP or CIDR. When the peer is trusted, the client is the rightmost forwarded hop that is not itself in the list. Leave the setting empty unless a reverse proxy is the only way clients reach MaxIO.
 
 The server refuses to start with the built-in `maxioadmin` / `maxioadmin` keys. Set your own keys, as below. `--allow-insecure-dev` keeps those defaults and also omits `Secure` on every host; use it only on a machine you trust.
 
@@ -32,7 +39,8 @@ The server refuses to start with the built-in `maxioadmin` / `maxioadmin` keys. 
 export MAXIO_ACCESS_KEY="local-admin"
 export MAXIO_SECRET_KEY="$(openssl rand -hex 24)"
 
-docker run -d --name maxio -p 9000:9000 -v "$(pwd)/data:/data" \
+# Named volume. The image runs as uid 999, which can write a volume Docker creates.
+docker run -d --name maxio -p 9000:9000 -v maxio-data:/data \
   -e MAXIO_ACCESS_KEY -e MAXIO_SECRET_KEY \
   ghcr.io/coollabsio/maxio
 
@@ -40,11 +48,29 @@ printf 'Open http://localhost:9000/ui/ and sign in with %s / %s\n' \
   "$MAXIO_ACCESS_KEY" "$MAXIO_SECRET_KEY"
 ```
 
+A bind mount of a directory you create (`-v "$(pwd)/data:/data"`) is often root-owned. Startup then fails while creating the lock file:
+
+```text
+failed to create the data-directory lock /data/.maxio.lock: Permission denied (os error 13). The data directory is not writable by this process. In Docker the image runs as uid 999. Use a named volume (-v maxio-data:/data). For a bind mount, chown 999:999 <host-path>, or start the container with --user matching the directory owner.
+```
+
+Either hand the directory to the container user first:
+
+```bash
+mkdir -p data
+sudo chown 999:999 data
+docker run -d --name maxio -p 9000:9000 -v "$(pwd)/data:/data" \
+  -e MAXIO_ACCESS_KEY -e MAXIO_SECRET_KEY \
+  ghcr.io/coollabsio/maxio
+```
+
+or run as your own user so the files stay yours: `--user "$(id -u):$(id -g)"`.
+
 Images are on [GHCR](https://ghcr.io/coollabsio/maxio) and Docker Hub (`coollabsio/maxio`).
 
 ### Build from source
 
-Install [Rust](https://rustup.rs) **1.89** or newer (`rust-version` in `Cargo.toml`; `rust-toolchain.toml` pins the toolchain used in this repo) and [bun](https://bun.sh) **1.4.2**. `cargo build` runs bun to compile the web console and embed it in the binary.
+Install [Rust](https://rustup.rs) **1.89** or newer (`rust-version` in `Cargo.toml`). This repository, CI, and the container image pin **1.97.1** in `rust-toolchain.toml`. You also need [bun](https://bun.sh) **1.4.2**. `cargo build` runs bun to compile the web console and embed it in the binary.
 
 ```bash
 curl -fsSL https://bun.sh/install | bash -s "bun-v1.4.2"
@@ -94,7 +120,9 @@ maxio --domain s3.example.com --data-dir ./data --port 9000
 # MAXIO_DOMAIN=s3.example.com,s3.example.org
 ```
 
-A request whose `Host` is `<bucket>.<domain>` (a port is ignored, and the host is matched case-insensitively) is served from that bucket. The bare domain, an IP address, and any other host stay on path-style, so the web console (`/ui/`), `/api/`, `/healthz`, and `/minio/health/*` on the service host are unchanged. Bucket names follow the S3 rules (lowercase letters, digits, dots, and hyphens). A dotted name such as `my.bucket` is the host `my.bucket.s3.example.com`.
+A request whose `Host` is `<bucket>.<domain>` (a port is ignored, and the host is matched case-insensitively) is served from that bucket. The bare domain, an IP address, and any other host stay on path-style, so the web console (`/ui/`), `/maxio/api/`, and `/maxio/health/*` on the service host are unchanged. The bucket names `maxio` and `ui` are reserved. `api` is an ordinary bucket. Bucket names follow the S3 rules (lowercase letters, digits, dots, and hyphens, 3–63 characters). A dotted name such as `my.bucket` is the host `my.bucket.s3.example.com`. `ui.<domain>` is rejected with `InvalidBucketName`, the same as `maxio.<domain>`.
+
+The console UI stays at `/ui`. An unauthenticated browser `GET` or `HEAD` of `/ui` or `/ui/...` is the console when the request has no `Authorization` header, no `x-amz-*` header, no `X-Amz-*` presign query, and no S3 subresource or listing query. Any other request for that path is handled as S3 and fails because `ui` is not a valid bucket name. A working bucket named `ui` is not possible: S3 names are at least 3 characters, and that path is the console. `CreateBucket` returns `400 InvalidBucketName`. A data directory that already contains `buckets/ui` or `buckets/maxio` refuses to start; `maxio check` reports it and does not delete it. The console API is only `/maxio/api/*`. The session cookie uses `Path=/maxio`.
 
 When more than one domain is configured, the longest match wins. `album.s3.example.com` is bucket `album` under `s3.example.com`, and the host `s3.example.com` itself stays the service host.
 
@@ -215,7 +243,7 @@ aws --endpoint-url http://localhost:9000 iam attach-user-policy \
 aws --endpoint-url http://localhost:9000 iam create-access-key --user-name alice
 ```
 
-A key policy only narrows what that user's policies already allow. Granting access is a separate step: attach a policy, or use **Grant scope to user** in the console (or `PUT /api/iam/users/{name}/inline/{policy}`). **Create access key** (`POST /api/iam/users/{name}/keys`) never adds a policy to the user. The scope is stored on that key only. Omitting `keyOnly` means key-only. Sending `keyOnly: false` is rejected.
+A key policy only narrows what that user's policies already allow. Granting access is a separate step: attach a policy, or use **Grant scope to user** in the console (or `PUT /maxio/api/iam/users/{name}/inline/{policy}`). **Create access key** (`POST /maxio/api/iam/users/{name}/keys`) never adds a policy to the user. The scope is stored on that key only. Omitting `keyOnly` means key-only. Sending `keyOnly: false` is rejected.
 
 The console at `/ui/users` and `/ui/policies` is available to root and to anyone whose policy allows IAM administration. Other IAM users can sign in and see only the buckets their policy allows.
 
@@ -262,7 +290,10 @@ The report lists stale temp files, stranded backups, promote directories and lef
 - restore object bytes stranded in a `.maxio-promote-*` directory (back to the key, or into `<key>/.maxio.object` if that directory exists) and remove the directory. Remove `.maxio-promote-target` and `.maxio-promote-ready` files left inside a published key directory
 - move object bytes that have no sidecar to `<data-dir>/.maxio-quarantine/<bucket>/<path>` and say so in the report. Those bytes are not given a new sidecar: they may be SSE-S3 ciphertext, and serving them as a plain object would return the ciphertext with no encryption headers. Copy a quarantined file back by hand if you know which object it belongs to
 - delete a sidecar whose bytes are gone, and delete a multipart upload that has no readable metadata. A sidecar is kept when a promote directory for that key still exists
-- rewrite a plain object's size, etag, and checksum so they match the file
+- rewrite a plain object's size so it matches the file. A single-part etag (the MD5) or a checksum that does not match the payload is not rewritten: `--repair` moves that object (plain, SSE-S3, or `<key>/.maxio.object`) to `<data-dir>/.maxio-quarantine/` and leaves the bytes there. `--accept-current-checksums` with `--repair` records the payload's current checksum or single-part etag instead. A multipart etag (`-N`) cannot be checked from the whole object; it is reported as unverifiable and left unchanged
+- when a versioned object's current bytes are missing or corrupt and another copy is positively verified, copy that verified version back. An intact current object is kept: a corrupt archived copy of that same version is quarantined and rebuilt from the current bytes. If two copies differ and neither can be verified, `check` reports `unverifiable-divergence` and `--repair` leaves both alone. `--accept-unverifiable-current` records a content hash of the current bytes and rebuilds the archive. `--restore-unverifiable-from-archive` quarantines the current bytes and restores the archived copy of that same version; it does not run unless you pass the flag. A multipart etag is an info line, `multipart etag (not verifiable by MD5)`, and is not counted as an issue. New objects store a SHA-256 of the bytes on disk (`content_sha256` in the sidecar) so a later check can verify multipart and SSE objects
+- rebuild an empty, truncated, or non-text sidecar only when the object bytes are not MaxIO SSE frames (12-byte nonce with a chunk index, 65536-byte frames, 16-byte tag). A file that matches that layout is left in place, because the data key is in the sidecar and cannot be trial-decrypted from the master key. A 0-byte object is left in place too: an empty SSE-S3 object has no frame. GET then returns an error instead of ciphertext. A plain object, including multipart, is rebuilt, and a multipart `-N` etag is kept when the broken text still has it. One bad sidecar does not stop the rest of the check
+- refuse `check --repair` before changing any file when SSE-S3 needs a master key this command cannot verify. Pass `--master-key`, `--master-key-file`, `MAXIO_MASTER_KEY`, or `MAXIO_MASTER_KEY_FILE`; an on-disk keyring that matches `.maxio-key-check.json` is enough. A read-only check still runs. SSE-S3 it cannot decrypt, and every SSE-C object, is an info line, `unverifiable without key`, and is not quarantined. A checksum is quarantined only when it was computed and does not match. `check` does not write key files. A supplied key that is not the recorded one is ignored on a read-only check and refuses repair. A multipart `-N` checksum is a composite of the part checksums, not a checksum of the whole object
 - rebuild a missing or corrupt data chunk when parity shards can reconstruct it
 
 It does not invent bucket configuration, rewrite encrypted sidecars (those are MAC-protected), or choose between a plain file and an erasure-coded directory for the same key. Those are reported and left unchanged.

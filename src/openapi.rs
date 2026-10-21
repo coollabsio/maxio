@@ -1,4 +1,4 @@
-//! OpenAPI document for the web console API (`/api/*`).
+//! OpenAPI document for the web console API (`/maxio/api/*`).
 //!
 //! `maxio openapi --output ui/src/api/generated/openapi.json` writes it; the UI
 //! generates its typed client from that file (`just api`).
@@ -14,6 +14,7 @@ use crate::api::{console, iam_console};
     security(("cookieAuth" = [])),
     modifiers(&CookieAuth),
     paths(
+        console::server_version,
         console::login,
         console::check,
         console::capabilities,
@@ -142,6 +143,7 @@ mod tests {
                 "getObjectInfo",
                 "getObjectTags",
                 "getPublicAccess",
+                "getServerVersion",
                 "getVersioning",
                 "listAccessKeys",
                 "listBuckets",
@@ -175,7 +177,10 @@ mod tests {
     #[test]
     fn login_and_check_are_public() {
         let doc: serde_json::Value = serde_json::from_str(&openapi_json()).unwrap();
-        for (path, method) in [("/api/auth/login", "post"), ("/api/auth/check", "get")] {
+        for (path, method) in [
+            ("/maxio/api/auth/login", "post"),
+            ("/maxio/api/auth/check", "get"),
+        ] {
             assert_eq!(
                 doc["paths"][path][method]["security"],
                 serde_json::json!([{}])

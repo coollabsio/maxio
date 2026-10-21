@@ -108,7 +108,7 @@ Status: ✅ supported · 🟡 partial · ❌ not supported
 | `MINIO_REGION_NAME` / `MINIO_REGION` env vars | ✅ | |
 | `MINIO_DEFAULT_BUCKETS` env var | ✅ | |
 | `mc` client | ✅ | `mb`, `rb`, `cp`, `ls`, `cat`, `rm`, `stat`, `tag`, `anonymous set download`, `ls/rm --versions` |
-| Health checks `/minio/health/live`, `/ready`, `/cluster` | ✅ | No auth |
+| Health checks `/minio/health/live`, `/ready`, `/cluster` | — | Removed. Use `/maxio/health/live` and `/maxio/health/ready` |
 | Erasure coding | 🟡 | Single node only, different on-disk format |
 | MinIO on-disk data format | ❌ | Cannot read an existing MinIO data dir |
 | MinIO Admin API (`mc admin`) | ❌ | |

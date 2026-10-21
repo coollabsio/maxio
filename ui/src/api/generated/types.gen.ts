@@ -378,6 +378,10 @@ export type RestoreVersionResponse = {
     versionId: string | null;
 };
 
+export type ServerVersion = {
+    version: string;
+};
+
 export type ServiceKeyBody = {
     access?: string | null;
     buckets?: Array<string>;
@@ -451,7 +455,7 @@ export type GetCapabilitiesData = {
         bucket?: string;
         prefix?: string;
     };
-    url: '/api/auth/capabilities';
+    url: '/maxio/api/auth/capabilities';
 };
 
 export type GetCapabilitiesResponses = {
@@ -464,7 +468,7 @@ export type CheckAuthData = {
     body?: never;
     path?: never;
     query?: never;
-    url: '/api/auth/check';
+    url: '/maxio/api/auth/check';
 };
 
 export type CheckAuthErrors = {
@@ -486,7 +490,7 @@ export type LoginData = {
     body: LoginRequest;
     path?: never;
     query?: never;
-    url: '/api/auth/login';
+    url: '/maxio/api/auth/login';
 };
 
 export type LoginErrors = {
@@ -516,8 +520,17 @@ export type LogoutData = {
     body?: never;
     path?: never;
     query?: never;
-    url: '/api/auth/logout';
+    url: '/maxio/api/auth/logout';
 };
+
+export type LogoutErrors = {
+    /**
+     * The session was revoked in memory but could not be saved
+     */
+    500: ErrorResponse;
+};
+
+export type LogoutError = LogoutErrors[keyof LogoutErrors];
 
 export type LogoutResponses = {
     200: OkResponse;
@@ -529,7 +542,7 @@ export type ListBucketsData = {
     body?: never;
     path?: never;
     query?: never;
-    url: '/api/buckets';
+    url: '/maxio/api/buckets';
 };
 
 export type ListBucketsErrors = {
@@ -548,7 +561,7 @@ export type CreateBucketData = {
     body: CreateBucketRequest;
     path?: never;
     query?: never;
-    url: '/api/buckets';
+    url: '/maxio/api/buckets';
 };
 
 export type CreateBucketErrors = {
@@ -576,7 +589,7 @@ export type DeleteBucketData = {
         bucket: string;
     };
     query?: never;
-    url: '/api/buckets/{bucket}';
+    url: '/maxio/api/buckets/{bucket}';
 };
 
 export type DeleteBucketErrors = {
@@ -608,7 +621,7 @@ export type DownloadObjectData = {
         key: string;
     };
     query?: never;
-    url: '/api/buckets/{bucket}/download/{key}';
+    url: '/maxio/api/buckets/{bucket}/download/{key}';
 };
 
 export type DownloadObjectErrors = {
@@ -632,7 +645,7 @@ export type GetEncryptionData = {
         bucket: string;
     };
     query?: never;
-    url: '/api/buckets/{bucket}/encryption';
+    url: '/maxio/api/buckets/{bucket}/encryption';
 };
 
 export type GetEncryptionResponses = {
@@ -647,7 +660,7 @@ export type SetEncryptionData = {
         bucket: string;
     };
     query?: never;
-    url: '/api/buckets/{bucket}/encryption';
+    url: '/maxio/api/buckets/{bucket}/encryption';
 };
 
 export type SetEncryptionResponses = {
@@ -662,7 +675,7 @@ export type CreateFolderData = {
         bucket: string;
     };
     query?: never;
-    url: '/api/buckets/{bucket}/folders';
+    url: '/maxio/api/buckets/{bucket}/folders';
 };
 
 export type CreateFolderErrors = {
@@ -686,7 +699,7 @@ export type GetBucketLifecycleData = {
         bucket: string;
     };
     query?: never;
-    url: '/api/buckets/{bucket}/lifecycle';
+    url: '/maxio/api/buckets/{bucket}/lifecycle';
 };
 
 export type GetBucketLifecycleErrors = {
@@ -710,7 +723,7 @@ export type SetBucketLifecycleData = {
         bucket: string;
     };
     query?: never;
-    url: '/api/buckets/{bucket}/lifecycle';
+    url: '/maxio/api/buckets/{bucket}/lifecycle';
 };
 
 export type SetBucketLifecycleErrors = {
@@ -750,7 +763,7 @@ export type GetObjectInfoData = {
          */
         versionId?: string;
     };
-    url: '/api/buckets/{bucket}/object-info/{key}';
+    url: '/maxio/api/buckets/{bucket}/object-info/{key}';
 };
 
 export type GetObjectInfoErrors = {
@@ -787,7 +800,7 @@ export type GetObjectTagsData = {
          */
         versionId?: string;
     };
-    url: '/api/buckets/{bucket}/object-tags/{key}';
+    url: '/maxio/api/buckets/{bucket}/object-tags/{key}';
 };
 
 export type GetObjectTagsErrors = {
@@ -824,7 +837,7 @@ export type SetObjectTagsData = {
          */
         versionId?: string;
     };
-    url: '/api/buckets/{bucket}/object-tags/{key}';
+    url: '/maxio/api/buckets/{bucket}/object-tags/{key}';
 };
 
 export type SetObjectTagsErrors = {
@@ -858,7 +871,7 @@ export type ListObjectsData = {
          */
         delimiter?: string;
     };
-    url: '/api/buckets/{bucket}/objects';
+    url: '/maxio/api/buckets/{bucket}/objects';
 };
 
 export type ListObjectsErrors = {
@@ -886,7 +899,7 @@ export type DeleteObjectData = {
         key: string;
     };
     query?: never;
-    url: '/api/buckets/{bucket}/objects/{key}';
+    url: '/maxio/api/buckets/{bucket}/objects/{key}';
 };
 
 export type DeleteObjectErrors = {
@@ -910,7 +923,7 @@ export type GetBucketPolicyData = {
         bucket: string;
     };
     query?: never;
-    url: '/api/buckets/{bucket}/policy';
+    url: '/maxio/api/buckets/{bucket}/policy';
 };
 
 export type GetBucketPolicyErrors = {
@@ -943,7 +956,7 @@ export type PresignObjectData = {
          */
         expires?: number;
     };
-    url: '/api/buckets/{bucket}/presign/{key}';
+    url: '/maxio/api/buckets/{bucket}/presign/{key}';
 };
 
 export type PresignObjectErrors = {
@@ -967,7 +980,7 @@ export type GetPublicAccessData = {
         bucket: string;
     };
     query?: never;
-    url: '/api/buckets/{bucket}/public';
+    url: '/maxio/api/buckets/{bucket}/public';
 };
 
 export type GetPublicAccessResponses = {
@@ -982,7 +995,7 @@ export type SetPublicAccessData = {
         bucket: string;
     };
     query?: never;
-    url: '/api/buckets/{bucket}/public';
+    url: '/maxio/api/buckets/{bucket}/public';
 };
 
 export type SetPublicAccessResponses = {
@@ -997,7 +1010,7 @@ export type GetBucketTagsData = {
         bucket: string;
     };
     query?: never;
-    url: '/api/buckets/{bucket}/tags';
+    url: '/maxio/api/buckets/{bucket}/tags';
 };
 
 export type GetBucketTagsErrors = {
@@ -1021,7 +1034,7 @@ export type SetBucketTagsData = {
         bucket: string;
     };
     query?: never;
-    url: '/api/buckets/{bucket}/tags';
+    url: '/maxio/api/buckets/{bucket}/tags';
 };
 
 export type SetBucketTagsErrors = {
@@ -1053,7 +1066,7 @@ export type UploadObjectData = {
         key: string;
     };
     query?: never;
-    url: '/api/buckets/{bucket}/upload/{key}';
+    url: '/maxio/api/buckets/{bucket}/upload/{key}';
 };
 
 export type UploadObjectErrors = {
@@ -1077,7 +1090,7 @@ export type GetVersioningData = {
         bucket: string;
     };
     query?: never;
-    url: '/api/buckets/{bucket}/versioning';
+    url: '/maxio/api/buckets/{bucket}/versioning';
 };
 
 export type GetVersioningResponses = {
@@ -1092,7 +1105,7 @@ export type SetVersioningData = {
         bucket: string;
     };
     query?: never;
-    url: '/api/buckets/{bucket}/versioning';
+    url: '/maxio/api/buckets/{bucket}/versioning';
 };
 
 export type SetVersioningResponses = {
@@ -1109,7 +1122,7 @@ export type ListVersionsData = {
     query: {
         key: string;
     };
-    url: '/api/buckets/{bucket}/versions';
+    url: '/maxio/api/buckets/{bucket}/versions';
 };
 
 export type ListVersionsResponses = {
@@ -1129,7 +1142,7 @@ export type DownloadVersionData = {
         key: string;
     };
     query?: never;
-    url: '/api/buckets/{bucket}/versions/{versionId}/download/{key}';
+    url: '/maxio/api/buckets/{bucket}/versions/{versionId}/download/{key}';
 };
 
 export type DownloadVersionErrors = {
@@ -1158,7 +1171,7 @@ export type DeleteVersionData = {
         key: string;
     };
     query?: never;
-    url: '/api/buckets/{bucket}/versions/{versionId}/objects/{key}';
+    url: '/maxio/api/buckets/{bucket}/versions/{versionId}/objects/{key}';
 };
 
 export type DeleteVersionResponses = {
@@ -1178,7 +1191,7 @@ export type RestoreVersionData = {
         key: string;
     };
     query?: never;
-    url: '/api/buckets/{bucket}/versions/{versionId}/restore/{key}';
+    url: '/maxio/api/buckets/{bucket}/versions/{versionId}/restore/{key}';
 };
 
 export type RestoreVersionErrors = {
@@ -1204,7 +1217,7 @@ export type ListIamPoliciesData = {
     body?: never;
     path?: never;
     query?: never;
-    url: '/api/iam/policies';
+    url: '/maxio/api/iam/policies';
 };
 
 export type ListIamPoliciesResponses = {
@@ -1217,7 +1230,7 @@ export type CreateIamPolicyData = {
     body: PolicyWriteBody;
     path?: never;
     query?: never;
-    url: '/api/iam/policies';
+    url: '/maxio/api/iam/policies';
 };
 
 export type CreateIamPolicyResponses = {
@@ -1232,7 +1245,7 @@ export type DeleteIamPolicyData = {
         name: string;
     };
     query?: never;
-    url: '/api/iam/policies/{name}';
+    url: '/maxio/api/iam/policies/{name}';
 };
 
 export type DeleteIamPolicyResponses = {
@@ -1248,7 +1261,7 @@ export type GetIamPolicyData = {
         name: string;
     };
     query?: never;
-    url: '/api/iam/policies/{name}';
+    url: '/maxio/api/iam/policies/{name}';
 };
 
 export type GetIamPolicyResponses = {
@@ -1263,7 +1276,7 @@ export type UpdateIamPolicyData = {
         name: string;
     };
     query?: never;
-    url: '/api/iam/policies/{name}';
+    url: '/maxio/api/iam/policies/{name}';
 };
 
 export type UpdateIamPolicyResponses = {
@@ -1276,7 +1289,7 @@ export type PreviewIamPolicyData = {
     body: PreviewBody;
     path?: never;
     query?: never;
-    url: '/api/iam/preview';
+    url: '/maxio/api/iam/preview';
 };
 
 export type PreviewIamPolicyResponses = {
@@ -1289,7 +1302,7 @@ export type ListServiceKeysData = {
     body?: never;
     path?: never;
     query?: never;
-    url: '/api/iam/service-keys';
+    url: '/maxio/api/iam/service-keys';
 };
 
 export type ListServiceKeysResponses = {
@@ -1302,7 +1315,7 @@ export type CreateServiceKeyData = {
     body: ServiceKeyBody;
     path?: never;
     query?: never;
-    url: '/api/iam/service-keys';
+    url: '/maxio/api/iam/service-keys';
 };
 
 export type CreateServiceKeyResponses = {
@@ -1317,7 +1330,7 @@ export type DeleteServiceKeyData = {
         id: string;
     };
     query?: never;
-    url: '/api/iam/service-keys/{id}';
+    url: '/maxio/api/iam/service-keys/{id}';
 };
 
 export type DeleteServiceKeyResponses = {
@@ -1333,7 +1346,7 @@ export type SetServiceKeyStatusData = {
         id: string;
     };
     query?: never;
-    url: '/api/iam/service-keys/{id}';
+    url: '/maxio/api/iam/service-keys/{id}';
 };
 
 export type SetServiceKeyStatusResponses = {
@@ -1346,7 +1359,7 @@ export type ListIamUsersData = {
     body?: never;
     path?: never;
     query?: never;
-    url: '/api/iam/users';
+    url: '/maxio/api/iam/users';
 };
 
 export type ListIamUsersErrors = {
@@ -1365,7 +1378,7 @@ export type CreateIamUserData = {
     body: CreateUserBody;
     path?: never;
     query?: never;
-    url: '/api/iam/users';
+    url: '/maxio/api/iam/users';
 };
 
 export type CreateIamUserErrors = {
@@ -1386,7 +1399,7 @@ export type DeleteIamUserData = {
         name: string;
     };
     query?: never;
-    url: '/api/iam/users/{name}';
+    url: '/maxio/api/iam/users/{name}';
 };
 
 export type DeleteIamUserResponses = {
@@ -1402,7 +1415,7 @@ export type GetIamUserData = {
         name: string;
     };
     query?: never;
-    url: '/api/iam/users/{name}';
+    url: '/maxio/api/iam/users/{name}';
 };
 
 export type GetIamUserErrors = {
@@ -1424,7 +1437,7 @@ export type DeleteInlineUserPolicyData = {
         policy: string;
     };
     query?: never;
-    url: '/api/iam/users/{name}/inline/{policy}';
+    url: '/maxio/api/iam/users/{name}/inline/{policy}';
 };
 
 export type DeleteInlineUserPolicyResponses = {
@@ -1441,7 +1454,7 @@ export type PutInlineUserPolicyData = {
         policy: string;
     };
     query?: never;
-    url: '/api/iam/users/{name}/inline/{policy}';
+    url: '/maxio/api/iam/users/{name}/inline/{policy}';
 };
 
 export type PutInlineUserPolicyResponses = {
@@ -1457,7 +1470,7 @@ export type ListAccessKeysData = {
         name: string;
     };
     query?: never;
-    url: '/api/iam/users/{name}/keys';
+    url: '/maxio/api/iam/users/{name}/keys';
 };
 
 export type ListAccessKeysResponses = {
@@ -1472,7 +1485,7 @@ export type CreateAccessKeyData = {
         name: string;
     };
     query?: never;
-    url: '/api/iam/users/{name}/keys';
+    url: '/maxio/api/iam/users/{name}/keys';
 };
 
 export type CreateAccessKeyResponses = {
@@ -1491,7 +1504,7 @@ export type DeleteAccessKeyData = {
         id: string;
     };
     query?: never;
-    url: '/api/iam/users/{name}/keys/{id}';
+    url: '/maxio/api/iam/users/{name}/keys/{id}';
 };
 
 export type DeleteAccessKeyResponses = {
@@ -1508,7 +1521,7 @@ export type SetAccessKeyStatusData = {
         id: string;
     };
     query?: never;
-    url: '/api/iam/users/{name}/keys/{id}';
+    url: '/maxio/api/iam/users/{name}/keys/{id}';
 };
 
 export type SetAccessKeyStatusResponses = {
@@ -1523,7 +1536,7 @@ export type AttachUserPolicyData = {
         name: string;
     };
     query?: never;
-    url: '/api/iam/users/{name}/policies';
+    url: '/maxio/api/iam/users/{name}/policies';
 };
 
 export type AttachUserPolicyResponses = {
@@ -1540,7 +1553,7 @@ export type DetachUserPolicyData = {
         policy: string;
     };
     query?: never;
-    url: '/api/iam/users/{name}/policies/{policy}';
+    url: '/maxio/api/iam/users/{name}/policies/{policy}';
 };
 
 export type DetachUserPolicyResponses = {
@@ -1556,7 +1569,7 @@ export type SetIamUserStatusData = {
         name: string;
     };
     query?: never;
-    url: '/api/iam/users/{name}/status';
+    url: '/maxio/api/iam/users/{name}/status';
 };
 
 export type SetIamUserStatusResponses = {
@@ -1569,7 +1582,7 @@ export type ValidateIamPolicyData = {
     body: DocumentBody;
     path?: never;
     query?: never;
-    url: '/api/iam/validate';
+    url: '/maxio/api/iam/validate';
 };
 
 export type ValidateIamPolicyErrors = {
@@ -1583,3 +1596,28 @@ export type ValidateIamPolicyResponses = {
 };
 
 export type ValidateIamPolicyResponse = ValidateIamPolicyResponses[keyof ValidateIamPolicyResponses];
+
+export type GetServerVersionData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/maxio/api/version';
+};
+
+export type GetServerVersionErrors = {
+    /**
+     * Not authenticated
+     */
+    401: ErrorResponse;
+};
+
+export type GetServerVersionError = GetServerVersionErrors[keyof GetServerVersionErrors];
+
+export type GetServerVersionResponses = {
+    /**
+     * Running server version
+     */
+    200: ServerVersion;
+};
+
+export type GetServerVersionResponse = GetServerVersionResponses[keyof GetServerVersionResponses];

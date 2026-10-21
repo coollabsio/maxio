@@ -52,10 +52,10 @@ export function bucketSettingsPath(bucket: string): string {
 
 /** Same-origin URL that downloads the current version of an object. */
 export function downloadUrl(bucket: string, key: string): string {
-  return `/api/buckets/${encodeURIComponent(bucket)}/download/${encodeObjectKey(key)}`
+  return `/maxio/api/buckets/${encodeURIComponent(bucket)}/download/${encodeObjectKey(key)}`
 }
 
 /** Same-origin URL that downloads a specific version of an object. */
 export function versionDownloadUrl(bucket: string, key: string, versionId: string): string {
-  return `/api/buckets/${encodeURIComponent(bucket)}/versions/${encodeURIComponent(versionId)}/download/${encodeObjectKey(key)}`
+  return `/maxio/api/buckets/${encodeURIComponent(bucket)}/versions/${encodeURIComponent(versionId)}/download/${encodeObjectKey(key)}`
 }

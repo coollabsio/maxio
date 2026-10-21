@@ -57,10 +57,14 @@ async fn start(domain: &str) -> Running {
         domain: domain.to_string(),
         ..Config::default()
     };
+    let revoked_sessions = Arc::new(
+        maxio::api::console::RevokedSessions::open(std::path::Path::new(&config.data_dir)).await,
+    );
     let state = AppState {
         storage: Arc::new(storage),
         config: Arc::new(config),
         login_rate_limiter: Arc::new(maxio::api::console::LoginRateLimiter::new()),
+        revoked_sessions,
     };
     let app = server::build_router(state);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -384,7 +388,7 @@ async fn domain_unset_keeps_path_style_and_health() {
     // A bucket-shaped Host is ignored until a domain is configured.
     let (status, body) = raw_http(
         server.port,
-        b"GET /healthz HTTP/1.1\r\nhost: photos.localhost\r\nconnection: close\r\n\r\n",
+        b"GET /maxio/health/live HTTP/1.1\r\nhost: photos.localhost\r\nconnection: close\r\n\r\n",
     )
     .await;
     assert_eq!(status, 200, "{body}");
@@ -756,14 +760,16 @@ async fn dotted_bucket_uppercase_host_and_service_routes() {
         .no_proxy()
         .build()
         .unwrap()
-        .get(format!("{}/healthz", server.base))
+        .get(format!("{}/maxio/health/live", server.base))
         .send()
         .await
         .unwrap();
     assert_eq!(health.status(), 200);
-    assert!(health.bytes().await.unwrap().is_empty());
+    let health_body = health.text().await.unwrap();
+    assert!(health_body.contains("\"status\":\"ok\""), "{health_body}");
+    assert!(!health_body.contains("\"version\""), "{health_body}");
 
-    for path in ["/readyz", "/minio/health/live", "/minio/health/ready"] {
+    for path in ["/maxio/health/ready"] {
         let response = reqwest::Client::builder()
             .no_proxy()
             .build()
@@ -779,7 +785,7 @@ async fn dotted_bucket_uppercase_host_and_service_routes() {
         .no_proxy()
         .build()
         .unwrap()
-        .get(format!("{}/api/auth/check", server.base))
+        .get(format!("{}/maxio/api/auth/check", server.base))
         .send()
         .await
         .unwrap();
@@ -820,7 +826,7 @@ async fn dotted_bucket_uppercase_host_and_service_routes() {
     let (status, body) = raw_http(
         server.port,
         &format!(
-            "GET /api/auth/check HTTP/1.1\r\nhost: photos.localhost:{}\r\nconnection: close\r\n\r\n",
+            "GET /maxio/api/auth/check HTTP/1.1\r\nhost: photos.localhost:{}\r\nconnection: close\r\n\r\n",
             server.port
         )
         .into_bytes(),
@@ -948,7 +954,7 @@ async fn forwarded_host_and_longest_domain() {
     let (status, body) = raw_http(
         server.port,
         &format!(
-            "GET /healthz HTTP/1.1\r\nhost: example.test:{}\r\nx-forwarded-host: photos.example.test\r\nconnection: close\r\n\r\n",
+            "GET /maxio/health/live HTTP/1.1\r\nhost: example.test:{}\r\nx-forwarded-host: photos.example.test\r\nconnection: close\r\n\r\n",
             server.port
         )
         .into_bytes(),
@@ -1004,4 +1010,76 @@ async fn forwarded_host_and_longest_domain() {
         "service host /ui/ returned {status}: {body}"
     );
     assert!(!body.contains("<Code>"), "{body}");
+}
+
+#[tokio::test]
+async fn buckets_named_version_and_healthz_work_on_virtual_host() {
+    let server = start("localhost").await;
+    let hosts = [
+        "version.localhost",
+        "healthz.localhost",
+        "api.localhost",
+        "readyz.localhost",
+    ];
+    let client = http_client(server.port, &hosts);
+
+    for bucket in ["version", "healthz", "api", "readyz"] {
+        let host = format!("{bucket}.localhost");
+        let root = vurl(&host, server.port, "/");
+        let (status, body) = call_status(&client, "PUT", &root, vec![], &[]).await;
+        assert_eq!(status, 200, "{bucket} create: {body}");
+
+        let key = vurl(&host, server.port, "/note.txt");
+        let (status, body) = call_status(&client, "PUT", &key, b"vhost-probe".to_vec(), &[]).await;
+        assert_eq!(status, 200, "{bucket} put: {body}");
+
+        let (status, body) = call_status(&client, "GET", &key, vec![], &[]).await;
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(body, "vhost-probe");
+
+        let (status, body) = call_status(&client, "GET", &root, vec![], &[]).await;
+        assert_eq!(status, 200, "{body}");
+        assert!(body.contains("note.txt"), "{body}");
+        assert!(
+            !body.contains("\"status\":\"ok\""),
+            "virtual-hosted list must not be the health probe: {body}"
+        );
+
+        let versioning = vurl(&host, server.port, "/?versioning");
+        let (status, body) = call_status(&client, "GET", &versioning, vec![], &[]).await;
+        assert_eq!(status, 200, "{body}");
+        assert!(body.contains("VersioningConfiguration"), "{body}");
+
+        let (status, _) = call_status(&client, "DELETE", &key, vec![], &[]).await;
+        assert_eq!(status, 204, "{bucket} delete object");
+        let (status, body) = call_status(&client, "DELETE", &root, vec![], &[]).await;
+        assert_eq!(status, 204, "{bucket} delete bucket: {body}");
+    }
+
+    let health = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .unwrap()
+        .get(format!("{}/maxio/health/live", server.base))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(health.status(), 200);
+    let health_body = health.text().await.unwrap();
+    assert!(health_body.contains("\"status\":\"ok\""), "{health_body}");
+    assert!(!health_body.contains("\"version\""), "{health_body}");
+
+    let reserved = http_client(server.port, &["maxio.localhost", "ui.localhost"]);
+    for bucket in ["maxio", "ui"] {
+        let (status, body) = call_status(
+            &reserved,
+            "PUT",
+            &vurl(&format!("{bucket}.localhost"), server.port, "/"),
+            vec![],
+            &[],
+        )
+        .await;
+        assert_eq!(status, 400, "{bucket}: {body}");
+        assert!(body.contains("InvalidBucketName"), "{body}");
+    }
 }

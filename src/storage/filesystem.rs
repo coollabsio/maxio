@@ -3120,7 +3120,7 @@ impl FilesystemStorage {
         // The lock is released when this method returns; streaming continues
         // on the already-open handle.
         let _key_guard = self.key_lock(bucket, key).await;
-        let meta = self.read_object_meta(bucket, key).await?;
+        let mut meta = self.read_object_meta(bucket, key).await?;
         reject_sse_c_on_plaintext(&meta, customer_key.is_some())?;
         let ec_dir = self.ec_dir(bucket, key);
         if Self::is_chunked_path(&ec_dir).await {
@@ -3167,6 +3167,13 @@ impl FilesystemStorage {
                 aad_builder,
             );
             return Ok((Box::pin(decryptor), meta));
+        }
+        // A sidecar size smaller than the file makes GET advertise a short
+        // Content-Length and drop the tail. The file is the plain object.
+        if let Ok(len) = fs::metadata(&obj_path).await.map(|m| m.len()) {
+            if len > meta.size {
+                meta.size = len;
+            }
         }
         if meta.size <= SMALL_OBJECT_THRESHOLD {
             let data = fs::read(&obj_path).await.map_err(|e| {
@@ -5581,7 +5588,7 @@ impl FilesystemStorage {
                 StorageError::Io(e)
             }
         })?;
-        let meta: ObjectMeta = serde_json::from_str(&data)?;
+        let mut meta: ObjectMeta = serde_json::from_str(&data)?;
 
         if meta.is_delete_marker {
             return Err(StorageError::NotFound(key.to_string()));
@@ -5657,6 +5664,11 @@ impl FilesystemStorage {
                 StorageError::Io(e)
             }
         })?;
+        if let Ok(len) = file.metadata().await.map(|m| m.len()) {
+            if len > meta.size {
+                meta.size = len;
+            }
+        }
         Ok((
             Box::pin(BufReader::with_capacity(IO_BUFFER_SIZE, file)),
             meta,

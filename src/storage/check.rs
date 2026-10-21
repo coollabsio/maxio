@@ -971,18 +971,25 @@ async fn check_meta_pair(
     if let Some(parts) = meta.part_sizes.as_deref().filter(|parts| !parts.is_empty()) {
         let covered: u64 = parts.iter().copied().sum();
         if covered != meta.size {
-            return report_damaged_sidecar(
-                meta_path,
-                data_path,
-                key,
-                bucket_dir,
-                bucket,
-                data_dir,
-                repair,
-                "multipart part sizes do not cover the recorded size",
-                report,
-            )
-            .await;
+            // The file is the size of a plain object. When the parts add up to
+            // that file, the sidecar size is stale and the size-mismatch repair
+            // below rewrites it. SSE plaintext size is not the file length, and
+            // a plain object whose parts match neither field is real damage.
+            let plain_parts_match_file = !encrypted && covered == file_len;
+            if !plain_parts_match_file {
+                return report_damaged_sidecar(
+                    meta_path,
+                    data_path,
+                    key,
+                    bucket_dir,
+                    bucket,
+                    data_dir,
+                    repair,
+                    "multipart part sizes do not cover the recorded size",
+                    report,
+                )
+                .await;
+            }
         }
     }
     // A crashed publish can leave a newer payload with the previous sidecar.
@@ -5979,6 +5986,103 @@ mod tests {
             reported.issues
         );
         assert!(reported.unresolved() >= 1, "{:?}", reported.issues);
+    }
+
+    #[tokio::test]
+    async fn plain_multipart_size_is_rewritten_when_parts_match_the_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bucket = tmp.path().join("buckets/bkt");
+        std::fs::create_dir_all(&bucket).unwrap();
+        let algo = crate::storage::ChecksumAlgorithm::CRC32;
+        let p1 = b"part-one-bytes";
+        let p2 = b"part-two-bytes";
+        let body = [p1.as_slice(), p2.as_slice()].concat();
+        let composite = composite_of(&[p1, p2], algo);
+        let hash = hex::encode(sha2::Sha256::digest(&body));
+        let meta = ObjectMeta {
+            key: "mp.bin".into(),
+            size: body.len() as u64,
+            etag: "\"0123456789abcdef0123456789abcdef-2\"".into(),
+            content_type: "application/octet-stream".into(),
+            last_modified: "2024-04-01T00:00:00.000Z".into(),
+            checksum_algorithm: Some(algo),
+            checksum_value: Some(composite.clone()),
+            content_sha256: Some(hash.clone()),
+            part_sizes: Some(vec![p1.len() as u64, p2.len() as u64]),
+            ..ObjectMeta::default()
+        };
+        std::fs::write(bucket.join("mp.bin"), &body).unwrap();
+        let mut wrong = meta.clone();
+        wrong.size = body.len() as u64 - 1;
+        std::fs::write(
+            bucket.join("mp.bin.meta.json"),
+            serde_json::to_vec_pretty(&wrong).unwrap(),
+        )
+        .unwrap();
+        // Parts match neither the recorded size nor the file.
+        std::fs::write(bucket.join("bad.bin"), &body).unwrap();
+        let mut bad = wrong.clone();
+        bad.key = "bad.bin".into();
+        bad.part_sizes = Some(vec![1, 1]);
+        bad.size = 3;
+        std::fs::write(
+            bucket.join("bad.bin.meta.json"),
+            serde_json::to_vec_pretty(&bad).unwrap(),
+        )
+        .unwrap();
+
+        let storage = storage_at(tmp.path()).await;
+        let (got, served_size) = {
+            let (mut reader, meta) = storage.get_object("bkt", "mp.bin", None).await.unwrap();
+            let mut buf = Vec::new();
+            tokio::io::AsyncReadExt::read_to_end(&mut reader, &mut buf)
+                .await
+                .unwrap();
+            (buf, meta.size)
+        };
+        assert_eq!(got, body);
+        assert_eq!(served_size, body.len() as u64);
+
+        let repaired = check(tmp.path(), true).await.unwrap();
+        assert!(
+            repaired.issues.iter().any(|issue| {
+                issue.kind == IssueKind::SizeMismatch
+                    && issue.repaired
+                    && issue.path.ends_with("mp.bin")
+            }),
+            "{:?}",
+            repaired.issues
+        );
+        assert!(
+            repaired.issues.iter().any(|issue| {
+                issue.kind == IssueKind::CorruptMetadata
+                    && issue.path.ends_with("bad.bin.meta.json")
+                    && issue.detail.contains("part sizes do not cover")
+            }),
+            "{:?}",
+            repaired.issues
+        );
+        let fixed: ObjectMeta =
+            serde_json::from_slice(&std::fs::read(bucket.join("mp.bin.meta.json")).unwrap())
+                .unwrap();
+        assert_eq!(fixed.size, body.len() as u64);
+        assert_eq!(fixed.checksum_value.as_deref(), Some(composite.as_str()));
+        assert_eq!(fixed.content_sha256.as_deref(), Some(hash.as_str()));
+        assert_eq!(
+            fixed.part_sizes,
+            Some(vec![p1.len() as u64, p2.len() as u64])
+        );
+        assert_eq!(read_key(&storage, "mp.bin").await, body);
+        let again = check(tmp.path(), false).await.unwrap();
+        assert!(
+            again
+                .issues
+                .iter()
+                .all(|issue| !issue.path.ends_with("mp.bin")
+                    && !issue.path.ends_with("mp.bin.meta.json")),
+            "the rewritten size must not stay unresolved: {:?}",
+            again.issues
+        );
     }
 }
 

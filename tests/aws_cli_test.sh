@@ -241,8 +241,9 @@ assert_eq "unsigned GET /ui/buckets/photos?prefix= is the console" "true" "$UI_D
 if [ "$UI_PAGE" = "200" ]; then
     assert_eq "console html references the favicon under /ui/" "true" \
         "$(grep -q '/ui/favicon-32.png' "$TMPDIR/ui-page" && ! grep -q 'href="/favicon' "$TMPDIR/ui-page" && echo true || echo false)"
+    curl -sS -D "$TMPDIR/ui-headers" -o /dev/null "$ENDPOINT/ui/" || true
     assert_eq "console html is not cached" "true" \
-        "$(curl -sS -D - -o /dev/null "$ENDPOINT/ui/" | grep -qi 'cache-control: no-store' && echo true || echo false)"
+        "$(grep -qi 'cache-control: no-store' "$TMPDIR/ui-headers" && echo true || echo false)"
 fi
 for PROBE_BUCKET in version healthz api readyz; do
     echo "probe-$PROBE_BUCKET" > "$TMPDIR/probe.txt"

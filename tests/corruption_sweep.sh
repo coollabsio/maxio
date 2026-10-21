@@ -31,5 +31,6 @@ cargo test --lib -- \
     tampered_sse_sidecar_size_is_an_issue_and_not_plaintext \
     tampered_sse_sidecar_is_restored_from_the_archive \
     every_sse_sidecar_mac_is_checked \
+    plain_multipart_size_is_rewritten_when_parts_match_the_file \
     hashed_multipart_etag_is_not_reported_unverifiable \
     -- --test-threads=8

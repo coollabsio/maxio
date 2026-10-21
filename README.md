@@ -28,6 +28,8 @@ The web console is at `http://localhost:9000/ui/`.
 
 Sign-in sticks on plain `http://localhost`, `http://127.0.0.1`, and `http://[::1]`. The session cookie is marked `Secure` when the request is HTTPS (`X-Forwarded-Proto: https`) or the host is anything else, so a public HTTP listener does not store a console session. A TLS proxy must forward `X-Forwarded-Proto: https`. To allow the console over plain HTTP on a non-loopback host, set `MAXIO_SECURE_COOKIES=false` (anyone on that network can read the session).
 
+Failed console logins are limited to 10 per 5 minutes for each client IP and access key. A successful login is not counted and clears that key's failures. The limit uses the TCP peer address. `X-Forwarded-For` is ignored unless `MAXIO_TRUSTED_PROXY` (or `--trusted-proxy`) lists that peer as an IP or CIDR. When the peer is trusted, the client is the rightmost forwarded hop that is not itself in the list. Leave the setting empty unless a reverse proxy is the only way clients reach MaxIO.
+
 The server refuses to start with the built-in `maxioadmin` / `maxioadmin` keys. Set your own keys, as below. `--allow-insecure-dev` keeps those defaults and also omits `Secure` on every host; use it only on a machine you trust.
 
 ### Docker
@@ -289,7 +291,7 @@ The report lists stale temp files, stranded backups, promote directories and lef
 - move object bytes that have no sidecar to `<data-dir>/.maxio-quarantine/<bucket>/<path>` and say so in the report. Those bytes are not given a new sidecar: they may be SSE-S3 ciphertext, and serving them as a plain object would return the ciphertext with no encryption headers. Copy a quarantined file back by hand if you know which object it belongs to
 - delete a sidecar whose bytes are gone, and delete a multipart upload that has no readable metadata. A sidecar is kept when a promote directory for that key still exists
 - rewrite a plain object's size so it matches the file. A single-part etag (the MD5) or a checksum that does not match the payload is not rewritten: `--repair` moves that object (plain, SSE-S3, or `<key>/.maxio.object`) to `<data-dir>/.maxio-quarantine/` and leaves the bytes there. `--accept-current-checksums` with `--repair` records the payload's current checksum or single-part etag instead. A multipart etag (`-N`) cannot be checked from the whole object; it is reported as unverifiable and left unchanged
-- when a versioned object's current bytes are quarantined, copy the newest intact version back to the current object (a newest delete marker leaves the key deleted). `check` reports a current object that does not match its versions
+- when a versioned object's current bytes are missing or corrupt, copy the newest intact version back to the current object (a newest delete marker leaves the key deleted). An intact current object is kept: a corrupt archived copy of that same version is quarantined and rebuilt from the current bytes. A multipart etag is an info line, `multipart etag (not verifiable by MD5)`, and is not counted as an issue
 - rebuild a missing or corrupt data chunk when parity shards can reconstruct it
 
 It does not invent bucket configuration, rewrite encrypted sidecars (those are MAC-protected), or choose between a plain file and an erasure-coded directory for the same key. Those are reported and left unchanged.

@@ -1136,6 +1136,169 @@ async fn corrupt_revocation_file_fails_closed_and_logout_write_failure_is_500() 
     );
 }
 
+fn session_token(response: &reqwest::Response) -> String {
+    response
+        .headers()
+        .get("set-cookie")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap()
+        .trim_start_matches("maxio_session=")
+        .to_string()
+}
+
+fn cookie_path(header: &str) -> &str {
+    header
+        .split(';')
+        .map(str::trim)
+        .find_map(|part| part.strip_prefix("Path="))
+        .unwrap_or("")
+}
+
+#[tokio::test]
+async fn logout_revokes_every_session_cookie_and_clears_the_legacy_path() {
+    let (base_url, _tmp) = start_server().await;
+    let login = client()
+        .post(format!("{base_url}/maxio/api/auth/login"))
+        .json(&serde_json::json!({
+            "accessKey": ACCESS_KEY,
+            "secretKey": SECRET_KEY
+        }));
+    let first = login.try_clone().unwrap().send().await.unwrap();
+    let second = login.send().await.unwrap();
+    assert_eq!(first.status(), 200);
+    assert_eq!(second.status(), 200);
+    let token_a = session_token(&first);
+    let token_b = session_token(&second);
+    assert_ne!(token_a, token_b);
+    let both = format!("maxio_session={token_a}; maxio_session={token_b}");
+    let alive = client()
+        .get(format!("{base_url}/maxio/api/version"))
+        .header("cookie", &both)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(alive.status(), 200, "two live cookies still authenticate");
+
+    let logout = client()
+        .post(format!("{base_url}/maxio/api/auth/logout"))
+        .header("cookie", &both)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(logout.status(), 200, "{}", logout.text().await.unwrap());
+    let clears: Vec<String> = logout
+        .headers()
+        .get_all("set-cookie")
+        .iter()
+        .map(|value| value.to_str().unwrap().to_string())
+        .collect();
+    assert!(
+        clears.iter().any(|header| cookie_path(header) == "/maxio"),
+        "missing Path=/maxio clear: {clears:?}"
+    );
+    assert!(
+        clears
+            .iter()
+            .any(|header| cookie_path(header) == "/" && header.contains("Max-Age=0")),
+        "missing Path=/ clear for pre-upgrade cookies: {clears:?}"
+    );
+    for token in [&token_a, &token_b] {
+        let rejected = client()
+            .get(format!("{base_url}/maxio/api/version"))
+            .header("cookie", format!("maxio_session={token}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(rejected.status(), 401, "each cookie must be revoked");
+    }
+}
+
+#[tokio::test]
+async fn one_revoked_cookie_rejects_the_request_even_if_another_is_live() {
+    let (base_url, _tmp) = start_server().await;
+    let login = || {
+        client()
+            .post(format!("{base_url}/maxio/api/auth/login"))
+            .json(&serde_json::json!({
+                "accessKey": ACCESS_KEY,
+                "secretKey": SECRET_KEY
+            }))
+    };
+    let first = login().send().await.unwrap();
+    let second = login().send().await.unwrap();
+    let token_a = session_token(&first);
+    let token_b = session_token(&second);
+    let logout = client()
+        .post(format!("{base_url}/maxio/api/auth/logout"))
+        .header("cookie", format!("maxio_session={token_a}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(logout.status(), 200);
+    let mixed = client()
+        .get(format!("{base_url}/maxio/api/version"))
+        .header(
+            "cookie",
+            format!("maxio_session={token_a}; maxio_session={token_b}"),
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        mixed.status(),
+        401,
+        "a revoked cookie in the same request must not be ignored"
+    );
+    let live = client()
+        .get(format!("{base_url}/maxio/api/version"))
+        .header("cookie", format!("maxio_session={token_b}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(live.status(), 200, "the other session stays signed in");
+}
+
+#[tokio::test]
+async fn login_rate_limit_counts_only_failures_for_that_access_key() {
+    let (base_url, _tmp) = start_server().await;
+    let attempt = |key: &'static str, secret: &'static str| {
+        let base_url = base_url.clone();
+        async move {
+            client()
+                .post(format!("{base_url}/maxio/api/auth/login"))
+                .json(&serde_json::json!({
+                    "accessKey": key,
+                    "secretKey": secret
+                }))
+                .send()
+                .await
+                .unwrap()
+                .status()
+        }
+    };
+    for _ in 0..9 {
+        assert_eq!(attempt(ACCESS_KEY, "wrong-secret").await, 401);
+    }
+    assert_eq!(
+        attempt(ACCESS_KEY, SECRET_KEY).await,
+        200,
+        "a successful login is not counted and clears earlier failures"
+    );
+    for _ in 0..10 {
+        assert_eq!(attempt(ACCESS_KEY, "wrong-secret").await, 401);
+    }
+    assert_eq!(attempt(ACCESS_KEY, "wrong-secret").await, 429);
+    assert_eq!(
+        attempt("other-user", "wrong-secret").await,
+        401,
+        "a different access key has its own failure window"
+    );
+}
+
 async fn spawn_console(data_dir: &str) -> String {
     let keyring = Arc::new(Keyring::load(data_dir, None).await.unwrap());
     let storage = FilesystemStorage::new(data_dir, false, 10 * 1024 * 1024, 0, keyring)

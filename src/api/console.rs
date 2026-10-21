@@ -321,82 +321,245 @@ const TOKEN_MAX_AGE_SECS: i64 = 7 * 24 * 60 * 60; // 7 days
 const RATE_LIMIT_MAX: u32 = 10;
 const RATE_LIMIT_WINDOW_SECS: u64 = 300; // 5 minutes
 
-struct Bucket {
-    count: u32,
+struct AttemptWindow {
+    failures: u32,
     window_start: Instant,
 }
 
+/// Failed console logins, keyed by client IP and access key.
+///
+/// Successful logins are not counted. `X-Forwarded-For` is used only when the
+/// TCP peer is in `trusted` (see `MAXIO_TRUSTED_PROXY`). The default is empty,
+/// so the header is ignored.
 pub struct LoginRateLimiter {
-    buckets: std::sync::Mutex<HashMap<String, Bucket>>,
+    windows: std::sync::Mutex<HashMap<String, AttemptWindow>>,
+    trusted: Vec<TrustedNet>,
 }
 
 impl LoginRateLimiter {
+    #[allow(dead_code)] // integration tests construct a limiter with no trusted proxies
     pub fn new() -> Self {
-        Self {
-            buckets: std::sync::Mutex::new(HashMap::new()),
-        }
+        Self::from_trusted("").expect("empty proxy list")
     }
 
-    /// Returns `Some(retry_after_secs)` if the IP is rate-limited, `None` if allowed.
-    /// Increments the counter on every call (success and failure both count).
-    pub fn check_and_increment(&self, ip: &str) -> Option<u64> {
-        let mut map = self.buckets.lock().unwrap();
+    pub fn from_trusted(spec: &str) -> Result<Self, String> {
+        Ok(Self {
+            windows: std::sync::Mutex::new(HashMap::new()),
+            trusted: parse_trusted_proxies(spec)?,
+        })
+    }
+
+    /// Client address for the login limit. The peer address wins unless that
+    /// peer is a trusted proxy, in which case the rightmost `X-Forwarded-For`
+    /// hop that is not itself a trusted proxy is the client.
+    pub fn client_ip(&self, headers: &HeaderMap, addr: &SocketAddr) -> String {
+        let peer = addr.ip();
+        if !self.trusted.iter().any(|net| net.contains(peer)) {
+            return peer.to_string();
+        }
+        let forwarded = headers
+            .get("x-forwarded-for")
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("");
+        let mut client = peer.to_string();
+        for hop in forwarded.split(',').rev() {
+            let hop = hop.trim();
+            if hop.is_empty() {
+                continue;
+            }
+            let Ok(ip) = hop.parse::<std::net::IpAddr>() else {
+                continue;
+            };
+            if self.trusted.iter().any(|net| net.contains(ip)) {
+                continue;
+            }
+            client = ip.to_string();
+            break;
+        }
+        client
+    }
+
+    fn key(ip: &str, access_key: &str) -> String {
+        format!("{ip}\n{access_key}")
+    }
+
+    fn prune_and_window<'a>(
+        map: &'a mut HashMap<String, AttemptWindow>,
+        key: &str,
+    ) -> &'a mut AttemptWindow {
         let now = Instant::now();
-
-        // Prune expired entries to prevent unbounded memory growth
-        map.retain(|_, b| {
-            now.duration_since(b.window_start).as_secs() < RATE_LIMIT_WINDOW_SECS * 2
+        map.retain(|_, window| {
+            now.duration_since(window.window_start).as_secs() < RATE_LIMIT_WINDOW_SECS * 2
         });
-
-        let bucket = map.entry(ip.to_string()).or_insert(Bucket {
-            count: 0,
+        let window = map.entry(key.to_string()).or_insert(AttemptWindow {
+            failures: 0,
             window_start: now,
         });
-
-        if now.duration_since(bucket.window_start).as_secs() >= RATE_LIMIT_WINDOW_SECS {
-            bucket.count = 0;
-            bucket.window_start = now;
+        if now.duration_since(window.window_start).as_secs() >= RATE_LIMIT_WINDOW_SECS {
+            window.failures = 0;
+            window.window_start = now;
         }
+        window
+    }
 
-        bucket.count += 1;
-
-        if bucket.count > RATE_LIMIT_MAX {
+    /// `Some(retry_after)` when this IP and access key already failed too many times.
+    pub fn is_blocked(&self, ip: &str, access_key: &str) -> Option<u64> {
+        let mut map = self.windows.lock().unwrap();
+        let window = Self::prune_and_window(&mut map, &Self::key(ip, access_key));
+        if window.failures >= RATE_LIMIT_MAX {
             let remaining = RATE_LIMIT_WINDOW_SECS
-                .saturating_sub(now.duration_since(bucket.window_start).as_secs());
+                .saturating_sub(Instant::now().duration_since(window.window_start).as_secs());
             Some(remaining.max(1))
         } else {
             None
         }
     }
+
+    pub fn record_failure(&self, ip: &str, access_key: &str) {
+        let mut map = self.windows.lock().unwrap();
+        let window = Self::prune_and_window(&mut map, &Self::key(ip, access_key));
+        window.failures = window.failures.saturating_add(1);
+    }
+
+    pub fn clear(&self, ip: &str, access_key: &str) {
+        let mut map = self.windows.lock().unwrap();
+        map.remove(&Self::key(ip, access_key));
+    }
 }
 
-fn extract_client_ip(headers: &HeaderMap, addr: &SocketAddr) -> String {
-    let _ = headers;
-    // Public console: do not trust spoofable X-Forwarded-For unless/until a
-    // trusted-proxy allowlist is configured. Use the connected peer IP.
-    addr.ip().to_string()
+#[derive(Clone)]
+enum TrustedNet {
+    V4 { addr: u32, prefix: u8 },
+    V6 { addr: u128, prefix: u8 },
 }
 
-fn extract_cookie(headers: &HeaderMap) -> Option<String> {
-    headers
-        .get("cookie")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|cookies| {
-            cookies
-                .split(';')
-                .map(|c| c.trim())
-                .find(|c| c.starts_with(&format!("{}=", COOKIE_NAME)))
-                .map(|c| c[COOKIE_NAME.len() + 1..].to_string())
+impl TrustedNet {
+    fn contains(&self, ip: std::net::IpAddr) -> bool {
+        match (self, ip) {
+            (Self::V4 { addr, prefix }, std::net::IpAddr::V4(ip)) => {
+                let mask = ipv4_mask(*prefix);
+                (u32::from(ip) & mask) == (*addr & mask)
+            }
+            (Self::V6 { addr, prefix }, std::net::IpAddr::V6(ip)) => {
+                let mask = ipv6_mask(*prefix);
+                (u128::from(ip) & mask) == (*addr & mask)
+            }
+            _ => false,
+        }
+    }
+}
+
+fn ipv4_mask(prefix: u8) -> u32 {
+    if prefix == 0 {
+        0
+    } else {
+        u32::MAX << (32 - prefix)
+    }
+}
+
+fn ipv6_mask(prefix: u8) -> u128 {
+    if prefix == 0 {
+        0
+    } else {
+        u128::MAX << (128 - prefix)
+    }
+}
+
+fn parse_trusted_proxies(spec: &str) -> Result<Vec<TrustedNet>, String> {
+    let mut nets = Vec::new();
+    for part in spec.split(',') {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+        nets.push(parse_trusted_net(part)?);
+    }
+    Ok(nets)
+}
+
+fn parse_trusted_net(part: &str) -> Result<TrustedNet, String> {
+    let (addr, prefix) = match part.split_once('/') {
+        Some((addr, prefix)) => (addr, Some(prefix)),
+        None => (part, None),
+    };
+    if let Ok(ip) = addr.parse::<std::net::Ipv4Addr>() {
+        let prefix = match prefix {
+            Some(raw) => raw
+                .parse::<u8>()
+                .map_err(|_| format!("invalid trusted proxy prefix in {part}"))?,
+            None => 32,
+        };
+        if prefix > 32 {
+            return Err(format!("IPv4 trusted proxy prefix is too large in {part}"));
+        }
+        return Ok(TrustedNet::V4 {
+            addr: u32::from(ip),
+            prefix,
+        });
+    }
+    if let Ok(ip) = addr.parse::<std::net::Ipv6Addr>() {
+        let prefix = match prefix {
+            Some(raw) => raw
+                .parse::<u8>()
+                .map_err(|_| format!("invalid trusted proxy prefix in {part}"))?,
+            None => 128,
+        };
+        if prefix > 128 {
+            return Err(format!("IPv6 trusted proxy prefix is too large in {part}"));
+        }
+        return Ok(TrustedNet::V6 {
+            addr: u128::from(ip),
+            prefix,
+        });
+    }
+    Err(format!("trusted proxy {part} is not an IP address or CIDR"))
+}
+
+fn extract_session_cookies(headers: &HeaderMap) -> Vec<String> {
+    let mut values = Vec::new();
+    for header in headers.get_all("cookie") {
+        let Ok(cookies) = header.to_str() else {
+            continue;
+        };
+        for cookie in cookies.split(';') {
+            let cookie = cookie.trim();
+            let Some(value) = cookie.strip_prefix(&format!("{COOKIE_NAME}=")) else {
+                continue;
+            };
+            if !value.is_empty() {
+                values.push(value.to_string());
+            }
+        }
+    }
+    values
+}
+
+fn any_session_revoked(state: &crate::server::AppState, cookies: &[String]) -> bool {
+    cookies.iter().any(|token| {
+        crate::iam::session::parse_token(token).is_some_and(|parsed| {
+            state
+                .revoked_sessions
+                .rejects(parsed.issued_at, parsed.revocation_id())
         })
+    })
 }
 
-fn make_cookie(value: &str, max_age: i64, secure: bool) -> String {
+fn make_cookie(value: &str, max_age: i64, secure: bool, path: &str) -> String {
     let secure_flag = if secure { "; Secure" } else { "" };
 
     format!(
-        "{}={}; Path=/maxio; HttpOnly; SameSite=Strict; Max-Age={}{}",
-        COOKIE_NAME, value, max_age, secure_flag
+        "{}={}; Path={}; HttpOnly; SameSite=Strict; Max-Age={}{}",
+        COOKIE_NAME, value, path, max_age, secure_flag
     )
+}
+
+fn append_cleared_session_cookies(headers: &mut HeaderMap, secure: bool) {
+    for path in ["/maxio", "/"] {
+        let cookie = make_cookie("", 0, secure, path);
+        if let Ok(value) = cookie.parse() {
+            headers.append(axum::http::header::SET_COOKIE, value);
+        }
+    }
 }
 
 #[derive(Serialize, ToSchema)]
@@ -463,18 +626,7 @@ async fn console_auth_middleware(
     request: Request,
     next: Next,
 ) -> Response {
-    let Some(token) = extract_cookie(request.headers()) else {
-        return error(StatusCode::UNAUTHORIZED, "Not authenticated");
-    };
-    if let Some(parsed) = crate::iam::session::parse_token(&token) {
-        if state
-            .revoked_sessions
-            .rejects(parsed.issued_at, parsed.revocation_id())
-        {
-            return error(StatusCode::UNAUTHORIZED, "Not authenticated");
-        }
-    }
-    let identity = match crate::iam::console_from_token(&state.config, &token).await {
+    let identity = match session_identity(&state, request.headers()).await {
         Ok(identity) => identity,
         Err(()) => return error(StatusCode::UNAUTHORIZED, "Not authenticated"),
     };
@@ -548,9 +700,9 @@ pub async fn login(
     headers: HeaderMap,
     Json(body): Json<LoginRequest>,
 ) -> Response {
-    let ip = extract_client_ip(&headers, &addr);
+    let ip = state.login_rate_limiter.client_ip(&headers, &addr);
 
-    if let Some(retry_after) = state.login_rate_limiter.check_and_increment(&ip) {
+    if let Some(retry_after) = state.login_rate_limiter.is_blocked(&ip, &body.access_key) {
         return (
             [(axum::http::header::RETRY_AFTER, retry_after.to_string())],
             error(
@@ -564,16 +716,22 @@ pub async fn login(
     let identity = match crate::iam::login(&state.config, &body.access_key, &body.secret_key).await
     {
         Ok(identity) => identity,
-        Err(crate::iam::LoginError::Disabled) => {
-            return error(
-                StatusCode::FORBIDDEN,
-                "This access key is inactive or the user is disabled",
-            );
-        }
-        Err(crate::iam::LoginError::Invalid) => {
-            return error(StatusCode::UNAUTHORIZED, "Invalid credentials");
+        Err(err) => {
+            state
+                .login_rate_limiter
+                .record_failure(&ip, &body.access_key);
+            return match err {
+                crate::iam::LoginError::Disabled => error(
+                    StatusCode::FORBIDDEN,
+                    "This access key is inactive or the user is disabled",
+                ),
+                crate::iam::LoginError::Invalid => {
+                    error(StatusCode::UNAUTHORIZED, "Invalid credentials")
+                }
+            };
         }
     };
+    state.login_rate_limiter.clear(&ip, &body.access_key);
     let token = match crate::iam::issue_session_token(&state.config, &identity).await {
         Ok(token) => token,
         Err(()) => return error(StatusCode::INTERNAL_SERVER_ERROR, "Could not start session"),
@@ -582,6 +740,7 @@ pub async fn login(
         &token,
         TOKEN_MAX_AGE_SECS,
         console_cookie_secure(&state.config, &headers),
+        "/maxio",
     );
 
     let mut resp_headers = HeaderMap::new();
@@ -656,21 +815,26 @@ pub async fn capabilities(
     )
 )]
 pub async fn check(State(state): State<AppState>, headers: HeaderMap) -> Response {
-    let Some(token) = extract_cookie(&headers) else {
-        return error(StatusCode::UNAUTHORIZED, "Not authenticated");
-    };
-    if let Some(parsed) = crate::iam::session::parse_token(&token) {
-        if state
-            .revoked_sessions
-            .rejects(parsed.issued_at, parsed.revocation_id())
-        {
-            return error(StatusCode::UNAUTHORIZED, "Not authenticated");
-        }
-    }
-    match crate::iam::console_from_token(&state.config, &token).await {
+    match session_identity(&state, &headers).await {
         Ok(identity) => (StatusCode::OK, Json(session_response(&identity))).into_response(),
         Err(()) => error(StatusCode::UNAUTHORIZED, "Not authenticated"),
     }
+}
+
+async fn session_identity(
+    state: &crate::server::AppState,
+    headers: &HeaderMap,
+) -> Result<crate::iam::ConsoleIdentity, ()> {
+    let cookies = extract_session_cookies(headers);
+    if cookies.is_empty() || any_session_revoked(state, &cookies) {
+        return Err(());
+    }
+    for token in &cookies {
+        if let Ok(identity) = crate::iam::console_from_token(&state.config, token).await {
+            return Ok(identity);
+        }
+    }
+    Err(())
 }
 
 #[utoipa::path(
@@ -685,36 +849,33 @@ pub async fn check(State(state): State<AppState>, headers: HeaderMap) -> Respons
 )]
 pub async fn logout(State(state): State<AppState>, headers: HeaderMap) -> Response {
     let mut saved = true;
-    if let Some(token) = extract_cookie(&headers) {
-        if let Some(parsed) = crate::iam::session::parse_token(&token) {
-            let expires_at = parsed
-                .issued_at
-                .saturating_add(crate::iam::session::TOKEN_MAX_AGE_SECS);
-            if let Err(err) = state
-                .revoked_sessions
-                .revoke(parsed.revocation_id(), expires_at)
-                .await
-            {
-                tracing::error!(
-                    "logout revoked the session in memory but could not save it: {err}"
-                );
-                saved = false;
-            }
+    for token in extract_session_cookies(&headers) {
+        let Some(parsed) = crate::iam::session::parse_token(&token) else {
+            continue;
+        };
+        let expires_at = parsed
+            .issued_at
+            .saturating_add(crate::iam::session::TOKEN_MAX_AGE_SECS);
+        if let Err(err) = state
+            .revoked_sessions
+            .revoke(parsed.revocation_id(), expires_at)
+            .await
+        {
+            tracing::error!("logout revoked the session in memory but could not save it: {err}");
+            saved = false;
         }
     }
-    let cookie = make_cookie("", 0, console_cookie_secure(&state.config, &headers));
+    let secure = console_cookie_secure(&state.config, &headers);
     if saved {
         let mut resp_headers = HeaderMap::new();
-        resp_headers.insert("Set-Cookie", cookie.parse().unwrap());
+        append_cleared_session_cookies(&mut resp_headers, secure);
         return (resp_headers, ok()).into_response();
     }
     let mut resp = error(
         StatusCode::INTERNAL_SERVER_ERROR,
         "session was revoked in memory but could not be saved",
     );
-    if let Ok(value) = cookie.parse() {
-        resp.headers_mut().insert("Set-Cookie", value);
-    }
+    append_cleared_session_cookies(resp.headers_mut(), secure);
     resp
 }
 
@@ -2833,5 +2994,70 @@ mod tests {
         assert!(store.rejects(1, "old"));
         assert!(!store.rejects(1, "new"));
         assert!(marker_path(temp.path()).is_file());
+    }
+
+    #[test]
+    fn session_cookies_are_all_collected() {
+        let headers = header_map(&[(
+            "cookie",
+            "maxio_session=old-path; other=1; maxio_session=new-path",
+        )]);
+        assert_eq!(
+            extract_session_cookies(&headers),
+            vec!["old-path".to_string(), "new-path".to_string()]
+        );
+    }
+
+    #[test]
+    fn cleared_cookies_cover_the_legacy_root_path() {
+        let mut headers = HeaderMap::new();
+        append_cleared_session_cookies(&mut headers, false);
+        let values: Vec<String> = headers
+            .get_all("set-cookie")
+            .iter()
+            .map(|value| value.to_str().unwrap().to_string())
+            .collect();
+        let path = |header: &str| {
+            header
+                .split(';')
+                .map(str::trim)
+                .find_map(|part| part.strip_prefix("Path="))
+                .unwrap()
+                .to_string()
+        };
+        assert!(values.iter().any(|header| path(header) == "/maxio"));
+        assert!(values.iter().any(|header| path(header) == "/"));
+        assert!(values.iter().all(|header| header.contains("Max-Age=0")));
+    }
+
+    #[test]
+    fn login_limit_counts_failures_per_access_key_and_ignores_untrusted_forwarding() {
+        let limiter = LoginRateLimiter::new();
+        let peer: std::net::SocketAddr = "203.0.113.8:443".parse().unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert("x-forwarded-for", "198.51.100.4".parse().unwrap());
+        assert_eq!(limiter.client_ip(&headers, &peer), "203.0.113.8");
+        for _ in 0..10 {
+            limiter.record_failure("203.0.113.8", "alice");
+        }
+        assert!(limiter.is_blocked("203.0.113.8", "alice").is_some());
+        assert!(limiter.is_blocked("203.0.113.8", "bob").is_none());
+        limiter.clear("203.0.113.8", "alice");
+        assert!(limiter.is_blocked("203.0.113.8", "alice").is_none());
+
+        let trusted = LoginRateLimiter::from_trusted("10.0.0.0/8,127.0.0.1").unwrap();
+        let proxy: std::net::SocketAddr = "10.1.2.3:9000".parse().unwrap();
+        let mut forwarded = HeaderMap::new();
+        forwarded.insert(
+            "x-forwarded-for",
+            "9.9.9.9, 198.51.100.7, 10.1.2.3".parse().unwrap(),
+        );
+        assert_eq!(
+            trusted.client_ip(&forwarded, &proxy),
+            "198.51.100.7",
+            "the rightmost hop that is not a trusted proxy is the client"
+        );
+        let outsider: std::net::SocketAddr = "192.0.2.9:1".parse().unwrap();
+        assert_eq!(trusted.client_ip(&forwarded, &outsider), "192.0.2.9");
     }
 }

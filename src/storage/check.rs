@@ -67,6 +67,10 @@ pub enum IssueKind {
     ReservedBucket,
     /// The current object does not match the newest version (or a delete marker).
     CurrentVersionMismatch,
+    /// Archived bytes of the current version are corrupt. The current object is intact.
+    VersionArchiveCorrupt,
+    /// Multipart etag (`-N`) is not the MD5 of the whole object. Informational.
+    MultipartEtag,
 }
 
 impl IssueKind {
@@ -92,6 +96,8 @@ impl IssueKind {
             Self::LegacyReservedKey => "legacy-reserved-key",
             Self::ReservedBucket => "reserved-bucket",
             Self::CurrentVersionMismatch => "current-version-mismatch",
+            Self::VersionArchiveCorrupt => "version-archive",
+            Self::MultipartEtag => "multipart-etag",
         }
     }
 }
@@ -202,7 +208,7 @@ impl CheckReport {
             let action = if issue.repaired {
                 "repaired"
             } else if issue.advisory {
-                "note"
+                "info"
             } else {
                 "report"
             };
@@ -214,10 +220,11 @@ impl CheckReport {
                 issue.detail
             );
         }
+        let counted = self.issues.iter().filter(|issue| !issue.advisory).count();
         println!(
             "checked {} object(s), {} issue(s), {} unresolved",
             self.objects_seen,
-            self.issues.len(),
+            counted,
             self.unresolved()
         );
     }
@@ -818,12 +825,9 @@ async fn check_meta_pair(
                 meta.size = file_len;
                 if etag_is_multipart(&meta.etag) {
                     report.note(
-                        IssueKind::EtagMismatch,
+                        IssueKind::MultipartEtag,
                         data_path,
-                        format!(
-                            "sidecar etag {} is a multipart etag (-N) and cannot be verified from the whole object. It was not rewritten.",
-                            meta.etag
-                        ),
+                        "multipart etag (not verifiable by MD5)",
                     );
                 } else {
                     meta.etag = file_md5_quoted(data_path).await?;
@@ -834,12 +838,9 @@ async fn check_meta_pair(
         } else if etag_is_multipart(&meta.etag) {
             if meta.checksum_algorithm.is_none() {
                 report.note(
-                    IssueKind::EtagMismatch,
+                    IssueKind::MultipartEtag,
                     data_path,
-                    format!(
-                        "sidecar etag {} is a multipart etag (-N) and cannot be verified from the whole object. It was not rewritten.",
-                        meta.etag
-                    ),
+                    "multipart etag (not verifiable by MD5)",
                 );
             }
         } else {
@@ -1318,15 +1319,102 @@ async fn reconcile_one_key(
     report: &mut CheckReport,
 ) -> anyhow::Result<()> {
     let ids = list_version_ids(ver_dir).await?;
-    if ids.is_empty() {
-        return Ok(());
-    }
     let (plain, inline, meta_path, ec_path) = object_locations(bucket_dir, key);
     let data_path = current_data_path(&plain, &inline).await;
-    if let Some(meta) = read_object_meta(&meta_path).await {
-        // A null version written while versioning was suspended is newer than
-        // every archived version and stays the current object.
-        if meta.version_id.is_none() && !meta.is_delete_marker && is_file(&data_path).await {
+    let current_meta = read_object_meta(&meta_path).await;
+    let current_intact = is_file(&data_path).await
+        && sidecar_matches_payload(&data_path, &meta_path, bucket, key, keyring).await;
+    // A null version (written while versioning was suspended, or before
+    // versioning) is newer than every archived version. Keep it when its own
+    // etag or checksum matches. A corrupt archive must not replace it.
+    if current_intact
+        && current_meta
+            .as_ref()
+            .is_some_and(|meta| meta.version_id.is_none() && !meta.is_delete_marker)
+    {
+        return Ok(());
+    }
+    if ids.is_empty() && !current_intact {
+        return Ok(());
+    }
+    // `--repair` may already have quarantined a corrupt newest archive, so
+    // the version id can be missing from `.versions` while the current object
+    // still names it. That id stays the newest version.
+    let newest = if current_intact {
+        match current_meta
+            .as_ref()
+            .and_then(|meta| meta.version_id.clone())
+        {
+            Some(vid)
+                if ids
+                    .first()
+                    .is_none_or(|id| vid == *id || version_is_newer(&vid, id)) =>
+            {
+                vid
+            }
+            _ => ids.first().cloned().unwrap_or_default(),
+        }
+    } else {
+        ids.first().cloned().unwrap_or_default()
+    };
+    if newest.is_empty() {
+        return Ok(());
+    }
+    let newest_meta = read_object_meta(&ver_dir.join(format!("{newest}.meta.json")))
+        .await
+        .or_else(|| {
+            current_meta
+                .as_ref()
+                .filter(|meta| meta.version_id.as_deref() == Some(newest.as_str()))
+                .cloned()
+        });
+    if let Some(newest_meta) = newest_meta {
+        if !newest_meta.is_delete_marker
+            && current_intact
+            && current_meta
+                .as_ref()
+                .is_some_and(|meta| meta.version_id.as_deref() == Some(newest.as_str()))
+        {
+            let archive_matches = current_matches_version(&data_path, &meta_path, &newest, ver_dir)
+                .await
+                && version_payload_intact(ver_dir, &newest, &newest_meta, bucket, key, keyring)
+                    .await;
+            if archive_matches {
+                return Ok(());
+            }
+            let detail = format!(
+                "archived copy of version {newest} of {bucket}/{key} is corrupt or missing, but the current object matches its stored etag or checksum and is that version"
+            );
+            if !repair {
+                report.push(
+                    IssueKind::VersionArchiveCorrupt,
+                    &ver_dir.join(format!("{newest}.data")),
+                    format!(
+                        "{detail}. Not modified. --repair quarantines only the corrupt version file and rebuilds the archived copy from the current object."
+                    ),
+                    false,
+                );
+                return Ok(());
+            }
+            let _ = quarantine_version_copy(data_dir, bucket, bucket_dir, ver_dir, &newest).await;
+            let Some(current) = read_object_meta(&meta_path).await else {
+                report.push(
+                    IssueKind::VersionArchiveCorrupt,
+                    &meta_path,
+                    format!("{detail}. The current sidecar disappeared before the archive could be rebuilt."),
+                    false,
+                );
+                return Ok(());
+            };
+            publish_version_from_current(ver_dir, &newest, &data_path, &current).await?;
+            report.push(
+                IssueKind::VersionArchiveCorrupt,
+                &data_path,
+                format!(
+                    "{detail}. Rebuilt the archived copy from the current object. The current bytes were kept."
+                ),
+                true,
+            );
             return Ok(());
         }
     }
@@ -1470,6 +1558,14 @@ async fn version_expectation(
         }
     }
     Ok(CurrentExpectation::NoIntactVersion)
+}
+
+fn version_is_newer(a: &str, b: &str) -> bool {
+    match (a == "null", b == "null") {
+        (true, _) => false,
+        (false, true) => true,
+        _ => a > b,
+    }
 }
 
 async fn list_version_ids(ver_dir: &Path) -> anyhow::Result<Vec<String>> {
@@ -1673,6 +1769,50 @@ async fn remove_current_object(plain: &Path, inline: &Path, meta: &Path, ec: &Pa
     {
         remove_path(ec).await;
     }
+}
+
+async fn quarantine_version_copy(
+    data_dir: &Path,
+    bucket: &str,
+    bucket_dir: &Path,
+    ver_dir: &Path,
+    vid: &str,
+) -> anyhow::Result<Option<PathBuf>> {
+    let data = ver_dir.join(format!("{vid}.data"));
+    let meta = ver_dir.join(format!("{vid}.meta.json"));
+    let ec = ver_dir.join(format!("{vid}.ec"));
+    if is_file(&data).await {
+        let dest = quarantine_payload(data_dir, bucket, bucket_dir, &data, &meta).await?;
+        return Ok(Some(dest));
+    }
+    if tokio::fs::metadata(&ec)
+        .await
+        .map(|meta| meta.is_dir())
+        .unwrap_or(false)
+    {
+        let rel = ec.strip_prefix(bucket_dir).unwrap_or(&ec);
+        let dest = data_dir.join(".maxio-quarantine").join(bucket).join(rel);
+        if let Some(parent) = dest.parent() {
+            tokio::fs::create_dir_all(parent).await?;
+        }
+        if tokio::fs::try_exists(&dest).await? {
+            let _ = tokio::fs::remove_dir_all(&dest).await;
+        }
+        tokio::fs::rename(&ec, &dest).await?;
+        if is_file(&meta).await {
+            let meta_rel = meta.strip_prefix(bucket_dir).unwrap_or(&meta);
+            let meta_dest = data_dir
+                .join(".maxio-quarantine")
+                .join(bucket)
+                .join(meta_rel);
+            if let Some(parent) = meta_dest.parent() {
+                tokio::fs::create_dir_all(parent).await?;
+            }
+            tokio::fs::rename(&meta, &meta_dest).await?;
+        }
+        return Ok(Some(dest));
+    }
+    Ok(None)
 }
 
 async fn restore_version_payload(
@@ -3204,12 +3344,20 @@ mod tests {
         let repaired = check(tmp.path(), true).await.unwrap();
         assert!(
             repaired.issues.iter().any(|issue| {
-                issue.kind == IssueKind::EtagMismatch
+                issue.kind == IssueKind::MultipartEtag
                     && issue.advisory
                     && !issue.repaired
-                    && issue.detail.contains("cannot be verified")
+                    && issue.detail == "multipart etag (not verifiable by MD5)"
             }),
             "{:?}",
+            repaired.issues
+        );
+        assert!(
+            repaired
+                .issues
+                .iter()
+                .all(|issue| issue.kind != IssueKind::EtagMismatch),
+            "a multipart etag is not a mismatch: {:?}",
             repaired.issues
         );
         assert_eq!(
@@ -3427,6 +3575,195 @@ mod tests {
         );
         let again = check(tmp.path(), false).await.unwrap();
         assert_eq!(again.unresolved(), 0, "{:?}", again.issues);
+    }
+
+    fn newest_version_data(bucket: &std::path::Path, key: &str) -> std::path::PathBuf {
+        let name = std::path::Path::new(key)
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let dir = bucket.join(".versions").join(name);
+        let mut ids = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .filter_map(|name| name.strip_suffix(".data").map(str::to_string))
+            .collect::<Vec<_>>();
+        ids.sort_by(|a, b| match (a.as_str() == "null", b.as_str() == "null") {
+            (true, false) => std::cmp::Ordering::Greater,
+            (false, true) => std::cmp::Ordering::Less,
+            _ => b.cmp(a),
+        });
+        dir.join(format!("{}.data", ids[0]))
+    }
+
+    async fn put_bytes(storage: &FilesystemStorage, key: &str, body: &'static [u8], sse: bool) {
+        storage
+            .put_object(
+                "bkt",
+                key,
+                "text/plain",
+                Box::pin(body),
+                None,
+                sse.then(crate::storage::EncryptionRequest::sse_s3),
+            )
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn corrupt_newest_archive_does_not_roll_back_an_intact_current() {
+        for sse in [false, true] {
+            let tmp = tempfile::tempdir().unwrap();
+            let storage = storage_at(tmp.path()).await;
+            storage.create_bucket(&bucket_meta("bkt")).await.unwrap();
+            storage.set_versioning("bkt", true).await.unwrap();
+            put_bytes(&storage, "obj", b"older-body", sse).await;
+            put_bytes(&storage, "obj", b"newest-body", sse).await;
+            let bucket = tmp.path().join("buckets/bkt");
+            let current = std::fs::read(bucket.join("obj")).unwrap();
+            let archive = newest_version_data(&bucket, "obj");
+            let vid = archive
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .trim_end_matches(".data")
+                .to_string();
+            flip_first_byte(&archive);
+            let reported = check(tmp.path(), false).await.unwrap();
+            assert!(
+                reported.issues.iter().any(|issue| {
+                    issue.kind == IssueKind::VersionArchiveCorrupt
+                        && !issue.repaired
+                        && issue.detail.contains("current object matches")
+                        && !issue.detail.contains("does not match intact version")
+                }),
+                "sse={sse} diagnosis: {:?}",
+                reported.issues
+            );
+            assert!(
+                reported
+                    .issues
+                    .iter()
+                    .filter(|issue| issue.kind == IssueKind::CurrentVersionMismatch)
+                    .all(|issue| !issue.detail.contains("does not match intact version")),
+                "sse={sse} must not call an intact current a mismatch: {:?}",
+                reported.issues
+            );
+            let repaired = check(tmp.path(), true).await.unwrap();
+            assert_eq!(read_key(&storage, "obj").await, b"newest-body", "sse={sse}");
+            assert_eq!(std::fs::read(bucket.join("obj")).unwrap(), current);
+            assert_eq!(read_version(&storage, "obj", &vid).await, b"newest-body");
+            let versions = storage.list_object_versions("bkt", "obj").await.unwrap();
+            assert!(
+                versions
+                    .iter()
+                    .any(|obj| obj.version_id.as_deref() == Some(vid.as_str())),
+                "sse={sse} newest version vanished: {versions:?}"
+            );
+            assert_eq!(repaired.unresolved(), 0, "sse={sse} {:?}", repaired.issues);
+        }
+    }
+
+    #[tokio::test]
+    async fn suspended_null_current_is_not_replaced_by_an_older_version() {
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = storage_at(tmp.path()).await;
+        storage.create_bucket(&bucket_meta("bkt")).await.unwrap();
+        storage.set_versioning("bkt", true).await.unwrap();
+        put_bytes(&storage, "obj", b"sv1", false).await;
+        put_bytes(&storage, "obj", b"sv2", false).await;
+        storage.set_versioning("bkt", false).await.unwrap();
+        put_bytes(&storage, "obj", b"sv3", false).await;
+        let bucket = tmp.path().join("buckets/bkt");
+        let archive = newest_version_data(&bucket, "obj");
+        flip_first_byte(&archive);
+        let repaired = check(tmp.path(), true).await.unwrap();
+        assert_eq!(
+            read_key(&storage, "obj").await,
+            b"sv3",
+            "repair rolled a suspended null write back: {:?}",
+            repaired.issues
+        );
+        let again = check(tmp.path(), false).await.unwrap();
+        assert_eq!(again.unresolved(), 0, "{:?}", again.issues);
+    }
+
+    fn copy_tree(src: &std::path::Path, dst: &std::path::Path) {
+        std::fs::create_dir_all(dst).unwrap();
+        for entry in std::fs::read_dir(src).unwrap() {
+            let entry = entry.unwrap();
+            let to = dst.join(entry.file_name());
+            if entry.path().is_dir() {
+                copy_tree(&entry.path(), &to);
+            } else {
+                std::fs::copy(entry.path(), &to).unwrap();
+            }
+        }
+    }
+
+    fn files_under(root: &std::path::Path) -> Vec<std::path::PathBuf> {
+        let mut out = Vec::new();
+        fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            for entry in std::fs::read_dir(dir).unwrap() {
+                let entry = entry.unwrap();
+                if entry.path().is_dir() {
+                    walk(&entry.path(), out);
+                } else {
+                    out.push(entry.path());
+                }
+            }
+        }
+        walk(root, &mut out);
+        out.sort();
+        out
+    }
+
+    #[tokio::test]
+    async fn single_file_corruption_never_serves_older_than_newest_intact() {
+        let fixture = tempfile::tempdir().unwrap();
+        let storage = storage_at(fixture.path()).await;
+        storage.create_bucket(&bucket_meta("bkt")).await.unwrap();
+        storage.set_versioning("bkt", true).await.unwrap();
+        put_bytes(&storage, "obj", b"v1-body", false).await;
+        put_bytes(&storage, "obj", b"v2-body", false).await;
+        put_bytes(&storage, "obj", b"v3-body", false).await;
+        drop(storage);
+        let files = files_under(&fixture.path().join("buckets"));
+        assert!(files.len() >= 4, "fixture should have several files");
+        for file in files {
+            let rel = file.strip_prefix(fixture.path()).unwrap().to_path_buf();
+            let copy = tempfile::tempdir().unwrap();
+            copy_tree(fixture.path(), copy.path());
+            let target = copy.path().join(&rel);
+            if std::fs::metadata(&target).unwrap().len() == 0 {
+                std::fs::write(&target, b"x").unwrap();
+            } else {
+                flip_first_byte(&target);
+            }
+            let repaired = check(copy.path(), true).await;
+            let opened = storage_at(copy.path()).await;
+            let got = opened.get_object("bkt", "obj", None).await;
+            let body = match got {
+                Ok((mut reader, _)) => {
+                    let mut buf = Vec::new();
+                    tokio::io::AsyncReadExt::read_to_end(&mut reader, &mut buf)
+                        .await
+                        .unwrap();
+                    buf
+                }
+                Err(err) => panic!(
+                    "corrupting {} made GET fail ({err}); check result: {repaired:?}",
+                    rel.display()
+                ),
+            };
+            assert_eq!(
+                body,
+                b"v3-body",
+                "corrupting {} made GET return older content: {body:?}\n{repaired:?}",
+                rel.display()
+            );
+        }
     }
 }
 

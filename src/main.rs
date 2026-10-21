@@ -328,7 +328,10 @@ async fn main() -> anyhow::Result<()> {
     let state = server::AppState {
         storage: Arc::new(storage),
         config: Arc::new(config.clone()),
-        login_rate_limiter: Arc::new(api::console::LoginRateLimiter::new()),
+        login_rate_limiter: Arc::new(
+            api::console::LoginRateLimiter::from_trusted(&config.trusted_proxy)
+                .map_err(|err| anyhow::anyhow!(err))?,
+        ),
         revoked_sessions: Arc::new(
             api::console::RevokedSessions::open(std::path::Path::new(&config.data_dir)).await,
         ),

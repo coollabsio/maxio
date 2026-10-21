@@ -2175,21 +2175,14 @@ data, bucket, older = sys.argv[1:]
 meta = pathlib.Path(data, "buckets", bucket, ".versions", "ver.bin", f"{older}.meta.json")
 meta.write_text("{", encoding="utf-8")
 PY
-    # The server has a keyring, and `{` does not prove the bytes are plaintext,
-    # so repair must not invent a sidecar. The current object stays v2.
-    set +e
-    "$ROBUST_BIN" check --data-dir "$ROBUST_DATA" --repair >"$TMPDIR/ver-check.txt" 2>"$TMPDIR/ver-check.err"
-    VER_RC=$?
-    set -e
-    assert_eq "older version meta is not rebuilt while a keyring exists" "true" \
-        "$([ "$VER_RC" -ne 0 ] && grep -q 'not rebuilt' "$TMPDIR/ver-check.txt" && echo true || echo false)"
-    assert_eq "older version check does not abort the scan" "false" \
-        "$(grep -q 'may record an SSE-S3 key id' "$TMPDIR/ver-check.err" && echo true || echo false)"
+    # The bytes are plain text, so repair rebuilds the sidecar even though the
+    # server created a keyring. The current object stays v2.
+    assert "repair after older version meta is corrupt" "$ROBUST_BIN" check --data-dir "$ROBUST_DATA" --repair
     start_robust
     assert "latest stays v2 after repair" $ROBUST_AWS s3 cp "s3://$ROBUST_BUCKET/ver.bin" "$TMPDIR/ver-latest.txt"
     assert_eq "latest body is v2" "v2-body" "$(cat "$TMPDIR/ver-latest.txt")"
-    assert_fail "older version with unreadable meta is not served" \
-        $ROBUST_AWS s3api get-object --bucket "$ROBUST_BUCKET" --key ver.bin --version-id "$V1_ID" "$TMPDIR/ver-old.txt"
+    assert "older version still readable" $ROBUST_AWS s3api get-object --bucket "$ROBUST_BUCKET" --key ver.bin --version-id "$V1_ID" "$TMPDIR/ver-old.txt"
+    assert_eq "older version body is v1" "v1-body" "$(cat "$TMPDIR/ver-old.txt")"
     stop_robust
     mc alias rm "$MC_ROBUST" >/dev/null 2>&1 || true
     rm -rf "$ROBUST_DATA"

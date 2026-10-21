@@ -38,7 +38,7 @@ use md5::{Digest, Md5};
 use sha2::Sha256;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncReadExt, AsyncSeekExt};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IssueKind {
@@ -311,9 +311,9 @@ pub async fn check_with_opts(
     }
     let mut report = CheckReport::default();
     let mut saw_sse_s3 = false;
-    let encryption_configured = master_key_b64.is_some()
+    let keyring_configured = master_key_b64.is_some()
         || tokio::fs::try_exists(data_dir.join(".maxio-keys.json")).await?;
-    let keyring = if encryption_configured {
+    let keyring = if keyring_configured {
         super::keys::Keyring::load(data_dir.to_str().unwrap_or("."), master_key_b64)
             .await
             .ok()
@@ -353,7 +353,6 @@ pub async fn check_with_opts(
                     accept_current_checksums,
                     accept_unverifiable_current,
                     restore_unverifiable_from_archive,
-                    encryption_configured,
                     keyring.as_ref(),
                     &mut report,
                     &mut saw_sse_s3,
@@ -405,7 +404,6 @@ async fn scan_bucket(
     accept_current_checksums: bool,
     accept_unverifiable_current: bool,
     restore_unverifiable_from_archive: bool,
-    encryption_configured: bool,
     keyring: Option<&Arc<super::keys::Keyring>>,
     report: &mut CheckReport,
     saw_sse_s3: &mut bool,
@@ -477,7 +475,6 @@ async fn scan_bucket(
                 &prefix,
                 repair,
                 accept_current_checksums,
-                encryption_configured,
                 keyring,
                 report,
                 saw_sse_s3,
@@ -553,7 +550,6 @@ async fn scan_bucket(
                     repair,
                     keep_sidecar: guard.keeps(stem),
                     accept_current_checksums,
-                    encryption_configured,
                 },
                 keyring,
                 report,
@@ -679,8 +675,6 @@ struct PairFlags {
     repair: bool,
     keep_sidecar: bool,
     accept_current_checksums: bool,
-    /// A keyring file or a master key is configured, so a payload may be ciphertext.
-    encryption_configured: bool,
 }
 
 async fn check_meta_pair(
@@ -711,24 +705,55 @@ async fn check_meta_pair(
         Ok(raw) => raw,
         Err(e) => {
             // Binary or otherwise unreadable. One object must not abort the scan.
-            let mut detail = format!(
-                "unreadable sidecar: {e}. Encryption cannot be ruled out, so the sidecar was not rebuilt and the object is unrecoverable metadata. It was left in place and is not served."
-            );
+            // Rebuild only when the bytes themselves cannot be an SSE frame.
+            let data_exists = is_file(data_path).await;
+            let ec_exists = tokio::fs::try_exists(ec_path).await?;
+            let decision = if data_exists && !ec_exists {
+                rebuild_decision("", data_path).await.unwrap_or_else(|_| {
+                    RebuildDecision::Refuse("the payload could not be read".into())
+                })
+            } else {
+                RebuildDecision::Refuse("there is no plain payload to rebuild from".into())
+            };
+            let mut repaired = false;
+            let mut detail = format!("unreadable sidecar: {e}");
             if repair {
                 match quarantine_sidecar_copy(data_dir, bucket, bucket_dir, meta_path).await {
                     Ok(dest) => {
                         detail = format!(
-                            "{detail} Copied the original sidecar to {}.",
+                            "{detail}. Copied the original sidecar to {}.",
                             dest.display()
                         );
                     }
                     Err(err) => {
-                        detail =
-                            format!("{detail} Could not quarantine the original sidecar: {err}.");
+                        detail = format!(
+                            "{detail}. Could not quarantine the original sidecar: {err}. It was left unchanged."
+                        );
+                        report.push(IssueKind::CorruptMetadata, meta_path, detail, false);
+                        return Ok(());
+                    }
+                }
+                match decision {
+                    RebuildDecision::Rebuild if data_exists && !ec_exists => {
+                        write_synthesized_sidecar(key, data_path, meta_path, "").await?;
+                        repaired = true;
+                        detail = format!(
+                            "{detail} Rebuilt a plaintext sidecar from the bytes. They are not MaxIO SSE frames. It is not a verified restore source."
+                        );
+                    }
+                    RebuildDecision::Refuse(why) => {
+                        detail = format!(
+                            "{detail} The sidecar was not rebuilt ({why}). It was left in place and is not served."
+                        );
+                    }
+                    RebuildDecision::Rebuild => {
+                        detail = format!(
+                            "{detail} The sidecar was not rebuilt (the payload is not a plain file). It was left in place and is not served."
+                        );
                     }
                 }
             }
-            report.push(IssueKind::CorruptMetadata, meta_path, detail, false);
+            report.push(IssueKind::CorruptMetadata, meta_path, detail, repaired);
             return Ok(());
         }
     };
@@ -737,14 +762,12 @@ async fn check_meta_pair(
         Err(e) => {
             let data_exists = is_file(data_path).await;
             let ec_exists = tokio::fs::try_exists(ec_path).await?;
-            let ruled_out = if repair && data_exists && !ec_exists {
-                encryption_ruled_out(&raw, data_path, flags.encryption_configured)
-                    .await
-                    .unwrap_or(false)
-            } else if repair && !data_exists && !ec_exists {
-                !flags.encryption_configured && !sidecar_looks_encrypted(&raw)
+            let decision = if repair && data_exists && !ec_exists {
+                Some(rebuild_decision(&raw, data_path).await.unwrap_or_else(|_| {
+                    RebuildDecision::Refuse("the payload could not be read".into())
+                }))
             } else {
-                false
+                None
             };
             let mut repaired = false;
             let mut detail = format!("sidecar JSON is invalid: {e}");
@@ -776,32 +799,18 @@ async fn check_meta_pair(
                         detail = format!(
                             "{detail} Restored this sidecar from the intact copy of the same bytes."
                         );
-                    } else if !ruled_out {
+                    } else if let Some(RebuildDecision::Refuse(why)) = decision {
                         detail = format!(
-                            "{detail} Encryption cannot be ruled out, so the sidecar was not rebuilt and the object is unrecoverable metadata. It was left in place and is not served."
+                            "{detail} The sidecar was not rebuilt ({why}). It was left in place and is not served."
                         );
                     } else {
-                        let mut rebuilt = synthesized_meta(key, data_path).await?;
-                        rebuilt.rebuilt_from_bytes = true;
-                        rebuilt.content_sha256 = None;
-                        apply_recovered_identity(&mut rebuilt, &raw);
-                        if let Some(vid) = version_id_from_meta_path(meta_path) {
-                            if let Some(stamp) = last_modified_from_version_id(&vid) {
-                                rebuilt.last_modified = stamp;
-                            }
-                            rebuilt.version_id = Some(vid);
-                        }
-                        write_file_atomic(
-                            meta_path,
-                            serde_json::to_string_pretty(&rebuilt)?.as_bytes(),
-                        )
-                        .await?;
+                        write_synthesized_sidecar(key, data_path, meta_path, &raw).await?;
                         repaired = true;
                         detail = format!(
                             "{detail} Rebuilt a plaintext sidecar from the bytes. It is not a verified restore source."
                         );
                     }
-                } else if !data_exists && !keep_sidecar && ruled_out {
+                } else if !data_exists && !keep_sidecar && !sidecar_looks_encrypted(&raw) {
                     let _ = tokio::fs::remove_file(meta_path).await;
                     repaired = true;
                 }
@@ -1331,7 +1340,6 @@ async fn scan_versions(
     prefix: &str,
     repair: bool,
     accept_current_checksums: bool,
-    encryption_configured: bool,
     keyring: Option<&Arc<super::keys::Keyring>>,
     report: &mut CheckReport,
     saw_sse_s3: &mut bool,
@@ -1377,7 +1385,6 @@ async fn scan_versions(
                     repair,
                     keep_sidecar: false,
                     accept_current_checksums,
-                    encryption_configured,
                 },
                 keyring,
                 report,
@@ -2537,36 +2544,123 @@ fn parse_json_string(raw: &str) -> Option<String> {
     None
 }
 
-/// Encryption is ruled out only when the broken sidecar proves the bytes are
-/// plaintext, or when this data directory has no keyring and no master key.
-/// An empty or truncated sidecar does not prove that.
-async fn encryption_ruled_out(
-    raw: &str,
-    data_path: &Path,
-    encryption_configured: bool,
-) -> anyhow::Result<bool> {
+enum RebuildDecision {
+    Rebuild,
+    Refuse(String),
+}
+
+/// A plaintext sidecar is written only when the bytes are provably not MaxIO
+/// SSE ciphertext. A keyring file is not evidence either way: every server
+/// creates one. The on-disk frame layout is.
+///
+/// A trial decrypt is not possible here. The data key is wrapped inside the
+/// sidecar, which is the file we cannot read, so the master key cannot
+/// authenticate the payload on its own.
+async fn rebuild_decision(raw: &str, data_path: &Path) -> anyhow::Result<RebuildDecision> {
     if sidecar_looks_encrypted(raw) {
-        return Ok(false);
+        return Ok(RebuildDecision::Refuse(
+            "the sidecar still contains encryption metadata".into(),
+        ));
     }
     let mut saw_plaintext_proof = false;
     if let Some(etag) = salvage_etag(raw) {
         if !etag.multipart {
             saw_plaintext_proof = true;
             if file_md5_quoted(data_path).await? != etag.quoted {
-                return Ok(false);
+                return Ok(RebuildDecision::Refuse(
+                    "a recorded plaintext checksum does not match the bytes".into(),
+                ));
             }
         }
     }
     if let Some((algo, expected)) = salvage_checksum(raw) {
         saw_plaintext_proof = true;
         if file_checksum(data_path, algo).await? != expected {
-            return Ok(false);
+            return Ok(RebuildDecision::Refuse(
+                "a recorded plaintext checksum does not match the bytes".into(),
+            ));
         }
     }
     if saw_plaintext_proof {
-        return Ok(true);
+        return Ok(RebuildDecision::Rebuild);
     }
-    Ok(!encryption_configured)
+    if payload_might_be_sse(data_path).await? {
+        return Ok(RebuildDecision::Refuse(
+            "the bytes match MaxIO SSE frame layout and cannot be shown to be plaintext".into(),
+        ));
+    }
+    Ok(RebuildDecision::Rebuild)
+}
+
+/// MaxIO SSE stores `[nonce: 12][ciphertext][tag: 16]`. Full frames are 65536
+/// plaintext bytes plus 28 bytes of overhead. The nonce ends with the frame
+/// index (8 bytes for a 4-byte prefix, 4 bytes for the current 8-byte prefix).
+/// A file that cannot be split that way is not ciphertext.
+async fn payload_might_be_sse(path: &Path) -> anyhow::Result<bool> {
+    const PLAINTEXT: u64 = 65_536;
+    const OVERHEAD: u64 = 28;
+    const FULL: u64 = PLAINTEXT + OVERHEAD;
+    let len = tokio::fs::metadata(path).await?.len();
+    if len < OVERHEAD {
+        return Ok(false);
+    }
+    let rem = len % FULL;
+    let full = len / FULL;
+    let frames = if rem == 0 {
+        full
+    } else if rem >= OVERHEAD {
+        full + 1
+    } else {
+        return Ok(false);
+    };
+    if frames == 0 {
+        return Ok(false);
+    }
+    let mut file = tokio::fs::File::open(path).await?;
+    let mut nonce = [0u8; 12];
+    let mut v1_ok = true;
+    let mut v2_ok = true;
+    for index in 0..frames {
+        let offset = index * FULL;
+        file.seek(std::io::SeekFrom::Start(offset)).await?;
+        file.read_exact(&mut nonce).await?;
+        let v1 = u64::from_le_bytes(nonce[4..12].try_into().expect("8 bytes"));
+        let v2 = u32::from_le_bytes(nonce[8..12].try_into().expect("4 bytes")) as u64;
+        if v1 != index {
+            v1_ok = false;
+        }
+        if v2 != index {
+            v2_ok = false;
+        }
+        if !v1_ok && !v2_ok {
+            return Ok(false);
+        }
+    }
+    Ok(v1_ok || v2_ok)
+}
+
+async fn write_synthesized_sidecar(
+    key: &str,
+    data_path: &Path,
+    meta_path: &Path,
+    raw: &str,
+) -> anyhow::Result<()> {
+    let mut rebuilt = synthesized_meta(key, data_path).await?;
+    rebuilt.rebuilt_from_bytes = true;
+    rebuilt.content_sha256 = None;
+    apply_recovered_identity(&mut rebuilt, raw);
+    if let Some(vid) = version_id_from_meta_path(meta_path) {
+        if let Some(stamp) = last_modified_from_version_id(&vid) {
+            rebuilt.last_modified = stamp;
+        }
+        rebuilt.version_id = Some(vid);
+    }
+    write_file_atomic(
+        meta_path,
+        serde_json::to_string_pretty(&rebuilt)?.as_bytes(),
+    )
+    .await?;
+    Ok(())
 }
 
 fn apply_recovered_identity(rebuilt: &mut ObjectMeta, raw: &str) {
@@ -2727,6 +2821,7 @@ mod tests {
     use crate::storage::filesystem::FilesystemStorage;
     use crate::storage::keys::Keyring;
     use crate::storage::{BucketMeta, ObjectMeta};
+    use base64::Engine;
     use md5::Digest;
     use std::sync::Arc;
 
@@ -4533,6 +4628,11 @@ mod tests {
         let ver = bucket.join(".versions/obj");
         std::fs::create_dir_all(&ver).unwrap();
         std::fs::write(bucket.join(".bucket.json"), br#"{"name":"bkt"}"#).unwrap();
+        // A normal server has already created a keyring. That must not block
+        // rebuilding a version whose bytes are not SSE frames.
+        let _ = Keyring::load(tmp.path().to_str().unwrap(), None)
+            .await
+            .unwrap();
         let older = "0000001700000000000000-aaaaaaaa";
         let newer = "0000001700000000000001-bbbbbbbb";
         let v1 = b"version-one-bytes";
@@ -4793,25 +4893,27 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn plain_truncated_sidecar_is_not_rebuilt_when_a_keyring_exists() {
+    async fn plain_truncated_sidecar_is_rebuilt_even_when_a_keyring_exists() {
         let tmp = tempfile::tempdir().unwrap();
         let storage = storage_at(tmp.path()).await;
         storage.create_bucket(&bucket_meta("bkt")).await.unwrap();
         put_bytes(&storage, "note.txt", b"hello", false).await;
-        let meta_path = tmp.path().join("buckets/bkt/note.txt.meta.json");
-        std::fs::write(&meta_path, b"").unwrap();
+        put_multipart(&storage, "multi.bin", &[b"plain-multipart"], false).await;
+        let bucket = tmp.path().join("buckets/bkt");
+        std::fs::write(bucket.join("note.txt.meta.json"), b"").unwrap();
+        std::fs::write(bucket.join("multi.bin.meta.json"), b"").unwrap();
         let repaired = check(tmp.path(), true).await.unwrap();
         assert!(
             repaired.issues.iter().any(|issue| {
                 issue.kind == IssueKind::CorruptMetadata
-                    && !issue.repaired
-                    && issue.detail.contains("not rebuilt")
+                    && issue.repaired
+                    && issue.path.ends_with("note.txt.meta.json")
             }),
             "{:?}",
             repaired.issues
         );
-        assert!(std::fs::read(&meta_path).unwrap().is_empty());
-        assert_not_served(&storage, "note.txt").await;
+        assert_eq!(read_key(&storage, "note.txt").await, b"hello");
+        assert_eq!(read_key(&storage, "multi.bin").await, b"plain-multipart");
     }
 
     #[tokio::test]
@@ -4838,17 +4940,18 @@ mod tests {
         let storage = storage_at(tmp.path()).await;
         storage.create_bucket(&bucket_meta("bkt")).await.unwrap();
         put_bytes(&storage, "keep.txt", b"keep-me", false).await;
-        put_bytes(&storage, "noise.txt", b"noise-body", false).await;
+        put_bytes(&storage, "secret", b"sse-plain", true).await;
         let bucket = tmp.path().join("buckets/bkt");
-        let noise = bucket.join("noise.txt.meta.json");
-        std::fs::write(&noise, [0xff, 0xfe, 0x00, 0x80]).unwrap();
+        let secret = bucket.join("secret.meta.json");
+        let ciphertext = std::fs::read(bucket.join("secret")).unwrap();
+        std::fs::write(&secret, [0xff, 0xfe, 0x00, 0x80]).unwrap();
         std::fs::write(bucket.join(".maxio-tmp-crash"), b"temp").unwrap();
         let report = check(tmp.path(), true).await.expect("check must not abort");
         assert!(
             report.issues.iter().any(|issue| {
                 issue.kind == IssueKind::CorruptMetadata
                     && !issue.repaired
-                    && issue.path.ends_with("noise.txt.meta.json")
+                    && issue.path.ends_with("secret.meta.json")
                     && issue.detail.contains("not rebuilt")
             }),
             "{:?}",
@@ -4863,15 +4966,140 @@ mod tests {
             report.issues
         );
         assert!(!bucket.join(".maxio-tmp-crash").exists());
-        assert_eq!(std::fs::read(&noise).unwrap(), [0xff, 0xfe, 0x00, 0x80]);
+        assert_eq!(std::fs::read(&secret).unwrap(), [0xff, 0xfe, 0x00, 0x80]);
+        assert_eq!(std::fs::read(bucket.join("secret")).unwrap(), ciphertext);
         assert_eq!(read_key(&storage, "keep.txt").await, b"keep-me");
-        assert_not_served(&storage, "noise.txt").await;
+        assert_not_served(&storage, "secret").await;
         assert!(
             files_under(&tmp.path().join(".maxio-quarantine"))
                 .iter()
                 .any(|path| std::fs::read(path).unwrap() == [0xff, 0xfe, 0x00, 0x80]),
             "the binary sidecar must be quarantined"
         );
+    }
+
+    #[tokio::test]
+    async fn external_master_key_check_does_not_rebuild_sse_without_the_key() {
+        for (multipart, keep) in [(false, 0usize), (true, 20usize)] {
+            let tmp = tempfile::tempdir().unwrap();
+            let key = [9u8; 32];
+            let b64 = base64::engine::general_purpose::STANDARD.encode(key);
+            let keyring = Arc::new(
+                Keyring::load(tmp.path().to_str().unwrap(), Some(&b64))
+                    .await
+                    .unwrap(),
+            );
+            assert!(
+                !tmp.path().join(".maxio-keys.json").exists(),
+                "an external key must not write a keyring file"
+            );
+            assert!(tmp.path().join(".maxio-key-check.json").exists());
+            let storage = FilesystemStorage::new(
+                tmp.path().to_str().unwrap(),
+                false,
+                1024 * 1024,
+                0,
+                keyring,
+            )
+            .await
+            .unwrap();
+            storage.create_bucket(&bucket_meta("bkt")).await.unwrap();
+            let object_key = "sse.txt";
+            if multipart {
+                let big = vec![7u8; 5 * 1024 * 1024];
+                put_multipart(&storage, object_key, &[big.as_slice(), b"tail"], true).await;
+            } else {
+                put_bytes(&storage, object_key, b"sse-plaintext", true).await;
+            }
+            drop(storage);
+            let meta_path = tmp
+                .path()
+                .join("buckets/bkt")
+                .join(format!("{object_key}.meta.json"));
+            let data_path = tmp.path().join("buckets/bkt").join(object_key);
+            let original = std::fs::read(&meta_path).unwrap();
+            let damaged = if keep == 0 {
+                Vec::new()
+            } else {
+                original[..keep.min(original.len())].to_vec()
+            };
+            std::fs::write(&meta_path, &damaged).unwrap();
+            let ciphertext = std::fs::read(&data_path).unwrap();
+            let repaired = check(tmp.path(), true).await.unwrap();
+            assert!(
+                repaired.issues.iter().any(|issue| {
+                    issue.kind == IssueKind::KeyringUnverified
+                        || issue.kind == IssueKind::KeyringMissing
+                }),
+                "check must notice the external key: {:?}",
+                repaired.issues
+            );
+            assert!(
+                repaired.issues.iter().any(|issue| {
+                    issue.kind == IssueKind::CorruptMetadata
+                        && !issue.repaired
+                        && issue.detail.contains("not rebuilt")
+                }),
+                "multipart={multipart} keep={keep}: {:?}",
+                repaired.issues
+            );
+            assert_eq!(std::fs::read(&meta_path).unwrap(), damaged);
+            assert_eq!(std::fs::read(&data_path).unwrap(), ciphertext);
+            let reopened = Arc::new(
+                Keyring::load(tmp.path().to_str().unwrap(), Some(&b64))
+                    .await
+                    .unwrap(),
+            );
+            let storage = FilesystemStorage::new(
+                tmp.path().to_str().unwrap(),
+                false,
+                1024 * 1024,
+                0,
+                reopened,
+            )
+            .await
+            .unwrap();
+            assert_not_served(&storage, object_key).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn frame_shaped_bytes_are_not_rebuilt_as_plaintext() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bucket = tmp.path().join("buckets/bkt");
+        std::fs::create_dir_all(&bucket).unwrap();
+        let mut body = vec![0x11u8; 40];
+        body[8] = 0;
+        body[9] = 0;
+        body[10] = 0;
+        body[11] = 0;
+        std::fs::write(bucket.join("shaped.bin"), &body).unwrap();
+        std::fs::write(bucket.join("shaped.bin.meta.json"), b"").unwrap();
+        let repaired = check(tmp.path(), true).await.unwrap();
+        assert!(
+            repaired.issues.iter().any(|issue| {
+                issue.kind == IssueKind::CorruptMetadata
+                    && !issue.repaired
+                    && issue.detail.contains("SSE frame layout")
+            }),
+            "{:?}",
+            repaired.issues
+        );
+        assert!(
+            std::fs::read(bucket.join("shaped.bin.meta.json"))
+                .unwrap()
+                .is_empty()
+        );
+        let mut plain = vec![0x11u8; 40];
+        plain[8] = 1;
+        std::fs::write(bucket.join("plain.bin"), &plain).unwrap();
+        std::fs::write(bucket.join("plain.bin.meta.json"), b"").unwrap();
+        let repaired = check(tmp.path(), true).await.unwrap();
+        let meta: ObjectMeta =
+            serde_json::from_slice(&std::fs::read(bucket.join("plain.bin.meta.json")).unwrap())
+                .unwrap();
+        assert!(meta.rebuilt_from_bytes, "{:?}", repaired.issues);
+        assert_eq!(std::fs::read(bucket.join("plain.bin")).unwrap(), plain);
     }
 
     #[tokio::test]

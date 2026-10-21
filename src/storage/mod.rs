@@ -254,6 +254,12 @@ pub struct ObjectMeta {
     pub checksum_algorithm: Option<ChecksumAlgorithm>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub checksum_value: Option<String>,
+    /// SHA-256 (hex) of the stored object bytes. Written for every flat object
+    /// this version stores, including multipart uploads and SSE ciphertext.
+    /// Older objects omit it and stay unverifiable when the etag is not a
+    /// single-part MD5 and no S3 checksum was stored.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_sha256: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tags: Option<HashMap<String, String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

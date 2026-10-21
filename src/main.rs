@@ -105,6 +105,12 @@ enum Commands {
         /// from the payload instead of quarantining the object.
         #[arg(long)]
         accept_current_checksums: bool,
+
+        /// With `--repair`, when two copies differ and neither can be verified,
+        /// record a content hash of the current bytes and rebuild the archive
+        /// from them. Without this flag those copies are left unchanged.
+        #[arg(long)]
+        accept_unverifiable_current: bool,
     },
 
     /// Write the web console OpenAPI document (used to generate the UI API client)
@@ -183,6 +189,7 @@ async fn main() -> anyhow::Result<()> {
             ref master_key,
             ref master_key_file,
             accept_current_checksums,
+            accept_unverifiable_current,
         }) => {
             // Read-only check must not stamp a marker. --repair writes it
             // only after the data-directory lock is held (see check_with).
@@ -197,6 +204,7 @@ async fn main() -> anyhow::Result<()> {
                 data_dir,
                 repair,
                 accept_current_checksums,
+                accept_unverifiable_current,
                 resolved.as_deref(),
             )
             .await;
@@ -465,6 +473,7 @@ async fn run_check(
     data_dir: &str,
     repair: bool,
     accept_current_checksums: bool,
+    accept_unverifiable_current: bool,
     master_key_b64: Option<&str>,
 ) -> anyhow::Result<()> {
     let report = storage::check::check_with_opts(
@@ -472,6 +481,7 @@ async fn run_check(
         repair,
         master_key_b64,
         accept_current_checksums,
+        accept_unverifiable_current,
     )
     .await?;
     report.print();

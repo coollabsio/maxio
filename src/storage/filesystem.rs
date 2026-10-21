@@ -868,6 +868,7 @@ impl FilesystemStorage {
         let file = fs::File::create(&tmp_obj_path).await?;
         let mut writer = BufWriter::with_capacity(IO_BUFFER_SIZE, file);
         let mut hasher = Md5::new();
+        let mut stored_hash = Sha256::new();
         let mut checksum_hasher = checksum
             .as_ref()
             .map(|(algo, _)| ChecksumHasher::new(*algo));
@@ -890,6 +891,7 @@ impl FilesystemStorage {
                             chunk_index,
                             &frame_buf,
                             &aad,
+                            &mut stored_hash,
                         )
                         .await?;
                     }
@@ -914,11 +916,13 @@ impl FilesystemStorage {
                         chunk_index,
                         &frame_data,
                         &aad,
+                        &mut stored_hash,
                     )
                     .await?;
                     chunk_index += 1;
                 }
             } else {
+                stored_hash.update(&buf[..n]);
                 writer.write_all(&buf[..n]).await?;
             }
         }
@@ -961,6 +965,7 @@ impl FilesystemStorage {
             storage_format: None,
             checksum_algorithm,
             checksum_value: checksum_value.clone(),
+            content_sha256: Some(hex::encode(stored_hash.finalize())),
             tags: None,
             part_sizes: None,
             encryption: enc_meta_opt.take(),
@@ -3518,6 +3523,7 @@ impl FilesystemStorage {
         let file = fs::File::create(&tmp_part_path).await?;
         let mut writer = BufWriter::with_capacity(IO_BUFFER_SIZE, file);
         let mut hasher = Md5::new();
+        let mut stored_hash = Sha256::new();
         let mut checksum_hasher = checksum
             .as_ref()
             .map(|(algo, _)| ChecksumHasher::new(*algo));
@@ -3539,6 +3545,7 @@ impl FilesystemStorage {
                             chunk_index,
                             &frame_buf,
                             &aad,
+                            &mut stored_hash,
                         )
                         .await?;
                     }
@@ -3563,6 +3570,7 @@ impl FilesystemStorage {
                         chunk_index,
                         &frame_data,
                         &aad,
+                        &mut stored_hash,
                     )
                     .await?;
                     chunk_index += 1;
@@ -3844,6 +3852,7 @@ impl FilesystemStorage {
         let mut writer = BufWriter::with_capacity(IO_BUFFER_SIZE, out);
         let mut total_size = 0u64;
         let mut etag_hasher = Md5::new();
+        let mut stored_hash = Sha256::new();
         let mut buf = vec![0u8; IO_BUFFER_SIZE];
         let mut frame_buf: Vec<u8> = Vec::with_capacity(FRAME_CHUNK_SIZE);
         let mut chunk_index: u64 = 0;
@@ -3897,11 +3906,13 @@ impl FilesystemStorage {
                             chunk_index,
                             &frame_data,
                             &aad,
+                            &mut stored_hash,
                         )
                         .await?;
                         chunk_index += 1;
                     }
                 } else {
+                    stored_hash.update(&buf[..n]);
                     writer.write_all(&buf[..n]).await?;
                 }
             }
@@ -3927,6 +3938,7 @@ impl FilesystemStorage {
                     chunk_index,
                     &frame_buf,
                     &aad,
+                    &mut stored_hash,
                 )
                 .await?;
             }
@@ -3978,6 +3990,7 @@ impl FilesystemStorage {
             storage_format: None,
             checksum_algorithm,
             checksum_value: checksum_value.clone(),
+            content_sha256: Some(hex::encode(stored_hash.finalize())),
             tags: upload_meta.tags,
             part_sizes: Some(part_sizes),
             encryption: enc_meta_opt,
@@ -5802,6 +5815,7 @@ async fn write_encrypted_frame(
     chunk_index: u64,
     plaintext: &[u8],
     aad: &[u8],
+    stored_hash: &mut Sha256,
 ) -> Result<(), StorageError> {
     let nonce_bytes = make_frame_nonce(nonce_prefix, chunk_index)?;
     let nonce = Nonce::from_slice(&nonce_bytes);
@@ -5814,6 +5828,8 @@ async fn write_encrypted_frame(
             },
         )
         .map_err(|_| StorageError::EncryptionError("frame encryption failed".into()))?;
+    stored_hash.update(&nonce_bytes);
+    stored_hash.update(&ciphertext);
     writer.write_all(&nonce_bytes).await?;
     writer.write_all(&ciphertext).await?;
     Ok(())

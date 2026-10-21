@@ -1299,6 +1299,44 @@ async fn login_rate_limit_counts_only_failures_for_that_access_key() {
     );
 }
 
+#[tokio::test]
+async fn login_clears_a_legacy_root_path_cookie() {
+    let (base_url, _tmp) = start_server().await;
+    let login = client()
+        .post(format!("{base_url}/maxio/api/auth/login"))
+        .json(&serde_json::json!({
+            "accessKey": ACCESS_KEY,
+            "secretKey": SECRET_KEY
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(login.status(), 200);
+    let headers: Vec<String> = login
+        .headers()
+        .get_all("set-cookie")
+        .iter()
+        .map(|value| value.to_str().unwrap().to_string())
+        .collect();
+    assert!(
+        headers
+            .iter()
+            .any(|header| cookie_path(header) == "/" && header.contains("Max-Age=0")),
+        "login must clear a stale Path=/ session cookie: {headers:?}"
+    );
+    assert_eq!(
+        cookie_path(&headers[0]),
+        "/maxio",
+        "the session cookie is the first Set-Cookie so existing clients keep it"
+    );
+    assert!(
+        headers
+            .iter()
+            .any(|header| { cookie_path(header) == "/maxio" && !header.contains("Max-Age=0") }),
+        "login must still set the new session: {headers:?}"
+    );
+}
+
 async fn spawn_console(data_dir: &str) -> String {
     let keyring = Arc::new(Keyring::load(data_dir, None).await.unwrap());
     let storage = FilesystemStorage::new(data_dir, false, 10 * 1024 * 1024, 0, keyring)

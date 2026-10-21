@@ -71,6 +71,10 @@ pub enum IssueKind {
     VersionArchiveCorrupt,
     /// Multipart etag (`-N`) is not the MD5 of the whole object. Informational.
     MultipartEtag,
+    /// Two copies differ and neither can be positively verified.
+    UnverifiableDivergence,
+    /// Stored content hash does not match the file.
+    ContentHashMismatch,
 }
 
 impl IssueKind {
@@ -98,6 +102,8 @@ impl IssueKind {
             Self::CurrentVersionMismatch => "current-version-mismatch",
             Self::VersionArchiveCorrupt => "version-archive",
             Self::MultipartEtag => "multipart-etag",
+            Self::UnverifiableDivergence => "unverifiable-divergence",
+            Self::ContentHashMismatch => "content-hash",
         }
     }
 }
@@ -261,7 +267,7 @@ pub async fn check_with(
     repair: bool,
     master_key_b64: Option<&str>,
 ) -> anyhow::Result<CheckReport> {
-    check_with_opts(data_dir, repair, master_key_b64, false).await
+    check_with_opts(data_dir, repair, master_key_b64, false, false).await
 }
 
 /// `accept_current_checksums` records a mismatched payload's checksum instead of quarantining it.
@@ -270,6 +276,7 @@ pub async fn check_with_opts(
     repair: bool,
     master_key_b64: Option<&str>,
     accept_current_checksums: bool,
+    accept_unverifiable_current: bool,
 ) -> anyhow::Result<CheckReport> {
     if !tokio::fs::try_exists(data_dir).await? {
         anyhow::bail!("data directory does not exist: {}", data_dir.display());
@@ -341,6 +348,7 @@ pub async fn check_with_opts(
                     data_dir,
                     repair,
                     accept_current_checksums,
+                    accept_unverifiable_current,
                     keyring.as_ref(),
                     &mut report,
                     &mut saw_sse_s3,
@@ -390,6 +398,7 @@ async fn scan_bucket(
     data_dir: &Path,
     repair: bool,
     accept_current_checksums: bool,
+    accept_unverifiable_current: bool,
     keyring: Option<&Arc<super::keys::Keyring>>,
     report: &mut CheckReport,
     saw_sse_s3: &mut bool,
@@ -646,6 +655,7 @@ async fn scan_bucket(
                 &prefix,
                 repair,
                 accept_current_checksums,
+                accept_unverifiable_current,
                 keyring,
                 report,
             )
@@ -810,9 +820,79 @@ async fn check_meta_pair(
 
     report.objects_seen += 1;
     let mut dirty = false;
+    let file_len = tokio::fs::metadata(data_path).await?.len();
+    // A crashed publish can leave a newer payload with the previous sidecar.
+    // A size change is that case and is repaired below. A same-size content
+    // hash miss is damage: do not adopt the bytes.
+    let size_changed = !encrypted && file_len != meta.size;
+    if !size_changed {
+        if let Some(expected) = meta.content_sha256.clone() {
+            let actual = match file_sha256_hex(data_path).await {
+                Ok(actual) => actual,
+                Err(err) => {
+                    report.push(
+                        IssueKind::ContentHashMismatch,
+                        data_path,
+                        format!("stored content hash could not be checked: {err}"),
+                        false,
+                    );
+                    return Ok(());
+                }
+            };
+            if actual != expected {
+                if repair && flags.accept_current_checksums {
+                    report.push(
+                    IssueKind::ContentHashMismatch,
+                    data_path,
+                    format!(
+                        "stored content hash is {expected}, file hashes to {actual}. Recorded the file hash because --accept-current-checksums was set."
+                    ),
+                    true,
+                );
+                    meta.content_sha256 = Some(actual);
+                    dirty = true;
+                } else if repair {
+                    match quarantine_payload(data_dir, bucket, bucket_dir, data_path, meta_path)
+                        .await
+                    {
+                        Ok(dest) => {
+                            report.push(
+                            IssueKind::ContentHashMismatch,
+                            data_path,
+                            format!(
+                                "stored content hash is {expected}, file hashes to {actual}. Quarantined at {} without deleting the bytes.",
+                                dest.display()
+                            ),
+                            true,
+                        );
+                        }
+                        Err(err) => {
+                            report.push(
+                            IssueKind::ContentHashMismatch,
+                            data_path,
+                            format!(
+                                "stored content hash is {expected}, file hashes to {actual}. Quarantine failed: {err}."
+                            ),
+                            false,
+                        );
+                        }
+                    }
+                    return Ok(());
+                } else {
+                    report.push(
+                    IssueKind::ContentHashMismatch,
+                    data_path,
+                    format!(
+                        "stored content hash is {expected}, file hashes to {actual}. The hash was not rewritten."
+                    ),
+                    false,
+                );
+                }
+            }
+        }
+    }
     // Ciphertext length and MD5 are not the plaintext size and etag.
     if !encrypted {
-        let file_len = tokio::fs::metadata(data_path).await?.len();
         if file_len != meta.size {
             let repaired = repair;
             report.push(
@@ -833,6 +913,7 @@ async fn check_meta_pair(
                     meta.etag = file_md5_quoted(data_path).await?;
                     meta.part_sizes = None;
                 }
+                meta.content_sha256 = Some(file_sha256_hex(data_path).await?);
                 dirty = true;
             }
         } else if etag_is_multipart(&meta.etag) {
@@ -1269,6 +1350,7 @@ async fn reconcile_versions_in(
     prefix: &str,
     repair: bool,
     accept_current_checksums: bool,
+    accept_unverifiable_current: bool,
     keyring: Option<&Arc<super::keys::Keyring>>,
     report: &mut CheckReport,
 ) -> anyhow::Result<()> {
@@ -1293,6 +1375,7 @@ async fn reconcile_versions_in(
             &key,
             repair,
             accept_current_checksums,
+            accept_unverifiable_current,
             keyring,
             report,
         )
@@ -1315,6 +1398,7 @@ async fn reconcile_one_key(
     key: &str,
     repair: bool,
     accept_current_checksums: bool,
+    accept_unverifiable_current: bool,
     keyring: Option<&Arc<super::keys::Keyring>>,
     report: &mut CheckReport,
 ) -> anyhow::Result<()> {
@@ -1325,14 +1409,25 @@ async fn reconcile_one_key(
     let current_intact = is_file(&data_path).await
         && sidecar_matches_payload(&data_path, &meta_path, bucket, key, keyring).await;
     // A null version (written while versioning was suspended, or before
-    // versioning) is newer than every archived version. Keep it when its own
-    // etag or checksum matches. A corrupt archive must not replace it.
-    if current_intact
+    // versioning) is newer than every archived version. Keep it unless its
+    // stored etag, checksum, or content hash positively fails. Unverifiable
+    // is not a match, but it is also not permission to roll the key back.
+    if is_file(&data_path).await
         && current_meta
             .as_ref()
             .is_some_and(|meta| meta.version_id.is_none() && !meta.is_delete_marker)
     {
-        return Ok(());
+        let verdict = payload_verdict(
+            &data_path,
+            current_meta.as_ref().unwrap(),
+            bucket,
+            key,
+            keyring,
+        )
+        .await;
+        if verdict != PayloadVerdict::Failed {
+            return Ok(());
+        }
     }
     if ids.is_empty() && !current_intact {
         return Ok(());
@@ -1416,6 +1511,63 @@ async fn reconcile_one_key(
                 true,
             );
             return Ok(());
+        }
+    }
+
+    if is_file(&data_path).await
+        && current_meta
+            .as_ref()
+            .is_some_and(|meta| meta.version_id.as_deref() == Some(newest.as_str()))
+        && !current_intact
+    {
+        let meta = current_meta.as_ref().unwrap();
+        if payload_verdict(&data_path, meta, bucket, key, keyring).await
+            == PayloadVerdict::Unverifiable
+        {
+            let archive = ver_dir.join(format!("{newest}.data"));
+            let same = is_file(&archive).await && files_same(&data_path, &archive).await;
+            let archive_verified =
+                match read_object_meta(&ver_dir.join(format!("{newest}.meta.json"))).await {
+                    Some(archive_meta) if is_file(&archive).await => {
+                        payload_verdict(&archive, &archive_meta, bucket, key, keyring).await
+                            == PayloadVerdict::Verified
+                    }
+                    _ => false,
+                };
+            if !same && !archive_verified {
+                let detail = format!(
+                    "current object {bucket}/{key} and archived version {newest} differ and neither copy can be verified"
+                );
+                if repair && accept_unverifiable_current && meta.encryption.is_none() {
+                    let hash = file_sha256_hex(&data_path).await?;
+                    let mut adopted = meta.clone();
+                    adopted.content_sha256 = Some(hash);
+                    write_file_atomic(&meta_path, serde_json::to_vec_pretty(&adopted)?.as_slice())
+                        .await
+                        .map_err(|err| anyhow::anyhow!(err))?;
+                    let _ = quarantine_version_copy(data_dir, bucket, bucket_dir, ver_dir, &newest)
+                        .await;
+                    publish_version_from_current(ver_dir, &newest, &data_path, &adopted).await?;
+                    report.push(
+                        IssueKind::UnverifiableDivergence,
+                        &data_path,
+                        format!(
+                            "{detail}. Recorded a content hash of the current bytes and rebuilt the archive because --accept-unverifiable-current was set."
+                        ),
+                        true,
+                    );
+                } else {
+                    report.push(
+                        IssueKind::UnverifiableDivergence,
+                        &data_path,
+                        format!(
+                            "{detail}. Not modified. --repair does not overwrite either copy. --accept-unverifiable-current with --repair records a content hash of the current bytes and rebuilds the archive from them."
+                        ),
+                        false,
+                    );
+                }
+                return Ok(());
+            }
         }
     }
 
@@ -1646,39 +1798,7 @@ async fn version_payload_intact(
     if !data_exists {
         return false;
     }
-    if meta.encryption.is_some() {
-        return checksum_field_matches(&data, meta, bucket, key, keyring).await;
-    }
-    let Ok(len) = tokio::fs::metadata(&data).await.map(|m| m.len()) else {
-        return false;
-    };
-    if len != meta.size {
-        return false;
-    }
-    if !etag_is_multipart(&meta.etag) {
-        match file_md5_quoted(&data).await {
-            Ok(etag) if etag == meta.etag => {}
-            _ => return false,
-        }
-    }
-    checksum_field_matches(&data, meta, bucket, key, keyring).await
-}
-
-async fn checksum_field_matches(
-    data_path: &Path,
-    meta: &ObjectMeta,
-    bucket: &str,
-    key: &str,
-    keyring: Option<&Arc<super::keys::Keyring>>,
-) -> bool {
-    let (Some(algo), Some(expected)) = (meta.checksum_algorithm, meta.checksum_value.as_deref())
-    else {
-        return true;
-    };
-    match payload_checksum(data_path, meta, algo, bucket, key, keyring).await {
-        Ok(actual) => actual == expected,
-        Err(_) => false,
-    }
+    payload_verdict(&data, meta, bucket, key, keyring).await == PayloadVerdict::Verified
 }
 
 async fn sidecar_matches_payload(
@@ -1694,22 +1814,74 @@ async fn sidecar_matches_payload(
     let Some(meta) = read_object_meta(meta_path).await else {
         return false;
     };
-    if meta.encryption.is_some() {
-        return checksum_field_matches(data_path, &meta, bucket, key, keyring).await;
+    payload_verdict(data_path, &meta, bucket, key, keyring).await == PayloadVerdict::Verified
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PayloadVerdict {
+    /// Etag, checksum, or content hash matched the stored bytes.
+    Verified,
+    /// A stored check ran and did not match.
+    Failed,
+    /// No single-part MD5, checksum, or content hash can be checked.
+    Unverifiable,
+}
+
+async fn payload_verdict(
+    data_path: &Path,
+    meta: &ObjectMeta,
+    bucket: &str,
+    key: &str,
+    keyring: Option<&Arc<super::keys::Keyring>>,
+) -> PayloadVerdict {
+    if let Some(expected) = &meta.content_sha256 {
+        return match file_sha256_hex(data_path).await {
+            Ok(actual) if actual == *expected => PayloadVerdict::Verified,
+            _ => PayloadVerdict::Failed,
+        };
+    }
+    if let (Some(algo), Some(expected)) = (meta.checksum_algorithm, meta.checksum_value.as_deref())
+    {
+        return match payload_checksum(data_path, meta, algo, bucket, key, keyring).await {
+            Ok(actual) if actual == expected => PayloadVerdict::Verified,
+            Ok(_) => PayloadVerdict::Failed,
+            Err(_) => PayloadVerdict::Unverifiable,
+        };
+    }
+    if meta.encryption.is_some() || etag_is_multipart(&meta.etag) {
+        return PayloadVerdict::Unverifiable;
     }
     let Ok(len) = tokio::fs::metadata(data_path).await.map(|m| m.len()) else {
-        return false;
+        return PayloadVerdict::Failed;
     };
     if len != meta.size {
-        return false;
+        return PayloadVerdict::Failed;
     }
-    if !etag_is_multipart(&meta.etag) {
-        match file_md5_quoted(data_path).await {
-            Ok(etag) if etag == meta.etag => {}
-            _ => return false,
+    match file_md5_quoted(data_path).await {
+        Ok(etag) if etag == meta.etag => PayloadVerdict::Verified,
+        _ => PayloadVerdict::Failed,
+    }
+}
+
+async fn files_same(left: &Path, right: &Path) -> bool {
+    match (file_sha256_hex(left).await, file_sha256_hex(right).await) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
+    }
+}
+
+async fn file_sha256_hex(path: &Path) -> anyhow::Result<String> {
+    let mut file = tokio::fs::File::open(path).await?;
+    let mut hasher = sha2::Sha256::new();
+    let mut buf = vec![0u8; 64 * 1024];
+    loop {
+        let n = file.read(&mut buf).await?;
+        if n == 0 {
+            break;
         }
+        sha2::Digest::update(&mut hasher, &buf[..n]);
     }
-    checksum_field_matches(data_path, &meta, bucket, key, keyring).await
+    Ok(hex::encode(sha2::Digest::finalize(hasher)))
 }
 
 async fn current_matches_version(
@@ -3131,7 +3303,7 @@ mod tests {
             repaired
                 .issues
                 .iter()
-                .any(|issue| issue.kind == IssueKind::ChecksumMismatch
+                .any(|issue| issue.kind == IssueKind::ContentHashMismatch
                     && issue.repaired
                     && issue.detail.contains("Quarantined")),
             "{:?}",
@@ -3212,10 +3384,9 @@ mod tests {
         let repaired = check(tmp.path(), true).await.unwrap();
         assert!(
             repaired.issues.iter().any(|issue| {
-                issue.kind == IssueKind::EtagMismatch
+                issue.kind == IssueKind::ContentHashMismatch
                     && issue.repaired
                     && issue.detail.contains("Quarantined")
-                    && issue.detail.contains("without adopting")
             }),
             "{:?}",
             repaired.issues
@@ -3251,7 +3422,9 @@ mod tests {
             .unwrap();
         let bucket = tmp.path().join("buckets/bkt");
         flip_first_byte(&bucket.join("note.txt"));
-        let repaired = check_with_opts(tmp.path(), true, None, true).await.unwrap();
+        let repaired = check_with_opts(tmp.path(), true, None, true, false)
+            .await
+            .unwrap();
         assert!(
             repaired.issues.iter().any(|issue| {
                 issue.kind == IssueKind::EtagMismatch
@@ -3763,6 +3936,162 @@ mod tests {
                 "corrupting {} made GET return older content: {body:?}\n{repaired:?}",
                 rel.display()
             );
+        }
+    }
+
+    fn write_legacy_multipart(dir: &std::path::Path, name: &str, body: &[u8], etag: &str) {
+        std::fs::write(dir.join(name), body).unwrap();
+        let meta = ObjectMeta {
+            key: name.into(),
+            size: body.len() as u64,
+            etag: etag.into(),
+            content_type: "application/octet-stream".into(),
+            last_modified: "2024-04-01T00:00:00.000Z".into(),
+            part_sizes: Some(vec![
+                body.len() as u64 / 2,
+                body.len() as u64 - body.len() as u64 / 2,
+            ]),
+            ..ObjectMeta::default()
+        };
+        std::fs::write(
+            dir.join(format!("{name}.meta.json")),
+            serde_json::to_vec_pretty(&meta).unwrap(),
+        )
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn unverifiable_multipart_divergence_is_not_repaired() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bucket = tmp.path().join("buckets/bkt");
+        let ver = bucket.join(".versions/multi.bin");
+        std::fs::create_dir_all(&ver).unwrap();
+        let etag = "\"0123456789abcdef0123456789abcdef-2\"";
+        let good = b"good-multipart-bytes";
+        write_legacy_multipart(&bucket, "multi.bin", good, etag);
+        std::fs::copy(bucket.join("multi.bin"), ver.join("vid.data")).unwrap();
+        let mut version_meta: ObjectMeta =
+            serde_json::from_slice(&std::fs::read(bucket.join("multi.bin.meta.json")).unwrap())
+                .unwrap();
+        version_meta.version_id = Some("vid".into());
+        std::fs::write(
+            ver.join("vid.meta.json"),
+            serde_json::to_vec_pretty(&version_meta).unwrap(),
+        )
+        .unwrap();
+        let current: ObjectMeta = version_meta.clone();
+        std::fs::write(
+            bucket.join("multi.bin.meta.json"),
+            serde_json::to_vec_pretty(&current).unwrap(),
+        )
+        .unwrap();
+        flip_first_byte(&bucket.join("multi.bin"));
+        let corrupt = std::fs::read(bucket.join("multi.bin")).unwrap();
+        let archive_before = std::fs::read(ver.join("vid.data")).unwrap();
+
+        let repaired = check(tmp.path(), true).await.unwrap();
+        assert!(
+            repaired.issues.iter().any(|issue| {
+                issue.kind == IssueKind::UnverifiableDivergence && !issue.repaired
+            }),
+            "{:?}",
+            repaired.issues
+        );
+        assert_eq!(
+            std::fs::read(ver.join("vid.data")).unwrap(),
+            archive_before,
+            "repair must not overwrite the intact archive with the corrupt current object"
+        );
+        assert_eq!(std::fs::read(bucket.join("multi.bin")).unwrap(), corrupt);
+        assert!(
+            repaired
+                .issues
+                .iter()
+                .all(|issue| issue.kind != IssueKind::VersionArchiveCorrupt),
+            "an unverifiable current must not be treated as the good copy: {:?}",
+            repaired.issues
+        );
+        let _ = current;
+    }
+
+    #[tokio::test]
+    async fn put_stores_content_hash_and_repair_restores_from_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = storage_at(tmp.path()).await;
+        storage.create_bucket(&bucket_meta("bkt")).await.unwrap();
+        storage.set_versioning("bkt", true).await.unwrap();
+        put_bytes(&storage, "obj", b"hashed-body", false).await;
+        let bucket = tmp.path().join("buckets/bkt");
+        let meta: ObjectMeta =
+            serde_json::from_str(&std::fs::read_to_string(bucket.join("obj.meta.json")).unwrap())
+                .unwrap();
+        assert!(
+            meta.content_sha256
+                .as_deref()
+                .is_some_and(|hash| hash.len() == 64),
+            "flat puts store a sha256 of the stored bytes: {meta:?}"
+        );
+        let vid = meta.version_id.clone().unwrap();
+        flip_first_byte(&bucket.join("obj"));
+        let repaired = check(tmp.path(), true).await.unwrap();
+        assert_eq!(read_key(&storage, "obj").await, b"hashed-body");
+        assert_eq!(read_version(&storage, "obj", &vid).await, b"hashed-body");
+        assert!(
+            repaired
+                .issues
+                .iter()
+                .any(|issue| issue.kind == IssueKind::ContentHashMismatch && issue.repaired),
+            "{:?}",
+            repaired.issues
+        );
+        assert_eq!(repaired.unresolved(), 0, "{:?}", repaired.issues);
+    }
+
+    #[tokio::test]
+    async fn corruption_sweep_versioned_unversioned_and_sse() {
+        for (versioned, sse) in [(false, false), (false, true), (true, false), (true, true)] {
+            let fixture = tempfile::tempdir().unwrap();
+            let storage = storage_at(fixture.path()).await;
+            storage.create_bucket(&bucket_meta("bkt")).await.unwrap();
+            if versioned {
+                storage.set_versioning("bkt", true).await.unwrap();
+                put_bytes(&storage, "obj", b"older-sweep", sse).await;
+            }
+            put_bytes(&storage, "obj", b"newest-sweep", sse).await;
+            drop(storage);
+            for file in files_under(&fixture.path().join("buckets")) {
+                let rel = file.strip_prefix(fixture.path()).unwrap().to_path_buf();
+                let copy = tempfile::tempdir().unwrap();
+                copy_tree(fixture.path(), copy.path());
+                let target = copy.path().join(&rel);
+                if std::fs::metadata(&target).unwrap().len() == 0 {
+                    std::fs::write(&target, b"x").unwrap();
+                } else {
+                    flip_first_byte(&target);
+                }
+                let _ = check(copy.path(), true).await;
+                let opened = storage_at(copy.path()).await;
+                match opened.get_object("bkt", "obj", None).await {
+                    Ok((mut reader, _)) => {
+                        let mut buf = Vec::new();
+                        tokio::io::AsyncReadExt::read_to_end(&mut reader, &mut buf)
+                            .await
+                            .unwrap();
+                        assert_eq!(
+                            buf,
+                            b"newest-sweep",
+                            "versioned={versioned} sse={sse} corrupting {} served {:?}\n",
+                            rel.display(),
+                            buf
+                        );
+                    }
+                    Err(_) if !versioned => {}
+                    Err(err) => panic!(
+                        "versioned={versioned} sse={sse} corrupting {} lost the object ({err})",
+                        rel.display()
+                    ),
+                }
+            }
         }
     }
 }

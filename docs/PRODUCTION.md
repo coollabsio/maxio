@@ -36,7 +36,7 @@ location / {
 
 `client_max_body_size 0` lets large uploads through. Also raise the proxy read timeout for big multipart parts.
 
-Console login limits count failed attempts per client IP and access key (10 in 5 minutes). Behind this proxy, set `MAXIO_TRUSTED_PROXY` to the proxy's address (for example `127.0.0.1`) so MaxIO reads `X-Forwarded-For`. Without that setting every login is attributed to the proxy itself. Do not list a network that clients can connect from directly.
+Console login limits count failed attempts: 10 per 5 minutes for one access key, and 50 per 5 minutes for one client IP across every access key. Behind this proxy, set `MAXIO_TRUSTED_PROXY` to the proxy's address (for example `127.0.0.1`) so MaxIO reads `X-Forwarded-For`. Without that setting every login is attributed to the proxy itself, so one client can lock the console for everyone until the window expires. Do not list a network that clients can connect from directly: a trusted proxy is allowed to choose the client address.
 
 - [ ] Leave port 9000 bound to localhost when a proxy is on the same machine (`MAXIO_ADDRESS=127.0.0.1`). If clients reach MaxIO directly, allow that port only from the networks that should use it.
 - [ ] Keep clocks in sync (for example chrony). Signature V4 requests outside the clock skew window are rejected.

@@ -319,11 +319,14 @@ async fn load_revocation_file(path: &std::path::Path) -> LoadedRevocations {
 const TOKEN_MAX_AGE_SECS: i64 = 7 * 24 * 60 * 60; // 7 days
 
 const RATE_LIMIT_MAX: u32 = 10;
+const RATE_LIMIT_IP_MAX: u32 = 50;
+const RATE_LIMIT_MAX_ENTRIES: usize = 4096;
 const RATE_LIMIT_WINDOW_SECS: u64 = 300; // 5 minutes
 
 struct AttemptWindow {
     failures: u32,
     window_start: Instant,
+    last_used: Instant,
 }
 
 /// Failed console logins, keyed by client IP and access key.
@@ -379,8 +382,22 @@ impl LoginRateLimiter {
         client
     }
 
-    fn key(ip: &str, access_key: &str) -> String {
-        format!("{ip}\n{access_key}")
+    fn user_key(ip: &str, access_key: &str) -> String {
+        use sha2::Digest;
+        let digest = hex::encode(Sha256::digest(access_key.as_bytes()));
+        format!("k\n{ip}\n{digest}")
+    }
+
+    fn ip_key(ip: &str) -> String {
+        format!("i\n{ip}")
+    }
+
+    fn touch(window: &mut AttemptWindow, now: Instant) {
+        window.last_used = now;
+        if now.duration_since(window.window_start).as_secs() >= RATE_LIMIT_WINDOW_SECS {
+            window.failures = 0;
+            window.window_start = now;
+        }
     }
 
     fn prune_and_window<'a>(
@@ -391,25 +408,50 @@ impl LoginRateLimiter {
         map.retain(|_, window| {
             now.duration_since(window.window_start).as_secs() < RATE_LIMIT_WINDOW_SECS * 2
         });
+        while map.len() >= RATE_LIMIT_MAX_ENTRIES && !map.contains_key(key) {
+            let oldest = map
+                .iter()
+                .min_by_key(|(_, window)| window.last_used)
+                .map(|(key, _)| key.clone());
+            match oldest {
+                Some(old) => {
+                    map.remove(&old);
+                }
+                None => break,
+            }
+        }
         let window = map.entry(key.to_string()).or_insert(AttemptWindow {
             failures: 0,
             window_start: now,
+            last_used: now,
         });
-        if now.duration_since(window.window_start).as_secs() >= RATE_LIMIT_WINDOW_SECS {
-            window.failures = 0;
-            window.window_start = now;
-        }
+        Self::touch(window, now);
         window
     }
 
-    /// `Some(retry_after)` when this IP and access key already failed too many times.
+    fn retry_after(window: &AttemptWindow) -> u64 {
+        RATE_LIMIT_WINDOW_SECS
+            .saturating_sub(Instant::now().duration_since(window.window_start).as_secs())
+            .max(1)
+    }
+
+    /// `Some(retry_after)` when this access key or this IP has failed too many times.
     pub fn is_blocked(&self, ip: &str, access_key: &str) -> Option<u64> {
         let mut map = self.windows.lock().unwrap();
-        let window = Self::prune_and_window(&mut map, &Self::key(ip, access_key));
+        let ip_retry = {
+            let ip_window = Self::prune_and_window(&mut map, &Self::ip_key(ip));
+            if ip_window.failures >= RATE_LIMIT_IP_MAX {
+                Some(Self::retry_after(ip_window))
+            } else {
+                None
+            }
+        };
+        if ip_retry.is_some() {
+            return ip_retry;
+        }
+        let window = Self::prune_and_window(&mut map, &Self::user_key(ip, access_key));
         if window.failures >= RATE_LIMIT_MAX {
-            let remaining = RATE_LIMIT_WINDOW_SECS
-                .saturating_sub(Instant::now().duration_since(window.window_start).as_secs());
-            Some(remaining.max(1))
+            Some(Self::retry_after(window))
         } else {
             None
         }
@@ -417,13 +459,31 @@ impl LoginRateLimiter {
 
     pub fn record_failure(&self, ip: &str, access_key: &str) {
         let mut map = self.windows.lock().unwrap();
-        let window = Self::prune_and_window(&mut map, &Self::key(ip, access_key));
+        {
+            let ip_window = Self::prune_and_window(&mut map, &Self::ip_key(ip));
+            ip_window.failures = ip_window.failures.saturating_add(1);
+        }
+        let window = Self::prune_and_window(&mut map, &Self::user_key(ip, access_key));
         window.failures = window.failures.saturating_add(1);
     }
 
     pub fn clear(&self, ip: &str, access_key: &str) {
         let mut map = self.windows.lock().unwrap();
-        map.remove(&Self::key(ip, access_key));
+        map.remove(&Self::user_key(ip, access_key));
+    }
+
+    #[cfg(test)]
+    fn entry_count(&self) -> usize {
+        self.windows.lock().unwrap().len()
+    }
+
+    #[cfg(test)]
+    fn stores_raw_access_key(&self, raw: &str) -> bool {
+        self.windows
+            .lock()
+            .unwrap()
+            .keys()
+            .any(|key| key.contains(raw))
     }
 }
 
@@ -744,7 +804,14 @@ pub async fn login(
     );
 
     let mut resp_headers = HeaderMap::new();
-    resp_headers.insert("Set-Cookie", cookie.parse().unwrap());
+    let secure = console_cookie_secure(&state.config, &headers);
+    resp_headers.append(axum::http::header::SET_COOKIE, cookie.parse().unwrap());
+    // A revoked Path=/ cookie from a pre-upgrade build is still sent to
+    // /maxio and would reject this new session. Clear it as we sign in.
+    // The session cookie is first so clients that read one Set-Cookie keep it.
+    if let Ok(clear) = make_cookie("", 0, secure, "/").parse() {
+        resp_headers.append(axum::http::header::SET_COOKIE, clear);
+    }
     (resp_headers, Json(session_response(&identity))).into_response()
 }
 
@@ -3044,6 +3111,26 @@ mod tests {
         assert!(limiter.is_blocked("203.0.113.8", "bob").is_none());
         limiter.clear("203.0.113.8", "alice");
         assert!(limiter.is_blocked("203.0.113.8", "alice").is_none());
+        let long_key = "k".repeat(1000);
+        limiter.record_failure("203.0.113.8", &long_key);
+        assert!(
+            !limiter.stores_raw_access_key(&long_key),
+            "the access key must be hashed before it is stored"
+        );
+        for n in 0..RATE_LIMIT_MAX_ENTRIES + 50 {
+            limiter.record_failure("203.0.113.9", &format!("user-{n}"));
+        }
+        assert!(limiter.entry_count() <= RATE_LIMIT_MAX_ENTRIES);
+        let ip_cap = LoginRateLimiter::new();
+        for n in 0..5 {
+            for _ in 0..10 {
+                ip_cap.record_failure("198.51.100.9", &format!("rotating-{n}"));
+            }
+        }
+        assert!(
+            ip_cap.is_blocked("198.51.100.9", "brand-new").is_some(),
+            "rotating access keys must not reset the per-IP failure cap"
+        );
 
         let trusted = LoginRateLimiter::from_trusted("10.0.0.0/8,127.0.0.1").unwrap();
         let proxy: std::net::SocketAddr = "10.1.2.3:9000".parse().unwrap();

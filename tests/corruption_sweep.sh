@@ -27,5 +27,9 @@ cargo test --lib -- \
     healthy_checksummed_sse_is_not_quarantined \
     external_key_repair_is_refused_until_the_key_is_supplied \
     empty_sse_s3_sidecar_is_not_rebuilt_as_plaintext \
+    broken_multipart_sidecar_rebuilds_from_composite_part_sizes \
+    tampered_sse_sidecar_size_is_an_issue_and_not_plaintext \
+    tampered_sse_sidecar_is_restored_from_the_archive \
+    every_sse_sidecar_mac_is_checked \
     hashed_multipart_etag_is_not_reported_unverifiable \
     -- --test-threads=8

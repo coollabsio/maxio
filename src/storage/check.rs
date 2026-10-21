@@ -962,6 +962,29 @@ async fn check_meta_pair(
     report.objects_seen += 1;
     let mut dirty = false;
     let file_len = tokio::fs::metadata(data_path).await?.len();
+    if let Some(why) = sse_sidecar_mac_failure(&meta, keyring) {
+        return report_damaged_sidecar(
+            meta_path, data_path, key, bucket_dir, bucket, data_dir, repair, &why, report,
+        )
+        .await;
+    }
+    if let Some(parts) = meta.part_sizes.as_deref().filter(|parts| !parts.is_empty()) {
+        let covered: u64 = parts.iter().copied().sum();
+        if covered != meta.size {
+            return report_damaged_sidecar(
+                meta_path,
+                data_path,
+                key,
+                bucket_dir,
+                bucket,
+                data_dir,
+                repair,
+                "multipart part sizes do not cover the recorded size",
+                report,
+            )
+            .await;
+        }
+    }
     // A crashed publish can leave a newer payload with the previous sidecar.
     // A size change is that case and is repaired below. A same-size content
     // hash miss is damage: do not adopt the bytes.
@@ -1183,6 +1206,20 @@ async fn check_meta_pair(
             // failure is: the key unwrapped and the ciphertext did not match.
             Err(err) if err.starts_with("unverifiable:") => {
                 report.note(IssueKind::CompositeChecksum, data_path, err);
+            }
+            Err(err) if err.starts_with("damaged-sidecar:") => {
+                return report_damaged_sidecar(
+                    meta_path,
+                    data_path,
+                    key,
+                    bucket_dir,
+                    bucket,
+                    data_dir,
+                    repair,
+                    err.trim_start_matches("damaged-sidecar: "),
+                    report,
+                )
+                .await;
             }
             Err(err) if !err.contains("authentication failed") => {
                 report.note(
@@ -2677,11 +2714,30 @@ async fn rebuild_decision(raw: &str, data_path: &Path) -> anyhow::Result<Rebuild
         }
     }
     if let Some((algo, expected)) = salvage_checksum(raw) {
-        saw_plaintext_proof = true;
-        if file_checksum(data_path, algo).await? != expected {
-            return Ok(RebuildDecision::Refuse(
-                "a recorded plaintext checksum does not match the bytes".into(),
-            ));
+        if composite_part_count(&expected).is_some() {
+            if let Some(parts) = salvage_part_sizes(raw) {
+                let covered: u64 = parts.iter().copied().sum();
+                let file_len = tokio::fs::metadata(data_path).await?.len();
+                if covered == file_len {
+                    let file = tokio::fs::File::open(data_path).await?;
+                    let actual = checksum_parts(file, algo, &parts, false)
+                        .await
+                        .map_err(|err| anyhow::anyhow!(err))?;
+                    if actual != expected {
+                        return Ok(RebuildDecision::Refuse(
+                            "a recorded plaintext checksum does not match the bytes".into(),
+                        ));
+                    }
+                    saw_plaintext_proof = true;
+                }
+            }
+        } else {
+            saw_plaintext_proof = true;
+            if file_checksum(data_path, algo).await? != expected {
+                return Ok(RebuildDecision::Refuse(
+                    "a recorded plaintext checksum does not match the bytes".into(),
+                ));
+            }
         }
     }
     if saw_plaintext_proof {
@@ -2771,6 +2827,24 @@ async fn write_synthesized_sidecar(
     Ok(())
 }
 
+fn salvage_part_sizes(raw: &str) -> Option<Vec<u64>> {
+    let marker = "\"part_sizes\"";
+    let idx = raw.find(marker)?;
+    let rest = raw[idx + marker.len()..].trim_start();
+    let rest = rest.strip_prefix(':')?.trim_start();
+    let start = rest.find('[')?;
+    let end = rest[start..].find(']')?;
+    let mut sizes = Vec::new();
+    for token in rest[start + 1..start + end].split(',') {
+        let token = token.trim();
+        if token.is_empty() {
+            continue;
+        }
+        sizes.push(token.parse().ok()?);
+    }
+    if sizes.is_empty() { None } else { Some(sizes) }
+}
+
 fn apply_recovered_identity(rebuilt: &mut ObjectMeta, raw: &str) {
     if let Some(etag) = salvage_etag(raw) {
         if etag.multipart {
@@ -2781,6 +2855,88 @@ fn apply_recovered_identity(rebuilt: &mut ObjectMeta, raw: &str) {
         rebuilt.checksum_algorithm = Some(algo);
         rebuilt.checksum_value = Some(value);
     }
+    if let Some(parts) = salvage_part_sizes(raw) {
+        rebuilt.part_sizes = Some(parts);
+    }
+}
+
+fn unwrap_sse_s3_dek(
+    enc: &super::EncryptionMeta,
+    keyring: &super::keys::Keyring,
+) -> Result<[u8; 32], String> {
+    let b64 = base64::engine::general_purpose::STANDARD;
+    let key_id = enc.key_id.as_deref().ok_or("missing key_id")?;
+    let wrapped = b64
+        .decode(enc.wrapped_dek.as_deref().ok_or("missing wrapped_dek")?)
+        .map_err(|err| err.to_string())?;
+    let nonce_raw = b64
+        .decode(enc.wrap_nonce.as_deref().ok_or("missing wrap_nonce")?)
+        .map_err(|err| err.to_string())?;
+    if nonce_raw.len() != 12 {
+        return Err("wrap_nonce must be 12 bytes".into());
+    }
+    let mut nonce = [0u8; 12];
+    nonce.copy_from_slice(&nonce_raw);
+    keyring
+        .unwrap_dek(key_id, &wrapped, &nonce)
+        .map_err(|err| err.to_string())
+}
+
+fn sse_sidecar_mac_failure(
+    meta: &ObjectMeta,
+    keyring: Option<&Arc<super::keys::Keyring>>,
+) -> Option<String> {
+    let enc = meta.encryption.as_ref()?;
+    if enc.mode != EncryptionMode::SseS3 {
+        return None;
+    }
+    let keyring = keyring?;
+    let dek = unwrap_sse_s3_dek(enc, keyring).ok()?;
+    super::filesystem::sidecar_mac_error(meta, &dek)
+}
+
+async fn report_damaged_sidecar(
+    meta_path: &Path,
+    data_path: &Path,
+    key: &str,
+    bucket_dir: &Path,
+    bucket: &str,
+    data_dir: &Path,
+    repair: bool,
+    why: &str,
+    report: &mut CheckReport,
+) -> anyhow::Result<()> {
+    let mut repaired = false;
+    let mut detail = format!("sidecar is damaged: {why}");
+    if repair {
+        match quarantine_sidecar_copy(data_dir, bucket, bucket_dir, meta_path).await {
+            Ok(dest) => {
+                detail = format!(
+                    "{detail}. Copied the original sidecar to {}.",
+                    dest.display()
+                );
+            }
+            Err(err) => {
+                detail = format!(
+                    "{detail}. Could not quarantine the original sidecar: {err}. It was left unchanged."
+                );
+                report.push(IssueKind::CorruptMetadata, meta_path, detail, false);
+                return Ok(());
+            }
+        }
+        if let Some(donor) = donor_sidecar(meta_path, data_path, bucket_dir, key).await {
+            write_file_atomic(meta_path, serde_json::to_string_pretty(&donor)?.as_bytes()).await?;
+            repaired = true;
+            detail =
+                format!("{detail} Restored this sidecar from the intact copy of the same bytes.");
+        } else {
+            detail = format!("{detail} It was not rebuilt as plaintext. It was left in place.");
+        }
+    } else {
+        detail = format!("{detail}. Not modified.");
+    }
+    report.push(IssueKind::CorruptMetadata, meta_path, detail, repaired);
+    Ok(())
 }
 
 fn version_id_from_meta_path(meta_path: &Path) -> Option<String> {
@@ -5654,6 +5810,176 @@ mod tests {
         let storage = storage_at(tmp.path()).await;
         assert_eq!(read_key(&storage, "s3.txt").await, b"sse-s3-body");
     }
+
+    async fn put_crc_multipart(storage: &FilesystemStorage, key: &str, parts: &[&[u8]], sse: bool) {
+        let spec = sse.then(|| {
+            crate::api::object::spec_from_request(&crate::storage::EncryptionRequest::sse_s3())
+        });
+        let upload = storage
+            .create_multipart_upload(
+                "bkt",
+                key,
+                "application/octet-stream",
+                Some(crate::storage::ChecksumAlgorithm::CRC32),
+                spec,
+                crate::storage::StoredObjectMetadata::default(),
+                None,
+            )
+            .await
+            .unwrap();
+        let mut completed = Vec::new();
+        for (i, body) in parts.iter().enumerate() {
+            let part = storage
+                .upload_part(
+                    "bkt",
+                    &upload.upload_id,
+                    (i as u32) + 1,
+                    Box::pin(std::io::Cursor::new(body.to_vec())),
+                    Some((crate::storage::ChecksumAlgorithm::CRC32, None)),
+                    None,
+                )
+                .await
+                .unwrap();
+            completed.push(((i as u32) + 1, part.etag));
+        }
+        storage
+            .complete_multipart_upload("bkt", &upload.upload_id, &completed, None, None)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn broken_multipart_sidecar_rebuilds_from_composite_part_sizes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = storage_at(tmp.path()).await;
+        storage.create_bucket(&bucket_meta("bkt")).await.unwrap();
+        put_crc_multipart(&storage, "multi.bin", &[b"part-one-bytespart-two"], false).await;
+        let meta_path = tmp.path().join("buckets/bkt/multi.bin.meta.json");
+        let original = std::fs::read_to_string(&meta_path).unwrap();
+        assert!(
+            original.contains("-1"),
+            "fixture must store a composite checksum: {original}"
+        );
+        let broken = original.replacen("\"size\": ", "\"size\": 0", 1);
+        assert!(serde_json::from_str::<ObjectMeta>(&broken).is_err());
+        std::fs::write(&meta_path, &broken).unwrap();
+        let repaired = check(tmp.path(), true).await.unwrap();
+        assert!(
+            repaired
+                .issues
+                .iter()
+                .any(|issue| { issue.kind == IssueKind::CorruptMetadata && issue.repaired }),
+            "{:?}",
+            repaired.issues
+        );
+        assert_eq!(
+            read_key(&storage, "multi.bin").await,
+            b"part-one-bytespart-two"
+        );
+        let rebuilt: ObjectMeta =
+            serde_json::from_slice(&std::fs::read(&meta_path).unwrap()).unwrap();
+        assert!(
+            rebuilt
+                .checksum_value
+                .as_deref()
+                .is_some_and(|v| v.ends_with("-1"))
+        );
+        assert!(rebuilt.part_sizes.is_some());
+    }
+
+    #[tokio::test]
+    async fn tampered_sse_sidecar_size_is_an_issue_and_not_plaintext() {
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = storage_at(tmp.path()).await;
+        storage.create_bucket(&bucket_meta("bkt")).await.unwrap();
+        let big = vec![9u8; 5 * 1024 * 1024];
+        put_crc_multipart(&storage, "sse.bin", &[big.as_slice(), b"tail"], true).await;
+        let meta_path = tmp.path().join("buckets/bkt/sse.bin.meta.json");
+        let data_path = tmp.path().join("buckets/bkt/sse.bin");
+        let before = std::fs::read(&data_path).unwrap();
+        let original = std::fs::read_to_string(&meta_path).unwrap();
+        assert!(original.contains("wrapped_dek"), "{original}");
+        let tampered = original.replacen("\"size\": ", "\"size\": 1", 1);
+        // "size": 1<old digits> is still a number and breaks the MAC.
+        assert!(serde_json::from_str::<ObjectMeta>(&tampered).is_ok());
+        std::fs::write(&meta_path, &tampered).unwrap();
+        let reported = check(tmp.path(), false).await.unwrap();
+        assert!(
+            reported.unresolved() >= 1,
+            "tampered size must be an issue, not only info: {:?}",
+            reported.issues
+        );
+        assert!(
+            reported.issues.iter().any(|issue| {
+                !issue.advisory
+                    && (issue.detail.contains("sidecar_mac")
+                        || issue.detail.contains("part sizes do not cover"))
+            }),
+            "{:?}",
+            reported.issues
+        );
+        let repaired = check(tmp.path(), true).await.unwrap();
+        assert!(
+            repaired.issues.iter().any(|issue| {
+                !issue.repaired && issue.detail.contains("not rebuilt as plaintext")
+            }),
+            "{:?}",
+            repaired.issues
+        );
+        assert_eq!(std::fs::read(&data_path).unwrap(), before);
+        assert!(
+            std::fs::read_to_string(&meta_path)
+                .unwrap()
+                .contains("wrapped_dek")
+        );
+        assert_not_served(&storage, "sse.bin").await;
+    }
+
+    #[tokio::test]
+    async fn tampered_sse_sidecar_is_restored_from_the_archive() {
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = storage_at(tmp.path()).await;
+        storage.create_bucket(&bucket_meta("bkt")).await.unwrap();
+        storage.set_versioning("bkt", true).await.unwrap();
+        put_bytes(&storage, "obj", b"sse-body", true).await;
+        let meta_path = tmp.path().join("buckets/bkt/obj.meta.json");
+        let original = std::fs::read_to_string(&meta_path).unwrap();
+        let tampered = original.replace("text/plain", "text/tampered");
+        std::fs::write(&meta_path, &tampered).unwrap();
+        let repaired = check(tmp.path(), true).await.unwrap();
+        assert_eq!(
+            read_key(&storage, "obj").await,
+            b"sse-body",
+            "{:?}",
+            repaired.issues
+        );
+        assert!(
+            std::fs::read_to_string(&meta_path)
+                .unwrap()
+                .contains("text/plain")
+        );
+    }
+
+    #[tokio::test]
+    async fn every_sse_sidecar_mac_is_checked() {
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = storage_at(tmp.path()).await;
+        storage.create_bucket(&bucket_meta("bkt")).await.unwrap();
+        put_bytes(&storage, "one.bin", b"single-sse", true).await;
+        let meta_path = tmp.path().join("buckets/bkt/one.bin.meta.json");
+        let original = std::fs::read_to_string(&meta_path).unwrap();
+        std::fs::write(&meta_path, original.replace("text/plain", "text/x-broken")).unwrap();
+        let reported = check(tmp.path(), false).await.unwrap();
+        assert!(
+            reported
+                .issues
+                .iter()
+                .any(|issue| { !issue.advisory && issue.detail.contains("sidecar_mac") }),
+            "{:?}",
+            reported.issues
+        );
+        assert!(reported.unresolved() >= 1, "{:?}", reported.issues);
+    }
 }
 
 fn composite_part_count(value: &str) -> Option<u32> {
@@ -5720,7 +6046,9 @@ async fn composite_checksum(
             return Err("SSE-S3 master key is not loaded; the payload was left in place".into());
         };
         if covered != meta.size {
-            return Err("unverifiable: multipart part sizes do not cover the plaintext".into());
+            return Err(
+                "damaged-sidecar: multipart part sizes do not cover the recorded size".into(),
+            );
         }
         return checksum_sse_s3(
             data_path,
@@ -5739,7 +6067,7 @@ async fn composite_checksum(
         .map(|m| m.len())
         .map_err(|err| err.to_string())?;
     if file_len != covered {
-        return Err("unverifiable: multipart part sizes do not cover the object".into());
+        return Err("damaged-sidecar: multipart part sizes do not cover the recorded size".into());
     }
     let file = tokio::fs::File::open(data_path)
         .await

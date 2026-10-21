@@ -2523,6 +2523,40 @@ PY
         "$(wc -c < "$TMPDIR/mp-crc32-down.bin" | tr -d ' ')"
     kill -TERM "$SUM_PID" 2>/dev/null || true
     wait "$SUM_PID" 2>/dev/null || true
+    python3 - "$SUM_DATA" <<'PY'
+import pathlib, sys
+root = pathlib.Path(sys.argv[1]) / "buckets" / "sum-bucket"
+plain = root / "mp-crc32.bin.meta.json"
+text = plain.read_text()
+plain.write_text(text.replace('"size": ', '"size": 0', 1), encoding="utf-8")
+sse = root / "mp-s3-crc32.bin.meta.json"
+body = sse.read_text()
+sse.write_text(body.replace('"size": ', '"size": 1', 1), encoding="utf-8")
+PY
+    set +e
+    "$ROBUST_BIN" check --data-dir "$SUM_DATA" --repair >"$TMPDIR/sse-mac-repair.txt" 2>"$TMPDIR/sse-mac-repair.err"
+    "$ROBUST_BIN" check --data-dir "$SUM_DATA" >"$TMPDIR/sse-mac-check.txt" 2>"$TMPDIR/sse-mac-check.err"
+    SSE_MAC_RC=$?
+    set -e
+    assert_eq "tampered sse sidecar is an issue" "true" \
+        "$([ "$SSE_MAC_RC" -ne 0 ] && grep -E -q 'sidecar_mac|part sizes do not cover' "$TMPDIR/sse-mac-check.txt" && echo true || echo false)"
+    assert_eq "tampered sse sidecar was not rebuilt as plaintext" "true" \
+        "$(grep -q wrapped_dek "$SUM_DATA/buckets/sum-bucket/mp-s3-crc32.bin.meta.json" && echo true || echo false)"
+    assert_file_exists "tampered sse bytes stayed in place" "$SUM_DATA/buckets/sum-bucket/mp-s3-crc32.bin"
+    RUST_LOG=warn "$ROBUST_BIN" --data-dir "$SUM_DATA" --port "$SUM_PORT" \
+        --address 127.0.0.1 "${SUB_CREDS[@]}" >"$SUM_DATA/server.log" 2>&1 &
+    SUM_PID=$!
+    for _ in $(seq 1 50); do
+        curl -sf "$SUM_EP/maxio/health/live" >/dev/null 2>&1 && break
+        sleep 0.1
+    done
+    assert "rebuilt plain multipart still downloads" $SUM_AWS s3 cp s3://sum-bucket/mp-crc32.bin "$TMPDIR/mp-crc32-again.bin"
+    assert_eq "rebuilt plain multipart size" \
+        "$(( $(wc -c < "$TMPDIR/mp-part.bin") + $(wc -c < "$TMPDIR/mp-tail.bin") ))" \
+        "$(wc -c < "$TMPDIR/mp-crc32-again.bin" | tr -d ' ')"
+    assert_fail "tampered sse multipart GET fails" $SUM_AWS s3 cp s3://sum-bucket/mp-s3-crc32.bin "$TMPDIR/mp-s3-fail.bin"
+    kill -TERM "$SUM_PID" 2>/dev/null || true
+    wait "$SUM_PID" 2>/dev/null || true
     rm -rf "$SUM_DATA"
 
     LIMIT_DATA=$(mktemp -d)

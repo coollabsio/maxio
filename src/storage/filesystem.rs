@@ -356,6 +356,12 @@ fn compute_sidecar_mac(dek: &[u8; 32], meta: &ObjectMeta) -> Result<String, Stor
 
 /// Verify the stored `sidecar_mac` against a freshly computed MAC. Used by the
 /// read path before any ciphertext is decrypted.
+pub(crate) fn sidecar_mac_error(meta: &ObjectMeta, dek: &[u8; 32]) -> Option<String> {
+    verify_sidecar_mac(meta, dek)
+        .err()
+        .map(|err| err.to_string())
+}
+
 fn verify_sidecar_mac(meta: &ObjectMeta, dek: &[u8; 32]) -> Result<(), StorageError> {
     let enc = meta
         .encryption

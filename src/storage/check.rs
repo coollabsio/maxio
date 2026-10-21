@@ -711,28 +711,68 @@ async fn check_meta_pair(
         Ok(meta) => meta,
         Err(e) => {
             let data_exists = is_file(data_path).await;
-            let repaired = if repair && data_exists && !tokio::fs::try_exists(ec_path).await? {
-                // A readable encryption sidecar is returned before this branch.
-                // Rebuilding from bytes is only for a corrupt plaintext sidecar.
-                let rebuilt = synthesized_meta(key, data_path).await?;
-                write_file_atomic(
-                    meta_path,
-                    serde_json::to_string_pretty(&rebuilt)?.as_bytes(),
-                )
-                .await?;
-                true
-            } else if repair && !data_exists && !keep_sidecar {
-                let _ = tokio::fs::remove_file(meta_path).await;
-                true
-            } else {
-                false
-            };
-            report.push(
-                IssueKind::CorruptMetadata,
-                meta_path,
-                format!("sidecar JSON is invalid: {e}"),
-                repaired,
-            );
+            let ec_exists = tokio::fs::try_exists(ec_path).await?;
+            let looks_sse = sidecar_looks_encrypted(&raw);
+            let mut repaired = false;
+            let mut detail = format!("sidecar JSON is invalid: {e}");
+            if repair {
+                match quarantine_sidecar_copy(data_dir, bucket, bucket_dir, meta_path).await {
+                    Ok(dest) => {
+                        detail = format!(
+                            "{detail}. Copied the original sidecar to {} before any rewrite.",
+                            dest.display()
+                        );
+                    }
+                    Err(err) => {
+                        detail = format!(
+                            "{detail}. Could not quarantine the original sidecar: {err}. It was left unchanged."
+                        );
+                        report.push(IssueKind::CorruptMetadata, meta_path, detail, false);
+                        return Ok(());
+                    }
+                }
+                if data_exists && !ec_exists {
+                    if let Some(donor) = donor_sidecar(meta_path, data_path, bucket_dir, key).await
+                    {
+                        write_file_atomic(
+                            meta_path,
+                            serde_json::to_string_pretty(&donor)?.as_bytes(),
+                        )
+                        .await?;
+                        repaired = true;
+                        detail = format!(
+                            "{detail} Restored this sidecar from the intact copy of the same bytes."
+                        );
+                    } else if looks_sse {
+                        detail = format!(
+                            "{detail} The sidecar looks encrypted and was not rebuilt, so the ciphertext is not served as a plaintext object. It was left in place."
+                        );
+                    } else {
+                        let mut rebuilt = synthesized_meta(key, data_path).await?;
+                        rebuilt.rebuilt_from_bytes = true;
+                        rebuilt.content_sha256 = None;
+                        if let Some(vid) = version_id_from_meta_path(meta_path) {
+                            if let Some(stamp) = last_modified_from_version_id(&vid) {
+                                rebuilt.last_modified = stamp;
+                            }
+                            rebuilt.version_id = Some(vid);
+                        }
+                        write_file_atomic(
+                            meta_path,
+                            serde_json::to_string_pretty(&rebuilt)?.as_bytes(),
+                        )
+                        .await?;
+                        repaired = true;
+                        detail = format!(
+                            "{detail} Rebuilt a plaintext sidecar from the bytes. It is not a verified restore source."
+                        );
+                    }
+                } else if !data_exists && !keep_sidecar && !looks_sse {
+                    let _ = tokio::fs::remove_file(meta_path).await;
+                    repaired = true;
+                }
+            }
+            report.push(IssueKind::CorruptMetadata, meta_path, detail, repaired);
             return Ok(());
         }
     };
@@ -903,13 +943,16 @@ async fn check_meta_pair(
             );
             if repair {
                 meta.size = file_len;
-                if etag_is_multipart(&meta.etag) {
+                if etag_is_multipart(&meta.etag)
+                    && meta.checksum_algorithm.is_none()
+                    && meta.content_sha256.is_none()
+                {
                     report.note(
                         IssueKind::MultipartEtag,
                         data_path,
                         "multipart etag (not verifiable by MD5)",
                     );
-                } else {
+                } else if !etag_is_multipart(&meta.etag) {
                     meta.etag = file_md5_quoted(data_path).await?;
                     meta.part_sizes = None;
                 }
@@ -917,7 +960,7 @@ async fn check_meta_pair(
                 dirty = true;
             }
         } else if etag_is_multipart(&meta.etag) {
-            if meta.checksum_algorithm.is_none() {
+            if meta.checksum_algorithm.is_none() && meta.content_sha256.is_none() {
                 report.note(
                     IssueKind::MultipartEtag,
                     data_path,
@@ -1834,6 +1877,9 @@ async fn payload_verdict(
     key: &str,
     keyring: Option<&Arc<super::keys::Keyring>>,
 ) -> PayloadVerdict {
+    if meta.rebuilt_from_bytes {
+        return PayloadVerdict::Unverifiable;
+    }
     if let Some(expected) = &meta.content_sha256 {
         return match file_sha256_hex(data_path).await {
             Ok(actual) if actual == *expected => PayloadVerdict::Verified,
@@ -2311,6 +2357,122 @@ async fn quarantine_file(
         tokio::fs::rename(&sidecar, std::path::PathBuf::from(side_dest)).await?;
     }
     Ok(dest)
+}
+
+fn sidecar_looks_encrypted(raw: &str) -> bool {
+    let lower = raw.to_ascii_lowercase();
+    lower.contains("wrapped_dek")
+        || lower.contains("sse_s3")
+        || lower.contains("sse_c")
+        || lower.contains("\"encryption\"")
+}
+
+fn version_id_from_meta_path(meta_path: &Path) -> Option<String> {
+    let in_versions = meta_path
+        .components()
+        .any(|component| component.as_os_str() == ".versions");
+    if !in_versions {
+        return None;
+    }
+    let name = meta_path.file_name()?.to_str()?;
+    let vid = name.strip_suffix(".meta.json")?;
+    if vid.is_empty() {
+        None
+    } else {
+        Some(vid.to_string())
+    }
+}
+
+fn last_modified_from_version_id(vid: &str) -> Option<String> {
+    let micros: i64 = vid.split('-').next()?.parse().ok()?;
+    let stamped = chrono::DateTime::from_timestamp_micros(micros)?;
+    Some(stamped.format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string())
+}
+
+async fn quarantine_sidecar_copy(
+    data_dir: &Path,
+    bucket: &str,
+    bucket_dir: &Path,
+    meta_path: &Path,
+) -> anyhow::Result<PathBuf> {
+    let bytes = tokio::fs::read(meta_path).await?;
+    let rel = meta_path.strip_prefix(bucket_dir).unwrap_or(meta_path);
+    let mut dest = data_dir.join(".maxio-quarantine").join(bucket).join(rel);
+    if let Some(parent) = dest.parent() {
+        tokio::fs::create_dir_all(parent).await?;
+    }
+    if tokio::fs::try_exists(&dest).await? {
+        let parent = dest
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| data_dir.to_path_buf());
+        let stem = dest
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "sidecar".into());
+        for n in 1..1000 {
+            let candidate = parent.join(format!("{stem}.{n}"));
+            if !tokio::fs::try_exists(&candidate).await? {
+                dest = candidate;
+                break;
+            }
+        }
+    }
+    tokio::fs::write(&dest, &bytes).await?;
+    Ok(dest)
+}
+
+async fn donor_sidecar(
+    meta_path: &Path,
+    data_path: &Path,
+    bucket_dir: &Path,
+    key: &str,
+) -> Option<ObjectMeta> {
+    let data_hash = file_sha256_hex(data_path).await.ok()?;
+    if let Some(vid) = version_id_from_meta_path(meta_path) {
+        let (plain, inline, current_meta, _) = object_locations(bucket_dir, key);
+        let current_data = current_data_path(&plain, &inline).await;
+        if current_meta != meta_path {
+            if let Some(meta) = read_object_meta(&current_meta).await {
+                if !meta.rebuilt_from_bytes && meta.version_id.as_deref() == Some(vid.as_str()) {
+                    if file_sha256_hex(&current_data).await.ok().as_deref()
+                        == Some(data_hash.as_str())
+                    {
+                        return Some(meta);
+                    }
+                }
+            }
+        }
+        return None;
+    }
+    let (plain, _, _, _) = object_locations(bucket_dir, key);
+    let ver_dir = plain
+        .parent()
+        .unwrap_or(bucket_dir)
+        .join(".versions")
+        .join(plain.file_name().unwrap_or_default());
+    let ids = list_version_ids(&ver_dir).await.ok()?;
+    for vid in ids {
+        let archived = ver_dir.join(format!("{vid}.meta.json"));
+        if archived == meta_path {
+            continue;
+        }
+        let Some(mut meta) = read_object_meta(&archived).await else {
+            continue;
+        };
+        if meta.rebuilt_from_bytes {
+            continue;
+        }
+        let archived_data = ver_dir.join(format!("{vid}.data"));
+        if file_sha256_hex(&archived_data).await.ok().as_deref() != Some(data_hash.as_str()) {
+            continue;
+        }
+        if meta.version_id.is_none() {
+            meta.version_id = Some(vid);
+        }
+        return Some(meta);
+    }
+    None
 }
 
 async fn synthesized_meta(key: &str, data_path: &Path) -> anyhow::Result<ObjectMeta> {
@@ -4093,6 +4255,164 @@ mod tests {
                 }
             }
         }
+    }
+
+    fn legacy_version_meta(key: &str, vid: &str, body: &[u8]) -> ObjectMeta {
+        ObjectMeta {
+            key: key.into(),
+            size: body.len() as u64,
+            etag: "\"0123456789abcdef0123456789abcdef-2\"".into(),
+            content_type: "text/plain".into(),
+            last_modified: "2024-01-01T00:00:00.000Z".into(),
+            version_id: Some(vid.into()),
+            ..ObjectMeta::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn corrupt_older_version_meta_does_not_replace_current() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bucket = tmp.path().join("buckets/bkt");
+        let ver = bucket.join(".versions/obj");
+        std::fs::create_dir_all(&ver).unwrap();
+        std::fs::write(bucket.join(".bucket.json"), br#"{"name":"bkt"}"#).unwrap();
+        let older = "0000001700000000000000-aaaaaaaa";
+        let newer = "0000001700000000000001-bbbbbbbb";
+        let v1 = b"version-one-bytes";
+        let v2 = b"version-two-bytes";
+        std::fs::write(ver.join(format!("{older}.data")), v1).unwrap();
+        std::fs::write(ver.join(format!("{newer}.data")), v2).unwrap();
+        std::fs::write(bucket.join("obj"), v2).unwrap();
+        let older_meta = legacy_version_meta("obj", older, v1);
+        let newer_meta = legacy_version_meta("obj", newer, v2);
+        let older_json = serde_json::to_vec_pretty(&older_meta).unwrap();
+        std::fs::write(ver.join(format!("{older}.meta.json")), &older_json).unwrap();
+        std::fs::write(
+            ver.join(format!("{newer}.meta.json")),
+            serde_json::to_vec_pretty(&newer_meta).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            bucket.join("obj.meta.json"),
+            serde_json::to_vec_pretty(&newer_meta).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(ver.join(format!("{older}.meta.json")), b"{").unwrap();
+
+        let repaired = check(tmp.path(), true).await.unwrap();
+        let storage = storage_at(tmp.path()).await;
+        assert_eq!(read_key(&storage, "obj").await, v2, "{:?}", repaired.issues);
+        let restored: ObjectMeta =
+            serde_json::from_slice(&std::fs::read(ver.join(format!("{older}.meta.json"))).unwrap())
+                .unwrap();
+        assert_eq!(restored.version_id.as_deref(), Some(older));
+        assert!(restored.rebuilt_from_bytes);
+        assert!(restored.content_sha256.is_none());
+        assert_eq!(read_version(&storage, "obj", older).await, v1);
+        let quarantine = tmp.path().join(".maxio-quarantine");
+        let mut found_original = false;
+        for path in files_under(&quarantine) {
+            if std::fs::read(&path).unwrap() == b"{" {
+                found_original = true;
+            }
+        }
+        assert!(found_original, "the unreadable sidecar must be quarantined");
+    }
+
+    #[tokio::test]
+    async fn corrupt_sse_sidecar_is_restored_from_the_archive_not_synthesized() {
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = storage_at(tmp.path()).await;
+        storage.create_bucket(&bucket_meta("bkt")).await.unwrap();
+        storage.set_versioning("bkt", true).await.unwrap();
+        put_bytes(&storage, "secret", b"sse-plain-v1", true).await;
+        put_bytes(&storage, "secret", b"sse-plain-v2", true).await;
+        let bucket = tmp.path().join("buckets/bkt");
+        let original = std::fs::read(bucket.join("secret.meta.json")).unwrap();
+        assert!(
+            String::from_utf8_lossy(&original).contains("wrapped_dek"),
+            "fixture must be SSE-S3"
+        );
+        std::fs::write(bucket.join("secret.meta.json"), b"{\"wrapped_dek\": ").unwrap();
+        let repaired = check(tmp.path(), true).await.unwrap();
+        assert_eq!(
+            read_key(&storage, "secret").await,
+            b"sse-plain-v2",
+            "repair must not serve ciphertext: {:?}",
+            repaired.issues
+        );
+        let meta = std::fs::read_to_string(bucket.join("secret.meta.json")).unwrap();
+        assert!(meta.contains("wrapped_dek"), "{meta}");
+        assert!(
+            files_under(&tmp.path().join(".maxio-quarantine"))
+                .iter()
+                .any(|path| std::fs::read(path)
+                    .unwrap()
+                    .starts_with(b"{\"wrapped_dek\": ")),
+            "original sidecar bytes must be quarantined"
+        );
+    }
+
+    #[tokio::test]
+    async fn unversioned_sse_sidecar_is_not_synthesized() {
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = storage_at(tmp.path()).await;
+        storage.create_bucket(&bucket_meta("bkt")).await.unwrap();
+        put_bytes(&storage, "secret", b"only-sse", true).await;
+        let meta_path = tmp.path().join("buckets/bkt/secret.meta.json");
+        let original = std::fs::read(&meta_path).unwrap();
+        std::fs::write(&meta_path, b"{\"wrapped_dek\": ").unwrap();
+        let repaired = check(tmp.path(), true).await.unwrap();
+        assert!(
+            repaired.issues.iter().any(|issue| {
+                issue.kind == IssueKind::CorruptMetadata
+                    && !issue.repaired
+                    && issue.detail.contains("not rebuilt")
+            }),
+            "{:?}",
+            repaired.issues
+        );
+        assert_eq!(std::fs::read(&meta_path).unwrap(), b"{\"wrapped_dek\": ");
+        assert!(
+            files_under(&tmp.path().join(".maxio-quarantine"))
+                .iter()
+                .any(|path| std::fs::read(path).unwrap() == b"{\"wrapped_dek\": "),
+            "quarantine must keep the original sidecar, not {original:?}"
+        );
+        let _ = original;
+    }
+
+    #[tokio::test]
+    async fn hashed_multipart_etag_is_not_reported_unverifiable() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bucket = tmp.path().join("buckets/bkt");
+        std::fs::create_dir_all(&bucket).unwrap();
+        let body = b"hashed-multipart";
+        std::fs::write(bucket.join("multi.bin"), body).unwrap();
+        let meta = ObjectMeta {
+            key: "multi.bin".into(),
+            size: body.len() as u64,
+            etag: "\"0123456789abcdef0123456789abcdef-2\"".into(),
+            content_type: "application/octet-stream".into(),
+            last_modified: "2024-04-01T00:00:00.000Z".into(),
+            content_sha256: Some(hex::encode(sha2::Sha256::digest(body))),
+            ..ObjectMeta::default()
+        };
+        std::fs::write(
+            bucket.join("multi.bin.meta.json"),
+            serde_json::to_vec_pretty(&meta).unwrap(),
+        )
+        .unwrap();
+        let report = check(tmp.path(), false).await.unwrap();
+        assert!(
+            report
+                .issues
+                .iter()
+                .all(|issue| issue.kind != IssueKind::MultipartEtag),
+            "a stored content hash already verifies the object: {:?}",
+            report.issues
+        );
+        assert_eq!(report.unresolved(), 0, "{:?}", report.issues);
     }
 }
 

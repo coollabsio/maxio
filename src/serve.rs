@@ -61,6 +61,7 @@ pub async fn serve(
     let mut tasks = JoinSet::new();
 
     loop {
+        reap_finished(&mut tasks);
         tokio::select! {
             biased;
             changed = shutdown.changed() => {
@@ -118,6 +119,16 @@ pub async fn serve(
 
 async fn drain(tasks: &mut JoinSet<()>) {
     while tasks.join_next().await.is_some() {}
+}
+
+fn reap_finished(tasks: &mut JoinSet<()>) {
+    while let Some(joined) = tasks.try_join_next() {
+        if let Err(err) = joined {
+            if !err.is_cancelled() {
+                tracing::debug!("connection task ended: {err}");
+            }
+        }
+    }
 }
 
 fn is_connection_error(err: &io::Error) -> bool {

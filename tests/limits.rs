@@ -293,3 +293,54 @@ async fn inflight_limit_and_request_timeout() {
     assert_eq!(timed.status(), 400);
     assert!(timed.text().await.unwrap().contains("RequestTimeout"));
 }
+
+#[tokio::test]
+async fn finished_connections_do_not_grow_rss() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let router = Router::new().route("/ok", get(|| async { "ok" }));
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let opts = serve_opts(0, Duration::from_millis(50), Duration::from_secs(2));
+    tokio::spawn(async move {
+        maxio::serve::serve(listener, router, opts, shutdown_rx)
+            .await
+            .unwrap();
+    });
+
+    async fn hit(addr: std::net::SocketAddr) {
+        let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        stream
+            .write_all(b"GET /ok HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+            .await
+            .unwrap();
+        let mut buf = vec![0u8; 256];
+        let _ = stream.read(&mut buf).await;
+    }
+
+    for _ in 0..32 {
+        hit(addr).await;
+    }
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let baseline = vm_rss_kb();
+    for _ in 0..4000 {
+        hit(addr).await;
+    }
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    let after = vm_rss_kb();
+    let _ = shutdown_tx.send(true);
+    let growth = after.saturating_sub(baseline);
+    assert!(
+        growth < 6 * 1024,
+        "RSS grew {growth} KiB after 4000 short connections (baseline {baseline} KiB, after {after} KiB). Finished connection tasks must be reaped."
+    );
+}
+
+fn vm_rss_kb() -> u64 {
+    let status = std::fs::read_to_string("/proc/self/status").unwrap();
+    status
+        .lines()
+        .find_map(|line| line.strip_prefix("VmRSS:"))
+        .and_then(|rest| rest.split_whitespace().next())
+        .and_then(|kb| kb.parse().ok())
+        .unwrap_or(0)
+}

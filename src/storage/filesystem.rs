@@ -3995,6 +3995,7 @@ impl FilesystemStorage {
             part_sizes: Some(part_sizes),
             encryption: enc_meta_opt,
             metadata: upload_meta.object_metadata,
+            rebuilt_from_bytes: false,
         };
         if let (Some(dek), Some(em)) = (dek_opt.as_ref(), object_meta.encryption.as_mut()) {
             em.sidecar_mac = String::new();

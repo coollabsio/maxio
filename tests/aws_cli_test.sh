@@ -2161,6 +2161,26 @@ EOF
     start_robust
     assert "get still works after check --repair" $ROBUST_AWS s3 cp "s3://$ROBUST_BUCKET/restart.txt" "$TMPDIR/restart-down2.txt"
     assert_eq "body intact after repair" "across-restart" "$(cat "$TMPDIR/restart-down2.txt")"
+
+    # An unreadable older version sidecar must not become the latest object.
+    assert "versioned rollback bucket" $ROBUST_AWS s3api put-bucket-versioning --bucket "$ROBUST_BUCKET" --versioning-configuration Status=Enabled
+    echo v1-body > "$TMPDIR/ver-body.txt"
+    V1_ID=$($ROBUST_AWS s3api put-object --bucket "$ROBUST_BUCKET" --key ver.bin --body "$TMPDIR/ver-body.txt" --query VersionId --output text)
+    echo v2-body > "$TMPDIR/ver-body.txt"
+    V2_ID=$($ROBUST_AWS s3api put-object --bucket "$ROBUST_BUCKET" --key ver.bin --body "$TMPDIR/ver-body.txt" --query VersionId --output text)
+    stop_robust
+    python3 - "$ROBUST_DATA" "$ROBUST_BUCKET" "$V1_ID" <<'PY'
+import pathlib, sys
+data, bucket, older = sys.argv[1:]
+meta = pathlib.Path(data, "buckets", bucket, ".versions", "ver.bin", f"{older}.meta.json")
+meta.write_text("{", encoding="utf-8")
+PY
+    assert "repair after older version meta is corrupt" "$ROBUST_BIN" check --data-dir "$ROBUST_DATA" --repair
+    start_robust
+    assert "latest stays v2 after repair" $ROBUST_AWS s3 cp "s3://$ROBUST_BUCKET/ver.bin" "$TMPDIR/ver-latest.txt"
+    assert_eq "latest body is v2" "v2-body" "$(cat "$TMPDIR/ver-latest.txt")"
+    assert "older version still readable" $ROBUST_AWS s3api get-object --bucket "$ROBUST_BUCKET" --key ver.bin --version-id "$V1_ID" "$TMPDIR/ver-old.txt"
+    assert_eq "older version body is v1" "v1-body" "$(cat "$TMPDIR/ver-old.txt")"
     stop_robust
     mc alias rm "$MC_ROBUST" >/dev/null 2>&1 || true
     rm -rf "$ROBUST_DATA"

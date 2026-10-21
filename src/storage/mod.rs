@@ -260,6 +260,11 @@ pub struct ObjectMeta {
     /// single-part MD5 and no S3 checksum was stored.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub content_sha256: Option<String>,
+    /// This sidecar was synthesized from payload bytes because the original
+    /// JSON was unreadable. It is not a verified copy and must not be used as
+    /// a restore source.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub rebuilt_from_bytes: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tags: Option<HashMap<String, String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

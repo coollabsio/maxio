@@ -11,4 +11,8 @@ cargo test --lib -- \
     unverifiable_multipart_divergence_is_not_repaired \
     put_stores_content_hash_and_repair_restores_from_it \
     single_file_corruption_never_serves_older_than_newest_intact \
+    corrupt_older_version_meta_does_not_replace_current \
+    corrupt_sse_sidecar_is_restored_from_the_archive_not_synthesized \
+    unversioned_sse_sidecar_is_not_synthesized \
+    hashed_multipart_etag_is_not_reported_unverifiable \
     -- --test-threads=8

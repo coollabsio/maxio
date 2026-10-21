@@ -50,6 +50,16 @@ Console login limits count failed attempts: 10 per 5 minutes for one access key,
 
 A backup is a copy of the data directory while MaxIO is stopped, or a filesystem snapshot that is consistent. Copying the live directory during writes can capture a torn object.
 
+## Repair flags
+
+Stop MaxIO before `maxio check --repair`. The scan fixes only what the bytes already on disk can prove. These flags change that, and none of them is the default:
+
+- `--accept-current-checksums` records the payload's checksum or single-part etag instead of quarantining a mismatch.
+- `--accept-unverifiable-current` applies when a versioned object's current bytes and the archived copy of the same version differ and neither copy can be verified. It records a content hash of the current bytes and rebuilds the archive from them. The current bytes stay, including when those bytes are the corrupt copy.
+- `--restore-unverifiable-from-archive` applies to that same unverifiable divergence, when the archive of the same version id is still there. It quarantines the current bytes and restores the current object from the archive. Pass this only when the archive is the copy you want to keep. If both this flag and `--accept-unverifiable-current` are set, the archive is restored and the current bytes are quarantined.
+
+An empty, truncated, or non-text sidecar is not rebuilt into a plaintext object when a keyring or master key is configured, or when the bytes do not match a plaintext checksum still recorded in the sidecar. `check` copies that sidecar to `.maxio-quarantine/`, reports the object as unrecoverable metadata, and continues with every other object. GET returns an error instead of the raw file. A data directory with no SSE keyring can still rebuild a plain object's sidecar. A multipart `-N` etag is kept when the broken sidecar or the archive copy still contains it.
+
 ## Capacity
 
 Start small and raise the limits when the workload needs it. These are starting points for a single small server, not a sizing formula.

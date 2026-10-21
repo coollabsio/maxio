@@ -2175,12 +2175,21 @@ data, bucket, older = sys.argv[1:]
 meta = pathlib.Path(data, "buckets", bucket, ".versions", "ver.bin", f"{older}.meta.json")
 meta.write_text("{", encoding="utf-8")
 PY
-    assert "repair after older version meta is corrupt" "$ROBUST_BIN" check --data-dir "$ROBUST_DATA" --repair
+    # The server has a keyring, and `{` does not prove the bytes are plaintext,
+    # so repair must not invent a sidecar. The current object stays v2.
+    set +e
+    "$ROBUST_BIN" check --data-dir "$ROBUST_DATA" --repair >"$TMPDIR/ver-check.txt" 2>"$TMPDIR/ver-check.err"
+    VER_RC=$?
+    set -e
+    assert_eq "older version meta is not rebuilt while a keyring exists" "true" \
+        "$([ "$VER_RC" -ne 0 ] && grep -q 'not rebuilt' "$TMPDIR/ver-check.txt" && echo true || echo false)"
+    assert_eq "older version check does not abort the scan" "false" \
+        "$(grep -q 'may record an SSE-S3 key id' "$TMPDIR/ver-check.err" && echo true || echo false)"
     start_robust
     assert "latest stays v2 after repair" $ROBUST_AWS s3 cp "s3://$ROBUST_BUCKET/ver.bin" "$TMPDIR/ver-latest.txt"
     assert_eq "latest body is v2" "v2-body" "$(cat "$TMPDIR/ver-latest.txt")"
-    assert "older version still readable" $ROBUST_AWS s3api get-object --bucket "$ROBUST_BUCKET" --key ver.bin --version-id "$V1_ID" "$TMPDIR/ver-old.txt"
-    assert_eq "older version body is v1" "v1-body" "$(cat "$TMPDIR/ver-old.txt")"
+    assert_fail "older version with unreadable meta is not served" \
+        $ROBUST_AWS s3api get-object --bucket "$ROBUST_BUCKET" --key ver.bin --version-id "$V1_ID" "$TMPDIR/ver-old.txt"
     stop_robust
     mc alias rm "$MC_ROBUST" >/dev/null 2>&1 || true
     rm -rf "$ROBUST_DATA"
@@ -2190,6 +2199,150 @@ PY
     if [ "$MAXIO_TEST_ACCESS_KEY" = "maxioadmin" ] && [ "$MAXIO_TEST_SECRET_KEY" = "maxioadmin" ]; then
         SUB_CREDS+=(--allow-insecure-dev)
     fi
+
+    # Truncated SSE metadata must not be served as ciphertext. A binary sidecar
+    # must not abort the scan. Restoring an unverifiable archive is opt-in.
+    META_DATA=$(mktemp -d)
+    META_PORT=$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1]); s.close()')
+    META_EP="http://127.0.0.1:$META_PORT"
+    META_AWS="aws --endpoint-url $META_EP"
+    RUST_LOG=warn "$ROBUST_BIN" --data-dir "$META_DATA" --port "$META_PORT" \
+        --address 127.0.0.1 "${SUB_CREDS[@]}" >"$META_DATA/server.log" 2>&1 &
+    META_PID=$!
+    META_UP=0
+    for _ in $(seq 1 50); do
+        if curl -sf "$META_EP/maxio/health/live" >/dev/null 2>&1; then
+            META_UP=1
+            break
+        fi
+        sleep 0.1
+    done
+    if [ "$META_UP" != 1 ]; then
+        echo "metadata server failed to start; log:"
+        cat "$META_DATA/server.log" || true
+        FAIL=$((FAIL + 1))
+    else
+        assert "meta create plain bucket" $META_AWS s3 mb s3://plain-meta
+        echo keep-body > "$TMPDIR/keep.txt"
+        echo sse-body > "$TMPDIR/sse.txt"
+        echo noise-body > "$TMPDIR/noise.txt"
+        assert "meta put keep" $META_AWS s3 cp "$TMPDIR/keep.txt" s3://plain-meta/keep.txt
+        assert "meta put sse" $META_AWS s3api put-object --bucket plain-meta --key sse.txt \
+            --body "$TMPDIR/sse.txt" --server-side-encryption AES256
+        assert "meta put noise" $META_AWS s3 cp "$TMPDIR/noise.txt" s3://plain-meta/noise.txt
+        dd if=/dev/zero of="$TMPDIR/sse-mp-1.txt" bs=1024 count=5120 status=none
+        echo mp2 > "$TMPDIR/sse-mp-2.txt"
+        SSE_MP=$($META_AWS s3api create-multipart-upload --bucket plain-meta --key sse-mp.bin \
+            --server-side-encryption AES256 --query UploadId --output text)
+        SSE_E1=$($META_AWS s3api upload-part --bucket plain-meta --key sse-mp.bin --part-number 1 \
+            --body "$TMPDIR/sse-mp-1.txt" --upload-id "$SSE_MP" --query ETag --output text)
+        SSE_E2=$($META_AWS s3api upload-part --bucket plain-meta --key sse-mp.bin --part-number 2 \
+            --body "$TMPDIR/sse-mp-2.txt" --upload-id "$SSE_MP" --query ETag --output text)
+        cat > "$TMPDIR/sse-mp-complete.json" <<EOF
+{"Parts":[{"ETag":$SSE_E1,"PartNumber":1},{"ETag":$SSE_E2,"PartNumber":2}]}
+EOF
+        assert "meta complete sse multipart" $META_AWS s3api complete-multipart-upload \
+            --bucket plain-meta --key sse-mp.bin --upload-id "$SSE_MP" \
+            --multipart-upload "file://$TMPDIR/sse-mp-complete.json"
+        assert "meta create versioned bucket" $META_AWS s3 mb s3://div-bucket
+        assert "meta enable versioning" $META_AWS s3api put-bucket-versioning --bucket div-bucket \
+            --versioning-configuration Status=Enabled
+        dd if=/dev/zero of="$TMPDIR/div-a.txt" bs=1024 count=5120 status=none
+        echo part-b > "$TMPDIR/div-b.txt"
+        DIV_MP=$($META_AWS s3api create-multipart-upload --bucket div-bucket --key div.bin \
+            --query UploadId --output text)
+        DIV_E1=$($META_AWS s3api upload-part --bucket div-bucket --key div.bin --part-number 1 \
+            --body "$TMPDIR/div-a.txt" --upload-id "$DIV_MP" --query ETag --output text)
+        DIV_E2=$($META_AWS s3api upload-part --bucket div-bucket --key div.bin --part-number 2 \
+            --body "$TMPDIR/div-b.txt" --upload-id "$DIV_MP" --query ETag --output text)
+        cat > "$TMPDIR/div-complete.json" <<EOF
+{"Parts":[{"ETag":$DIV_E1,"PartNumber":1},{"ETag":$DIV_E2,"PartNumber":2}]}
+EOF
+        assert "meta complete divergence multipart" $META_AWS s3api complete-multipart-upload \
+            --bucket div-bucket --key div.bin --upload-id "$DIV_MP" \
+            --multipart-upload "file://$TMPDIR/div-complete.json"
+        assert "meta get div before damage" $META_AWS s3 cp s3://div-bucket/div.bin "$TMPDIR/div-good.bin"
+    fi
+    kill -TERM "$META_PID" 2>/dev/null || true
+    wait "$META_PID" 2>/dev/null || true
+    python3 - "$META_DATA" "$TMPDIR/div-good.bin" "$TMPDIR/div-corrupt.bin" <<'PY'
+import json, pathlib, sys
+data, good_path, corrupt_path = sys.argv[1:]
+root = pathlib.Path(data)
+plain = root / "buckets" / "plain-meta"
+for name in ("sse.txt.meta.json", "sse-mp.bin.meta.json"):
+    path = plain / name
+    raw = path.read_bytes()
+    path.write_bytes(raw[:20])
+plain.joinpath("noise.txt.meta.json").write_bytes(bytes([0xFF, 0xFE, 0x00, 0x80]))
+plain.joinpath(".maxio-tmp-crash").write_text("temp", encoding="utf-8")
+div = root / "buckets" / "div-bucket"
+current_meta = div / "div.bin.meta.json"
+meta = json.loads(current_meta.read_text())
+vid = meta["version_id"]
+archive_meta = div / ".versions" / "div.bin" / f"{vid}.meta.json"
+archive_data = div / ".versions" / "div.bin" / f"{vid}.data"
+current_data = div / "div.bin"
+for path in (current_meta, archive_meta):
+    obj = json.loads(path.read_text())
+    obj.pop("content_sha256", None)
+    path.write_text(json.dumps(obj), encoding="utf-8")
+raw = bytearray(current_data.read_bytes())
+raw[0] ^= 0xFF
+current_data.write_bytes(raw)
+pathlib.Path(corrupt_path).write_bytes(raw)
+pathlib.Path(good_path).write_bytes(archive_data.read_bytes())
+PY
+    set +e
+    "$ROBUST_BIN" check --data-dir "$META_DATA" --repair >"$TMPDIR/meta-check.txt" 2>"$TMPDIR/meta-check.err"
+    META_RC=$?
+    set -e
+    assert_eq "binary sidecar does not abort check" "false" \
+        "$(grep -q 'may record an SSE-S3 key id' "$TMPDIR/meta-check.err" && echo true || echo false)"
+    assert_eq "check still repairs another object" "true" \
+        "$(grep -q 'stale-temp' "$TMPDIR/meta-check.txt" && echo true || echo false)"
+    assert_eq "truncated sse is corrupt-metadata" "true" \
+        "$(grep -q 'sse.txt.meta.json' "$TMPDIR/meta-check.txt" && grep -q 'not rebuilt' "$TMPDIR/meta-check.txt" && echo true || echo false)"
+    assert_eq "check exits non-zero while metadata is unrecoverable" "true" \
+        "$([ "$META_RC" -ne 0 ] && echo true || echo false)"
+    assert_eq "sse sidecar stays truncated" "20" \
+        "$(wc -c < "$META_DATA/buckets/plain-meta/sse.txt.meta.json" | tr -d ' ')"
+    assert_eq "sse multipart sidecar stays truncated" "20" \
+        "$(wc -c < "$META_DATA/buckets/plain-meta/sse-mp.bin.meta.json" | tr -d ' ')"
+    assert_eq "divergence is not repaired by default" "true" \
+        "$(cmp -s "$META_DATA/buckets/div-bucket/div.bin" "$TMPDIR/div-corrupt.bin" && echo true || echo false)"
+    set +e
+    "$ROBUST_BIN" check --data-dir "$META_DATA" --repair --restore-unverifiable-from-archive \
+        >"$TMPDIR/meta-restore.txt" 2>"$TMPDIR/meta-restore.err"
+    set -e
+    assert_eq "restore flag puts the archive back" "true" \
+        "$(cmp -s "$META_DATA/buckets/div-bucket/div.bin" "$TMPDIR/div-good.bin" && echo true || echo false)"
+    RUST_LOG=warn "$ROBUST_BIN" --data-dir "$META_DATA" --port "$META_PORT" \
+        --address 127.0.0.1 "${SUB_CREDS[@]}" >"$META_DATA/server.log" 2>&1 &
+    META_PID=$!
+    for _ in $(seq 1 50); do
+        curl -sf "$META_EP/maxio/health/live" >/dev/null 2>&1 && break
+        sleep 0.1
+    done
+    assert_fail "truncated sse GET fails" $META_AWS s3 cp s3://plain-meta/sse.txt "$TMPDIR/sse-down.txt"
+    assert_fail "truncated sse multipart GET fails" $META_AWS s3 cp s3://plain-meta/sse-mp.bin "$TMPDIR/sse-mp-down.bin"
+    SSE_DISK=$(wc -c < "$META_DATA/buckets/plain-meta/sse.txt" | tr -d ' ')
+    if [ -f "$TMPDIR/sse-down.txt" ]; then SSE_DOWN=$(wc -c < "$TMPDIR/sse-down.txt" | tr -d ' '); else SSE_DOWN=0; fi
+    assert_eq "truncated sse GET is not the ciphertext" "true" \
+        "$([ "$SSE_DOWN" != "$SSE_DISK" ] && echo true || echo false)"
+    MP_DISK=$(wc -c < "$META_DATA/buckets/plain-meta/sse-mp.bin" | tr -d ' ')
+    if [ -f "$TMPDIR/sse-mp-down.bin" ]; then MP_DOWN=$(wc -c < "$TMPDIR/sse-mp-down.bin" | tr -d ' '); else MP_DOWN=0; fi
+    assert_eq "truncated sse multipart GET is not the ciphertext" "true" \
+        "$([ "$MP_DOWN" != "$MP_DISK" ] && echo true || echo false)"
+    assert "keep object still downloads" $META_AWS s3 cp s3://plain-meta/keep.txt "$TMPDIR/keep-down.txt"
+    assert_eq "keep object body" "keep-body" "$(cat "$TMPDIR/keep-down.txt")"
+    assert "restored divergence downloads" $META_AWS s3 cp s3://div-bucket/div.bin "$TMPDIR/div-down.bin"
+    assert_eq "restored divergence matches the archive" "true" \
+        "$(cmp -s "$TMPDIR/div-down.bin" "$TMPDIR/div-good.bin" && echo true || echo false)"
+    kill -TERM "$META_PID" 2>/dev/null || true
+    wait "$META_PID" 2>/dev/null || true
+    rm -rf "$META_DATA"
+
     LIMIT_DATA=$(mktemp -d)
     LIMIT_PORT=$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1]); s.close()')
     RUST_LOG=warn "$ROBUST_BIN" --data-dir "$LIMIT_DATA" --port "$LIMIT_PORT" \

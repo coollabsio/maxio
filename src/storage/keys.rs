@@ -1227,13 +1227,23 @@ fn scan_dir_sync(dir: &Path, scan: &mut SseScan) -> anyhow::Result<()> {
 }
 
 fn inspect_meta_file(path: &Path, scan: &mut SseScan) -> anyhow::Result<()> {
-    let text = std::fs::read_to_string(path).map_err(|e| {
+    let bytes = std::fs::read(path).map_err(|e| {
         anyhow::anyhow!(
             "Failed to read object metadata {}: {e}. Refusing to continue, because this file may record an SSE-S3 key id.",
             path.display()
         )
     })?;
-    let value: serde_json::Value = match serde_json::from_str(&text) {
+    let text = match std::str::from_utf8(&bytes) {
+        Ok(text) => text,
+        Err(_) => {
+            // Not JSON. A key id cannot be parsed from these bytes. Record the
+            // path so a missing keyring is not replaced, and let `check` report
+            // this one object instead of aborting the scan.
+            scan.unresolved.push(path.display().to_string());
+            return Ok(());
+        }
+    };
+    let value: serde_json::Value = match serde_json::from_str(text) {
         Ok(v) => v,
         Err(_) => {
             if text.contains("sse_s3") {

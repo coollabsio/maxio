@@ -111,6 +111,14 @@ enum Commands {
         /// from them. Without this flag those copies are left unchanged.
         #[arg(long)]
         accept_unverifiable_current: bool,
+
+        /// With `--repair`, when two copies differ and neither can be verified,
+        /// quarantine the current object and restore it from the archived copy
+        /// of the same version id. Off unless this flag is set. When both this
+        /// flag and `--accept-unverifiable-current` are set, the archive is
+        /// restored and the current bytes are quarantined.
+        #[arg(long)]
+        restore_unverifiable_from_archive: bool,
     },
 
     /// Write the web console OpenAPI document (used to generate the UI API client)
@@ -190,6 +198,7 @@ async fn main() -> anyhow::Result<()> {
             ref master_key_file,
             accept_current_checksums,
             accept_unverifiable_current,
+            restore_unverifiable_from_archive,
         }) => {
             // Read-only check must not stamp a marker. --repair writes it
             // only after the data-directory lock is held (see check_with).
@@ -205,6 +214,7 @@ async fn main() -> anyhow::Result<()> {
                 repair,
                 accept_current_checksums,
                 accept_unverifiable_current,
+                restore_unverifiable_from_archive,
                 resolved.as_deref(),
             )
             .await;
@@ -474,6 +484,7 @@ async fn run_check(
     repair: bool,
     accept_current_checksums: bool,
     accept_unverifiable_current: bool,
+    restore_unverifiable_from_archive: bool,
     master_key_b64: Option<&str>,
 ) -> anyhow::Result<()> {
     let report = storage::check::check_with_opts(
@@ -482,6 +493,7 @@ async fn run_check(
         master_key_b64,
         accept_current_checksums,
         accept_unverifiable_current,
+        restore_unverifiable_from_archive,
     )
     .await?;
     report.print();

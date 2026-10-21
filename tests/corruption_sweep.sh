@@ -14,5 +14,13 @@ cargo test --lib -- \
     corrupt_older_version_meta_does_not_replace_current \
     corrupt_sse_sidecar_is_restored_from_the_archive_not_synthesized \
     unversioned_sse_sidecar_is_not_synthesized \
+    truncated_unversioned_sse_sidecar_is_not_served \
+    truncated_versioned_sse_current_is_restored_when_archive_meta_is_intact \
+    versioned_sse_without_archive_meta_is_not_synthesized \
+    plain_empty_sidecar_is_rebuilt_without_a_keyring \
+    plain_truncated_sidecar_is_not_rebuilt_when_a_keyring_exists \
+    binary_sidecar_does_not_abort_the_check \
+    rebuilt_plain_sidecar_keeps_multipart_etag \
+    restore_unverifiable_from_archive_replaces_corrupt_current \
     hashed_multipart_etag_is_not_reported_unverifiable \
     -- --test-threads=8

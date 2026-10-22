@@ -97,7 +97,7 @@ impl Service<Request<Body>> for AppService {
 
 fn insert_security_headers(headers: &mut axum::http::HeaderMap) {
     headers.entry(header::CONTENT_SECURITY_POLICY).or_insert_with(|| {
-        HeaderValue::from_static("default-src 'self'; base-uri 'self'; object-src 'none'; frame-ancestors 'none'; img-src 'self' https: data:; style-src 'self' 'unsafe-inline'; font-src 'self' data:; script-src 'self' 'unsafe-inline'; connect-src 'self'; form-action 'self'")
+        HeaderValue::from_static("default-src 'self'; base-uri 'self'; object-src 'none'; frame-ancestors 'none'; img-src 'self' https: data: blob:; style-src 'self' 'unsafe-inline'; font-src 'self' data:; script-src 'self' 'unsafe-inline'; connect-src 'self'; frame-src 'self' blob:; form-action 'self'")
     });
     headers
         .entry(header::X_CONTENT_TYPE_OPTIONS)

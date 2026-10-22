@@ -2,12 +2,15 @@ import type * as React from 'react'
 import { Dialog as DialogPrimitive } from '@base-ui/react/dialog'
 import { X } from 'lucide-react'
 import { Button } from '@/components/ui/button'
+import { cn } from '@/lib/utils'
 
 type DialogProps = {
   open: boolean
   title: string
   description?: string
   loading?: boolean
+  /** `lg` widens the frame (file previews); the body scrolls when taller than the viewport. */
+  size?: 'default' | 'lg'
   onClose: () => void
   /** Element focused when the dialog opens (defaults to the first focusable element). */
   initialFocus?: React.RefObject<HTMLElement | null>
@@ -26,6 +29,7 @@ function DialogShell({
   title,
   description,
   loading = false,
+  size = 'default',
   onClose,
   initialFocus,
   closeLabel = 'Close dialog',
@@ -49,13 +53,16 @@ function DialogShell({
         <DialogPrimitive.Popup
           data-slot="dialog-content"
           initialFocus={initialFocus}
-          className="fixed left-1/2 top-1/2 z-[101] w-[calc(100vw-2rem)] max-w-lg -translate-x-1/2 -translate-y-1/2 rounded-xl border border-neutral-200 bg-white p-5 text-black shadow-modal outline-none transition-[opacity,scale] duration-150 data-ending-style:scale-95 data-ending-style:opacity-0 data-starting-style:scale-95 data-starting-style:opacity-0 dark:border-white/[0.08] dark:bg-panel dark:text-fg"
+          className={cn(
+            'fixed left-1/2 top-1/2 z-[101] max-h-[calc(100vh-2rem)] w-[calc(100vw-2rem)] -translate-x-1/2 -translate-y-1/2 overflow-y-auto rounded-xl border border-neutral-200 bg-white p-5 text-black shadow-modal outline-none transition-[opacity,scale] duration-150 data-ending-style:scale-95 data-ending-style:opacity-0 data-starting-style:scale-95 data-starting-style:opacity-0 dark:border-white/[0.08] dark:bg-panel dark:text-fg',
+            size === 'lg' ? 'max-w-4xl' : 'max-w-lg',
+          )}
         >
           <div className="flex items-start justify-between gap-4 pb-1">
             <div className="flex min-w-0 flex-col gap-1">
-              <DialogPrimitive.Title className="text-base font-semibold text-black dark:text-white">{title}</DialogPrimitive.Title>
+              <DialogPrimitive.Title className="truncate text-base font-semibold text-black dark:text-white">{title}</DialogPrimitive.Title>
               {description ? (
-                <DialogPrimitive.Description className="text-[13px] text-neutral-500 dark:text-fg-faint">
+                <DialogPrimitive.Description className="truncate text-[13px] text-neutral-500 dark:text-fg-faint">
                   {description}
                 </DialogPrimitive.Description>
               ) : null}

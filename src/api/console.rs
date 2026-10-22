@@ -1264,6 +1264,7 @@ pub struct ObjectSummary {
     size: u64,
     last_modified: String,
     etag: String,
+    /// Stored `Content-Type` of the object (what download/preview will serve).
     content_type: String,
 }
 

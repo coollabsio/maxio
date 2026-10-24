@@ -70,10 +70,10 @@ Images are on [GHCR](https://ghcr.io/coollabsio/maxio) and Docker Hub (`coollabs
 
 ### Build from source
 
-Install [Rust](https://rustup.rs) **1.89** or newer (`rust-version` in `Cargo.toml`). This repository, CI, and the container image pin **1.97.1** in `rust-toolchain.toml`. You also need [bun](https://bun.sh) **1.4.2**. `cargo build` runs bun to compile the web console and embed it in the binary.
+Install [Rust](https://rustup.rs) **1.89** or newer (`rust-version` in `Cargo.toml`). This repository, CI, and the container image pin **1.97.1** in `rust-toolchain.toml`. You also need [bun](https://bun.sh) **1.4.4**. `cargo build` runs bun to compile the web console and embed it in the binary.
 
 ```bash
-curl -fsSL https://bun.sh/install | bash -s "bun-v1.4.2"
+curl -fsSL https://bun.sh/install | bash -s "bun-v1.4.4"
 export PATH="$HOME/.bun/bin:$PATH"
 
 export MAXIO_ACCESS_KEY="local-admin"

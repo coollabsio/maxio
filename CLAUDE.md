@@ -15,7 +15,7 @@ Always spell the product name **MaxIO** (capital M, capital I, capital O). Never
 `Cargo.toml` `rust-version` is the MSRV (1.89). `rust-toolchain.toml` pins 1.97.1 for local builds, CI, the release workflow, and the Docker builder.
 
 ```bash
-# bun 1.4.2 is required; build.rs runs `bun run build` and embeds ui/dist
+# bun 1.4.4 is required; build.rs runs `bun run build` and embeds ui/dist
 export MAXIO_ACCESS_KEY="local-admin"
 export MAXIO_SECRET_KEY="$(openssl rand -hex 24)"
 cargo build --release
@@ -51,7 +51,7 @@ Defaults: port 9000, region `us-east-1`. The built-in access/secret `maxioadmin`
 
 **Test-Driven Development (TDD)**: Before implementing any new function or feature, write a failing test first. Then implement until the test passes.
 
-Tasks run through [`just`](https://github.com/casey/just) (see `justfile`). Toolchains are pinned: Rust in `rust-toolchain.toml`, bun 1.4.2 in CI.
+Tasks run through [`just`](https://github.com/casey/just) (see `justfile`). Toolchains are pinned: Rust in `rust-toolchain.toml`, bun 1.4.4 in CI.
 
 **After every code change**, re-run the full test suite to catch regressions:
 

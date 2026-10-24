@@ -1,5 +1,5 @@
 # syntax=docker/dockerfile:1.7
-FROM oven/bun:1.4.2 AS web
+FROM oven/bun:1.4.4 AS web
 WORKDIR /app/ui
 COPY ui/package.json ui/bun.lock ./
 RUN bun install --frozen-lockfile

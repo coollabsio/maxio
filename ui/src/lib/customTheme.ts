@@ -14,7 +14,7 @@ export const THEME_PRESETS: { name: string; colors: CustomThemeColors | null; sw
   {
     name: 'Coolify',
     colors: null,
-    swatch: { sidebar: '#2c1114', selected: '#1c1c1c', accent: '#6b16ed', background: '#0a0a0a' },
+    swatch: { sidebar: '#2c1114', selected: '#1c1c1c', accent: '#e8333a', background: '#0a0a0a' },
   },
   {
     name: 'Midnight',
@@ -73,7 +73,7 @@ export const THEME_PRESETS: { name: string; colors: CustomThemeColors | null; sw
   },
 ]
 
-const BRAND = '#6b16ed'
+const BRAND = '#e8333a'
 
 export function normalizeHex(color: string | null | undefined, fallback = BRAND): string {
   const hex = String(color ?? '')

@@ -44,7 +44,7 @@ function OptionCard({
       <div className="p-3">
         <div className="flex items-center justify-between gap-2">
           <span className="text-sm font-semibold text-black dark:text-fg">{label}</span>
-          {selected ? <Check className="size-4 text-coollabs dark:text-brand-light" aria-hidden="true" /> : null}
+          {selected ? <Check className="size-4 text-brand dark:text-brand-light" aria-hidden="true" /> : null}
         </div>
         <p className="mt-1 text-xs leading-5 text-neutral-500 dark:text-fg-dim">{description}</p>
       </div>

@@ -13,18 +13,18 @@
 /* ==============================================
    COOLIFY MAIN DESIGN TOKENS
    Light mode = :root, Dark mode = .dark on <html>.
-   Brand purple (#6b16ed) stays the accent for buttons, links, and focus.
-   The dark sidebar is #1a0e10 with a 9% #e8333a wash (same mix as Coolify's
-   purple shell, in red).
+   Primary actions use the navbar red (#e8333a and its hover, depth, and light
+   siblings). The dark sidebar is #1a0e10 with a 9% wash of that same red.
+   Destructive actions stay on the separate error color.
    ============================================== */
 
 :root {
-  --color-brand: #6b16ed;
-  --color-brand-hover: #7317ff;
-  --color-brand-press: #5a12c7;
-  --color-brand-depth: #4a0fa3;
-  --color-brand-light: #a391ff;
-  --color-brand-ring: #8a4dff;
+  --color-brand: #e8333a;
+  --color-brand-hover: #f04b52;
+  --color-brand-press: #c4272e;
+  --color-brand-depth: #8e1c22;
+  --color-brand-light: #ffb0aa;
+  --color-brand-ring: #ff8d86;
   --color-brand-foreground: #ffffff;
   --color-sidebar: transparent;
 
@@ -54,7 +54,7 @@
   --cool-border: oklch(92.2% 0 0);
   --cool-border-input: oklch(92.2% 0 0);
   --cool-line: oklch(14.5% 0 0 / 0.1);
-  --cool-ring: #6b16ed;
+  --cool-ring: var(--color-brand-ring);
 
   --cool-success: oklch(48% 0.135 149.58);
   --cool-error: oklch(52% 0.2 27.33);
@@ -153,13 +153,13 @@
   --color-success: var(--cool-success);
   --color-error: var(--cool-error);
 
-  /* Brand — coollabs purple. Custom themes override these on <html> for the shell CSS. */
-  --color-brand: #6b16ed;
-  --color-brand-hover: #7317ff;
-  --color-brand-press: #5a12c7;
-  --color-brand-depth: #4a0fa3;
-  --color-brand-light: #a391ff;
-  --color-brand-ring: #8a4dff;
+  /* Navbar red. Custom themes override these on <html>. */
+  --color-brand: #e8333a;
+  --color-brand-hover: #f04b52;
+  --color-brand-press: #c4272e;
+  --color-brand-depth: #8e1c22;
+  --color-brand-light: #ffb0aa;
+  --color-brand-ring: #ff8d86;
   --color-brand-foreground: #ffffff;
   --color-sidebar: #1a0e10;
 
@@ -422,7 +422,7 @@ body {
 
 .button-3d.button-highlighted:not(:disabled),
 .dark .button-3d.button-highlighted:not(:disabled) {
-  --button-depth-color: var(--color-coollabs-300);
+  --button-depth-color: var(--color-brand-depth);
 }
 
 .button-3d.button-error:not(:disabled) {
@@ -780,6 +780,7 @@ html.dark.is-scrolled:not([data-nav-style="floating"]) .app-topbar > div:not(.ap
   opacity: 1;
 }
 
+.button-3d.button-highlighted:not(:disabled),
 .dark .button-3d.button-highlighted:not(:disabled) {
   background: var(--color-brand);
   border-color: transparent;
@@ -787,8 +788,22 @@ html.dark.is-scrolled:not([data-nav-style="floating"]) .app-topbar > div:not(.ap
   --button-depth-color: var(--color-brand-depth);
 }
 
+.button-3d.button-highlighted:not(:disabled):hover,
 .dark .button-3d.button-highlighted:not(:disabled):hover {
   background: var(--color-brand-hover);
+}
+
+/* Delete stays a hollow danger control so it does not match a solid primary. */
+.button-3d.button-error:not(:disabled) {
+  background-color: var(--color-red-50, #fef2f2);
+  color: var(--color-red-800, #991b1b);
+}
+
+.dark .button-3d.button-error:not(:disabled) {
+  background-color: rgb(127 29 29 / 0.28);
+  border-color: rgb(153 27 27 / 0.85);
+  color: #f0a8a0;
+  --button-depth-color: rgb(127 29 29 / 0.9);
 }
 
 html[data-nav-items="flat"] .button-3d {

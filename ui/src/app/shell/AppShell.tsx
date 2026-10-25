@@ -12,13 +12,13 @@ import { Sidebar } from './Sidebar'
 import { readSidebarCollapsed, storeSidebarCollapsed } from './sidebarState'
 
 /**
- * Coolify v4.5 layout: a fixed top bar (brand + breadcrumb), a fixed sidebar below it, and the page in a centered
- * column. With the floating navigation style (index.css) the bars become framed panels over a dotted backdrop.
+ * Coolify shell: a fixed top bar (brand + breadcrumb), a fixed sidebar below it, and the page on the black canvas.
+ * The top bar's bottom border appears only after the page scrolls. Floating navigation frames the bars.
  */
 export function AppShell() {
   const navigate = useNavigate()
   const queryClient = useQueryClient()
-  const { isDark } = useTheme()
+  const { isDark, pageWidth } = useTheme()
   const isDesktop = useMediaQuery(DESKTOP_QUERY)
   const [collapsedSetting, setCollapsed] = useState(readSidebarCollapsed)
   const [menuOpen, setMenuOpen] = useState(false)
@@ -32,6 +32,18 @@ export function AppShell() {
     : session.data?.kind === 'service'
       ? 'Service key'
       : 'IAM user'
+
+  useEffect(() => {
+    const markScrolled = () => {
+      document.documentElement.classList.toggle('is-scrolled', window.scrollY > 2)
+    }
+    markScrolled()
+    window.addEventListener('scroll', markScrolled, { passive: true })
+    return () => {
+      window.removeEventListener('scroll', markScrolled)
+      document.documentElement.classList.remove('is-scrolled')
+    }
+  }, [])
 
   useEffect(() => {
     if (!menuOpen) return
@@ -60,7 +72,7 @@ export function AppShell() {
     <>
       <div
         className="app-shell min-h-dvh bg-app"
-        style={{ '--sidebar-w': collapsed ? '4rem' : '14rem' } as CSSProperties}
+        style={{ '--sidebar-w': collapsed ? 'var(--sidebar-collapsed-w)' : '14rem' } as CSSProperties}
       >
         {isDesktop ? (
           <TopBar collapsed={collapsed} />
@@ -92,13 +104,8 @@ export function AppShell() {
             logoutMutation.mutate()
           }}
         />
-        <main
-          className={cn(
-            'app-main min-h-dvh bg-app px-5 py-6 transition-[margin] duration-200 sm:px-8 lg:px-10 lg:pt-[calc(3rem+1.75rem)] lg:pb-10',
-            collapsed ? 'lg:ml-16' : 'lg:ml-56',
-          )}
-        >
-          <div className="mx-auto w-full max-w-[1400px]">
+        <main className="app-main min-h-dvh bg-app px-5 py-6 transition-[margin] duration-200 sm:px-8 lg:px-10 lg:pt-[calc(3rem+1.75rem)] lg:pb-10">
+          <div className={cn('w-full', pageWidth === 'centered' && 'mx-auto max-w-[1400px]')}>
             {isDesktop ? null : <Breadcrumbs className="-mx-1.5 mb-4" />}
             <Outlet />
           </div>

@@ -5,7 +5,7 @@ function Highlighted({ className, ...props }: React.ComponentProps<'span'>) {
   return (
     <span
       data-slot="highlighted"
-      className={cn('inline-block font-bold text-coollabs dark:text-warning', className)}
+      className={cn('inline-block font-bold text-coollabs dark:text-brand-light', className)}
       {...props}
     />
   )

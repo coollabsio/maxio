@@ -119,7 +119,7 @@ export function VersionHistory({ bucket, objectKey, onClose, onVersionsChanged }
                       {version.versionId ? truncateId(version.versionId) : 'null'}
                     </span>
                     {index === 0 ? (
-                      <span className="ml-1 rounded-md bg-coollabs/10 px-1.5 py-0.5 text-[10px] font-medium text-coollabs dark:bg-warning/15 dark:text-warning">
+                      <span className="ml-1 rounded-md bg-coollabs/10 px-1.5 py-0.5 text-[10px] font-medium text-coollabs dark:bg-brand/15 dark:text-brand-light">
                         latest
                       </span>
                     ) : null}

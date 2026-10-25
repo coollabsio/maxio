@@ -11,14 +11,25 @@
 @custom-variant dark (&:where(.dark, .dark *));
 
 /* ==============================================
-   COOLIFY v4.5 DESIGN TOKENS ("graphite")
-   Light mode = :root, Dark mode = .dark on <html>
+   COOLIFY MAIN DESIGN TOKENS
+   Light mode = :root, Dark mode = .dark on <html>.
+   Brand purple is the accent in both themes (Coolify main).
+   The dark sidebar is #120e1a with a 9% #6b16ed wash.
    ============================================== */
 
 :root {
-  --cool-accent: #6b16ed;
-  --cool-accent-hover: #5a12c7;
-  --cool-accent-fg: #ffffff;
+  --color-brand: #6b16ed;
+  --color-brand-hover: #7317ff;
+  --color-brand-press: #5a12c7;
+  --color-brand-depth: #4a0fa3;
+  --color-brand-light: #a391ff;
+  --color-brand-ring: #8a4dff;
+  --color-brand-foreground: #ffffff;
+  --color-sidebar: transparent;
+
+  --cool-accent: var(--color-brand);
+  --cool-accent-hover: var(--color-brand-press);
+  --cool-accent-fg: var(--color-brand-foreground);
 
   /* Page canvas is off-white so white cards lift off it. */
   --cool-bg: oklch(98.5% 0 0);
@@ -53,11 +64,14 @@
 }
 
 .dark {
-  --cool-accent: oklch(88.13% 0.1507 91.7);
-  --cool-accent-hover: oklch(86.06% 0.1731 91.94);
-  --cool-accent-fg: #101010;
+  /* Purple stays the accent in dark mode. Warning yellow is only for warnings. */
+  --cool-accent: var(--color-brand);
+  --cool-accent-hover: var(--color-brand-hover);
+  --cool-accent-fg: var(--color-brand-foreground);
 
-  /* Content canvas → panel (top bar, sidebar) → surface (cards) → raised. */
+  /* Content canvas (sRGB ~10) → panel → card well #121212. Sidebar is separate. */
+  --color-sidebar: #120e1a;
+  --color-card: #121212;
   --cool-bg: oklch(14.48% 0 0);
   --cool-panel: oklch(19.13% 0 0);
   --cool-bg-card: oklch(20.02% 0 0);
@@ -77,7 +91,7 @@
   --cool-border: oklch(100% 0 0 / 0.08);
   --cool-border-input: oklch(100% 0 0 / 0.08);
   --cool-line: oklch(32% 0 0);
-  --cool-ring: oklch(88.13% 0.1507 91.7);
+  --cool-ring: var(--color-brand-light);
 
   --cool-success: oklch(72.27% 0.192 149.58);
   --cool-error: oklch(66% 0.2 27.33);
@@ -138,11 +152,15 @@
   --color-success: var(--cool-success);
   --color-error: var(--cool-error);
 
-  /* Brand — always coollabs purple, does not swap with dark mode */
+  /* Brand — coollabs purple. Custom themes override these on <html> for the shell CSS. */
   --color-brand: #6b16ed;
-  --color-brand-highlight: #7317ff;
-  --color-brand-hover: #5a12c7;
+  --color-brand-hover: #7317ff;
+  --color-brand-press: #5a12c7;
+  --color-brand-depth: #4a0fa3;
+  --color-brand-light: #a391ff;
+  --color-brand-ring: #8a4dff;
   --color-brand-foreground: #ffffff;
+  --color-sidebar: #120e1a;
 
   --color-border: var(--cool-border);
   --color-input: var(--cool-bg-input);
@@ -284,60 +302,101 @@ body {
 }
 
 /* ==============================================
-   SETTINGS SECTION — layered card: a muted header strip
-   on the card shell, then a nested body panel.
+   LAYER CARD — Coolify's outer box + inset well.
+   12px outer radius, 6px padding, 8px well.
+   Dark outer is #121212 mixed 66% toward black;
+   the well is #121212.
    ============================================== */
 
 :root {
-  --section-shell: oklch(98% 0 0);
-  --section-body: oklch(100% 0 0);
-  --section-hairline: oklch(85.5% 0 0);
+  --coollabs-canvas: oklch(97% 0 0);
+  --coollabs-elevated: oklch(98% 0 0);
+  --coollabs-recessed: oklch(96% 0 0);
+  --coollabs-base: #ffffff;
+  --coollabs-fill: oklch(92.2% 0 0);
+  --coollabs-line: oklch(14.5% 0 0 / 0.1);
+  --coollabs-hairline: oklch(85.5% 0 0);
+  --card-bg: rgb(0 0 0 / 0.75%);
+  --card-border: rgb(0 0 0 / 9%);
+  --well-bg: #ffffff;
+  --well-border: rgb(0 0 0 / 8%);
+  --well-shadow: 0 1px 2px rgb(0 0 0 / 6%);
+  --card-fg: oklch(14.5% 0 0);
+  --card-fg-dim: oklch(40% 0 0);
+  --card-fg-faint: oklch(50% 0 0);
 }
 
 .dark {
-  --section-shell: oklch(20.02% 0 0);
-  --section-body: oklch(22.64% 0 0);
-  --section-hairline: oklch(32% 0 0);
+  --coollabs-canvas: var(--cool-bg);
+  --coollabs-elevated: oklch(20.02% 0 0);
+  --coollabs-recessed: oklch(25.2% 0 0);
+  --coollabs-base: oklch(22.64% 0 0);
+  --coollabs-fill: oklch(29.31% 0 0);
+  --coollabs-line: oklch(36% 0 0);
+  --coollabs-hairline: oklch(36% 0 0);
+  --card-bg: rgb(255 255 255 / 6%);
+  --card-border: rgb(255 255 255 / 8%);
+  --well-bg: var(--color-card);
+  --well-border: rgb(255 255 255 / 7%);
+  --well-shadow: none;
+  --card-fg: var(--cool-fg);
+  --card-fg-dim: var(--cool-fg-dim);
+  --card-fg-faint: var(--cool-fg-muted);
 }
 
 .settings-section {
   display: flex;
+  width: 100%;
   flex-direction: column;
-  border-radius: 8px;
-  background: var(--section-shell);
-  box-shadow: 0 0 0 1px var(--section-hairline), 0 1px 2px 0 rgb(0 0 0 / 0.05);
+  margin: 0;
+  border: 1px solid var(--card-border);
+  border-radius: 0.75rem;
+  padding: 0.375rem;
+  background: var(--card-bg);
+  box-shadow: 0 1px 2px rgb(0 0 0 / 5%);
+}
+
+.dark .settings-section {
+  background: color-mix(in srgb, var(--color-card) 66%, black);
+  box-shadow: none;
 }
 
 .settings-section-header {
   display: flex;
-  min-height: 3rem;
-  flex-direction: column;
-  justify-content: center;
-  padding: 0.5rem 1rem;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+  padding: 0.25rem 0.5rem 0.625rem;
+  font-weight: 500;
+  color: var(--card-fg-faint);
 }
 
 .settings-section-header h2 {
-  font-size: 0.875rem;
-  font-weight: 500;
+  font-size: 13px;
+  font-weight: 600;
   line-height: 1.25rem;
-  color: oklch(40% 0 0);
-}
-
-.dark .settings-section-header h2 {
-  color: var(--cool-fg-dim);
+  letter-spacing: 0;
+  color: var(--card-fg-dim);
 }
 
 .settings-section-header p {
   margin-top: 0.125rem;
-  font-size: 0.75rem;
+  font-size: 11px;
   line-height: 1rem;
-  color: var(--cool-fg-muted);
+  color: var(--card-fg-faint);
 }
 
 .settings-section-body {
-  border-radius: 8px;
-  background: var(--section-body);
-  box-shadow: 0 0 0 1px var(--section-hairline);
+  position: relative;
+  border: 1px solid var(--well-border);
+  border-radius: 0.5rem;
+  background: var(--well-bg);
+  box-shadow: var(--well-shadow);
+}
+
+.dark .settings-section-body thead {
+  background: color-mix(in srgb, var(--color-card) 66%, black);
 }
 
 /* ==============================================
@@ -422,7 +481,7 @@ body {
    reacts; the row has no background. data-nav-items="flat" on <html> turns these
    rules off and brings back the plain rows. */
 html:where(:not([data-nav-items="flat"])) .menu-item:not(.sidebar-toggle) {
-  height: 2.5rem;
+  height: 2.25rem;
   padding-left: 0.25rem;
 }
 
@@ -437,7 +496,7 @@ html:where(:not([data-nav-items="flat"])) .menu-item:not(.sidebar-toggle) .menu-
   box-sizing: content-box;
   width: 1rem;
   height: 1rem;
-  padding: 0.4375rem;
+  padding: 0.375rem;
   border: 1px solid oklch(0% 0 0 / 0.09);
   border-radius: 8px;
   background: #fafafa;
@@ -449,8 +508,9 @@ html:where(:not([data-nav-items="flat"])) .menu-item:not(.sidebar-toggle) .menu-
 
 html.dark:where(:not([data-nav-items="flat"])) .menu-item:not(.sidebar-toggle) .menu-item-icon {
   --button-depth-color: rgb(255 255 255 / 0.08);
-  border-color: oklch(100% 0 0 / 0.09);
-  background: oklch(100% 0 0 / 0.04);
+  border-color: rgb(255 255 255 / 0.07);
+  background: rgb(255 255 255 / 0.03);
+  color: oklch(72% 0 0);
 }
 
 html:where(:not([data-nav-items="flat"])) .menu-item:not(.sidebar-toggle):hover .menu-item-icon {
@@ -469,13 +529,13 @@ html:where(:not([data-nav-items="flat"])) .menu-item-active .menu-item-icon {
   background: #fff;
 }
 
-html.dark:where(:not([data-nav-items="flat"])) .menu-item:not(.sidebar-toggle):hover .menu-item-icon,
-html.dark:where(:not([data-nav-items="flat"])) .menu-item-active .menu-item-icon {
-  border-color: oklch(100% 0 0 / 0.18);
-  background: oklch(100% 0 0 / 0.08);
+html.dark:where(:not([data-nav-items="flat"])) .menu-item:not(.sidebar-toggle):not(.menu-item-active):hover .menu-item-icon {
+  border-color: rgb(255 255 255 / 0.14);
+  background: rgb(255 255 255 / 0.06);
+  color: #fff;
 }
 
-/* The current item's tile takes the accent. */
+/* The current item's tile takes the accent, like Coolify's active tab. */
 html:where(:not([data-nav-items="flat"])) .menu-item-active .menu-item-icon {
   color: var(--color-coollabs);
   border-color: color-mix(in oklab, var(--color-coollabs) 45%, transparent);
@@ -483,9 +543,11 @@ html:where(:not([data-nav-items="flat"])) .menu-item-active .menu-item-icon {
 }
 
 html.dark:where(:not([data-nav-items="flat"])) .menu-item-active .menu-item-icon {
-  color: var(--color-warning);
-  border-color: color-mix(in oklab, var(--color-warning) 40%, transparent);
-  --button-depth-color: color-mix(in oklab, var(--color-warning) 35%, transparent);
+  color: var(--color-brand-foreground);
+  border-color: var(--color-brand-ring) !important;
+  background: linear-gradient(180deg, var(--color-brand-hover) 0%, var(--color-brand-press) 100%) !important;
+  --button-depth-color: var(--color-brand-depth) !important;
+  box-shadow: 0 2px 0 var(--color-brand-depth) !important;
 }
 
 html:where(:not([data-nav-items="flat"])) .menu-item:not(.sidebar-toggle):focus-visible {
@@ -498,10 +560,10 @@ html:where(:not([data-nav-items="flat"])) .menu-item:not(.sidebar-toggle):focus-
 }
 
 @media (min-width: 1024px) {
-  /* The collapsed rail is 64px wide with 40px of content: center the 32px tile. */
+  /* The collapsed rail centers the 30px tile. */
   html:where(:not([data-nav-items="flat"])) .sidebar-collapsed .menu-item:not(.sidebar-toggle) {
-    padding-left: 0.25rem;
-    padding-right: 0.25rem;
+    padding-left: 0.3125rem;
+    padding-right: 0.3125rem;
   }
 }
 
@@ -566,7 +628,263 @@ html:where(:not([data-nav-items="flat"])) .menu-item:not(.sidebar-toggle):focus-
     left: var(--floating-gap);
   }
 
-  html[data-nav-style="floating"] .app-sidebar-footer {
+  html[data-nav-style="floating"] .app-sidebar-footer,
+  html[data-nav-style="floating"] .sidebar-footer {
     border-radius: 0 0 var(--floating-radius) var(--floating-radius);
   }
+
+  html[data-nav-style="floating"] {
+    --sidebar-collapsed-w: 3.25rem;
+  }
+}
+
+/* ==============================================
+   BRAND SHELL — Coolify main
+   Dark sidebar #120e1a with a 9% brand wash. The top bar matches the
+   canvas and grows a hairline only after the page scrolls.
+   ============================================== */
+
+html {
+  --sidebar-collapsed-w: 4rem;
+}
+
+@media (min-width: 1024px) {
+  .app-sidebar {
+    width: var(--sidebar-w);
+  }
+
+  .app-topbar-brand {
+    width: var(--sidebar-w);
+  }
+
+  .app-main {
+    margin-left: var(--sidebar-w);
+  }
+}
+
+html.dark .app-sidebar nav.sidebar-nav,
+html.dark .mobile-sidebar-sheet [role="dialog"] {
+  background-color: var(--color-sidebar);
+  border-right-color: rgb(255 255 255 / 0.06);
+}
+
+html.dark .app-topbar-brand {
+  background-color: var(--color-sidebar);
+  border-right-color: rgb(255 255 255 / 0.06);
+}
+
+html.dark .mobile-sidebar-sheet nav.sidebar-nav {
+  background-color: transparent;
+  background-image: none;
+}
+
+html.dark :is(.app-sidebar, .mobile-sidebar-sheet) .sidebar-footer {
+  background-color: transparent;
+}
+
+/* Default dark theme: purple-black sidebar, lavender tiles and edges. */
+html.dark:not([data-theme="custom"]) .app-sidebar nav.sidebar-nav,
+html.dark:not([data-theme="custom"]) .mobile-sidebar-sheet [role="dialog"] {
+  background-image: linear-gradient(180deg, rgb(107 22 237 / 0.09), transparent 520px);
+  border-right-color: rgb(163 145 255 / 0.1);
+  --cool-nav-text: oklch(80% 0.02 300);
+  --cool-nav-muted: oklch(58% 0.04 300);
+}
+
+html.dark:not([data-theme="custom"]) .app-topbar-brand {
+  background-image: linear-gradient(rgb(107 22 237 / 0.09), rgb(107 22 237 / 0.09));
+  border-right-color: rgb(163 145 255 / 0.1);
+}
+
+/* The drawer paints the brand surface; its nav must not cover that wash. */
+html.dark .mobile-sidebar-sheet nav.sidebar-nav {
+  background-color: transparent;
+  background-image: none;
+}
+
+html.dark:not([data-theme="custom"]) :is(.app-sidebar, .mobile-sidebar-sheet) nav:not(.sidebar-collapsed) .nav-section {
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  font-weight: 500;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: rgb(163 145 255 / 0.55);
+}
+
+html.dark:not([data-theme="custom"]):where(:not([data-nav-items="flat"])) :is(.app-sidebar, .mobile-sidebar-sheet) .menu-item:not(.sidebar-toggle):not(.menu-item-active) .menu-item-icon {
+  border-color: rgb(163 145 255 / 0.13);
+  background: rgb(107 22 237 / 0.07);
+  color: #b9adff;
+  --button-depth-color: rgb(255 255 255 / 0.05);
+}
+
+html.dark:not([data-theme="custom"]):where(:not([data-nav-items="flat"])) :is(.app-sidebar, .mobile-sidebar-sheet) .menu-item:not(.sidebar-toggle):not(.menu-item-active):hover .menu-item-icon {
+  border-color: rgb(163 145 255 / 0.28);
+  background: rgb(107 22 237 / 0.16);
+  color: #fff;
+}
+
+html.dark:not([data-nav-style="floating"]) .app-topbar {
+  background-color: var(--cool-bg);
+  backdrop-filter: none;
+  transition: background-color 180ms ease;
+}
+
+html.dark:not([data-nav-style="floating"]) .app-topbar > div:not(.app-topbar-brand) {
+  border-bottom-color: transparent;
+  box-shadow: none;
+  transition: border-color 180ms ease, box-shadow 180ms ease, background-color 180ms ease;
+}
+
+html.dark.is-scrolled:not([data-nav-style="floating"]) .app-topbar {
+  background-color: color-mix(in srgb, var(--cool-bg) 72%, transparent);
+  backdrop-filter: blur(12px) saturate(140%);
+}
+
+html.dark.is-scrolled:not([data-nav-style="floating"]) .app-topbar > .app-topbar-brand {
+  background-color: var(--color-sidebar);
+}
+
+html.dark.is-scrolled:not([data-nav-style="floating"]) .app-topbar > div:not(.app-topbar-brand) {
+  border-bottom-color: rgb(255 255 255 / 0.06);
+  box-shadow: 0 10px 30px -14px rgb(0 0 0 / 0.95);
+}
+
+/* Dark buttons carry the brand tint, the same way Coolify's .button does. */
+.dark .button-3d:not(.button-highlighted):not(.button-error):not(:disabled) {
+  --button-depth-color: color-mix(in srgb, var(--color-brand) 35%, transparent);
+  background-color: color-mix(in srgb, var(--color-brand) 14%, var(--cool-bg));
+  border-color: color-mix(in srgb, var(--color-brand-light) 24%, transparent);
+  color: color-mix(in srgb, var(--color-brand-light) 78%, white);
+}
+
+.dark .button-3d:not(.button-highlighted):not(.button-error):not(:disabled):hover {
+  background-color: color-mix(in srgb, var(--color-brand) 20%, var(--cool-bg));
+  border-color: color-mix(in srgb, var(--color-brand-light) 34%, transparent);
+}
+
+.dark .button-3d:not(.button-highlighted):not(.button-error):not(:disabled) svg {
+  color: var(--color-brand-light);
+  opacity: 1;
+}
+
+.dark .button-3d.button-highlighted:not(:disabled) {
+  background: var(--color-brand);
+  border-color: transparent;
+  color: var(--color-brand-foreground);
+  --button-depth-color: var(--color-brand-depth);
+}
+
+.dark .button-3d.button-highlighted:not(:disabled):hover {
+  background: var(--color-brand-hover);
+}
+
+html[data-nav-items="flat"] .button-3d {
+  --button-depth-color: transparent !important;
+}
+
+html[data-nav-items="flat"] .button-3d:not(:disabled):hover {
+  transform: none;
+}
+
+html[data-nav-items="flat"] .button-3d:not(:disabled):active {
+  transform: scale(0.97);
+}
+
+/* Navbar menus: Coolify listbox surface, with the sidebar's brand tint. */
+.listbox-panel {
+  z-index: 90;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  width: 13rem;
+  max-height: min(24rem, calc(100dvh - 5rem));
+  overflow-x: hidden;
+  overflow-y: auto;
+  padding: 0.25rem;
+  border-radius: 10px;
+  border: 1px solid var(--coollabs-line);
+  background: var(--coollabs-recessed);
+  box-shadow: var(--shadow-dropdown);
+}
+
+.listbox-option {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+  width: 100%;
+  min-height: 2rem;
+  padding: 0.375rem 0.5rem;
+  border-radius: 6px;
+  font-size: 0.875rem;
+  line-height: 1.25rem;
+  color: #000;
+  text-align: left;
+  cursor: pointer;
+}
+
+.dark .listbox-option {
+  color: var(--color-fg);
+}
+
+.listbox-option:hover {
+  background: var(--coollabs-fill);
+}
+
+html.dark:not([data-theme="custom"]) .listbox-panel.top-user-menu-panel-sidebar {
+  background: color-mix(in oklab, #6b16ed 10%, var(--coollabs-elevated));
+  border-color: rgb(163 145 255 / 0.22);
+}
+
+html.dark:not([data-theme="custom"]) .top-user-menu-panel-sidebar .listbox-option:hover {
+  background: rgb(163 145 255 / 0.1);
+}
+
+html[data-theme="custom"] {
+  --cool-bg: var(--theme-bg);
+  --cool-fg: var(--theme-text);
+  --color-fg: var(--theme-text);
+  --cool-accent: var(--theme-accent);
+  --cool-ring: var(--theme-accent);
+  --color-sidebar: var(--theme-sidebar);
+  --color-card: color-mix(in oklab, var(--theme-text) 8%, var(--theme-bg));
+  --cool-bg-card: var(--color-card);
+  --cool-panel: color-mix(in oklab, var(--theme-text) 5%, var(--theme-bg));
+  --cool-fg-dim: color-mix(in oklab, var(--theme-text) 74%, var(--theme-bg));
+  --cool-fg-muted: color-mix(in oklab, var(--theme-text) 58%, var(--theme-bg));
+  --card-fg: var(--theme-text);
+  --card-fg-dim: var(--cool-fg-dim);
+  --card-fg-faint: var(--cool-fg-muted);
+  --well-bg: var(--color-card);
+  color: var(--theme-text);
+}
+
+html[data-theme="custom"] :is(.app-sidebar nav.sidebar-nav, .app-topbar-brand, .mobile-sidebar-sheet [role="dialog"]) {
+  background-color: var(--theme-sidebar) !important;
+  background-image: none !important;
+  border-right-color: color-mix(in oklab, var(--theme-sidebar-text) 12%, transparent);
+}
+
+html[data-theme="custom"] :is(.app-sidebar, .app-topbar-brand, .mobile-sidebar-sheet [role="dialog"]) {
+  --cool-nav-text: color-mix(in oklab, var(--theme-sidebar-text) 78%, var(--theme-sidebar));
+  --cool-nav-active: var(--theme-sidebar-text);
+  --cool-nav-muted: color-mix(in oklab, var(--theme-sidebar-text) 55%, var(--theme-sidebar));
+  color: var(--theme-sidebar-text);
+}
+
+html[data-theme="custom"][data-nav-items="flat"] .menu-item-active {
+  background-color: var(--theme-selected) !important;
+  color: var(--theme-selected-text) !important;
+}
+
+html[data-theme="custom"] :is(.app-sidebar, .mobile-sidebar-sheet) .sidebar-footer .button-3d:not(.button-highlighted):not(.button-error):not(:disabled) {
+  --button-depth-color: color-mix(in oklab, var(--theme-sidebar-text) 12%, transparent);
+  background-color: color-mix(in oklab, var(--theme-sidebar-text) 6%, transparent);
+  border-color: color-mix(in oklab, var(--theme-sidebar-text) 14%, transparent);
+  color: var(--theme-sidebar-text);
+}
+
+html[data-theme="custom"] :is(.app-sidebar, .mobile-sidebar-sheet) .sidebar-footer .button-3d:not(.button-highlighted):not(.button-error):not(:disabled):hover {
+  background-color: color-mix(in oklab, var(--theme-sidebar-text) 10%, transparent);
 }

@@ -2,6 +2,7 @@ import { Navigate, Route, Routes } from 'react-router'
 import { AppShell } from '@/app/shell/AppShell'
 import { RequireAuth } from '@/features/auth/RequireAuth'
 import { LoginPage } from '@/features/auth/LoginPage'
+import { AppearancePage } from '@/features/appearance/AppearancePage'
 import { BucketListPage } from '@/features/buckets/BucketListPage'
 import { PoliciesPage } from '@/features/iam/PoliciesPage'
 import { PolicyEditorPage } from '@/features/iam/PolicyEditorPage'
@@ -23,6 +24,7 @@ export default function App() {
         }
       >
         <Route index element={<BucketListPage />} />
+        <Route path="appearance" element={<AppearancePage />} />
         <Route path="buckets/:bucket" element={<ObjectBrowserPage />} />
         <Route path="buckets/:bucket/settings" element={<BucketSettingsPage />} />
         <Route

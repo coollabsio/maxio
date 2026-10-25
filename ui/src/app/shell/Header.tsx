@@ -47,6 +47,7 @@ export function Breadcrumbs({ className }: { className?: string }) {
   const usersIndex = useMatch('/users')
   const policyMatch = useMatch('/policies/:name')
   const policiesIndex = useMatch('/policies')
+  const appearanceMatch = useMatch('/appearance')
   const bucket = settingsMatch?.params.bucket ?? objectsMatch?.params.bucket ?? null
   const prefix = normalizePrefix(searchParams.get('prefix'))
   const crumbs = bucket ? buildBreadcrumbs(bucket, prefix) : []
@@ -80,6 +81,8 @@ export function Breadcrumbs({ className }: { className?: string }) {
       ) : (
         <Current>Policies</Current>
       )
+  } else if (appearanceMatch) {
+    trail = <Current>Appearance</Current>
   } else if (!bucket) {
     trail = <Current>Buckets</Current>
   } else if (settingsMatch) {
@@ -142,11 +145,11 @@ function Brand({ collapsed = false }: { collapsed?: boolean }) {
 /** Desktop top bar: the brand (as wide as the sidebar) and the breadcrumb. Floats as a panel in the floating style. */
 export function TopBar({ collapsed }: { collapsed: boolean }) {
   return (
-    <header className="app-topbar fixed inset-x-0 top-0 z-50 flex h-12 items-center bg-white/95 backdrop-blur dark:bg-panel/95">
+    <header className="app-topbar fixed inset-x-0 top-0 z-50 flex h-12 items-center bg-white/95 backdrop-blur dark:bg-transparent">
       <div
         className={cn(
-          'flex h-full shrink-0 items-center border-r border-neutral-200 transition-[width] duration-200 dark:border-white/[0.06]',
-          collapsed ? 'w-16 justify-center' : 'w-56 px-4',
+          'app-topbar-brand flex h-full shrink-0 items-center border-r border-neutral-200 bg-neutral-50 transition-[width] duration-200 dark:border-white/[0.06]',
+          collapsed ? 'justify-center border-b' : 'px-4',
         )}
       >
         <Brand collapsed={collapsed} />

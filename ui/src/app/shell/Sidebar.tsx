@@ -56,13 +56,12 @@ export function Sidebar({
       aria-label="Main"
       inert={!isDesktop && !mobileOpen}
       className={cn(
-        'app-sidebar-panel flex min-h-0 flex-1 flex-col bg-white px-2 pt-2 dark:bg-panel lg:px-3',
+        'sidebar-nav app-sidebar-panel flex min-h-0 flex-1 flex-col bg-neutral-50 px-2 pt-2 lg:px-3',
         isDesktop && 'border-r border-neutral-200 dark:border-white/[0.06]',
         collapsed && 'sidebar-collapsed',
       )}
     >
       <ul className="flex flex-col gap-0.5 overflow-y-auto">
-        {collapsed ? null : <li className="nav-section">Storage</li>}
         <li>
           <button
             type="button"
@@ -106,7 +105,7 @@ export function Sidebar({
         ) : null}
       </ul>
 
-      <div className="app-sidebar-footer sticky bottom-0 mt-auto -mx-2 flex flex-col gap-1 bg-white px-2 py-2 dark:bg-panel lg:-mx-3 lg:px-3">
+      <div className="sidebar-footer app-sidebar-footer sticky bottom-0 mt-auto -mx-2 flex flex-col gap-1 bg-neutral-50 px-2 py-2 lg:-mx-3 lg:px-3">
         <div className={cn('flex items-center gap-1', collapsed ? 'flex-col justify-center' : 'justify-between')}>
           <UserMenu collapsed={collapsed} onLogout={onLogout} name={accountName} detail={accountDetail} />
           {isDesktop ? (
@@ -129,10 +128,7 @@ export function Sidebar({
   if (isDesktop) {
     return (
       <div
-        className={cn(
-          'app-sidebar fixed top-12 bottom-0 left-0 z-40 flex min-w-0 flex-col transition-[width] duration-200',
-          collapsed ? 'w-16' : 'w-56',
-        )}
+        className="app-sidebar fixed top-12 bottom-0 left-0 z-40 flex min-w-0 flex-col transition-[width] duration-200"
       >
         {nav}
       </div>
@@ -141,9 +137,13 @@ export function Sidebar({
 
   // Mobile: a sheet that slides in from the right, like Coolify.
   return (
+    <div className="mobile-sidebar-sheet">
     <div
+      role="dialog"
+      aria-modal="true"
+      aria-label="Navigation menu"
       className={cn(
-        'fixed inset-y-0 right-0 z-40 flex w-72 max-w-[85vw] flex-col overflow-hidden rounded-l-2xl border-l border-neutral-200 bg-white shadow-[-8px_0_30px_-6px_rgba(0,0,0,0.18)] transition-transform duration-300 ease-[cubic-bezier(0.32,0.72,0,1)] dark:border-white/[0.12] dark:bg-panel dark:shadow-[-8px_0_30px_-4px_rgba(0,0,0,0.5)]',
+        'fixed inset-y-0 right-0 z-40 flex w-72 max-w-[85vw] flex-col overflow-hidden rounded-l-2xl border-l border-neutral-200 bg-white shadow-[-8px_0_30px_-6px_rgba(0,0,0,0.18)] transition-transform duration-300 ease-[cubic-bezier(0.32,0.72,0,1)] dark:border-white/[0.12] dark:shadow-[-8px_0_30px_-4px_rgba(0,0,0,0.5)]',
         mobileOpen ? 'translate-x-0' : 'pointer-events-none translate-x-full',
       )}
     >
@@ -160,6 +160,7 @@ export function Sidebar({
         </button>
       </div>
       {nav}
+    </div>
     </div>
   )
 }

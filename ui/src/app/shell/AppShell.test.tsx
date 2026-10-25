@@ -61,3 +61,29 @@ test('on desktop the sidebar is always visible and there is no burger button', (
   expect(screen.queryByRole('button', { name: 'Open menu' })).toBeNull()
   expect(screen.queryByText(/^v\d/)).toBeNull()
 })
+
+test('the account menu opens upward with appearance and log out', async () => {
+  const user = userEvent.setup()
+  setViewport(1280, 800)
+  const screen = renderShell()
+  await user.click(screen.getByRole('button', { name: /Account menu/ }))
+  expect(screen.getByRole('link', { name: 'Appearance' })).toBeTruthy()
+  expect(screen.getByRole('button', { name: 'Log out' })).toBeTruthy()
+  expect(screen.queryByText('Navigation items')).toBeNull()
+})
+
+test('the main view border is marked only after the page scrolls', () => {
+  setViewport(1280, 800)
+  renderShell()
+  expect(document.documentElement.classList.contains('is-scrolled')).toBe(false)
+  act(() => {
+    Object.defineProperty(window, 'scrollY', { configurable: true, value: 24 })
+    window.dispatchEvent(new Event('scroll'))
+  })
+  expect(document.documentElement.classList.contains('is-scrolled')).toBe(true)
+  act(() => {
+    Object.defineProperty(window, 'scrollY', { configurable: true, value: 0 })
+    window.dispatchEvent(new Event('scroll'))
+  })
+  expect(document.documentElement.classList.contains('is-scrolled')).toBe(false)
+})

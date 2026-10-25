@@ -14,7 +14,7 @@ export const THEME_PRESETS: { name: string; colors: CustomThemeColors | null; sw
   {
     name: 'Coolify',
     colors: null,
-    swatch: { sidebar: '#1a0f2d', selected: '#1c1c1c', accent: '#6b16ed', background: '#0a0a0a' },
+    swatch: { sidebar: '#2c1114', selected: '#1c1c1c', accent: '#6b16ed', background: '#0a0a0a' },
   },
   {
     name: 'Midnight',
@@ -185,7 +185,7 @@ export function applyCustomThemeProperties(theme: CustomThemeColors) {
   const values: Record<(typeof CUSTOM_PROPERTIES)[number], string> = {
     '--theme-bg': normalizeHex(theme.background, '#0a0a0a'),
     '--theme-text': readableTextOn(theme.background),
-    '--theme-sidebar': normalizeHex(theme.sidebar, '#120e1a'),
+    '--theme-sidebar': normalizeHex(theme.sidebar, '#1a0e10'),
     '--theme-sidebar-text': readableTextOn(theme.sidebar),
     '--theme-selected': normalizeHex(theme.selected, '#1c1c1c'),
     '--theme-selected-text': readableTextOn(theme.selected),

@@ -8,7 +8,7 @@
 
 Reference: Coolify `main` (`resources/css/app.css`, `resources/views/layouts/app.blade.php`, `components/navbar.blade.php`, `components/theme-controls.blade.php`, `components/top-user-menu.blade.php`). Where a later section disagrees, this section wins.
 
-Dark mode keeps brand purple as the accent (warning yellow is only for warnings). The default dark sidebar is `#120e1a` with a 9% `#6b16ed` wash and a lavender edge (`rgb(163 145 255 / 0.10)`); the brand cell uses the same wash. The top bar matches the canvas and draws its bottom hairline only after scroll (`html.is-scrolled`). Cards are a 12px outer box (6px padding, dark fill `color-mix(#121212 66%, black)`) around an 8px `#121212` well. Appearance lives on its own page (theme, custom colors, page width, navigation style, item style). The account menu opens upward from the sidebar footer and, in the default dark theme, uses the sidebar's purple tint.
+Dark mode keeps brand purple `#6b16ed` for buttons, links, and focus (warning yellow is only for warnings). The default dark sidebar is `#1a0e10` with a 9% `#e8333a` wash and a rose edge (`rgb(255 176 170 / 0.10)`); the brand cell uses the same wash. Primary buttons stay purple. The top bar matches the canvas and draws its bottom hairline only after scroll (`html.is-scrolled`). Cards are a 12px outer box (6px padding, dark fill `color-mix(#121212 66%, black)`) around an 8px `#121212` well. Appearance lives on its own page (theme, custom colors, page width, navigation style, item style). The account menu opens upward from the sidebar footer and, in the default dark theme, uses a light red tint on its panel.
 
 | Topic | v4.5 rule | In MaxIO |
 |---|---|---|

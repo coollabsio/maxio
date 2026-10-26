@@ -17,17 +17,42 @@
     <title>MaxIO</title>
     <script>
       try {
+        const root = document.documentElement
         const saved = localStorage.getItem('theme')
+        const theme = saved === 'purple' ? 'custom' : saved || 'dark'
         const prefersDark = window.matchMedia('(prefers-color-scheme: dark)').matches
-        const shouldUseDark = saved === 'dark' || ((saved === null || saved === 'system') && prefersDark)
-        document.documentElement.classList.toggle('dark', shouldUseDark)
-        document.documentElement.dataset.navStyle = localStorage.getItem('navStyle') === 'floating' ? 'floating' : 'default'
-        document.documentElement.dataset.navItems = localStorage.getItem('navItems') === 'flat' ? 'flat' : '3d'
+        root.dataset.navStyle = localStorage.getItem('navStyle') === 'floating' ? 'floating' : 'default'
+        root.dataset.navItems = localStorage.getItem('navItems') === 'flat' ? 'flat' : '3d'
+        if (theme === 'custom') {
+          const parts = (localStorage.getItem('customTheme') || '').split(',').map((part) => part.trim())
+          const hex = parts.map((part) => (/^#?[0-9a-fA-F]{6}$/.test(part) ? (part.startsWith('#') ? part : '#' + part) : null))
+          if (hex.length === 4 && hex.every(Boolean)) {
+            const [sidebar, selected, accent, background] = hex
+            root.style.setProperty('--theme-sidebar', sidebar)
+            root.style.setProperty('--theme-selected', selected)
+            root.style.setProperty('--theme-accent', accent)
+            root.style.setProperty('--theme-bg', background)
+            root.style.setProperty('--color-brand', accent)
+            root.style.setProperty('--color-sidebar', sidebar)
+            const value = parseInt(background.slice(1), 16)
+            const r = (value >> 16) & 255
+            const g = (value >> 8) & 255
+            const b = value & 255
+            const dark = (0.2126 * r + 0.7152 * g + 0.0722 * b) / 255 < 0.5
+            root.classList.toggle('dark', dark)
+            root.dataset.theme = 'custom'
+          } else {
+            root.classList.add('dark')
+            root.dataset.theme = 'dark'
+          }
+        } else {
+          const dark = theme === 'dark' || (theme === 'system' && prefersDark)
+          root.classList.toggle('dark', dark)
+          root.dataset.theme = dark ? 'dark' : 'light'
+        }
       } catch (_) {
-        document.documentElement.classList.toggle(
-          'dark',
-          window.matchMedia('(prefers-color-scheme: dark)').matches
-        )
+        document.documentElement.classList.add('dark')
+        document.documentElement.dataset.theme = 'dark'
       }
     </script>
   </head>

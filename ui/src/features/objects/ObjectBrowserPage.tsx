@@ -292,7 +292,7 @@ function ObjectBrowser({ bucket }: { bucket: string }) {
                 <TableRow key={folder} className="cursor-pointer" onClick={() => navigateTo(folder)}>
                   <TableCell>
                     <span className="flex items-center gap-2">
-                      <Folder className="size-4 shrink-0 text-coollabs dark:text-warning" />
+                      <Folder className="size-4 shrink-0 text-brand dark:text-brand-light" />
                       <span className="font-semibold">{displayName(folder)}/</span>
                     </span>
                   </TableCell>

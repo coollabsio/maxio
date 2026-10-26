@@ -16,7 +16,7 @@ const buttonVariants = cva(
         secondary: `${depth} border-neutral-200 bg-control-strong text-black hover:bg-control-strong-hover dark:border-white/[0.08] dark:text-fg`,
         ghost:
           'text-neutral-500 hover:bg-neutral-100 hover:text-black disabled:border-transparent disabled:bg-transparent dark:text-fg-dim dark:hover:bg-white/[0.07] dark:hover:text-fg dark:disabled:border-transparent',
-        link: 'text-coollabs underline-offset-4 hover:underline dark:text-warning',
+        link: 'text-brand underline-offset-4 hover:underline dark:text-brand-light',
         brand: `${depth} button-highlighted border-coollabs-200 bg-linear-to-b from-coollabs-100 to-coollabs-200 text-white hover:to-coollabs`,
       },
       size: {

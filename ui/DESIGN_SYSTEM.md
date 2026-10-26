@@ -4,9 +4,11 @@
 >
 > **In MaxIO**: tokens, `.input-cool`, `.button-3d`, `.menu-item` and the floating navigation rules live in `ui/src/index.css` (Tailwind v4, CSS-first). The React primitives in `ui/src/components/ui/*.tsx` (shadcn `base-nova` style on `@base-ui/react`, variants via `class-variance-authority`) implement the component styles below.
 
-## 0. Coolify v4.5 (current — overrides the sections below)
+## 0. Coolify main (current — overrides the sections below)
 
-Reference: Coolify `release/v4.5` (`resources/css/app.css`, `utilities.css`, `layouts/app.blade.php`). Where a later section disagrees, this section wins.
+Reference: Coolify `main` (`resources/css/app.css`, `resources/views/layouts/app.blade.php`, `components/navbar.blade.php`, `components/theme-controls.blade.php`, `components/top-user-menu.blade.php`). Where a later section disagrees, this section wins.
+
+Primary buttons, links, and focus use the navbar red `#e8333a` (hover `#f04b52`, depth `#8e1c22`, light `#ffb0aa`). Warning yellow is only for warnings. Destructive actions stay on the separate error color, drawn as text or a hollow fill so they do not match a solid primary. The default dark sidebar is `#1a0e10` with a 9% `#e8333a` wash and a rose edge (`rgb(255 176 170 / 0.10)`); the brand cell uses the same wash. The top bar matches the canvas and draws its bottom hairline only after scroll (`html.is-scrolled`). Cards are a 12px outer box (6px padding, dark fill `color-mix(#121212 66%, black)`) around an 8px `#121212` well. Appearance lives on its own page (theme, custom colors, page width, navigation style, item style). The account menu opens upward from the sidebar footer and, in the default dark theme, uses a light red tint on its panel.
 
 | Topic | v4.5 rule | In MaxIO |
 |---|---|---|

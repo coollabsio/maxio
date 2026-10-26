@@ -2,6 +2,7 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import {
   Check,
   Download,
+  Eye,
   File as FileIcon,
   Folder,
   FolderPlus,
@@ -27,9 +28,11 @@ import { getVersioning } from '@/features/settings/api'
 import { VersionHistory } from '@/features/versions/VersionHistory'
 import { formatDate, formatSize } from '@/lib/format'
 import { bucketPath, bucketSettingsPath, displayName, normalizePrefix } from '@/lib/paths'
+import { isPreviewable } from '@/lib/preview'
 import { toast } from '@/lib/toast'
 import { createFolder, deleteObject, getCapabilities, listObjects, presignObject, uploadObject } from './api'
 import { downloadObjectFile } from './download'
+import { FilePreview } from './FilePreview'
 import { ObjectDetailsSheet } from './ObjectDetailsSheet'
 
 const expiryOptions = [
@@ -59,6 +62,7 @@ function ObjectBrowser({ bucket }: { bucket: string }) {
   const [newFolderName, setNewFolderName] = useState('')
   const [versionKey, setVersionKey] = useState<string | null>(null)
   const [detailsKey, setDetailsKey] = useState<string | null>(null)
+  const [previewFile, setPreviewFile] = useState<{ key: string; contentType: string; size: number } | null>(null)
   const [pendingDelete, setPendingDelete] = useState<{ key: string; kind: 'object' | 'folder' } | null>(null)
 
   const objectsQuery = useQuery({
@@ -359,6 +363,20 @@ function ObjectBrowser({ bucket }: { bucket: string }) {
                             <History className="size-4" />
                           </button>
                         ) : null}
+                        {isPreviewable(file.contentType) ? (
+                          <button
+                            type="button"
+                            className="icon-button"
+                            onClick={(event) => {
+                              event.stopPropagation()
+                              setPreviewFile({ key: file.key, contentType: file.contentType, size: file.size })
+                            }}
+                            title="Preview"
+                            aria-label="Preview"
+                          >
+                            <Eye className="size-4" />
+                          </button>
+                        ) : null}
                         <button
                           type="button"
                           className="icon-button"
@@ -489,6 +507,16 @@ function ObjectBrowser({ bucket }: { bucket: string }) {
       ) : null}
 
       <ObjectDetailsSheet bucket={bucket} objectKey={detailsKey} onClose={() => setDetailsKey(null)} />
+
+      {previewFile ? (
+        <FilePreview
+          bucket={bucket}
+          objectKey={previewFile.key}
+          contentType={previewFile.contentType}
+          size={previewFile.size}
+          onClose={() => setPreviewFile(null)}
+        />
+      ) : null}
 
       {pendingDelete ? (
         <ConfirmDialog

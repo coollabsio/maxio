@@ -1,6 +1,6 @@
 import { afterEach, expect, test } from 'bun:test'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
-import { render } from '@testing-library/react'
+import { render, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { MemoryRouter, Route, Routes } from 'react-router'
 import { Toaster } from '@/components/ui/sonner'
@@ -146,4 +146,140 @@ test('a 403 during upload shows a toast and leaves the browser in place', async 
   await userEvents.upload(input, new File(['nope'], 'note.txt', { type: 'text/plain' }))
   expect((await screen.findAllByText('Access Denied')).length).toBeGreaterThan(0)
   expect(screen.getByRole('heading', { name: 'photos' })).toBeTruthy()
+})
+
+const previewListing = {
+  files: [
+    { key: 'readme.txt', size: 5, lastModified: '2026-01-02T03:04:05Z', etag: '"a"', contentType: 'text/plain' },
+    { key: 'bundle.zip', size: 9, lastModified: '2026-01-02T03:04:05Z', etag: '"b"', contentType: 'application/zip' },
+  ],
+  prefixes: [],
+  emptyPrefixes: [],
+}
+
+function renderPreviewBrowser(downloads: string[] = []) {
+  globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+    const request = input instanceof Request ? input : new Request(input, init)
+    const url = new URL(request.url)
+    if (url.pathname.includes('/download/readme.txt')) {
+      downloads.push(url.pathname)
+      return new Response('hello', { status: 200, headers: { 'Content-Type': 'text/plain' } })
+    }
+    if (url.pathname.includes('/capabilities')) {
+      return json({ createBucket: false, deleteBucket: false, putObject: false, deleteObject: false })
+    }
+    if (url.pathname.includes('/versioning')) return json({ enabled: false })
+    return json(previewListing)
+  }) as typeof globalThis.fetch
+  const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false }, mutations: { retry: false } } })
+  return render(
+    <QueryClientProvider client={queryClient}>
+      <MemoryRouter initialEntries={['/buckets/docs']}>
+        <Routes>
+          <Route path="/buckets/:bucket" element={<ObjectBrowserPage />} />
+        </Routes>
+      </MemoryRouter>
+      <Toaster />
+    </QueryClientProvider>,
+  )
+}
+
+test('lists the content type and only offers preview for previewable files', async () => {
+  const screen = renderPreviewBrowser()
+
+  const readme = within((await screen.findByText('readme.txt')).closest('tr')!)
+  expect(readme.getByText('text/plain')).toBeTruthy()
+  expect(readme.getByRole('button', { name: 'Preview' })).toBeTruthy()
+
+  const zip = within(screen.getByText('bundle.zip').closest('tr')!)
+  expect(zip.getByText('application/zip')).toBeTruthy()
+  expect(zip.queryByRole('button', { name: 'Preview' })).toBeNull()
+})
+
+test('preview opens a dialog with the fetched text and an in-page download', async () => {
+  const user = userEvent.setup()
+  const downloads: string[] = []
+  const screen = renderPreviewBrowser(downloads)
+
+  const readme = within((await screen.findByText('readme.txt')).closest('tr')!)
+  await user.click(readme.getByRole('button', { name: 'Preview' }))
+
+  const dialog = within(await screen.findByRole('dialog', { name: 'readme.txt' }))
+  await waitFor(() => expect(dialog.getByText('hello')).toBeTruthy())
+  expect(dialog.getByText('text/plain')).toBeTruthy()
+  expect(downloads).toEqual(['/maxio/api/buckets/docs/download/readme.txt'])
+
+  // Like the row action, the footer download fetches in place (errors stay in the page) instead of following a link.
+  expect(dialog.queryByRole('link', { name: 'Download' })).toBeNull()
+  // happy-dom would navigate the test window to the blob: URL the download helper clicks.
+  const realClick = HTMLAnchorElement.prototype.click
+  let saved: string | null = null
+  HTMLAnchorElement.prototype.click = function (this: HTMLAnchorElement) {
+    saved = this.download
+  }
+  try {
+    await user.click(dialog.getByRole('button', { name: 'Download' }))
+    await waitFor(() => expect(saved).toBe('readme.txt'))
+  } finally {
+    HTMLAnchorElement.prototype.click = realClick
+  }
+  expect(downloads).toHaveLength(2)
+
+  await user.click(dialog.getByRole('button', { name: 'Close preview' }))
+  await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull())
+})
+
+function renderServedAs(file: { key: string; contentType: string }, served: { body: string; contentType: string }) {
+  globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+    const request = input instanceof Request ? input : new Request(input, init)
+    const url = new URL(request.url)
+    if (url.pathname.includes('/download/')) {
+      return new Response(served.body, { status: 200, headers: { 'Content-Type': served.contentType } })
+    }
+    if (url.pathname.includes('/capabilities')) {
+      return json({ createBucket: false, deleteBucket: false, putObject: false, deleteObject: false })
+    }
+    if (url.pathname.includes('/versioning')) return json({ enabled: false })
+    return json({
+      files: [{ ...file, size: served.body.length, lastModified: '2026-01-02T03:04:05Z', etag: '"a"' }],
+      prefixes: [],
+      emptyPrefixes: [],
+    })
+  }) as typeof globalThis.fetch
+  const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+  return render(
+    <QueryClientProvider client={queryClient}>
+      <MemoryRouter initialEntries={['/buckets/docs']}>
+        <Routes>
+          <Route path="/buckets/:bucket" element={<ObjectBrowserPage />} />
+        </Routes>
+      </MemoryRouter>
+    </QueryClientProvider>,
+  )
+}
+
+test('preview refuses to frame a file whose served type no longer matches the listing', async () => {
+  const user = userEvent.setup()
+  const screen = renderServedAs(
+    { key: 'report.pdf', contentType: 'application/pdf' },
+    { body: '<script>alert(1)</script>', contentType: 'text/html' },
+  )
+
+  await user.click(within((await screen.findByText('report.pdf')).closest('tr')!).getByRole('button', { name: 'Preview' }))
+  const dialog = within(await screen.findByRole('dialog', { name: 'report.pdf' }))
+  expect((await dialog.findByRole('alert')).textContent).toContain('changed since it was listed')
+  expect(screen.baseElement.querySelector('iframe')).toBeNull()
+})
+
+test('SVG previews use a data: URL, never a same-origin blob: URL', async () => {
+  const user = userEvent.setup()
+  const screen = renderServedAs(
+    { key: 'logo.svg', contentType: 'image/svg+xml' },
+    { body: '<svg xmlns="http://www.w3.org/2000/svg"/>', contentType: 'image/svg+xml' },
+  )
+
+  await user.click(within((await screen.findByText('logo.svg')).closest('tr')!).getByRole('button', { name: 'Preview' }))
+  const dialog = within(await screen.findByRole('dialog', { name: 'logo.svg' }))
+  const img = await dialog.findByRole('img', { name: 'logo.svg' })
+  expect(img.getAttribute('src')).toStartWith('data:image/svg+xml')
 })

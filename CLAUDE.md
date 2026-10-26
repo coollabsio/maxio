@@ -102,7 +102,7 @@ This runs both processes concurrently (Ctrl+C kills both):
 - **Path-style and virtual-hosted-style**: `/{bucket}/{key}` always. With `--domain` / `MAXIO_DOMAIN`, a `Host` of `<bucket>.<domain>` is rewritten to that path before routing; SigV4 still verifies the original path and `Host`. Unset domain keeps path-style only
 - **UNSIGNED-PAYLOAD accepted**: Skips body hashing for PutObject (AWS CLI default)
 - **Embedded UI assets**: Frontend is compiled into the binary via `rust-embed`. `build.rs` runs `bun run build` into `ui/dist/` (skip with `SKIP_FRONTEND=1`); `index.html` is the SPA fallback. Dev uses Vite HMR. In release builds, assets are baked in — single binary, no external files needed
-- **Web console**: React SPA at `/ui/`, API at `/maxio/api/` (OpenAPI via utoipa, typed client generated with hey-api). Cookie-based auth (HMAC tokens, `Path=/maxio`, not SigV4). An unauthenticated browser GET/HEAD of `/ui` is the console. The bucket name `ui` is reserved (S3 names are at least 3 characters). Presigned URL generation with configurable expiry (1h/6h/24h/7d picker in UI)
+- **Web console**: React SPA at `/ui/`, API at `/maxio/api/` (OpenAPI via utoipa, typed client generated with hey-api). Cookie-based auth (HMAC tokens, `Path=/maxio`, not SigV4). An unauthenticated browser GET/HEAD of `/ui` is the console. The bucket name `ui` is reserved (S3 names are at least 3 characters). Presigned URL generation with configurable expiry (1h/6h/24h/7d picker in UI). In-browser file preview (images, PDF, text up to 1 MiB; HTML is never rendered inline) driven by the stored content type, which the UI guesses from the file name on upload when the browser leaves it empty
 
 ### Data Layout
 

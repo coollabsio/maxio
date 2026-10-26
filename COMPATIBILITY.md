@@ -81,7 +81,7 @@ Status: ✅ supported · 🟡 partial · ❌ not supported
 | `STREAMING-UNSIGNED-PAYLOAD-TRAILER` | ✅ | Trailer checksum verified (AWS CLI v2 / SDK default over HTTPS) |
 | POST policy (browser form upload) | ❌ | |
 | AWS Signature V2 | ❌ | |
-| Multiple users / IAM policies | ❌ | Single root access key only |
+| Multiple users / IAM policies | 🟡 | IAM users, scoped access keys, and AWS-style allow/deny policies. The root key remains `MAXIO_ACCESS_KEY`. No groups |
 | STS | ❌ | |
 
 ## Encryption
@@ -108,7 +108,7 @@ Status: ✅ supported · 🟡 partial · ❌ not supported
 | `MINIO_REGION_NAME` / `MINIO_REGION` env vars | ✅ | |
 | `MINIO_DEFAULT_BUCKETS` env var | ✅ | |
 | `mc` client | ✅ | `mb`, `rb`, `cp`, `ls`, `cat`, `rm`, `stat`, `tag`, `anonymous set download`, `ls/rm --versions` |
-| Health checks `/minio/health/live`, `/ready`, `/cluster` | — | Removed. Use `/maxio/health/live` and `/maxio/health/ready` |
+| Health checks `/minio/health/live`, `/ready`, `/cluster`, `/cluster/read` | ✅ | Same status as `/maxio/health/live` and `/maxio/health/ready`. Cluster follows single-node readiness. `?maintenance=true` on `/cluster` is 412. Body is status only, no version |
 | Erasure coding | 🟡 | Single node only, different on-disk format |
 | MinIO on-disk data format | ❌ | Cannot read an existing MinIO data dir |
 | MinIO Admin API (`mc admin`) | ❌ | |

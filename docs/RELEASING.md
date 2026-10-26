@@ -2,7 +2,7 @@
 
 Versions are [semantic versions](https://semver.org/spec/v2.0.0.html). The number in `Cargo.toml` is the release version. `ui/package.json` (`version`) must match it. The console bundle must not contain that string; the badge reads `GET /maxio/api/version` after login. `just dist-version-check` greps `ui/dist`.
 
-`just version-check` fails when they differ. `maxio --version` prints it. A signed-in console session can read `GET /maxio/api/version`, and the console badge uses that. Unauthenticated health checks are `GET /maxio/health/live` and `/maxio/health/ready`; they report status only.
+`just version-check` fails when they differ. `maxio --version` prints it. A signed-in console session can read `GET /maxio/api/version`, and the console badge uses that. Unauthenticated health checks are `GET /maxio/health/live` and `/maxio/health/ready`, plus `/minio/health/live`, `/minio/health/ready`, `/minio/health/cluster`, and `/minio/health/cluster/read`. They report status only.
 
 ## Changelog
 
@@ -23,7 +23,7 @@ git cliff --tag v1.0.0 --output CHANGELOG.md
 
 `just changelog` rewrites `CHANGELOG.md` from the whole history. Read the diff. The seeded sections for 0.1.0 through 0.4.2 were written by hand; a full rewrite replaces them with one line per commit.
 
-`scripts/release-notes.sh 1.0.0` prints the section the GitHub Release will use. If the version heading is missing, it prints `## [Unreleased]` retitled to that version.
+`scripts/release-notes.sh 1.0.0` prints the section the GitHub Release will use. It prints only the `## [version]` section. Bullets still under `## [Unreleased]` are left out once that heading exists, so move them into the version section before tagging. If the version heading is missing, the script exits with an error.
 
 ## What the workflow publishes
 
@@ -92,4 +92,4 @@ docker rm -f maxio-smoke
 rm -rf "$data"
 ```
 
-`MAXIO_SMOKE=1` checks `/maxio/health/live`, `.maxio-format`, and one `aws` plus `mc` upload. The rest of `tests/aws_cli_test.sh` is the full suite and runs when the variable is unset.
+`MAXIO_SMOKE=1` checks `/maxio/health/live`, `/minio/health/live`, `/minio/health/cluster`, `.maxio-format`, and one `aws` plus `mc` upload. The rest of `tests/aws_cli_test.sh` is the full suite and runs when the variable is unset.

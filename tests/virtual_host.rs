@@ -1083,3 +1083,79 @@ async fn buckets_named_version_and_healthz_work_on_virtual_host() {
         assert!(body.contains("InvalidBucketName"), "{body}");
     }
 }
+
+/// Path-style `/minio/health/*` is a probe. A virtual-hosted bucket named
+/// `minio` still stores `health/live`, and another bucket's `/minio/health/live`
+/// is an object key, not the probe.
+#[tokio::test]
+async fn minio_health_on_the_service_host_is_not_a_virtual_bucket_key() {
+    let server = start("localhost").await;
+    let client = http_client(server.port, &["minio.localhost", "photos.localhost"]);
+    let plain = reqwest::Client::builder().no_proxy().build().unwrap();
+
+    for path in [
+        "/maxio/health/live",
+        "/minio/health/live",
+        "/minio/health/ready",
+        "/minio/health/cluster",
+        "/minio/health/cluster/read",
+    ] {
+        let response = plain
+            .get(format!("{}{path}", server.base))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200, "{path}");
+        let body = response.text().await.unwrap();
+        assert!(body.contains("\"status\":\"ok\""), "{path}: {body}");
+        assert!(!body.contains("\"version\""), "{path}: {body}");
+        assert!(!body.contains(env!("CARGO_PKG_VERSION")), "{path}: {body}");
+    }
+
+    let (status, body) = call_status(
+        &client,
+        "PUT",
+        &vurl("minio.localhost", server.port, "/"),
+        vec![],
+        &[],
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    let (status, body) = call_status(
+        &client,
+        "PUT",
+        &vurl("minio.localhost", server.port, "/health/live"),
+        b"object-bytes".to_vec(),
+        &[],
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    let (status, body) = call_status(
+        &client,
+        "GET",
+        &vurl("minio.localhost", server.port, "/health/live"),
+        vec![],
+        &[],
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body, "object-bytes");
+
+    let probe = plain
+        .get(format!("{}/minio/health/live", server.base))
+        .send()
+        .await
+        .unwrap();
+    let probe_status = probe.status();
+    let probe_body = probe.text().await.unwrap();
+    assert_eq!(probe_status, 200);
+    assert!(probe_body.contains("\"status\":\"ok\""), "{probe_body}");
+
+    let (status, body) = raw_http(
+        server.port,
+        b"GET /minio/health/live HTTP/1.1\r\nhost: photos.localhost\r\nconnection: close\r\n\r\n",
+    )
+    .await;
+    assert_ne!(status, 200, "{body}");
+    assert!(!body.contains("\"status\":\"ok\""), "{body}");
+}

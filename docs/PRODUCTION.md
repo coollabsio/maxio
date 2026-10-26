@@ -94,10 +94,13 @@ LimitNOFILE=65535
 
 ## Health
 
-- [ ] The process supervisor uses `GET /maxio/health/live` or `maxio healthcheck`. A 200 body looks like `{"status":"ok"}` and does not include the version.
-- [ ] `/maxio/health/ready` is the readiness probe (`503` when the data directory cannot be read). `/maxio/health/live` and `/maxio/health/ready` are the only health URLs.
+- [ ] The process supervisor uses `GET /maxio/health/live` or `maxio healthcheck`. A 200 body looks like `{"status":"ok"}` and does not include the version. `Cache-Control` is `no-store`.
+- [ ] `/maxio/health/ready` is the readiness probe (`503` when the data directory cannot be read).
+- [ ] MinIO-compatible probes answer the same way: `/minio/health/live` (liveness), `/minio/health/ready` (readiness), `/minio/health/cluster` and `/minio/health/cluster/read` (single-node quorum, same result as readiness). `mc ready` calls `/minio/health/cluster`. Coolify's MinIO template runs `mc ready local`, which needs that path. `GET /minio/health/cluster?maintenance=true` is `412` while the node is up, because this build is one node and taking it down loses the service.
+- [ ] These probes are unauthenticated `GET` and `HEAD`. They skip the in-flight and request-time limits. `/healthz` and `/readyz` are ordinary bucket names, not probes.
+- [ ] The container image does not include `curl` or `mc`. Its healthcheck is `maxio healthcheck` against `/maxio/health/live`. A copied MinIO compose check (`mc ready local`, or `curl` of `/minio/health/live`) fails inside this image even though those URLs work from outside the container.
 - [ ] The image tag or binary version is pinned. `latest` is for experiments.
-- [ ] You know which version is installed (`maxio --version`) and which format the data directory is on (the startup log, or `.maxio-format`).
+- [ ] You know which version is installed (`maxio --version`) and which format the data directory is on (the startup log, or `.maxio-format`). Unauthenticated health URLs do not report that version. A signed-in console session can read `GET /maxio/api/version`.
 
 ## Still single node
 

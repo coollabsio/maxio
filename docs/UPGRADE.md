@@ -34,7 +34,7 @@ maxio --version
 curl -fsS http://127.0.0.1:9000/maxio/health/live
 ```
 
-`/maxio/health/live` returns `{"status":"ok"}` and does not include the version. The log line `on-disk format version 2` means the data directory was accepted. `/maxio/health/ready` is `503` when the data directory cannot be read.
+`/maxio/health/live` returns `{"status":"ok"}` and does not include the version. `/minio/health/live` is the same probe. The log line `on-disk format version 2` means the data directory was accepted. `/maxio/health/ready` and `/minio/health/ready` are `503` when the data directory cannot be read.
 
 ## Upgrade a container
 

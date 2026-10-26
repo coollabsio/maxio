@@ -51,7 +51,7 @@ Status: ✅ supported · 🟡 partial · ❌ not supported
 | Get/Put/DeleteObjectTagging | ✅ | |
 | Range requests | ✅ | HTTP 206 |
 | Conditional requests | ✅ | `If-Match`, `If-None-Match`, `If-Modified-Since`, `If-Unmodified-Since` |
-| Checksums | ✅ | CRC32, CRC32C, SHA-1, SHA-256, CRC64NVME (header or trailer) |
+| Checksums | ✅ | CRC32, CRC32C, SHA-1, SHA-256, CRC64NVME (header or trailer). Responses that carry a checksum also send `x-amz-checksum-type`: `FULL_OBJECT` or `COMPOSITE`. PutObject is always `FULL_OBJECT`. Multipart CRC64NVME is `FULL_OBJECT`; CRC32 and CRC32C may be either; SHA-1 and SHA-256 multipart checksums are `COMPOSITE`. CreateMultipartUpload stores the type (the algorithm default when the header is omitted). CompleteMultipartUpload rejects a type that does not match. Objects written before the field existed are inferred the same way `maxio check` tells the two apart: a value ending in `-N` is `COMPOSITE`, any other stored checksum is `FULL_OBJECT`. A composite whose `-N` suffix is missing cannot be told apart from a full-object digest |
 | User metadata (`x-amz-meta-*`) | ✅ | Plus Cache-Control, Content-Disposition, Content-Encoding, Content-Language, Expires |
 | Object ACLs | 🟡 | GET returns owner `FULL_CONTROL`; PUT accepts `private` only |
 | GetObjectAttributes | ✅ | ETag, Checksum, ObjectSize, StorageClass |

@@ -4579,11 +4579,20 @@ async fn test_range_get_omits_full_object_checksum() {
     let resp = s3_request_with_headers("GET", &url, vec![], vec![("range", "bytes=0-4")]).await;
     assert_eq!(resp.status(), 206);
     assert!(resp.headers().get("x-amz-checksum-crc32").is_none());
+    assert!(resp.headers().get("x-amz-checksum-type").is_none());
     assert_eq!(resp.bytes().await.unwrap().as_ref(), b"hello");
 
     // A range covering the whole object still carries it.
     let resp = s3_request_with_headers("GET", &url, vec![], vec![("range", "bytes=0-")]).await;
     assert!(resp.headers().get("x-amz-checksum-crc32").is_some());
+    assert_eq!(
+        resp.headers()
+            .get("x-amz-checksum-type")
+            .unwrap()
+            .to_str()
+            .unwrap(),
+        "FULL_OBJECT"
+    );
 }
 
 #[tokio::test]
@@ -4637,6 +4646,7 @@ async fn test_put_object_no_checksum_backward_compat() {
     assert!(resp.headers().get("x-amz-checksum-crc32c").is_none());
     assert!(resp.headers().get("x-amz-checksum-sha1").is_none());
     assert!(resp.headers().get("x-amz-checksum-sha256").is_none());
+    assert!(resp.headers().get("x-amz-checksum-type").is_none());
 }
 
 #[tokio::test]
@@ -4665,6 +4675,443 @@ async fn test_put_object_with_sha256_checksum() {
             .to_str()
             .unwrap(),
         hash_b64
+    );
+    assert_eq!(
+        resp.headers()
+            .get("x-amz-checksum-type")
+            .unwrap()
+            .to_str()
+            .unwrap(),
+        "FULL_OBJECT"
+    );
+}
+
+/// `x-amz-checksum-type` round-trips for a single-part full-object checksum
+/// and for multipart composite vs full-object checksums.
+#[tokio::test]
+async fn test_checksum_type_full_object_and_composite() {
+    use base64::Engine;
+    use sha2::Digest;
+    let (base_url, tmp) = start_server().await;
+    s3_request("PUT", &format!("{base_url}/cksum"), vec![]).await;
+
+    let body = b"hello checksum type";
+    let crc_b64 =
+        base64::engine::general_purpose::STANDARD.encode(crc32fast::hash(body).to_be_bytes());
+    let url = format!("{base_url}/cksum/full.txt");
+    let put = s3_request_with_headers(
+        "PUT",
+        &url,
+        body.to_vec(),
+        vec![
+            ("x-amz-checksum-crc32", &crc_b64),
+            ("x-amz-checksum-type", "FULL_OBJECT"),
+        ],
+    )
+    .await;
+    assert_eq!(put.status(), 200, "{}", put.text().await.unwrap());
+    assert_eq!(
+        c_header(&put, "x-amz-checksum-type").as_deref(),
+        Some("FULL_OBJECT")
+    );
+    assert_eq!(
+        c_header(&put, "x-amz-checksum-crc32").as_deref(),
+        Some(crc_b64.as_str())
+    );
+    for method in ["GET", "HEAD"] {
+        let resp = s3_request(method, &url, vec![]).await;
+        assert_eq!(resp.status(), 200);
+        assert_eq!(
+            c_header(&resp, "x-amz-checksum-type").as_deref(),
+            Some("FULL_OBJECT")
+        );
+        assert_eq!(
+            c_header(&resp, "x-amz-checksum-crc32").as_deref(),
+            Some(crc_b64.as_str())
+        );
+    }
+
+    let composite_put = s3_request_with_headers(
+        "PUT",
+        &format!("{base_url}/cksum/composite-put.txt"),
+        body.to_vec(),
+        vec![
+            ("x-amz-checksum-crc32", &crc_b64),
+            ("x-amz-checksum-type", "COMPOSITE"),
+        ],
+    )
+    .await;
+    assert_eq!(composite_put.status(), 400);
+    assert!(
+        composite_put
+            .text()
+            .await
+            .unwrap()
+            .contains("InvalidRequest"),
+        "PutObject rejects COMPOSITE"
+    );
+    let invalid = s3_request_with_headers(
+        "PUT",
+        &format!("{base_url}/cksum/bad-type.txt"),
+        body.to_vec(),
+        vec![
+            ("x-amz-checksum-crc32", &crc_b64),
+            ("x-amz-checksum-type", "BOTH"),
+        ],
+    )
+    .await;
+    assert_eq!(invalid.status(), 400);
+    let bare = s3_request_with_headers(
+        "PUT",
+        &format!("{base_url}/cksum/bare-type.txt"),
+        body.to_vec(),
+        vec![("x-amz-checksum-type", "FULL_OBJECT")],
+    )
+    .await;
+    assert_eq!(bare.status(), 400);
+
+    // A sidecar written before checksum_type existed still reports FULL_OBJECT.
+    let meta_path = tmp.path().join("buckets/cksum/full.txt.meta.json");
+    let mut stored: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&meta_path).unwrap()).unwrap();
+    assert_eq!(stored["checksum_type"], "FULL_OBJECT");
+    stored.as_object_mut().unwrap().remove("checksum_type");
+    std::fs::write(&meta_path, serde_json::to_vec_pretty(&stored).unwrap()).unwrap();
+    let legacy = s3_request("HEAD", &url, vec![]).await;
+    assert_eq!(
+        c_header(&legacy, "x-amz-checksum-type").as_deref(),
+        Some("FULL_OBJECT")
+    );
+
+    // SHA-256 multipart is composite. One part is enough: the composite is
+    // hash(part checksum) plus `-1`, not the part checksum itself.
+    let part = b"multipart-part";
+    let part_sha = <sha2::Sha256 as sha2::Digest>::digest(part);
+    let mut outer = sha2::Sha256::new();
+    outer.update(part_sha);
+    let composite = format!(
+        "{}-1",
+        base64::engine::general_purpose::STANDARD.encode(outer.finalize())
+    );
+    let full_sha = base64::engine::general_purpose::STANDARD.encode(part_sha);
+    assert_ne!(composite, full_sha);
+
+    let create = s3_request_with_headers(
+        "POST",
+        &format!("{base_url}/cksum/multi.bin?uploads"),
+        vec![],
+        vec![("x-amz-checksum-algorithm", "SHA256")],
+    )
+    .await;
+    assert_eq!(create.status(), 200, "{}", create.text().await.unwrap());
+    assert_eq!(
+        c_header(&create, "x-amz-checksum-algorithm").as_deref(),
+        Some("SHA256")
+    );
+    assert_eq!(
+        c_header(&create, "x-amz-checksum-type").as_deref(),
+        Some("COMPOSITE")
+    );
+    let upload_id = extract_xml_tag(&create.text().await.unwrap(), "UploadId").unwrap();
+    let listed = s3_request(
+        "GET",
+        &format!("{base_url}/cksum/multi.bin?uploadId={upload_id}"),
+        vec![],
+    )
+    .await;
+    let listed_body = listed.text().await.unwrap();
+    assert!(
+        listed_body.contains("<ChecksumAlgorithm>SHA256</ChecksumAlgorithm>"),
+        "{listed_body}"
+    );
+    assert!(
+        listed_body.contains("<ChecksumType>COMPOSITE</ChecksumType>"),
+        "{listed_body}"
+    );
+
+    let uploaded = s3_request_with_headers(
+        "PUT",
+        &format!("{base_url}/cksum/multi.bin?partNumber=1&uploadId={upload_id}"),
+        part.to_vec(),
+        vec![
+            ("x-amz-checksum-algorithm", "SHA256"),
+            ("x-amz-checksum-type", "FULL_OBJECT"),
+        ],
+    )
+    .await;
+    assert_eq!(uploaded.status(), 200, "{}", uploaded.text().await.unwrap());
+    assert!(c_header(&uploaded, "x-amz-checksum-sha256").is_some());
+    assert!(
+        c_header(&uploaded, "x-amz-checksum-type").is_none(),
+        "UploadPart does not return x-amz-checksum-type"
+    );
+    let etag = c_header(&uploaded, "etag").unwrap();
+    let complete_body = format!(
+        "<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>{etag}</ETag></Part></CompleteMultipartUpload>"
+    );
+    let complete = s3_request_with_headers(
+        "POST",
+        &format!("{base_url}/cksum/multi.bin?uploadId={upload_id}"),
+        complete_body.into_bytes(),
+        vec![("x-amz-checksum-type", "COMPOSITE")],
+    )
+    .await;
+    assert_eq!(complete.status(), 200, "{}", complete.text().await.unwrap());
+    assert_eq!(
+        c_header(&complete, "x-amz-checksum-type").as_deref(),
+        Some("COMPOSITE")
+    );
+    assert_eq!(
+        c_header(&complete, "x-amz-checksum-sha256").as_deref(),
+        Some(composite.as_str())
+    );
+    let complete_xml = complete.text().await.unwrap();
+    assert!(
+        complete_xml.contains(&format!("<ChecksumSHA256>{composite}</ChecksumSHA256>")),
+        "{complete_xml}"
+    );
+    assert!(
+        complete_xml.contains("<ChecksumType>COMPOSITE</ChecksumType>"),
+        "{complete_xml}"
+    );
+    let object_url = format!("{base_url}/cksum/multi.bin");
+    for method in ["GET", "HEAD"] {
+        let resp = s3_request(method, &object_url, vec![]).await;
+        assert_eq!(
+            c_header(&resp, "x-amz-checksum-type").as_deref(),
+            Some("COMPOSITE"),
+            "{method}"
+        );
+        assert_eq!(
+            c_header(&resp, "x-amz-checksum-sha256").as_deref(),
+            Some(composite.as_str())
+        );
+    }
+    let digest = composite.split('-').next().unwrap();
+    let attrs = s3_request_with_headers(
+        "GET",
+        &format!("{object_url}?attributes"),
+        vec![],
+        vec![("x-amz-object-attributes", "Checksum")],
+    )
+    .await;
+    assert_eq!(attrs.status(), 200);
+    let attrs_body = attrs.text().await.unwrap();
+    assert!(
+        attrs_body.contains(&format!("<ChecksumSHA256>{digest}</ChecksumSHA256>")),
+        "{attrs_body}"
+    );
+    assert!(
+        attrs_body.contains("<ChecksumType>COMPOSITE</ChecksumType>"),
+        "{attrs_body}"
+    );
+
+    // Drop the stored type. The `-1` suffix is still COMPOSITE.
+    let multi_meta = tmp.path().join("buckets/cksum/multi.bin.meta.json");
+    let mut stored: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&multi_meta).unwrap()).unwrap();
+    stored.as_object_mut().unwrap().remove("checksum_type");
+    std::fs::write(&multi_meta, serde_json::to_vec_pretty(&stored).unwrap()).unwrap();
+    let inferred = s3_request("HEAD", &object_url, vec![]).await;
+    assert_eq!(
+        c_header(&inferred, "x-amz-checksum-type").as_deref(),
+        Some("COMPOSITE")
+    );
+
+    // Copy is a single write, so the destination checksum is FULL_OBJECT.
+    let copy = s3_request_with_headers(
+        "PUT",
+        &format!("{base_url}/cksum/copied.bin"),
+        vec![],
+        vec![("x-amz-copy-source", "/cksum/multi.bin")],
+    )
+    .await;
+    assert_eq!(copy.status(), 200, "{}", copy.text().await.unwrap());
+    assert_eq!(
+        c_header(&copy, "x-amz-checksum-type").as_deref(),
+        Some("FULL_OBJECT")
+    );
+    assert_eq!(
+        c_header(&copy, "x-amz-checksum-sha256").as_deref(),
+        Some(full_sha.as_str())
+    );
+
+    // CRC32 multipart can be an explicit full-object checksum.
+    let full_crc =
+        base64::engine::general_purpose::STANDARD.encode(crc32fast::hash(part).to_be_bytes());
+    let create = s3_request_with_headers(
+        "POST",
+        &format!("{base_url}/cksum/crc-full.bin?uploads"),
+        vec![],
+        vec![
+            ("x-amz-checksum-algorithm", "CRC32"),
+            ("x-amz-checksum-type", "FULL_OBJECT"),
+        ],
+    )
+    .await;
+    assert_eq!(create.status(), 200, "{}", create.text().await.unwrap());
+    assert_eq!(
+        c_header(&create, "x-amz-checksum-type").as_deref(),
+        Some("FULL_OBJECT")
+    );
+    let upload_id = extract_xml_tag(&create.text().await.unwrap(), "UploadId").unwrap();
+    let uploaded = s3_request_with_headers(
+        "PUT",
+        &format!("{base_url}/cksum/crc-full.bin?partNumber=1&uploadId={upload_id}"),
+        part.to_vec(),
+        vec![("x-amz-checksum-algorithm", "CRC32")],
+    )
+    .await;
+    assert_eq!(uploaded.status(), 200);
+    let etag = c_header(&uploaded, "etag").unwrap();
+    let complete_body = format!(
+        "<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>{etag}</ETag></Part></CompleteMultipartUpload>"
+    );
+    let wrong_type = s3_request_with_headers(
+        "POST",
+        &format!("{base_url}/cksum/crc-full.bin?uploadId={upload_id}"),
+        complete_body.clone().into_bytes(),
+        vec![("x-amz-checksum-type", "COMPOSITE")],
+    )
+    .await;
+    assert_eq!(wrong_type.status(), 400);
+    assert!(
+        wrong_type.text().await.unwrap().contains("BadDigest"),
+        "type mismatch is BadDigest"
+    );
+    assert_eq!(
+        s3_request("GET", &format!("{base_url}/cksum/crc-full.bin"), vec![])
+            .await
+            .status(),
+        404,
+        "a rejected complete must not publish the object"
+    );
+
+    let wrong_value = s3_request_with_headers(
+        "POST",
+        &format!("{base_url}/cksum/crc-full.bin?uploadId={upload_id}"),
+        complete_body.clone().into_bytes(),
+        vec![
+            ("x-amz-checksum-type", "FULL_OBJECT"),
+            ("x-amz-checksum-crc32", "AAAAAAAA"),
+        ],
+    )
+    .await;
+    assert_eq!(wrong_value.status(), 400);
+    assert!(wrong_value.text().await.unwrap().contains("BadDigest"));
+
+    let complete = s3_request_with_headers(
+        "POST",
+        &format!("{base_url}/cksum/crc-full.bin?uploadId={upload_id}"),
+        complete_body.into_bytes(),
+        vec![
+            ("x-amz-checksum-type", "FULL_OBJECT"),
+            ("x-amz-checksum-crc32", &full_crc),
+        ],
+    )
+    .await;
+    assert_eq!(complete.status(), 200, "{}", complete.text().await.unwrap());
+    assert_eq!(
+        c_header(&complete, "x-amz-checksum-type").as_deref(),
+        Some("FULL_OBJECT")
+    );
+    assert_eq!(
+        c_header(&complete, "x-amz-checksum-crc32").as_deref(),
+        Some(full_crc.as_str())
+    );
+    assert!(!full_crc.contains('-'));
+    let head = s3_request("HEAD", &format!("{base_url}/cksum/crc-full.bin"), vec![]).await;
+    assert_eq!(
+        c_header(&head, "x-amz-checksum-type").as_deref(),
+        Some("FULL_OBJECT")
+    );
+    assert_eq!(
+        c_header(&head, "x-amz-checksum-crc32").as_deref(),
+        Some(full_crc.as_str())
+    );
+
+    // CRC64NVME multipart is full-object even when the type header is omitted.
+    // SHA-256 cannot be full-object, and a type without an algorithm is rejected.
+    let rejected = s3_request_with_headers(
+        "POST",
+        &format!("{base_url}/cksum/nope.bin?uploads"),
+        vec![],
+        vec![
+            ("x-amz-checksum-algorithm", "CRC64NVME"),
+            ("x-amz-checksum-type", "COMPOSITE"),
+        ],
+    )
+    .await;
+    assert_eq!(rejected.status(), 400);
+    assert!(rejected.text().await.unwrap().contains("InvalidRequest"));
+    let rejected = s3_request_with_headers(
+        "POST",
+        &format!("{base_url}/cksum/nope.bin?uploads"),
+        vec![],
+        vec![
+            ("x-amz-checksum-algorithm", "SHA256"),
+            ("x-amz-checksum-type", "FULL_OBJECT"),
+        ],
+    )
+    .await;
+    assert_eq!(rejected.status(), 400);
+    let rejected = s3_request_with_headers(
+        "POST",
+        &format!("{base_url}/cksum/nope.bin?uploads"),
+        vec![],
+        vec![("x-amz-checksum-type", "FULL_OBJECT")],
+    )
+    .await;
+    assert_eq!(rejected.status(), 400);
+
+    let create = s3_request_with_headers(
+        "POST",
+        &format!("{base_url}/cksum/crc64.bin?uploads"),
+        vec![],
+        vec![("x-amz-checksum-algorithm", "CRC64NVME")],
+    )
+    .await;
+    assert_eq!(create.status(), 200, "{}", create.text().await.unwrap());
+    assert_eq!(
+        c_header(&create, "x-amz-checksum-type").as_deref(),
+        Some("FULL_OBJECT")
+    );
+    let upload_id = extract_xml_tag(&create.text().await.unwrap(), "UploadId").unwrap();
+    let uploaded = s3_request(
+        "PUT",
+        &format!("{base_url}/cksum/crc64.bin?partNumber=1&uploadId={upload_id}"),
+        part.to_vec(),
+    )
+    .await;
+    assert_eq!(uploaded.status(), 200);
+    let etag = c_header(&uploaded, "etag").unwrap();
+    let complete = s3_request(
+        "POST",
+        &format!("{base_url}/cksum/crc64.bin?uploadId={upload_id}"),
+        format!(
+            "<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>{etag}</ETag></Part></CompleteMultipartUpload>"
+        )
+        .into_bytes(),
+    )
+    .await;
+    assert_eq!(complete.status(), 200, "{}", complete.text().await.unwrap());
+    let crc64 = c_header(&complete, "x-amz-checksum-crc64nvme").unwrap();
+    assert!(
+        !crc64.contains('-'),
+        "full-object CRC64NVME has no -N suffix: {crc64}"
+    );
+    assert_eq!(
+        c_header(&complete, "x-amz-checksum-type").as_deref(),
+        Some("FULL_OBJECT")
+    );
+    let head = s3_request("HEAD", &format!("{base_url}/cksum/crc64.bin"), vec![]).await;
+    assert_eq!(
+        c_header(&head, "x-amz-checksum-crc64nvme").as_deref(),
+        Some(crc64.as_str())
+    );
+    assert_eq!(
+        c_header(&head, "x-amz-checksum-type").as_deref(),
+        Some("FULL_OBJECT")
     );
 }
 
@@ -10382,6 +10829,10 @@ async fn test_c_get_object_attributes() {
     assert!(body.contains("<ObjectSize>5</ObjectSize>"), "{body}");
     assert!(
         body.contains(&format!("<ChecksumCRC32>{}</ChecksumCRC32>", crc)),
+        "{body}"
+    );
+    assert!(
+        body.contains("<ChecksumType>FULL_OBJECT</ChecksumType>"),
         "{body}"
     );
     use md5::Digest as _;

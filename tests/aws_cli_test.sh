@@ -475,6 +475,8 @@ assert_eq "put-object with CRC32 checksum accepted" "true" "$(echo "$OUTPUT" | g
 # HeadObject should return the checksum
 OUTPUT=$($AWS s3api head-object --bucket "$BUCKET" --key "checksum.txt" --checksum-mode ENABLED 2>&1)
 assert_eq "head-object returns CRC32 checksum" "true" "$(echo "$OUTPUT" | grep -q "ChecksumCRC32" && echo true || echo false)"
+assert_eq "head-object checksum type is FULL_OBJECT" "FULL_OBJECT" \
+  "$($AWS s3api head-object --bucket "$BUCKET" --key "checksum.txt" --checksum-mode ENABLED --query ChecksumType --output text 2>/dev/null || true)"
 
 # PutObject with wrong checksum should fail
 assert_fail "put-object with wrong CRC32 rejects" \

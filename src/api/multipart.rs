@@ -9,14 +9,15 @@ use axum::{
 
 use crate::error::S3Error;
 use crate::server::AppState;
-use crate::storage::{ChecksumAlgorithm, StorageError};
+use crate::storage::{ChecksumAlgorithm, ChecksumType, StorageError};
 use crate::xml::{response::to_xml, types::*};
 
 use super::bucket::require_bucket;
 use super::object::{
-    Md5VerifyingReader, body_to_reader, encryption_from_bucket_default, extract_checksum,
-    extract_customer_key, extract_object_metadata, extract_sse_request, extract_write_precondition,
-    is_content_md5_mismatch, parse_content_md5, parse_tagging_header, reject_oversized_body,
+    Md5VerifyingReader, add_checksum_headers, body_to_reader, encryption_from_bucket_default,
+    extract_checksum, extract_checksum_type, extract_customer_key, extract_object_metadata,
+    extract_sse_request, extract_write_precondition, is_content_md5_mismatch, parse_content_md5,
+    parse_tagging_header, reject_oversized_body, resolve_multipart_checksum_type,
     spec_from_request,
 };
 
@@ -40,6 +41,8 @@ pub async fn create_multipart_upload(
         .get("x-amz-checksum-algorithm")
         .and_then(|v| v.to_str().ok())
         .and_then(ChecksumAlgorithm::from_header_str);
+    let checksum_type =
+        resolve_multipart_checksum_type(checksum_algorithm, extract_checksum_type(&headers)?)?;
 
     // Resolve encryption spec at upload-create time (explicit > bucket default).
     let mut encryption = extract_sse_request(&headers)?;
@@ -58,6 +61,7 @@ pub async fn create_multipart_upload(
             &key,
             content_type,
             checksum_algorithm,
+            checksum_type,
             encryption_spec,
             object_metadata,
             tags,
@@ -75,6 +79,12 @@ pub async fn create_multipart_upload(
     let mut builder = Response::builder()
         .status(StatusCode::OK)
         .header("content-type", "application/xml");
+    if let Some(algo) = checksum_algorithm {
+        builder = builder.header("x-amz-checksum-algorithm", algo.as_str());
+    }
+    if let Some(ty) = checksum_type {
+        builder = builder.header("x-amz-checksum-type", ty.header_value());
+    }
     match applied_mode {
         Some(crate::storage::EncryptionMode::SseS3) => {
             builder = builder.header("x-amz-server-side-encryption", "AES256");
@@ -166,6 +176,13 @@ pub async fn complete_multipart_upload(
     // SSE-C customer key, if the upload was SSE-C, arrives here again.
     let customer_key = extract_customer_key(&headers)?;
     let precondition = extract_write_precondition(&headers)?;
+    let requested_type = extract_checksum_type(&headers)?;
+    // UploadPart does not take x-amz-checksum-type (a part checksum is the
+    // part bytes). CompleteMultipartUpload does: it must match the type fixed
+    // at CreateMultipartUpload, and an optional checksum header is the object
+    // digest to verify.
+    let requested_checksum =
+        extract_checksum(&headers).and_then(|(algo, value)| value.map(|value| (algo, value)));
 
     let result = state
         .storage
@@ -175,6 +192,8 @@ pub async fn complete_multipart_upload(
             &parts,
             customer_key,
             precondition.as_ref(),
+            requested_type,
+            requested_checksum,
         )
         .await
         .map_err(|e| match e {
@@ -183,20 +202,34 @@ pub async fn complete_multipart_upload(
             other => map_storage_err(other),
         })?;
 
+    let checksums = checksum_xml_fields(
+        result.checksum_algorithm,
+        result.checksum_value.as_deref(),
+        result.checksum_type,
+    );
     let xml = to_xml(&CompleteMultipartUploadResult {
         location: format!("/{}/{}", bucket, key),
         bucket,
         key,
         etag: result.etag,
+        checksum_crc32: checksums.crc32,
+        checksum_crc32c: checksums.crc32c,
+        checksum_crc64nvme: checksums.crc64nvme,
+        checksum_sha1: checksums.sha1,
+        checksum_sha256: checksums.sha256,
+        checksum_type: checksums.checksum_type,
     })
     .map_err(S3Error::internal)?;
 
     let mut builder = Response::builder()
         .status(StatusCode::OK)
         .header("content-type", "application/xml");
-    if let (Some(algo), Some(val)) = (&result.checksum_algorithm, &result.checksum_value) {
-        builder = builder.header(algo.header_name(), val.as_str());
-    }
+    builder = add_checksum_headers(
+        builder,
+        result.checksum_algorithm,
+        result.checksum_value.as_deref(),
+        result.checksum_type,
+    );
     if let Some(vid) = &result.version_id {
         builder = builder.header("x-amz-version-id", vid.as_str());
     }
@@ -241,10 +274,18 @@ pub async fn list_parts(
         .await
         .map_err(map_storage_err)?;
 
+    let checksum_algorithm = upload
+        .checksum_algorithm
+        .map(|algo| algo.as_str().to_string());
+    let checksum_type = upload
+        .resolved_checksum_type()
+        .map(|ty| ty.header_value().to_string());
     let xml = to_xml(&ListPartsResult {
         bucket,
         key: upload.key,
         upload_id: upload_id.clone(),
+        checksum_algorithm,
+        checksum_type,
         is_truncated: false,
         parts: parts
             .into_iter()
@@ -298,9 +339,53 @@ pub async fn list_multipart_uploads(
         .unwrap())
 }
 
+struct ChecksumXmlFields {
+    crc32: Option<String>,
+    crc32c: Option<String>,
+    crc64nvme: Option<String>,
+    sha1: Option<String>,
+    sha256: Option<String>,
+    checksum_type: Option<String>,
+}
+
+fn checksum_xml_fields(
+    algorithm: Option<ChecksumAlgorithm>,
+    value: Option<&str>,
+    checksum_type: Option<ChecksumType>,
+) -> ChecksumXmlFields {
+    let mut fields = ChecksumXmlFields {
+        crc32: None,
+        crc32c: None,
+        crc64nvme: None,
+        sha1: None,
+        sha256: None,
+        checksum_type: None,
+    };
+    let (Some(algo), Some(value)) = (algorithm, value) else {
+        return fields;
+    };
+    let value = value.to_string();
+    match algo {
+        ChecksumAlgorithm::CRC32 => fields.crc32 = Some(value),
+        ChecksumAlgorithm::CRC32C => fields.crc32c = Some(value),
+        ChecksumAlgorithm::CRC64NVME => fields.crc64nvme = Some(value),
+        ChecksumAlgorithm::SHA1 => fields.sha1 = Some(value),
+        ChecksumAlgorithm::SHA256 => fields.sha256 = Some(value),
+    }
+    fields.checksum_type = checksum_type.map(|ty| ty.header_value().to_string());
+    fields
+}
+
 pub(super) fn map_storage_err(err: StorageError) -> S3Error {
     match err {
+        StorageError::ChecksumMismatch(msg) if msg.starts_with("type:") => S3Error::new(
+            crate::error::S3ErrorCode::BadDigest,
+            "The checksum type you specified did not match the checksum type specified in CreateMultipartUpload.",
+        ),
         StorageError::ChecksumMismatch(_) => S3Error::bad_checksum("x-amz-checksum"),
+        StorageError::InvalidKey(msg) if msg.contains("checksum algorithm") => {
+            S3Error::invalid_request(&msg)
+        }
         StorageError::UploadNotFound(upload_id) => S3Error::no_such_upload(&upload_id),
         StorageError::InvalidPartOrder => S3Error::invalid_part_order(),
         StorageError::EntityTooLarge => S3Error::entity_too_large(),

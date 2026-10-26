@@ -2,10 +2,10 @@ use super::chunk_reader::VerifiedChunkReader;
 use super::crypto::{AadBuilder, FRAME_CHUNK_SIZE, FrameDecryptor};
 use super::keys::Keyring;
 use super::{
-    BucketEncryptionConfig, BucketMeta, ByteStream, ChecksumAlgorithm, ChecksumHasher, ChunkInfo,
-    ChunkKind, ChunkManifest, DeleteResult, EncryptionMeta, EncryptionMode, EncryptionRequest,
-    MultipartUploadMeta, ObjectMeta, PartMeta, PutResult, StorageError, UploadEncryptionSpec,
-    validate_bucket_name,
+    BucketEncryptionConfig, BucketMeta, ByteStream, ChecksumAlgorithm, ChecksumHasher,
+    ChecksumType, ChunkInfo, ChunkKind, ChunkManifest, DeleteResult, EncryptionMeta,
+    EncryptionMode, EncryptionRequest, MultipartUploadMeta, ObjectMeta, PartMeta, PutResult,
+    StorageError, UploadEncryptionSpec, validate_bucket_name,
 };
 use super::{KeyDirListing, PutOptions, StoredObjectMetadata, WritePrecondition};
 use aes_gcm::{
@@ -48,6 +48,8 @@ struct CompletedUploadRecord {
     version_id: Option<String>,
     checksum_algorithm: Option<ChecksumAlgorithm>,
     checksum_value: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    checksum_type: Option<ChecksumType>,
 }
 
 pub struct FilesystemStorage {
@@ -291,6 +293,123 @@ fn part_aad_builder(upload_id: &str, part_number: u32) -> AadBuilder {
 /// recorded size and MD5 ETag. Catches a torn or stale part file (e.g. from a
 /// crashed re-upload) before it is baked into a completed object whose
 /// composite ETag would otherwise still "match".
+fn full_object_checksum_type(value: &Option<String>) -> Option<ChecksumType> {
+    value.as_ref().map(|_| ChecksumType::FullObject)
+}
+
+fn full_object_hasher(upload: &MultipartUploadMeta) -> Option<ChecksumHasher> {
+    let algo = upload.checksum_algorithm?;
+    let ty = upload
+        .checksum_type
+        .unwrap_or_else(|| algo.default_multipart_checksum_type());
+    (ty == ChecksumType::FullObject).then(|| ChecksumHasher::new(algo))
+}
+
+/// Composite of the per-part checksums (`<digest>-<part count>`). Parts that
+/// did not store a checksum are skipped, matching the historical behavior
+/// when an algorithm was declared but a part omitted its checksum header.
+fn composite_object_checksum(algo: ChecksumAlgorithm, parts: &[PartMeta]) -> Option<String> {
+    let b64 = base64::engine::general_purpose::STANDARD;
+    let mut raw_checksums = Vec::new();
+    for part in parts {
+        if let Some(val) = part.checksum_value.as_deref() {
+            if let Ok(raw) = b64.decode(val) {
+                raw_checksums.extend_from_slice(&raw);
+            }
+        }
+    }
+    if raw_checksums.is_empty() {
+        return None;
+    }
+    let mut hasher = ChecksumHasher::new(algo);
+    hasher.update(&raw_checksums);
+    Some(format!("{}-{}", hasher.finalize_base64(), parts.len()))
+}
+
+fn object_checksum_from_upload(
+    upload: &MultipartUploadMeta,
+    parts: &[PartMeta],
+    full_object: Option<ChecksumHasher>,
+) -> (
+    Option<ChecksumAlgorithm>,
+    Option<String>,
+    Option<ChecksumType>,
+) {
+    let Some(algo) = upload.checksum_algorithm else {
+        return (None, None, None);
+    };
+    let ty = upload
+        .checksum_type
+        .unwrap_or_else(|| algo.default_multipart_checksum_type());
+    let value = match ty {
+        ChecksumType::FullObject => full_object.map(|hasher| hasher.finalize_base64()),
+        ChecksumType::Composite => composite_object_checksum(algo, parts),
+    };
+    let stored_ty = value.as_ref().map(|_| ty);
+    (Some(algo), value, stored_ty)
+}
+
+fn reject_complete_checksum_value(
+    computed: Option<&str>,
+    expected: Option<&str>,
+) -> Result<(), StorageError> {
+    let Some(expected) = expected else {
+        return Ok(());
+    };
+    match computed {
+        Some(computed) if super::checksum_values_equivalent(computed, expected) => Ok(()),
+        other => Err(StorageError::ChecksumMismatch(format!(
+            "expected {expected}, got {}",
+            other.unwrap_or("none")
+        ))),
+    }
+}
+
+/// `requested_type` / `requested_checksum` come from CompleteMultipartUpload.
+/// A checksum value is checked only when this upload declared an algorithm.
+/// A type that does not match CreateMultipartUpload is `type:`-prefixed so
+/// the API can return BadDigest with the checksum-type message.
+fn reject_complete_checksum_request(
+    algorithm: Option<ChecksumAlgorithm>,
+    checksum_type: Option<ChecksumType>,
+    requested_type: Option<ChecksumType>,
+    requested_checksum: Option<&(ChecksumAlgorithm, String)>,
+) -> Result<(), StorageError> {
+    if let Some((algo, _)) = requested_checksum {
+        if let Some(expected) = algorithm {
+            if expected != *algo {
+                return Err(StorageError::InvalidKey(
+                    "checksum algorithm does not match the algorithm fixed at initiate".into(),
+                ));
+            }
+        }
+    }
+    if let Some(requested) = requested_type {
+        let Some(algo) = algorithm else {
+            return Err(StorageError::ChecksumMismatch(
+                "type: checksum type was not specified for this upload".into(),
+            ));
+        };
+        let actual = checksum_type.unwrap_or_else(|| algo.default_multipart_checksum_type());
+        if actual != requested {
+            return Err(StorageError::ChecksumMismatch(format!(
+                "type: expected {actual}, got {requested}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn expected_complete_checksum(
+    algorithm: Option<ChecksumAlgorithm>,
+    requested: Option<&(ChecksumAlgorithm, String)>,
+) -> Option<&str> {
+    match requested {
+        Some((algo, value)) if algorithm == Some(*algo) => Some(value.as_str()),
+        _ => None,
+    }
+}
+
 fn verify_part_bytes(part: &PartMeta, bytes: u64, md5: Md5) -> Result<(), StorageError> {
     if bytes != part.size {
         return Err(StorageError::InvalidKey(format!(
@@ -971,6 +1090,7 @@ impl FilesystemStorage {
             storage_format: None,
             checksum_algorithm,
             checksum_value: checksum_value.clone(),
+            checksum_type: full_object_checksum_type(&checksum_value),
             content_sha256: Some(hex::encode(stored_hash.finalize())),
             tags: None,
             part_sizes: None,
@@ -1039,6 +1159,7 @@ impl FilesystemStorage {
             etag: etag_quoted,
             version_id,
             checksum_algorithm,
+            checksum_type: full_object_checksum_type(&checksum_value),
             checksum_value,
         })
     }
@@ -1167,6 +1288,7 @@ impl FilesystemStorage {
             storage_format: Some(storage_format.to_string()),
             checksum_algorithm: checksum_algo,
             checksum_value: checksum_value.clone(),
+            checksum_type: full_object_checksum_type(&checksum_value),
             tags: None,
             part_sizes: None,
             encryption: None,
@@ -1220,6 +1342,7 @@ impl FilesystemStorage {
             etag: etag_quoted,
             version_id,
             checksum_algorithm: checksum_algo,
+            checksum_type: full_object_checksum_type(&checksum_value),
             checksum_value,
         })
     }
@@ -1420,6 +1543,7 @@ impl FilesystemStorage {
             storage_format: Some(storage_format.to_string()),
             checksum_algorithm: ck_algo,
             checksum_value: ck_val.clone(),
+            checksum_type: full_object_checksum_type(&ck_val),
             tags: None,
             part_sizes: None,
             encryption: Some(enc_meta),
@@ -1476,6 +1600,7 @@ impl FilesystemStorage {
             etag: etag_quoted,
             version_id,
             checksum_algorithm: ck_algo,
+            checksum_type: full_object_checksum_type(&ck_val),
             checksum_value: ck_val,
         })
     }
@@ -2537,6 +2662,7 @@ impl FilesystemStorage {
         upload_meta: &MultipartUploadMeta,
         selected: &[PartMeta],
         precondition: Option<&WritePrecondition>,
+        expected_checksum: Option<&str>,
     ) -> Result<PutResult, StorageError> {
         let key = &upload_meta.key;
         let ec_dir = self.ec_dir(bucket, key);
@@ -2555,6 +2681,7 @@ impl FilesystemStorage {
 
         let mut total_size = 0u64;
         let mut etag_hasher = Md5::new();
+        let mut full_object_checksum = full_object_hasher(upload_meta);
         let mut chunks: Vec<ChunkInfo> = Vec::new();
         let mut chunk_index: u32 = 0;
         let mut chunk_buf = Vec::with_capacity(self.chunk_size as usize);
@@ -2573,6 +2700,9 @@ impl FilesystemStorage {
                 part_md5.update(&buf[..n]);
                 part_bytes += n as u64;
                 total_size += n as u64;
+                if let Some(hasher) = full_object_checksum.as_mut() {
+                    hasher.update(&buf[..n]);
+                }
                 chunk_buf.extend_from_slice(&buf[..n]);
 
                 while chunk_buf.len() >= self.chunk_size as usize {
@@ -2641,30 +2771,9 @@ impl FilesystemStorage {
             selected.len()
         );
 
-        // Compute composite checksum if algorithm was specified
-        let (checksum_algorithm, checksum_value) =
-            if let Some(algo) = upload_meta.checksum_algorithm {
-                let b64 = base64::engine::general_purpose::STANDARD;
-                let mut raw_checksums = Vec::new();
-                for part in selected {
-                    if let Some(ref val) = part.checksum_value {
-                        if let Ok(raw) = b64.decode(val) {
-                            raw_checksums.extend_from_slice(&raw);
-                        }
-                    }
-                }
-                if !raw_checksums.is_empty() {
-                    let mut composite_hasher = ChecksumHasher::new(algo);
-                    composite_hasher.update(&raw_checksums);
-                    let composite =
-                        format!("{}-{}", composite_hasher.finalize_base64(), selected.len());
-                    (Some(algo), Some(composite))
-                } else {
-                    (Some(algo), None)
-                }
-            } else {
-                (None, None)
-            };
+        let (checksum_algorithm, checksum_value, checksum_type) =
+            object_checksum_from_upload(upload_meta, selected, full_object_checksum);
+        reject_complete_checksum_value(checksum_value.as_deref(), expected_checksum)?;
 
         let part_sizes: Vec<u64> = selected.iter().map(|p| p.size).collect();
         let storage_format = if has_parity {
@@ -2685,6 +2794,7 @@ impl FilesystemStorage {
             storage_format: Some(storage_format.to_string()),
             checksum_algorithm,
             checksum_value: checksum_value.clone(),
+            checksum_type,
             tags: None,
             part_sizes: Some(part_sizes),
             encryption: None,
@@ -2747,6 +2857,7 @@ impl FilesystemStorage {
             etag,
             version_id,
             checksum_algorithm,
+            checksum_type,
             checksum_value,
         })
     }
@@ -2763,6 +2874,7 @@ impl FilesystemStorage {
         selected: &[PartMeta],
         customer_key: Option<[u8; 32]>,
         precondition: Option<&WritePrecondition>,
+        expected_checksum: Option<&str>,
     ) -> Result<PutResult, StorageError> {
         let key = upload_meta.key.as_str();
         let ec_dir = self.ec_dir(bucket, key);
@@ -2814,6 +2926,7 @@ impl FilesystemStorage {
         let mut total_plaintext: u64 = 0;
         let mut ct_size: u64 = 0;
         let mut etag_hasher = Md5::new();
+        let mut full_object_checksum = full_object_hasher(upload_meta);
         let mut chunks: Vec<ChunkInfo> = Vec::new();
         let mut chunk_index: u32 = 0;
         let mut frame_index: u64 = 0;
@@ -2847,6 +2960,9 @@ impl FilesystemStorage {
                 part_md5.update(&read_buf[..n]);
                 part_bytes += n as u64;
                 total_plaintext += n as u64;
+                if let Some(hasher) = full_object_checksum.as_mut() {
+                    hasher.update(&read_buf[..n]);
+                }
                 frame_buf.extend_from_slice(&read_buf[..n]);
                 while frame_buf.len() >= FRAME_CHUNK_SIZE {
                     let frame_data: Vec<u8> = frame_buf.drain(..FRAME_CHUNK_SIZE).collect();
@@ -2942,28 +3058,9 @@ impl FilesystemStorage {
             selected.len()
         );
 
-        let (checksum_algorithm, checksum_value) =
-            if let Some(algo) = upload_meta.checksum_algorithm {
-                let mut raw_checksums = Vec::new();
-                for part in selected {
-                    if let Some(ref val) = part.checksum_value {
-                        if let Ok(raw) = b64.decode(val) {
-                            raw_checksums.extend_from_slice(&raw);
-                        }
-                    }
-                }
-                if !raw_checksums.is_empty() {
-                    let mut composite_hasher = ChecksumHasher::new(algo);
-                    composite_hasher.update(&raw_checksums);
-                    let composite =
-                        format!("{}-{}", composite_hasher.finalize_base64(), selected.len());
-                    (Some(algo), Some(composite))
-                } else {
-                    (Some(algo), None)
-                }
-            } else {
-                (None, None)
-            };
+        let (checksum_algorithm, checksum_value, checksum_type) =
+            object_checksum_from_upload(upload_meta, selected, full_object_checksum);
+        reject_complete_checksum_value(checksum_value.as_deref(), expected_checksum)?;
 
         let part_sizes: Vec<u64> = selected.iter().map(|p| p.size).collect();
         let storage_format = if has_parity {
@@ -2984,6 +3081,7 @@ impl FilesystemStorage {
             storage_format: Some(storage_format.to_string()),
             checksum_algorithm,
             checksum_value: checksum_value.clone(),
+            checksum_type,
             tags: None,
             part_sizes: Some(part_sizes),
             encryption: Some(enc_meta),
@@ -3049,6 +3147,7 @@ impl FilesystemStorage {
             etag,
             version_id,
             checksum_algorithm,
+            checksum_type,
             checksum_value,
         })
     }
@@ -3104,6 +3203,7 @@ impl FilesystemStorage {
             version_id: None,
             checksum_algorithm: None,
             checksum_value: None,
+            checksum_type: None,
         })
     }
 
@@ -3435,6 +3535,7 @@ impl FilesystemStorage {
         key: &str,
         content_type: &str,
         checksum_algorithm: Option<ChecksumAlgorithm>,
+        checksum_type: Option<ChecksumType>,
         encryption_spec: Option<UploadEncryptionSpec>,
         object_metadata: StoredObjectMetadata,
         tags: Option<HashMap<String, String>>,
@@ -3469,6 +3570,18 @@ impl FilesystemStorage {
             None
         };
 
+        let checksum_type = match checksum_algorithm {
+            Some(algo) => {
+                let ty = checksum_type.unwrap_or_else(|| algo.default_multipart_checksum_type());
+                if !algo.allows_multipart_checksum_type(ty) {
+                    return Err(StorageError::InvalidKey(format!(
+                        "checksum type {ty} is not valid for {algo:?}"
+                    )));
+                }
+                Some(ty)
+            }
+            None => None,
+        };
         let meta = MultipartUploadMeta {
             upload_id: upload_id.clone(),
             bucket: bucket.to_string(),
@@ -3478,6 +3591,7 @@ impl FilesystemStorage {
                 .format("%Y-%m-%dT%H:%M:%S%.3fZ")
                 .to_string(),
             checksum_algorithm,
+            checksum_type,
             encryption_spec,
             object_metadata,
             tags: tags.filter(|t| !t.is_empty()),
@@ -3659,6 +3773,8 @@ impl FilesystemStorage {
         parts: &[(u32, String)],
         customer_key: Option<[u8; 32]>,
         precondition: Option<&WritePrecondition>,
+        requested_checksum_type: Option<ChecksumType>,
+        requested_checksum: Option<(ChecksumAlgorithm, String)>,
     ) -> Result<PutResult, StorageError> {
         validate_bucket_name(bucket)?;
         validate_upload_id(upload_id)?;
@@ -3682,6 +3798,19 @@ impl FilesystemStorage {
             // same result instead of NoSuchUpload.
             Err(StorageError::UploadNotFound(_)) => {
                 if let Some(done) = self.read_completed_upload(bucket, upload_id).await? {
+                    reject_complete_checksum_request(
+                        done.checksum_algorithm,
+                        done.checksum_type,
+                        requested_checksum_type,
+                        requested_checksum.as_ref(),
+                    )?;
+                    reject_complete_checksum_value(
+                        done.checksum_value.as_deref(),
+                        expected_complete_checksum(
+                            done.checksum_algorithm,
+                            requested_checksum.as_ref(),
+                        ),
+                    )?;
                     return Ok(done);
                 }
                 return Err(StorageError::UploadNotFound(upload_id.to_string()));
@@ -3689,6 +3818,14 @@ impl FilesystemStorage {
             Err(e) => return Err(e),
         };
         validate_key(&upload_meta.key)?;
+        reject_complete_checksum_request(
+            upload_meta.checksum_algorithm,
+            upload_meta.checksum_type,
+            requested_checksum_type,
+            requested_checksum.as_ref(),
+        )?;
+        let expected_checksum =
+            expected_complete_checksum(upload_meta.checksum_algorithm, requested_checksum.as_ref());
         let mut selected = Vec::with_capacity(parts.len());
         for (idx, (part_number, requested_etag)) in parts.iter().enumerate() {
             let meta = self.read_part_meta(bucket, upload_id, *part_number).await?;
@@ -3749,6 +3886,7 @@ impl FilesystemStorage {
                         &selected,
                         customer_key,
                         precondition,
+                        expected_checksum,
                     )
                     .await?;
                 self.remember_completed_upload(bucket, upload_id, &result)
@@ -3762,6 +3900,7 @@ impl FilesystemStorage {
                     &upload_meta,
                     &selected,
                     precondition,
+                    expected_checksum,
                 )
                 .await?;
             self.remember_completed_upload(bucket, upload_id, &result)
@@ -3866,9 +4005,7 @@ impl FilesystemStorage {
         let mut total_size = 0u64;
         let mut etag_hasher = Md5::new();
         let mut stored_hash = Sha256::new();
-        let mut full_object_checksum = (upload_meta.checksum_algorithm
-            == Some(ChecksumAlgorithm::CRC64NVME))
-        .then(|| ChecksumHasher::new(ChecksumAlgorithm::CRC64NVME));
+        let mut full_object_checksum = full_object_hasher(&upload_meta);
         let mut buf = vec![0u8; IO_BUFFER_SIZE];
         let mut frame_buf: Vec<u8> = Vec::with_capacity(FRAME_CHUNK_SIZE);
         let mut chunk_index: u64 = 0;
@@ -3970,36 +4107,11 @@ impl FilesystemStorage {
             selected.len()
         );
 
-        // CRC64NVME is a full-object checksum. The other algorithms are a
-        // composite of the per-part checksums (`<digest>-<part count>`).
-        let (checksum_algorithm, checksum_value) =
-            if upload_meta.checksum_algorithm == Some(ChecksumAlgorithm::CRC64NVME) {
-                (
-                    Some(ChecksumAlgorithm::CRC64NVME),
-                    full_object_checksum.map(|hasher| hasher.finalize_base64()),
-                )
-            } else if let Some(algo) = upload_meta.checksum_algorithm {
-                let b64 = base64::engine::general_purpose::STANDARD;
-                let mut raw_checksums = Vec::new();
-                for part in &selected {
-                    if let Some(ref val) = part.checksum_value {
-                        if let Ok(raw) = b64.decode(val) {
-                            raw_checksums.extend_from_slice(&raw);
-                        }
-                    }
-                }
-                if !raw_checksums.is_empty() {
-                    let mut composite_hasher = ChecksumHasher::new(algo);
-                    composite_hasher.update(&raw_checksums);
-                    let composite =
-                        format!("{}-{}", composite_hasher.finalize_base64(), selected.len());
-                    (Some(algo), Some(composite))
-                } else {
-                    (Some(algo), None)
-                }
-            } else {
-                (None, None)
-            };
+        // FULL_OBJECT (CRC64NVME, or CRC32/CRC32C when requested) is a digest
+        // of the concatenated bytes. COMPOSITE is `<digest>-<part count>`.
+        let (checksum_algorithm, checksum_value, checksum_type) =
+            object_checksum_from_upload(&upload_meta, &selected, full_object_checksum);
+        reject_complete_checksum_value(checksum_value.as_deref(), expected_checksum)?;
 
         let part_sizes: Vec<u64> = selected.iter().map(|p| p.size).collect();
         let mut object_meta = ObjectMeta {
@@ -4015,6 +4127,7 @@ impl FilesystemStorage {
             storage_format: None,
             checksum_algorithm,
             checksum_value: checksum_value.clone(),
+            checksum_type,
             content_sha256: Some(hex::encode(stored_hash.finalize())),
             tags: upload_meta.tags,
             part_sizes: Some(part_sizes),
@@ -4087,6 +4200,7 @@ impl FilesystemStorage {
             etag,
             version_id,
             checksum_algorithm,
+            checksum_type,
             checksum_value,
         };
         self.remember_completed_upload(bucket, upload_id, &result)
@@ -4106,6 +4220,7 @@ impl FilesystemStorage {
             version_id: result.version_id.clone(),
             checksum_algorithm: result.checksum_algorithm,
             checksum_value: result.checksum_value.clone(),
+            checksum_type: result.checksum_type,
         };
         let Ok(json) = serde_json::to_string(&record) else {
             return;
@@ -4129,12 +4244,19 @@ impl FilesystemStorage {
             Err(e) => return Err(StorageError::Io(e)),
         };
         let record: CompletedUploadRecord = serde_json::from_slice(&data)?;
+        let checksum_type = record.checksum_type.or_else(|| {
+            match (record.checksum_algorithm, record.checksum_value.as_deref()) {
+                (Some(_), Some(value)) => Some(ChecksumType::infer_from_value(value)),
+                _ => None,
+            }
+        });
         Ok(Some(PutResult {
             size: record.size,
             etag: record.etag,
             version_id: record.version_id,
             checksum_algorithm: record.checksum_algorithm,
             checksum_value: record.checksum_value,
+            checksum_type,
         }))
     }
 

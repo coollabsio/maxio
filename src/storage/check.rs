@@ -2861,6 +2861,9 @@ fn apply_recovered_identity(rebuilt: &mut ObjectMeta, raw: &str) {
     if let Some((algo, value)) = salvage_checksum(raw) {
         rebuilt.checksum_algorithm = Some(algo);
         rebuilt.checksum_value = Some(value);
+        if let Some(raw_ty) = json_string_field(raw, "checksum_type") {
+            rebuilt.checksum_type = super::ChecksumType::from_header_str(&raw_ty);
+        }
     }
     if let Some(parts) = salvage_part_sizes(raw) {
         rebuilt.part_sizes = Some(parts);
@@ -4536,6 +4539,7 @@ mod tests {
                 key,
                 "application/octet-stream",
                 None,
+                None,
                 spec,
                 crate::storage::StoredObjectMetadata::default(),
                 None,
@@ -4558,7 +4562,7 @@ mod tests {
             completed.push(((i as u32) + 1, part.etag));
         }
         storage
-            .complete_multipart_upload("bkt", &upload.upload_id, &completed, None, None)
+            .complete_multipart_upload("bkt", &upload.upload_id, &completed, None, None, None, None)
             .await
             .unwrap();
     }
@@ -5828,6 +5832,7 @@ mod tests {
                 key,
                 "application/octet-stream",
                 Some(crate::storage::ChecksumAlgorithm::CRC32),
+                None,
                 spec,
                 crate::storage::StoredObjectMetadata::default(),
                 None,
@@ -5850,7 +5855,7 @@ mod tests {
             completed.push(((i as u32) + 1, part.etag));
         }
         storage
-            .complete_multipart_upload("bkt", &upload.upload_id, &completed, None, None)
+            .complete_multipart_upload("bkt", &upload.upload_id, &completed, None, None, None, None)
             .await
             .unwrap();
     }
@@ -6087,12 +6092,7 @@ mod tests {
 }
 
 fn composite_part_count(value: &str) -> Option<u32> {
-    let (body, count) = value.rsplit_once('-')?;
-    if body.is_empty() {
-        return None;
-    }
-    let n = count.parse::<u32>().ok()?;
-    if n >= 1 { Some(n) } else { None }
+    super::composite_checksum_part_count(value)
 }
 
 async fn payload_checksum(

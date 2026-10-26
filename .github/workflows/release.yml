@@ -379,13 +379,6 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4
-
-      - name: Release notes
-        env:
-          RELEASE_VERSION: ${{ needs.plan.outputs.version }}
-        run: bash scripts/release-notes.sh "$RELEASE_VERSION" > release-notes.md
-
       - uses: actions/download-artifact@v4
         with:
           pattern: maxio-*
@@ -397,9 +390,10 @@ jobs:
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
+          # Body comes from merged pull requests and commits since the previous tag.
           tag_name: ${{ needs.plan.outputs.tag }}
           name: MaxIO ${{ needs.plan.outputs.version }}
-          body_path: release-notes.md
+          generate_release_notes: true
           prerelease: ${{ needs.plan.outputs.prerelease == 'true' }}
           files: |
             *.tar.gz

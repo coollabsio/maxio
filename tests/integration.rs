@@ -811,6 +811,21 @@ fn body_has_no_version(body: &str) {
     );
 }
 
+fn response_has_no_version(headers: &reqwest::header::HeaderMap, body: &str) {
+    body_has_no_version(body);
+    assert!(
+        headers.get("server").is_none(),
+        "server header: {headers:?}"
+    );
+    for (name, value) in headers {
+        let text = value.to_str().unwrap_or("");
+        assert!(
+            !text.contains(env!("CARGO_PKG_VERSION")),
+            "header {name} leaked the release version: {text}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn test_healthz_is_public_and_returns_ok() {
     let (base_url, _tmp) = start_server().await;
@@ -820,10 +835,17 @@ async fn test_healthz_is_public_and_returns_ok() {
         .await
         .unwrap();
     assert_eq!(resp.status(), 200);
-    assert!(resp.headers().get("server").is_none());
+    let cache = resp
+        .headers()
+        .get("cache-control")
+        .unwrap()
+        .to_str()
+        .unwrap();
+    assert!(cache.contains("no-store"), "{cache}");
+    let headers = resp.headers().clone();
     let body = resp.text().await.unwrap();
     assert!(body.contains("\"status\":\"ok\""), "{body}");
-    body_has_no_version(&body);
+    response_has_no_version(&headers, &body);
 
     let head = client()
         .head(format!("{base_url}/maxio/health/live"))
@@ -831,7 +853,10 @@ async fn test_healthz_is_public_and_returns_ok() {
         .await
         .unwrap();
     assert_eq!(head.status(), 200);
-    assert!(head.headers().get("server").is_none());
+    let head_headers = head.headers().clone();
+    let head_body = head.text().await.unwrap();
+    assert!(head_body.is_empty(), "{head_body}");
+    response_has_no_version(&head_headers, &head_body);
 }
 
 #[tokio::test]
@@ -1395,26 +1420,54 @@ async fn health_ready_is_503_when_the_data_dir_cannot_be_read() {
     let mut perms = std::fs::metadata(tmp.path()).unwrap().permissions();
     perms.set_mode(0o0);
     std::fs::set_permissions(tmp.path(), perms).unwrap();
-    let denied = client()
-        .get(format!("{base_url}/maxio/health/ready"))
-        .send()
-        .await
-        .unwrap();
-    let status = denied.status();
-    let body = denied.text().await.unwrap();
-    let mut restore = std::fs::metadata(tmp.path()).unwrap().permissions();
-    restore.set_mode(0o755);
-    std::fs::set_permissions(tmp.path(), restore).unwrap();
-    assert_eq!(status, 503, "{body}");
-    body_has_no_version(&body);
-
-    let live = client()
+    let mut denied_paths = Vec::new();
+    for path in [
+        "/maxio/health/ready",
+        "/minio/health/ready",
+        "/minio/health/cluster",
+        "/minio/health/cluster/read",
+        "/minio/health/cluster?maintenance=true",
+    ] {
+        let resp = client()
+            .get(format!("{base_url}{path}"))
+            .send()
+            .await
+            .unwrap();
+        let status = resp.status().as_u16();
+        let headers = resp.headers().clone();
+        let body = resp.text().await.unwrap();
+        denied_paths.push((path, status, headers, body));
+    }
+    let live_while_denied = client()
         .get(format!("{base_url}/maxio/health/live"))
         .send()
         .await
         .unwrap();
-    assert_eq!(live.status(), 200);
-    body_has_no_version(&live.text().await.unwrap());
+    let live_status = live_while_denied.status();
+    let live_body = live_while_denied.text().await.unwrap();
+    let minio_live = client()
+        .get(format!("{base_url}/minio/health/live"))
+        .send()
+        .await
+        .unwrap();
+    let minio_live_status = minio_live.status();
+    let minio_live_body = minio_live.text().await.unwrap();
+    let mut restore = std::fs::metadata(tmp.path()).unwrap().permissions();
+    restore.set_mode(0o755);
+    std::fs::set_permissions(tmp.path(), restore).unwrap();
+
+    for (path, status, headers, body) in denied_paths {
+        assert_eq!(status, 503, "{path}: {body}");
+        assert!(
+            body.contains("\"status\":\"unavailable\""),
+            "{path}: {body}"
+        );
+        response_has_no_version(&headers, &body);
+    }
+    assert_eq!(live_status, 200, "{live_body}");
+    body_has_no_version(&live_body);
+    assert_eq!(minio_live_status, 200, "{minio_live_body}");
+    body_has_no_version(&minio_live_body);
 }
 
 #[tokio::test]
@@ -1639,9 +1692,12 @@ async fn legacy_health_aliases_are_not_probes() {
     let (base_url, _tmp) = start_server().await;
     for path in [
         "/readyz",
-        "/minio/health/live",
-        "/minio/health/ready",
-        "/minio/health/cluster",
+        "/healthz",
+        "/version",
+        "/minio/health",
+        "/minio/health/live/",
+        "/minio/health/cluster/write",
+        "/minio/health/cluster/ready",
     ] {
         let resp = client()
             .get(format!("{base_url}{path}"))
@@ -9676,20 +9732,113 @@ async fn test_a_list_encoding_type_and_fetch_owner() {
     assert_eq!(resp.status(), 400);
 }
 
+/// MinIO liveness, readiness, and cluster probes share the MaxIO handlers.
+/// `mc ready` (Coolify's MinIO check) calls `/minio/health/cluster`.
 #[tokio::test]
-async fn test_a_minio_health_endpoints_are_not_aliases() {
+async fn minio_health_endpoints_match_maxio() {
     let (base, _tmp) = start_server().await;
     for path in [
+        "/maxio/health/live",
         "/minio/health/live",
+        "/maxio/health/ready",
         "/minio/health/ready",
         "/minio/health/cluster",
+        "/minio/health/cluster/read",
+        "/minio/health/cluster/read?maintenance=true",
     ] {
         let resp = client().get(format!("{base}{path}")).send().await.unwrap();
         let status = resp.status();
+        let headers = resp.headers().clone();
+        let cache = headers
+            .get("cache-control")
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("")
+            .to_string();
         let body = resp.text().await.unwrap();
-        assert_eq!(status, 403, "GET {path}: {body}");
-        assert!(body.contains("<Code>"), "{path}: {body}");
+        assert_eq!(status, 200, "GET {path}: {body}");
+        assert!(body.contains("\"status\":\"ok\""), "{path}: {body}");
+        assert!(
+            cache.contains("no-store"),
+            "{path} cache-control is {cache}"
+        );
+        response_has_no_version(&headers, &body);
     }
+
+    let head = client()
+        .head(format!("{base}/minio/health/ready"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(head.status(), 200);
+    let head_headers = head.headers().clone();
+    let head_body = head.text().await.unwrap();
+    assert!(head_body.is_empty(), "{head_body}");
+    response_has_no_version(&head_headers, &head_body);
+
+    let maintenance = client()
+        .get(format!("{base}/minio/health/cluster?maintenance=true"))
+        .send()
+        .await
+        .unwrap();
+    let maintenance_status = maintenance.status();
+    let maintenance_headers = maintenance.headers().clone();
+    let maintenance_body = maintenance.text().await.unwrap();
+    assert_eq!(maintenance_status, 412, "{maintenance_body}");
+    assert!(
+        maintenance_body.contains("\"status\":\"unavailable\""),
+        "{maintenance_body}"
+    );
+    response_has_no_version(&maintenance_headers, &maintenance_body);
+
+    // Live ignores the maintenance query. A downed disk is a ready/cluster
+    // failure, not a liveness failure.
+    let live_maint = client()
+        .get(format!("{base}/minio/health/live?maintenance=true"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(live_maint.status(), 200);
+    body_has_no_version(&live_maint.text().await.unwrap());
+
+    let created = signed("PUT", &format!("{base}/minio"), b"").await;
+    assert_eq!(created.status(), 200, "{}", created.text().await.unwrap());
+    let stored = signed("PUT", &format!("{base}/minio/health/live"), b"stored").await;
+    assert_eq!(stored.status(), 200, "{}", stored.text().await.unwrap());
+    let note = signed("PUT", &format!("{base}/minio/note.txt"), b"note").await;
+    assert_eq!(note.status(), 200, "{}", note.text().await.unwrap());
+
+    let probe = client()
+        .get(format!("{base}/minio/health/live"))
+        .send()
+        .await
+        .unwrap();
+    let probe_status = probe.status();
+    let probe_body = probe.text().await.unwrap();
+    assert_eq!(probe_status, 200);
+    assert!(probe_body.contains("\"status\":\"ok\""), "{probe_body}");
+    assert_ne!(probe_body, "stored");
+
+    let signed_probe = signed("GET", &format!("{base}/minio/health/live"), b"").await;
+    let signed_status = signed_probe.status();
+    let signed_body = signed_probe.text().await.unwrap();
+    assert_eq!(signed_status, 200, "{signed_body}");
+    assert!(
+        signed_body.contains("\"status\":\"ok\""),
+        "path-style GET stays the probe: {signed_body}"
+    );
+
+    let got = signed("GET", &format!("{base}/minio/note.txt"), b"").await;
+    let got_status = got.status();
+    let got_body = got.text().await.unwrap();
+    assert_eq!(got_status, 200, "{got_body}");
+    assert_eq!(got_body, "note");
+
+    let removed_note = signed("DELETE", &format!("{base}/minio/note.txt"), b"").await;
+    assert_eq!(removed_note.status(), 204);
+    let removed_probe_key = signed("DELETE", &format!("{base}/minio/health/live"), b"").await;
+    assert_eq!(removed_probe_key.status(), 204);
+    let removed_bucket = signed("DELETE", &format!("{base}/minio"), b"").await;
+    assert_eq!(removed_bucket.status(), 204);
 }
 
 // ---- streaming chunked uploads (agent B) ----

@@ -167,7 +167,7 @@ This runs both processes concurrently (Ctrl+C kills both):
 | Get/Put/DeleteBucketLifecycle | GET/PUT/DELETE | `/{bucket}?lifecycle` (expiration, noncurrent expiration, abort MPU; no transitions) |
 | Get/PutBucketAcl, Get/PutObjectAcl | GET/PUT | `?acl` (owner FULL_CONTROL; PUT `private` only) |
 | GetObjectAttributes | GET | `/{bucket}/{key}?attributes` |
-| Health | GET/HEAD | `/maxio/health/live`, `/maxio/health/ready` (no auth, status only) |
+| Health | GET/HEAD | `/maxio/health/live`, `/maxio/health/ready`, and MinIO `/minio/health/live`, `/ready`, `/cluster`, `/cluster/read` (no auth, status only) |
 
 Unknown or unsupported subresources return `501 NotImplemented` (never the default action). Unconfigured object-lock, website, replication, ownership controls and public access block return their S3 "not found" errors. Streaming uploads (`STREAMING-AWS4-HMAC-SHA256-PAYLOAD[-TRAILER]`, `STREAMING-UNSIGNED-PAYLOAD-TRAILER`) are decoded in `src/api/chunked.rs` with chunk / trailer signature and checksum checks. See `COMPATIBILITY.md` for details.
 

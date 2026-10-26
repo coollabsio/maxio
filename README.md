@@ -120,7 +120,7 @@ maxio --domain s3.example.com --data-dir ./data --port 9000
 # MAXIO_DOMAIN=s3.example.com,s3.example.org
 ```
 
-A request whose `Host` is `<bucket>.<domain>` (a port is ignored, and the host is matched case-insensitively) is served from that bucket. The bare domain, an IP address, and any other host stay on path-style, so the web console (`/ui/`), `/maxio/api/`, and `/maxio/health/*` on the service host are unchanged. The bucket names `maxio` and `ui` are reserved. `api` is an ordinary bucket. Bucket names follow the S3 rules (lowercase letters, digits, dots, and hyphens, 3–63 characters). A dotted name such as `my.bucket` is the host `my.bucket.s3.example.com`. `ui.<domain>` is rejected with `InvalidBucketName`, the same as `maxio.<domain>`.
+A request whose `Host` is `<bucket>.<domain>` (a port is ignored, and the host is matched case-insensitively) is served from that bucket. The bare domain, an IP address, and any other host stay on path-style, so the web console (`/ui/`), `/maxio/api/`, and the health probes (`/maxio/health/*`, `/minio/health/*`) on the service host are unchanged. The bucket names `maxio` and `ui` are reserved. `api` is an ordinary bucket. Bucket names follow the S3 rules (lowercase letters, digits, dots, and hyphens, 3–63 characters). A dotted name such as `my.bucket` is the host `my.bucket.s3.example.com`. `ui.<domain>` is rejected with `InvalidBucketName`, the same as `maxio.<domain>`.
 
 The console UI stays at `/ui`. An unauthenticated browser `GET` or `HEAD` of `/ui` or `/ui/...` is the console when the request has no `Authorization` header, no `x-amz-*` header, no `X-Amz-*` presign query, and no S3 subresource or listing query. Any other request for that path is handled as S3 and fails because `ui` is not a valid bucket name. A working bucket named `ui` is not possible: S3 names are at least 3 characters, and that path is the console. `CreateBucket` returns `400 InvalidBucketName`. A data directory that already contains `buckets/ui` or `buckets/maxio` refuses to start; `maxio check` reports it and does not delete it. The console API is only `/maxio/api/*`. The session cookie uses `Path=/maxio`.
 
@@ -297,6 +297,29 @@ The report lists stale temp files, stranded backups, promote directories and lef
 - rebuild a missing or corrupt data chunk when parity shards can reconstruct it
 
 It does not invent bucket configuration, rewrite encrypted sidecars (those are MAC-protected), or choose between a plain file and an erasure-coded directory for the same key. Those are reported and left unchanged.
+
+## Health
+
+`GET` and `HEAD` of these paths need no credentials. A healthy body is `{"status":"ok"}`. When the data directory cannot be read, readiness is `503` with `{"status":"unavailable"}`. The body does not include the version. Responses send `Cache-Control: no-store`.
+
+| Path | Meaning |
+|---|---|
+| `/maxio/health/live`, `/minio/health/live` | The process is answering. `200` once the listener is up |
+| `/maxio/health/ready`, `/minio/health/ready` | The data directory can be read. `503` when it cannot |
+| `/minio/health/cluster`, `/minio/health/cluster/read` | Same as readiness. This build is one node, so write and read quorum follow that node. `mc ready` uses `/minio/health/cluster` (Coolify's MinIO check is `mc ready local`) |
+| `/minio/health/cluster?maintenance=true` | `412` while the node is up. One node cannot be removed without taking the service down |
+
+`maxio healthcheck` calls `/maxio/health/live`. Override it with `--url` or `MAXIO_HEALTHCHECK_URL`. The container image uses that command. The image does not include `curl` or `mc`.
+
+```bash
+curl -fsS http://127.0.0.1:9000/maxio/health/live
+curl -fsS http://127.0.0.1:9000/minio/health/live
+curl -fsS http://127.0.0.1:9000/minio/health/cluster
+```
+
+A virtual-hosted request is not a probe. `GET http://minio.example.com/health/live` reads the object `health/live` in bucket `minio`. Path-style `GET /minio/health/live` on the service host is always the probe, including a signed request. Other methods on that path are S3, so the object can still be written and deleted. `/healthz` and `/readyz` are not probes.
+
+Probes skip the in-flight and request-time limits. The version is `maxio --version`, or `GET /maxio/api/version` after a console login. Unauthenticated callers of that route get 401 and no version.
 
 ## Shutdown and limits
 

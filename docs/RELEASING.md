@@ -2,28 +2,11 @@
 
 Versions are [semantic versions](https://semver.org/spec/v2.0.0.html). The number in `Cargo.toml` is the release version. `ui/package.json` (`version`) must match it. The console bundle must not contain that string; the badge reads `GET /maxio/api/version` after login. `just dist-version-check` greps `ui/dist`.
 
-`just version-check` fails when they differ. `maxio --version` prints it. A signed-in console session can read `GET /maxio/api/version`, and the console badge uses that. Unauthenticated health checks are `GET /maxio/health/live` and `/maxio/health/ready`; they report status only.
+`just version-check` fails when they differ. `maxio --version` prints it. A signed-in console session can read `GET /maxio/api/version`, and the console badge uses that. Unauthenticated health checks are `GET /maxio/health/live` and `/maxio/health/ready`, plus `/minio/health/live`, `/minio/health/ready`, `/minio/health/cluster`, and `/minio/health/cluster/read`. They report status only.
 
-## Changelog
+## Release notes
 
-`CHANGELOG.md` follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). While a version is in progress, notes live under `## [Unreleased]`.
-
-Before you tag, rename that heading to the version and add the date:
-
-```markdown
-## [1.0.0] - 2026-10-20
-```
-
-[git-cliff](https://git-cliff.org/) can draft the file from conventional commits (`cliff.toml`):
-
-```bash
-git cliff --unreleased
-git cliff --tag v1.0.0 --output CHANGELOG.md
-```
-
-`just changelog` rewrites `CHANGELOG.md` from the whole history. Read the diff. The seeded sections for 0.1.0 through 0.4.2 were written by hand; a full rewrite replaces them with one line per commit.
-
-`scripts/release-notes.sh 1.0.0` prints the section the GitHub Release will use. If the version heading is missing, it prints `## [Unreleased]` retitled to that version.
+The GitHub Release body is generated from merged pull requests and commits since the previous tag. The release title is `MaxIO <version>`.
 
 ## What the workflow publishes
 
@@ -52,7 +35,7 @@ Images, pushed to GHCR and Docker Hub:
 ## First release
 
 1. Merge the release-engineering changes and anything else that belongs in 1.0.0.
-2. Move `## [Unreleased]` to `## [1.0.0] - <date>` and commit on `main`. Confirm `Cargo.toml` is `1.0.0`.
+2. Confirm `Cargo.toml` and `ui/package.json` are `1.0.0`.
 3. In the repository settings, add the Docker Hub secrets the workflow already reads:
    - `DOCKERHUB_USERNAME`
    - `DOCKERHUB_TOKEN` (a write token for `coollabsio/maxio`, not your password)
@@ -92,4 +75,4 @@ docker rm -f maxio-smoke
 rm -rf "$data"
 ```
 
-`MAXIO_SMOKE=1` checks `/maxio/health/live`, `.maxio-format`, and one `aws` plus `mc` upload. The rest of `tests/aws_cli_test.sh` is the full suite and runs when the variable is unset.
+`MAXIO_SMOKE=1` checks `/maxio/health/live`, `/minio/health/live`, `/minio/health/cluster`, `.maxio-format`, and one `aws` plus `mc` upload. The rest of `tests/aws_cli_test.sh` is the full suite and runs when the variable is unset.

@@ -5,7 +5,6 @@ use axum::extract::{Request, State};
 use axum::http::{HeaderValue, Method, StatusCode, header};
 use axum::middleware::from_fn_with_state;
 use axum::response::IntoResponse;
-use axum::routing::get;
 use std::convert::Infallible;
 use std::future::Future;
 use std::pin::Pin;
@@ -138,13 +137,14 @@ pub fn build_router(state: AppState) -> AppService {
 
     let mut router = Router::new()
         .nest("/maxio/api", console_router(state.clone()))
-        // The only unauthenticated probes. `/readyz`, `/healthz`, `/version`,
-        // and `/minio/health/*` are ordinary bucket paths.
-        .route("/maxio/health/live", get(health_live))
-        .route("/maxio/health/ready", get(health_ready))
         // `/ui` is not a static route. Browser GET/HEAD is the console; every
         // other request, including bucket `ui`, falls through to S3.
         .merge(s3_routes)
+        // Probes sit in front of S3 so they stay unauthenticated. Only
+        // path-style GET/HEAD matches; a virtual-hosted rewrite and every
+        // other method fall through. `/healthz`, `/readyz`, and `/version`
+        // stay ordinary bucket paths.
+        .layer(from_fn_with_state(state.clone(), health_probe_middleware))
         .layer(axum::middleware::from_fn(console_ui_middleware))
         .layer(from_fn_with_state(max_header_bytes, limit_headers));
 
@@ -241,23 +241,71 @@ struct HealthBody {
 }
 
 fn health_json(status: &'static str, code: StatusCode) -> axum::response::Response {
-    (code, Json(HealthBody { status })).into_response()
+    let mut response = (code, Json(HealthBody { status })).into_response();
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    response
 }
 
-/// Process is answering. Does not inspect storage and does not report a version.
-async fn health_live() -> axum::response::Response {
-    health_json("ok", StatusCode::OK)
+fn query_flag(query: Option<&str>, name: &str) -> bool {
+    query.is_some_and(|query| {
+        query.split('&').any(|pair| {
+            let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+            key == name && value == "true"
+        })
+    })
 }
 
-/// Data directory can be read. `503` when it cannot, still without a version.
-async fn health_ready(State(state): State<AppState>) -> axum::response::Response {
+async fn data_dir_readable(state: &AppState) -> bool {
     let data_dir = std::path::Path::new(&state.config.data_dir);
-    let usable = tokio::fs::read_dir(data_dir).await.is_ok()
-        && tokio::fs::read_dir(data_dir.join("buckets")).await.is_ok();
-    if usable {
+    tokio::fs::read_dir(data_dir).await.is_ok()
+        && tokio::fs::read_dir(data_dir.join("buckets")).await.is_ok()
+}
+
+async fn ready_response(state: &AppState) -> axum::response::Response {
+    if data_dir_readable(state).await {
         health_json("ok", StatusCode::OK)
     } else {
         health_json("unavailable", StatusCode::SERVICE_UNAVAILABLE)
+    }
+}
+
+/// `GET`/`HEAD` liveness and readiness for `/maxio/health/*` and `/minio/health/*`.
+///
+/// The body is status only. MinIO's cluster probes follow readiness on this
+/// single-node build. `?maintenance=true` on `/minio/health/cluster` is 412
+/// while the node is up: taking the only node down loses the service (`mc ready
+/// --maintenance`, not the default Coolify check).
+async fn health_probe_middleware(
+    State(state): State<AppState>,
+    request: Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let Some(probe) = crate::limits::health_probe(&request) else {
+        return next.run(request).await;
+    };
+    let head = request.method() == Method::HEAD;
+    let response = match probe {
+        crate::limits::HealthProbe::Live => health_json("ok", StatusCode::OK),
+        crate::limits::HealthProbe::Ready | crate::limits::HealthProbe::ClusterRead => {
+            ready_response(&state).await
+        }
+        crate::limits::HealthProbe::Cluster if query_flag(request.uri().query(), "maintenance") => {
+            if data_dir_readable(&state).await {
+                health_json("unavailable", StatusCode::PRECONDITION_FAILED)
+            } else {
+                health_json("unavailable", StatusCode::SERVICE_UNAVAILABLE)
+            }
+        }
+        crate::limits::HealthProbe::Cluster => ready_response(&state).await,
+    };
+    if head {
+        let mut response = response;
+        *response.body_mut() = Body::empty();
+        response
+    } else {
+        response
     }
 }
 

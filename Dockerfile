@@ -30,6 +30,9 @@ ENV MAXIO_DATA_DIR="/data"
 EXPOSE 9000
 VOLUME ["/data"]
 USER maxio:maxio
+# Liveness is also served at /minio/health/live for MinIO-compatible probes.
+# This image has no curl or mc, so a copied MinIO `mc ready` / curl check
+# cannot run inside the container. Probe from outside, or use this command.
 HEALTHCHECK --interval=30s --timeout=3s --start-period=10s --retries=3 \
   CMD ["maxio", "healthcheck", "--url", "http://127.0.0.1:9000/maxio/health/live", "--timeout-ms", "2000"]
 

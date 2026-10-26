@@ -155,6 +155,12 @@ if [ "${MAXIO_SMOKE:-0}" = "1" ]; then
     HEALTH_VERSION=$(json_field "$HEALTH" version)
     assert_eq "live health status is ok" "ok" "$HEALTH_STATUS"
     assert_eq "live health has no version" "" "$HEALTH_VERSION"
+    MINIO_HEALTH=$(curl -fsS "$ENDPOINT/minio/health/live" || true)
+    assert_eq "minio live health status is ok" "ok" "$(json_field "$MINIO_HEALTH" status)"
+    assert_eq "minio live health has no version" "" "$(json_field "$MINIO_HEALTH" version)"
+    MINIO_CLUSTER=$(curl -sS -o "$TMPDIR/minio-cluster" -w '%{http_code}' "$ENDPOINT/minio/health/cluster" || echo "000")
+    assert_eq "minio cluster health is 200" "200" "$MINIO_CLUSTER"
+    assert_eq "minio cluster health has no version" "" "$(json_field "$(cat "$TMPDIR/minio-cluster")" version)"
     VER_CODE=$(curl -sS -o "$TMPDIR/api-version" -w '%{http_code}' "$ENDPOINT/maxio/api/version" || echo "000")
     assert_eq "unauthenticated /maxio/api/version is denied" "401" "$VER_CODE"
 
@@ -203,6 +209,20 @@ assert_eq "HEAD /maxio/health/live is 200" "200" "$LIVE_HEAD"
 READY_BODY=$(curl -fsS "$ENDPOINT/maxio/health/ready" || true)
 assert_eq "GET /maxio/health/ready status" "ok" "$(json_field "$READY_BODY" status)"
 assert_eq "GET /maxio/health/ready has no version" "" "$(json_field "$READY_BODY" version)"
+for MINIO_PATH in /minio/health/live /minio/health/ready /minio/health/cluster /minio/health/cluster/read; do
+    MINIO_BODY=$(curl -fsS "$ENDPOINT$MINIO_PATH" || true)
+    assert_eq "GET $MINIO_PATH status" "ok" "$(json_field "$MINIO_BODY" status)"
+    assert_eq "GET $MINIO_PATH has no version" "" "$(json_field "$MINIO_BODY" version)"
+    MINIO_HEAD=$(curl -sS -o /dev/null -D - -X HEAD "$ENDPOINT$MINIO_PATH" || true)
+    assert_eq "HEAD $MINIO_PATH is 200" "200" "$(printf '%s\n' "$MINIO_HEAD" | awk 'toupper($1) ~ /^HTTP/ { code=$2 } END { print code }')"
+    assert_eq "HEAD $MINIO_PATH is not cached" "true" \
+        "$(printf '%s\n' "$MINIO_HEAD" | grep -qi 'cache-control:.*no-store' && echo true || echo false)"
+done
+MAINT_CODE=$(curl -sS -o "$TMPDIR/minio-maint" -w '%{http_code}' "$ENDPOINT/minio/health/cluster?maintenance=true" || echo "000")
+assert_eq "GET /minio/health/cluster?maintenance=true is 412" "412" "$MAINT_CODE"
+assert_eq "cluster maintenance has no version" "" "$(json_field "$(cat "$TMPDIR/minio-maint")" version)"
+READYZ_CODE=$(curl -sS -o /dev/null -w '%{http_code}' "$ENDPOINT/readyz" || echo "000")
+assert_eq "GET /readyz is not a probe" "true" "$([ "$READYZ_CODE" != "200" ] && echo true || echo false)"
 VER_CODE=$(curl -sS -o "$TMPDIR/unauth-version" -w '%{http_code}' "$ENDPOINT/maxio/api/version" || echo "000")
 assert_eq "unauthenticated /maxio/api/version is denied" "401" "$VER_CODE"
 curl -sS -c "$TMPDIR/version.cookies" -H 'content-type: application/json' \

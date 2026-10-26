@@ -95,14 +95,6 @@ e2e:
     done
     cd ui && MAXIO_E2E_URL=http://127.0.0.1:9876 bun x playwright test
 
-# Rewrite CHANGELOG.md from conventional commits (review the diff before committing).
-changelog:
-    git cliff --output CHANGELOG.md
-
-# Print the Keep a Changelog section for a version (`1.0.0` or `v1.0.0`).
-release-notes version:
-    bash scripts/release-notes.sh {{version}}
-
 # Release binary with the UI embedded.
 build:
     cd ui && bun run build

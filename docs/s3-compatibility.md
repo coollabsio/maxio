@@ -86,7 +86,7 @@ These were wrong for clients that already work against AWS, and each has a regre
 
 These 37 tests still fail and are listed in `tests/s3_compat_expected_failures.txt`. They are the ones most likely to matter to a client next:
 
-- **Multipart checksums and `GetObjectAttributes`.** Complete and attributes responses do not yet surface `ChecksumAlgorithm` / `ChecksumSHA256` or `PartsCount` the way the suite expects. Trailer checksums on ordinary PUT already work (see `tests/aws_cli_test.sh`).
+- **Multipart checksums and `GetObjectAttributes`.** Complete and attributes responses now include `x-amz-checksum-type` (`FULL_OBJECT` or `COMPOSITE`) and the checksum value when one was stored. The suite can still disagree on `ChecksumAlgorithm`, `ChecksumSHA256`, or `PartsCount`. Trailer checksums on ordinary PUT already work (see `tests/aws_cli_test.sh`).
 - **`UploadPartCopy` between SSE-S3 and SSE-C** on an 8 MiB object. The copy response is missing `x-amz-server-side-encryption`.
 - **`partNumber` on an SSE-C multipart object**, and one SSE-C multipart chunk-size rejection (`test_encryption_sse_c_multipart_invalid_chunks_2`, `test_multipart_sse_c_get_part`).
 - **Lifecycle expiry header arithmetic** for the suite's "days equals the header delta" check is sensitive to how the date is rounded. The header is present; three of the suite's checks now pass, and `test_delete_marker_expiration` still depends on the hourly lifecycle sweep rather than the suite's one-second debug interval.

@@ -45,6 +45,27 @@ impl ChecksumAlgorithm {
         }
     }
 
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::CRC32 => "CRC32",
+            Self::CRC32C => "CRC32C",
+            Self::CRC64NVME => "CRC64NVME",
+            Self::SHA1 => "SHA1",
+            Self::SHA256 => "SHA256",
+        }
+    }
+
+    /// XML element used by CompleteMultipartUpload and GetObjectAttributes.
+    pub fn xml_tag(&self) -> &'static str {
+        match self {
+            Self::CRC32 => "ChecksumCRC32",
+            Self::CRC32C => "ChecksumCRC32C",
+            Self::CRC64NVME => "ChecksumCRC64NVME",
+            Self::SHA1 => "ChecksumSHA1",
+            Self::SHA256 => "ChecksumSHA256",
+        }
+    }
+
     /// Parse an `x-amz-checksum-*` header name (case-insensitive).
     pub fn from_header_name(name: &str) -> Option<Self> {
         let name = name.trim().to_ascii_lowercase();
@@ -61,6 +82,107 @@ impl ChecksumAlgorithm {
             "SHA256" => Some(Self::SHA256),
             _ => None,
         }
+    }
+
+    /// Multipart default when `CreateMultipartUpload` names an algorithm and
+    /// omits `x-amz-checksum-type`. Matches the checksum MaxIO already stores:
+    /// CRC64NVME is a full-object digest; the others are a composite of the
+    /// part checksums.
+    pub fn default_multipart_checksum_type(self) -> ChecksumType {
+        match self {
+            Self::CRC64NVME => ChecksumType::FullObject,
+            Self::CRC32 | Self::CRC32C | Self::SHA1 | Self::SHA256 => ChecksumType::Composite,
+        }
+    }
+
+    /// AWS multipart support: full-object only for CRC32, CRC32C, and
+    /// CRC64NVME. SHA-1 and SHA-256 are composite only. CRC64NVME is never
+    /// composite.
+    pub fn allows_multipart_checksum_type(self, ty: ChecksumType) -> bool {
+        match ty {
+            ChecksumType::FullObject => {
+                matches!(self, Self::CRC32 | Self::CRC32C | Self::CRC64NVME)
+            }
+            ChecksumType::Composite => !matches!(self, Self::CRC64NVME),
+        }
+    }
+}
+
+/// How an object checksum was combined. `FULL_OBJECT` is a digest of the
+/// object bytes. `COMPOSITE` is a digest of the per-part checksums, stored
+/// as `<base64>-<part count>`.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum ChecksumType {
+    #[serde(rename = "FULL_OBJECT")]
+    FullObject,
+    #[serde(rename = "COMPOSITE")]
+    Composite,
+}
+
+impl ChecksumType {
+    pub fn header_value(self) -> &'static str {
+        match self {
+            Self::FullObject => "FULL_OBJECT",
+            Self::Composite => "COMPOSITE",
+        }
+    }
+
+    pub fn from_header_str(s: &str) -> Option<Self> {
+        if s.trim().eq_ignore_ascii_case("FULL_OBJECT") {
+            Some(Self::FullObject)
+        } else if s.trim().eq_ignore_ascii_case("COMPOSITE") {
+            Some(Self::Composite)
+        } else {
+            None
+        }
+    }
+
+    /// Legacy objects have no stored type. `check` treats a value ending in
+    /// `-N` as a composite of the part checksums and every other stored
+    /// checksum as a digest of the whole object. The response header uses the
+    /// same rule.
+    ///
+    /// A composite whose `-N` suffix was lost cannot be told apart from a
+    /// full-object digest and is reported as `FULL_OBJECT`. `part_sizes` is
+    /// not a signal: CRC64NVME multipart objects store part sizes and a
+    /// full-object checksum.
+    pub fn infer_from_value(value: &str) -> Self {
+        if composite_checksum_part_count(value).is_some() {
+            Self::Composite
+        } else {
+            Self::FullObject
+        }
+    }
+}
+
+impl std::fmt::Display for ChecksumType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.header_value())
+    }
+}
+
+/// Part count encoded in a composite checksum (`<digest>-<count>`). Standard
+/// base64 does not contain `-`, so the suffix is unambiguous.
+pub fn composite_checksum_part_count(value: &str) -> Option<u32> {
+    let (body, count) = value.rsplit_once('-')?;
+    if body.is_empty() {
+        return None;
+    }
+    let n = count.parse::<u32>().ok()?;
+    if n >= 1 { Some(n) } else { None }
+}
+
+/// A CompleteMultipartUpload checksum header may repeat the stored value,
+/// including a composite `-N` suffix, or send only the digest.
+pub fn checksum_values_equivalent(stored: &str, provided: &str) -> bool {
+    if stored == provided {
+        return true;
+    }
+    match composite_checksum_part_count(stored) {
+        Some(_) => stored
+            .rsplit_once('-')
+            .is_some_and(|(digest, _)| digest == provided),
+        None => false,
     }
 }
 
@@ -181,6 +303,7 @@ pub struct PutResult {
     pub version_id: Option<String>,
     pub checksum_algorithm: Option<ChecksumAlgorithm>,
     pub checksum_value: Option<String>,
+    pub checksum_type: Option<ChecksumType>,
 }
 
 /// One directory level of a bucket's key namespace (see
@@ -254,6 +377,10 @@ pub struct ObjectMeta {
     pub checksum_algorithm: Option<ChecksumAlgorithm>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub checksum_value: Option<String>,
+    /// Absent on objects written before checksum type was stored. Readers
+    /// infer it from `checksum_value` (`ChecksumType::infer_from_value`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checksum_type: Option<ChecksumType>,
     /// SHA-256 (hex) of the stored object bytes. Written for every flat object
     /// this version stores, including multipart uploads and SSE ciphertext.
     /// Older objects omit it and stay unverifiable when the etag is not a
@@ -340,6 +467,10 @@ pub struct MultipartUploadMeta {
     pub initiated: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub checksum_algorithm: Option<ChecksumAlgorithm>,
+    /// Resolved at CreateMultipartUpload, including the algorithm default
+    /// when the client omits `x-amz-checksum-type`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checksum_type: Option<ChecksumType>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub encryption_spec: Option<UploadEncryptionSpec>,
     /// Metadata applied to the object on CompleteMultipartUpload.
@@ -348,6 +479,31 @@ pub struct MultipartUploadMeta {
     /// Tags (`x-amz-tagging`) applied on CompleteMultipartUpload.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tags: Option<HashMap<String, String>>,
+}
+
+impl ObjectMeta {
+    /// Stored type, or the legacy inference when a checksum value is present
+    /// and `checksum_type` was never written.
+    pub fn resolved_checksum_type(&self) -> Option<ChecksumType> {
+        self.checksum_algorithm?;
+        let value = self.checksum_value.as_deref()?;
+        Some(
+            self.checksum_type
+                .unwrap_or_else(|| ChecksumType::infer_from_value(value)),
+        )
+    }
+}
+
+impl MultipartUploadMeta {
+    /// Type fixed at CreateMultipartUpload. In-progress uploads from before
+    /// this field existed fall back to the algorithm default.
+    pub fn resolved_checksum_type(&self) -> Option<ChecksumType> {
+        let algo = self.checksum_algorithm?;
+        Some(
+            self.checksum_type
+                .unwrap_or_else(|| algo.default_multipart_checksum_type()),
+        )
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -708,6 +864,54 @@ mod sidecar_format_tests {
         }
         let meta: ObjectMeta = serde_json::from_str(full).unwrap();
         assert_eq!(meta.metadata.cache_control.as_deref(), Some("no-cache"));
+        assert_eq!(meta.checksum_type, None);
+        assert_eq!(
+            meta.resolved_checksum_type(),
+            Some(super::ChecksumType::FullObject)
+        );
         assert_eq!(meta.metadata.user_metadata.unwrap()["b"], "2");
+    }
+
+    #[test]
+    fn checksum_type_round_trips_and_legacy_values_infer() {
+        use super::{ChecksumAlgorithm, ChecksumType, ObjectMeta};
+        let mut meta = ObjectMeta {
+            key: "k".into(),
+            checksum_algorithm: Some(ChecksumAlgorithm::SHA256),
+            checksum_value: Some("abc==-2".into()),
+            part_sizes: Some(vec![1, 2]),
+            ..ObjectMeta::default()
+        };
+        assert_eq!(
+            meta.resolved_checksum_type(),
+            Some(ChecksumType::Composite),
+            "a -N suffix is composite even when the field was not stored"
+        );
+        meta.checksum_value = Some("abc==".into());
+        assert_eq!(
+            meta.resolved_checksum_type(),
+            Some(ChecksumType::FullObject),
+            "a digest with no -N suffix is full-object even when part sizes are stored"
+        );
+        meta.checksum_type = Some(ChecksumType::FullObject);
+        let json = serde_json::to_string(&meta).unwrap();
+        assert!(json.contains("\"checksum_type\":\"FULL_OBJECT\""), "{json}");
+        let back: ObjectMeta = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.checksum_type, Some(ChecksumType::FullObject));
+        assert!(super::checksum_values_equivalent("abc==-2", "abc=="));
+        assert!(super::checksum_values_equivalent("abc==-2", "abc==-2"));
+        assert!(!super::checksum_values_equivalent("abc==", "abc==-2"));
+        assert!(
+            !ChecksumAlgorithm::SHA256.allows_multipart_checksum_type(ChecksumType::FullObject)
+        );
+        assert!(ChecksumAlgorithm::CRC32.allows_multipart_checksum_type(ChecksumType::FullObject));
+        assert_eq!(
+            ChecksumAlgorithm::CRC64NVME.default_multipart_checksum_type(),
+            ChecksumType::FullObject
+        );
+        assert_eq!(
+            ChecksumAlgorithm::SHA1.default_multipart_checksum_type(),
+            ChecksumType::Composite
+        );
     }
 }

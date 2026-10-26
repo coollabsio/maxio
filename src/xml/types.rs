@@ -136,6 +136,18 @@ pub struct CompleteMultipartUploadResult {
     pub key: String,
     #[serde(rename = "ETag")]
     pub etag: String,
+    #[serde(rename = "ChecksumCRC32", skip_serializing_if = "Option::is_none")]
+    pub checksum_crc32: Option<String>,
+    #[serde(rename = "ChecksumCRC32C", skip_serializing_if = "Option::is_none")]
+    pub checksum_crc32c: Option<String>,
+    #[serde(rename = "ChecksumCRC64NVME", skip_serializing_if = "Option::is_none")]
+    pub checksum_crc64nvme: Option<String>,
+    #[serde(rename = "ChecksumSHA1", skip_serializing_if = "Option::is_none")]
+    pub checksum_sha1: Option<String>,
+    #[serde(rename = "ChecksumSHA256", skip_serializing_if = "Option::is_none")]
+    pub checksum_sha256: Option<String>,
+    #[serde(rename = "ChecksumType", skip_serializing_if = "Option::is_none")]
+    pub checksum_type: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -159,6 +171,10 @@ pub struct ListPartsResult {
     pub key: String,
     #[serde(rename = "UploadId")]
     pub upload_id: String,
+    #[serde(rename = "ChecksumAlgorithm", skip_serializing_if = "Option::is_none")]
+    pub checksum_algorithm: Option<String>,
+    #[serde(rename = "ChecksumType", skip_serializing_if = "Option::is_none")]
+    pub checksum_type: Option<String>,
     #[serde(rename = "IsTruncated")]
     pub is_truncated: bool,
     #[serde(rename = "Part", default)]

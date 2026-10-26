@@ -10,8 +10,8 @@ use tokio_util::io::ReaderStream;
 use crate::error::S3Error;
 use crate::server::AppState;
 use crate::storage::{
-    BucketEncryptionConfig, ChecksumAlgorithm, EncryptionMode, EncryptionRequest, PutOptions,
-    StorageError, StoredObjectMetadata, UploadEncryptionSpec, WritePrecondition,
+    BucketEncryptionConfig, ChecksumAlgorithm, ChecksumType, EncryptionMode, EncryptionRequest,
+    PutOptions, StorageError, StoredObjectMetadata, UploadEncryptionSpec, WritePrecondition,
 };
 use crate::xml::{
     response::to_xml,
@@ -231,6 +231,74 @@ pub(crate) fn extract_checksum(headers: &HeaderMap) -> Option<(ChecksumAlgorithm
         // aws-chunked trailer checksum: validated by the decoder, computed and
         // recorded by storage.
         .or_else(|| super::chunked::trailer_checksum_algorithm(headers).map(|algo| (algo, None)))
+}
+
+/// `x-amz-checksum-type` when the client sent it. An unknown value is
+/// `InvalidRequest`. Absence is `Ok(None)`.
+pub(crate) fn extract_checksum_type(headers: &HeaderMap) -> Result<Option<ChecksumType>, S3Error> {
+    let Some(raw) = headers.get("x-amz-checksum-type") else {
+        return Ok(None);
+    };
+    let raw = raw.to_str().map_err(|_| {
+        S3Error::invalid_request("Value for x-amz-checksum-type header is invalid.")
+    })?;
+    ChecksumType::from_header_str(raw)
+        .map(Some)
+        .ok_or_else(|| S3Error::invalid_request("Value for x-amz-checksum-type header is invalid."))
+}
+
+/// PutObject and CopyObject are always a single part. AWS treats that
+/// checksum as `FULL_OBJECT` and rejects `COMPOSITE`.
+pub(crate) fn reject_single_part_checksum_type(
+    has_checksum: bool,
+    requested: Option<ChecksumType>,
+) -> Result<(), S3Error> {
+    match requested {
+        None => Ok(()),
+        Some(_) if !has_checksum => Err(S3Error::invalid_request(
+            "The x-amz-checksum-type header cannot be provided without a checksum algorithm.",
+        )),
+        Some(ChecksumType::Composite) => Err(S3Error::invalid_request(
+            "Checksum Type mismatch occurred, expected checksum Type: FULL_OBJECT, actual checksum Type: COMPOSITE",
+        )),
+        Some(ChecksumType::FullObject) => Ok(()),
+    }
+}
+
+/// Algorithm plus optional type for CreateMultipartUpload. The returned type
+/// is the value to store, including the algorithm default when the header is
+/// omitted.
+pub(crate) fn resolve_multipart_checksum_type(
+    algorithm: Option<ChecksumAlgorithm>,
+    requested: Option<ChecksumType>,
+) -> Result<Option<ChecksumType>, S3Error> {
+    match (algorithm, requested) {
+        (None, None) => Ok(None),
+        (None, Some(_)) => Err(S3Error::invalid_request(
+            "The x-amz-checksum-type header cannot be provided without a checksum algorithm.",
+        )),
+        (Some(algo), None) => Ok(Some(algo.default_multipart_checksum_type())),
+        (Some(algo), Some(ty)) if algo.allows_multipart_checksum_type(ty) => Ok(Some(ty)),
+        (Some(algo), Some(ty)) => Err(S3Error::invalid_request(&format!(
+            "The {ty} checksum type cannot be used with the {} checksum algorithm.",
+            algo.as_str()
+        ))),
+    }
+}
+
+pub(crate) fn add_checksum_headers(
+    mut builder: http::response::Builder,
+    algorithm: Option<ChecksumAlgorithm>,
+    value: Option<&str>,
+    checksum_type: Option<ChecksumType>,
+) -> http::response::Builder {
+    if let (Some(algo), Some(val)) = (algorithm, value) {
+        builder = builder.header(algo.header_name(), val);
+        if let Some(ty) = checksum_type {
+            builder = builder.header("x-amz-checksum-type", ty.header_value());
+        }
+    }
+    builder
 }
 
 // ── Object metadata, tagging header, preconditions, subresources ────────────
@@ -651,6 +719,9 @@ fn object_headers(
     }
     if let (Some(algo), Some(val)) = (&meta.checksum_algorithm, &meta.checksum_value) {
         insert_header(&mut h, algo.header_name(), val);
+        if let Some(ty) = meta.resolved_checksum_type() {
+            insert_header(&mut h, "x-amz-checksum-type", ty.header_value());
+        }
     }
     if let Some(em) = &meta.encryption {
         match em.mode {
@@ -921,16 +992,18 @@ async fn get_object_attributes(
     }
     if wants("Checksum") {
         if let (Some(algo), Some(val)) = (&meta.checksum_algorithm, &meta.checksum_value) {
-            let tag = match algo {
-                ChecksumAlgorithm::CRC32 => "ChecksumCRC32",
-                ChecksumAlgorithm::CRC32C => "ChecksumCRC32C",
-                ChecksumAlgorithm::CRC64NVME => "ChecksumCRC64NVME",
-                ChecksumAlgorithm::SHA1 => "ChecksumSHA1",
-                ChecksumAlgorithm::SHA256 => "ChecksumSHA256",
-            };
+            let tag = algo.xml_tag();
             // Composite multipart checksums are stored as `<b64>-<parts>`.
+            // Attributes reports the digest; ChecksumType says which it is.
             let value = val.split('-').next().unwrap_or(val);
-            xml.push_str(&format!("<Checksum><{tag}>{value}</{tag}></Checksum>"));
+            xml.push_str(&format!("<Checksum><{tag}>{value}</{tag}>"));
+            if let Some(ty) = meta.resolved_checksum_type() {
+                xml.push_str(&format!(
+                    "<ChecksumType>{}</ChecksumType>",
+                    ty.header_value()
+                ));
+            }
+            xml.push_str("</Checksum>");
         }
     }
     if wants("ObjectParts") {
@@ -1025,6 +1098,7 @@ pub async fn put_object(
     let reader = Md5VerifyingReader::wrap(body_to_reader(&headers, body).await?, content_md5);
 
     let checksum = extract_checksum(&headers);
+    reject_single_part_checksum_type(checksum.is_some(), extract_checksum_type(&headers)?)?;
 
     // Resolve encryption: explicit request headers win over bucket default.
     let mut encryption = extract_sse_request(&headers)?;
@@ -1064,9 +1138,12 @@ pub async fn put_object(
     if let Some(vid) = &result.version_id {
         builder = builder.header("x-amz-version-id", vid.as_str());
     }
-    if let (Some(algo), Some(val)) = (&result.checksum_algorithm, &result.checksum_value) {
-        builder = builder.header(algo.header_name(), val.as_str());
-    }
+    builder = add_checksum_headers(
+        builder,
+        result.checksum_algorithm,
+        result.checksum_value.as_deref(),
+        result.checksum_type,
+    );
     // Echo SSE headers matching what was applied.
     match applied_mode {
         Some(EncryptionMode::SseS3) => {
@@ -1458,8 +1535,11 @@ async fn copy_object(
         None => src_meta.tags.clone(),
     };
 
-    // Propagate source checksum algorithm so it's recomputed during copy
+    // Propagate source checksum algorithm so it's recomputed during copy.
+    // CopyObject is one full-object write, so a composite source becomes
+    // FULL_OBJECT of the same algorithm.
     let checksum = src_meta.checksum_algorithm.map(|algo| (algo, None));
+    reject_single_part_checksum_type(checksum.is_some(), extract_checksum_type(&headers)?)?;
 
     // Destination may request its own SSE; fall back to bucket default.
     let mut encryption = extract_sse_request(&headers)?;
@@ -1512,6 +1592,12 @@ async fn copy_object(
         builder = builder.header("x-amz-copy-source-version-id", vid.as_str());
     }
     builder = add_sse_headers(builder, &dst_meta.encryption);
+    builder = add_checksum_headers(
+        builder,
+        result.checksum_algorithm,
+        result.checksum_value.as_deref(),
+        result.checksum_type,
+    );
     Ok(builder.body(Body::from(xml)).unwrap())
 }
 
@@ -1788,6 +1874,7 @@ pub async fn get_object(
     if let (Some((_, length, _)), Some(algo)) = (selection, &meta.checksum_algorithm) {
         if length < meta.size {
             hdrs.remove(algo.header_name());
+            hdrs.remove("x-amz-checksum-type");
         }
     }
 

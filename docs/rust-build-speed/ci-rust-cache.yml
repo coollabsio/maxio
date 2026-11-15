@@ -1,0 +1,10 @@
+# GitHub Actions snippet. Put it after the Rust toolchain step.
+# On MaxIO, restoring an unchanged debug target made `cargo build`
+# finish in 0.12s (median of 0.19, 0.12, 0.11). A one-line edit of a
+# library file on that target finished in 2.84s, against a 28.36s cold
+# build. sccache 0.19 with incremental compilation forced off finished
+# a warm-cache cold build in 7.46s and does not cache bins or
+# proc-macros, so prefer keeping target/.
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2

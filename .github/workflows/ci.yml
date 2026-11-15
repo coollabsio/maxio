@@ -43,6 +43,9 @@ jobs:
       - name: fmt
         run: cargo fmt --all -- --check
 
+      - name: agent check script
+        run: bash scripts/agent-check-test.sh
+
       - name: actionlint
         uses: rhysd/actionlint@03d0035246f3e81f36aed592ffb4bebf33a03106 # v1.7.7
 

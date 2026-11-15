@@ -753,67 +753,171 @@ pub async fn provision_default_buckets(
     }
 }
 
-/// For each bucket in `public_buckets` (comma-separated): create it if missing,
-/// then flag it anonymous public-read (read = true, list = false). This is the
-/// equivalent of `mc anonymous set download`.
+/// Names this feature last made public-read. Lives next to the data, not in
+/// bucket metadata, so a console public-read flag is never mistaken for one
+/// this setting applied.
+const ENV_PUBLIC_FILE: &str = ".maxio-public-buckets.json";
+
+#[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
+struct EnvPublicRecord {
+    buckets: Vec<String>,
+}
+
+fn fresh_public_meta(name: &str, region: &str) -> BucketMeta {
+    BucketMeta {
+        name: name.to_string(),
+        created_at: chrono::Utc::now()
+            .format("%Y-%m-%dT%H:%M:%S%.3fZ")
+            .to_string(),
+        region: region.to_string(),
+        versioning: false,
+        cors_rules: None,
+        encryption_config: None,
+        public_read: true,
+        public_list: false,
+        versioning_suspended: false,
+        tags: None,
+        lifecycle: None,
+    }
+}
+
+async fn read_env_public(path: &std::path::Path) -> Vec<String> {
+    match tokio::fs::read_to_string(path).await {
+        Ok(text) => serde_json::from_str::<EnvPublicRecord>(&text)
+            .map(|record| record.buckets)
+            .unwrap_or_else(|err| {
+                tracing::warn!(
+                    "Ignoring unreadable {} ({err}); buckets it listed stay as they are until the next successful write",
+                    path.display()
+                );
+                Vec::new()
+            }),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(err) => {
+            tracing::warn!("Could not read {}: {err}", path.display());
+            Vec::new()
+        }
+    }
+}
+
+async fn write_env_public(path: &std::path::Path, names: &[String]) {
+    if names.is_empty() {
+        if let Err(err) = tokio::fs::remove_file(path).await {
+            if err.kind() != std::io::ErrorKind::NotFound {
+                tracing::warn!("Could not remove {}: {err}", path.display());
+            }
+        }
+        return;
+    }
+    let body = serde_json::to_string(&EnvPublicRecord {
+        buckets: names.to_vec(),
+    })
+    .unwrap_or_else(|_| "{}".to_string());
+    let tmp = path.with_extension("json.tmp");
+    if let Err(err) = tokio::fs::write(&tmp, body).await {
+        tracing::warn!("Could not write {}: {err}", tmp.display());
+        return;
+    }
+    if let Err(err) = tokio::fs::rename(&tmp, path).await {
+        tracing::warn!("Could not replace {}: {err}", path.display());
+    }
+}
+
+/// Create or flag each name in `public_buckets` as anonymous public-read
+/// (`public_list` is left as it already is). This is the startup equivalent of
+/// `mc anonymous set download`.
 ///
-/// Runs after `provision_default_buckets`, so a bucket may appear in both lists.
-/// Invalid names, including the reserved buckets `maxio` and `ui`, are skipped.
-/// Errors are non-fatal. Removing a name from the list does not make that
-/// bucket private again.
+/// The list is the source of truth for public-read **only for buckets this
+/// function made public**. Those names are recorded in
+/// `{data_dir}/.maxio-public-buckets.json`. A name dropped from a later start
+/// loses public-read and keeps its `public_list`. A bucket that was already
+/// public-read when this function first saw it was made public another way
+/// and is not recorded, so a later start does not turn it private.
+///
+/// Invalid names (including the reserved buckets `maxio` and `ui`) are
+/// skipped. Errors are non-fatal. An empty list still runs, so a previous
+/// record can be cleared.
 pub async fn provision_public_buckets(
     storage: &filesystem::FilesystemStorage,
     public_buckets: &str,
     region: &str,
 ) {
-    if public_buckets.is_empty() {
-        return;
-    }
+    let record_path = storage.root_dir().join(ENV_PUBLIC_FILE);
+    let previously_owned = read_env_public(&record_path).await;
+    let mut wanted = Vec::new();
     for bucket_name in public_buckets.split(',') {
         let bucket_name = bucket_name.trim();
-        if bucket_name.is_empty() {
+        if bucket_name.is_empty() || wanted.iter().any(|name| name == bucket_name) {
             continue;
         }
         if !is_valid_bucket_name(bucket_name) {
             tracing::warn!("Skipping invalid public bucket name: '{}'", bucket_name);
             continue;
         }
-        let meta = BucketMeta {
-            name: bucket_name.to_string(),
-            created_at: chrono::Utc::now()
-                .format("%Y-%m-%dT%H:%M:%S%.3fZ")
-                .to_string(),
-            region: region.to_string(),
-            versioning: false,
-            cors_rules: None,
-            encryption_config: None,
-            public_read: true,
-            public_list: false,
-            versioning_suspended: false,
-            tags: None,
-            lifecycle: None,
-        };
+        wanted.push(bucket_name.to_string());
+    }
+
+    let mut owned = Vec::new();
+    for bucket_name in &wanted {
+        let meta = fresh_public_meta(bucket_name, region);
         match storage.create_bucket(&meta).await {
-            Ok(true) => tracing::info!("Created public bucket: {}", bucket_name),
+            Ok(true) => {
+                tracing::info!("Created public bucket: {}", bucket_name);
+                owned.push(bucket_name.clone());
+            }
             Ok(false) => match storage.get_bucket_public(bucket_name).await {
-                Ok((_read, list)) => match storage.set_bucket_public(bucket_name, true, list).await
-                {
-                    Ok(()) => {
-                        tracing::info!("Enabled public-read on existing bucket: {}", bucket_name)
+                Ok((read, list)) => {
+                    let already_owned = previously_owned.iter().any(|name| name == bucket_name);
+                    if already_owned || !read {
+                        if let Err(err) = storage.set_bucket_public(bucket_name, true, list).await {
+                            tracing::warn!(
+                                "Failed to flag bucket '{}' public-read: {}",
+                                bucket_name,
+                                err
+                            );
+                            continue;
+                        }
+                        tracing::info!("Enabled public-read on bucket: {}", bucket_name);
+                        owned.push(bucket_name.clone());
                     }
-                    Err(e) => {
-                        tracing::warn!("Failed to flag bucket '{}' public-read: {}", bucket_name, e)
-                    }
-                },
-                Err(e) => tracing::warn!(
+                }
+                Err(err) => tracing::warn!(
                     "Failed to read public flags for bucket '{}': {}",
                     bucket_name,
-                    e
+                    err
                 ),
             },
-            Err(e) => tracing::warn!("Failed to create public bucket '{}': {}", bucket_name, e),
+            Err(err) => {
+                tracing::warn!("Failed to create public bucket '{}': {}", bucket_name, err)
+            }
         }
     }
+
+    for bucket_name in &previously_owned {
+        if owned.iter().any(|name| name == bucket_name) {
+            continue;
+        }
+        match storage.get_bucket_public(bucket_name).await {
+            Ok((true, list)) => {
+                if let Err(err) = storage.set_bucket_public(bucket_name, false, list).await {
+                    tracing::warn!(
+                        "Failed to clear public-read on bucket '{}': {}",
+                        bucket_name,
+                        err
+                    );
+                } else {
+                    tracing::info!(
+                        "Cleared public-read on bucket removed from MAXIO_PUBLIC_BUCKETS: {}",
+                        bucket_name
+                    );
+                }
+            }
+            Ok((false, _)) => {}
+            Err(_) => {}
+        }
+    }
+
+    write_env_public(&record_path, &owned).await;
 }
 
 #[derive(Debug, thiserror::Error)]

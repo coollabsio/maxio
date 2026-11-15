@@ -3325,6 +3325,144 @@ assert "iam prefix-key delete-user" $AWS iam delete-user --user-name "$IAM_PFX_U
 $AWS s3 rm "s3://$IAM_PFX_BUCKET" --recursive >/dev/null 2>&1 || true
 assert "iam prefix-key delete bucket" $AWS s3 rb "s3://$IAM_PFX_BUCKET"
 
+# --- MAXIO_PUBLIC_BUCKETS ---
+# Own server so the env var is the startup source of truth. The caller-owned
+# server stays up for the rest of the suite.
+echo ""
+echo "--- MAXIO_PUBLIC_BUCKETS ---"
+PUB_BIN="${MAXIO_BIN:-}"
+if [ -z "$PUB_BIN" ]; then
+    if [ -x ./target/release/maxio ]; then
+        PUB_BIN=./target/release/maxio
+    elif [ -x ./target/debug/maxio ]; then
+        PUB_BIN=./target/debug/maxio
+    fi
+fi
+if [ -z "$PUB_BIN" ]; then
+    red "FAIL: maxio binary required for MAXIO_PUBLIC_BUCKETS"
+    FAIL=$((FAIL + 1))
+else
+    PUB_DATA=$(mktemp -d)
+    PUB_PORT=$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1]); s.close()')
+    PUB_EP="http://127.0.0.1:$PUB_PORT"
+    PUB_CREDS=(--access-key "$MAXIO_TEST_ACCESS_KEY" --secret-key "$MAXIO_TEST_SECRET_KEY")
+    if [ "$MAXIO_TEST_ACCESS_KEY" = "maxioadmin" ] && [ "$MAXIO_TEST_SECRET_KEY" = "maxioadmin" ]; then
+        PUB_CREDS+=(--allow-insecure-dev)
+    fi
+    MAXIO_PUBLIC_BUCKETS="pubmedia, pubassets,maxio,ui,BAD_NAME" \
+        "$PUB_BIN" --data-dir "$PUB_DATA" --port "$PUB_PORT" --address 127.0.0.1 \
+        "${PUB_CREDS[@]}" >"$PUB_DATA/server.log" 2>&1 &
+    PUB_PID=$!
+    for _ in $(seq 1 50); do
+        curl -sf "$PUB_EP/maxio/health/live" >/dev/null 2>&1 && break
+        sleep 0.1
+    done
+    PUB_AWS=(aws --endpoint-url "$PUB_EP")
+    assert "public env created pubmedia" "${PUB_AWS[@]}" s3api head-bucket --bucket pubmedia
+    assert "public env created pubassets" "${PUB_AWS[@]}" s3api head-bucket --bucket pubassets
+    assert_fail "public env skipped reserved maxio" "${PUB_AWS[@]}" s3api head-bucket --bucket maxio
+    assert_fail "public env skipped reserved ui" "${PUB_AWS[@]}" s3api head-bucket --bucket ui
+    assert_fail "public env skipped invalid name" "${PUB_AWS[@]}" s3api head-bucket --bucket BAD_NAME
+    echo "public body" > "$TMPDIR/pub-body.txt"
+    assert "put public env object" "${PUB_AWS[@]}" s3api put-object --bucket pubmedia \
+        --key notes.txt --content-type text/plain --body "$TMPDIR/pub-body.txt"
+    ANON_GET=$(curl -sS -D "$TMPDIR/pub-get.hdr" -o "$TMPDIR/pub-get.txt" -w '%{http_code}' \
+        "$PUB_EP/pubmedia/notes.txt")
+    assert_eq "anonymous public GET" "200" "$ANON_GET"
+    assert_eq "anonymous public body" "public body" "$(cat "$TMPDIR/pub-get.txt")"
+    assert_eq "anonymous public object is sandboxed" "true" \
+        "$(grep -i '^content-security-policy:' "$TMPDIR/pub-get.hdr" | grep -q sandbox && echo true || echo false)"
+    ANON_HEAD=$(curl -sS -o /dev/null -w '%{http_code}' -I "$PUB_EP/pubmedia/notes.txt")
+    assert_eq "anonymous public HEAD" "200" "$ANON_HEAD"
+    ANON_RANGE=$(curl -sS -o "$TMPDIR/pub-range.txt" -w '%{http_code}' \
+        -H 'Range: bytes=0-5' "$PUB_EP/pubmedia/notes.txt")
+    assert_eq "anonymous public range" "206" "$ANON_RANGE"
+    assert_eq "anonymous public range body" "public" "$(cat "$TMPDIR/pub-range.txt")"
+    ANON_PART=$(curl -sS -o "$TMPDIR/pub-part.txt" -w '%{http_code}' \
+        "$PUB_EP/pubmedia/notes.txt?partNumber=1")
+    assert_eq "anonymous public partNumber" "206" "$ANON_PART"
+    assert_eq "anonymous public part body" "public body" "$(cat "$TMPDIR/pub-part.txt")"
+    assert_eq "anonymous public list denied" "403" \
+        "$(curl -sS -o /dev/null -w '%{http_code}' "$PUB_EP/pubmedia")"
+    assert_eq "anonymous public list-type denied" "403" \
+        "$(curl -sS -o /dev/null -w '%{http_code}' "$PUB_EP/pubmedia?list-type=2")"
+    assert_eq "anonymous public PUT denied" "403" \
+        "$(curl -sS -o /dev/null -w '%{http_code}' -X PUT --data nope "$PUB_EP/pubmedia/nope.txt")"
+    assert_eq "anonymous public DELETE denied" "403" \
+        "$(curl -sS -o /dev/null -w '%{http_code}' -X DELETE "$PUB_EP/pubmedia/notes.txt")"
+    for query in tagging acl "versionId=abc" "uploadId=deadbeef" uploads attributes; do
+        CODE=$(curl -sS -o /dev/null -w '%{http_code}' "$PUB_EP/pubmedia/notes.txt?$query")
+        assert_eq "anonymous public ?$query denied" "403" "$CODE"
+    done
+    ANON_PREFLIGHT=$(curl -sS -o /dev/null -w '%{http_code}' -X OPTIONS \
+        -H 'Origin: https://example.com' -H 'Access-Control-Request-Method: GET' \
+        "$PUB_EP/pubmedia/notes.txt")
+    assert_eq "anonymous public CORS preflight denied" "403" "$ANON_PREFLIGHT"
+    printf '<html><body id="marker">visible</body></html>\n' > "$TMPDIR/pub.html"
+    assert "put public html object" "${PUB_AWS[@]}" s3api put-object --bucket pubmedia \
+        --key page.html --content-type text/html --body "$TMPDIR/pub.html"
+    curl -sS -D "$TMPDIR/pub-html.hdr" -o "$TMPDIR/pub-html.body" "$PUB_EP/pubmedia/page.html"
+    assert_eq "public html body intact" "true" \
+        "$(grep -q 'visible' "$TMPDIR/pub-html.body" && echo true || echo false)"
+    assert_eq "public html CSP is sandbox" "true" \
+        "$(grep -i '^content-security-policy:' "$TMPDIR/pub-html.hdr" | grep -q sandbox && echo true || echo false)"
+    assert_eq "public html CSP is not the console policy" "true" \
+        "$(grep -i '^content-security-policy:' "$TMPDIR/pub-html.hdr" | grep -q unsafe-inline && echo false || echo true)"
+    SSEC_KEY_B64=$(openssl rand 32 | base64 -w 0)
+    SSEC_KEY_MD5=$(printf '%s' "$SSEC_KEY_B64" | base64 -d | openssl dgst -md5 -binary | base64 -w 0)
+    echo "sse-c public" > "$TMPDIR/pub-ssec.txt"
+    assert "put public SSE-C object" "${PUB_AWS[@]}" s3api put-object --bucket pubmedia \
+        --key secret.bin --body "$TMPDIR/pub-ssec.txt" \
+        --sse-customer-algorithm AES256 \
+        --sse-customer-key "$SSEC_KEY_B64" \
+        --sse-customer-key-md5 "$SSEC_KEY_MD5"
+    SSEC_NOKEY=$(curl -sS -o /dev/null -w '%{http_code}' "$PUB_EP/pubmedia/secret.bin")
+    assert_eq "anonymous SSE-C without key denied" "400" "$SSEC_NOKEY"
+    SSEC_OK=$(curl -sS -o "$TMPDIR/pub-ssec.out" -w '%{http_code}' \
+        -H 'x-amz-server-side-encryption-customer-algorithm: AES256' \
+        -H "x-amz-server-side-encryption-customer-key: $SSEC_KEY_B64" \
+        -H "x-amz-server-side-encryption-customer-key-md5: $SSEC_KEY_MD5" \
+        "$PUB_EP/pubmedia/secret.bin")
+    assert_eq "anonymous SSE-C with key" "200" "$SSEC_OK"
+    assert_eq "anonymous SSE-C body" "sse-c public" "$(cat "$TMPDIR/pub-ssec.out")"
+    echo "assets" > "$TMPDIR/assets.txt"
+    assert "put pubassets object" "${PUB_AWS[@]}" s3api put-object --bucket pubassets \
+        --key notes.txt --body "$TMPDIR/assets.txt"
+    echo "kept" > "$TMPDIR/kept.txt"
+    assert "create console-public bucket" "${PUB_AWS[@]}" s3api create-bucket --bucket consolepub
+    assert "put console-public object" "${PUB_AWS[@]}" s3api put-object --bucket consolepub \
+        --key kept.txt --body "$TMPDIR/kept.txt"
+    assert_eq "bucket outside the env list stays private" "403" \
+        "$(curl -sS -o /dev/null -w '%{http_code}' "$PUB_EP/consolepub/kept.txt")"
+    cat > "$TMPDIR/consolepub-policy.json" <<EOF
+{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::consolepub/*"}]}
+EOF
+    assert "policy makes consolepub public" "${PUB_AWS[@]}" s3api put-bucket-policy \
+        --bucket consolepub --policy "file://$TMPDIR/consolepub-policy.json"
+    assert_eq "console-public object readable" "200" \
+        "$(curl -sS -o /dev/null -w '%{http_code}' "$PUB_EP/consolepub/kept.txt")"
+    kill -TERM "$PUB_PID" 2>/dev/null || true
+    wait "$PUB_PID" 2>/dev/null || true
+    MAXIO_PUBLIC_BUCKETS="pubassets" \
+        "$PUB_BIN" --data-dir "$PUB_DATA" --port "$PUB_PORT" --address 127.0.0.1 \
+        "${PUB_CREDS[@]}" >"$PUB_DATA/server2.log" 2>&1 &
+    PUB_PID=$!
+    for _ in $(seq 1 50); do
+        curl -sf "$PUB_EP/maxio/health/live" >/dev/null 2>&1 && break
+        sleep 0.1
+    done
+    assert_eq "removed env bucket is private again" "403" \
+        "$(curl -sS -o /dev/null -w '%{http_code}' "$PUB_EP/pubmedia/notes.txt")"
+    assert_eq "bucket still in the env list stays public" "200" \
+        "$(curl -sS -o "$TMPDIR/pubassets.txt" -w '%{http_code}' "$PUB_EP/pubassets/notes.txt")"
+    assert_eq "bucket still in the env list body" "assets" "$(cat "$TMPDIR/pubassets.txt")"
+    assert_eq "console-made public bucket stays public" "200" \
+        "$(curl -sS -o /dev/null -w '%{http_code}' "$PUB_EP/consolepub/kept.txt")"
+    kill -TERM "$PUB_PID" 2>/dev/null || true
+    wait "$PUB_PID" 2>/dev/null || true
+    rm -rf "$PUB_DATA"
+fi
+
 # --- Summary ---
 echo ""
 echo "=== Results: $PASS passed, $FAIL failed ==="

@@ -527,6 +527,13 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 }
 
 impl FilesystemStorage {
+    /// Data directory that contains `buckets/`.
+    pub fn root_dir(&self) -> &Path {
+        self.buckets_dir
+            .parent()
+            .unwrap_or(self.buckets_dir.as_path())
+    }
+
     pub async fn new(
         data_dir: &str,
         erasure_coding: bool,

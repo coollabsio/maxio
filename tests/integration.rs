@@ -543,6 +543,40 @@ async fn test_public_buckets_skip_invalid_and_empty() {
 }
 
 #[tokio::test]
+async fn test_public_buckets_removal_reverts_only_buckets_this_feature_made_public() {
+    let tmp = TempDir::new().unwrap();
+    let data_dir = tmp.path().to_str().unwrap().to_string();
+    let keyring = Arc::new(Keyring::load(&data_dir, None).await.unwrap());
+    let storage = FilesystemStorage::new(&data_dir, false, 10 * 1024 * 1024, 0, keyring)
+        .await
+        .unwrap();
+
+    // Made public by the console (or a bucket policy), not by the env list.
+    maxio::storage::provision_default_buckets(&storage, "kept", REGION).await;
+    storage
+        .set_bucket_public("kept", true, false)
+        .await
+        .unwrap();
+
+    maxio::storage::provision_public_buckets(&storage, "media", REGION).await;
+    let (read, list) = storage.get_bucket_public("media").await.unwrap();
+    assert!(read && !list);
+
+    // Listing an already-public bucket does not take ownership of it.
+    maxio::storage::provision_public_buckets(&storage, "media,kept", REGION).await;
+    maxio::storage::provision_public_buckets(&storage, "", REGION).await;
+
+    let (read, _) = storage.get_bucket_public("media").await.unwrap();
+    assert!(!read, "removing media from the env list clears public-read");
+    let (read, list) = storage.get_bucket_public("kept").await.unwrap();
+    assert!(
+        read && !list,
+        "a bucket made public another way stays public-read"
+    );
+    assert!(!tmp.path().join(".maxio-public-buckets.json").exists());
+}
+
+#[tokio::test]
 async fn test_default_buckets_skips_invalid_names() {
     let (base_url, _tmp) =
         start_server_with_default_buckets("INVALID,valid,b..a,a.-b,a-.b,192.168.0.1").await;

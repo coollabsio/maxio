@@ -98,7 +98,7 @@ impl Service<Request<Body>> for AppService {
 /// the console bundle needs them. `blob:` is limited to image and PDF
 /// previews. Object responses must not inherit this policy: they are
 /// same-origin bytes and `'unsafe-inline'` would run them.
-const CONSOLE_CSP: &str = "default-src 'self'; base-uri 'self'; object-src 'none'; frame-ancestors 'none'; img-src 'self' https: data: blob:; style-src 'self' 'unsafe-inline'; font-src 'self' data:; script-src 'self' 'unsafe-inline'; connect-src 'self'; frame-src 'self' blob:; form-action 'self'";
+const CONSOLE_CSP: &str = "default-src 'self'; base-uri 'self'; object-src 'none'; frame-ancestors 'none'; img-src 'self' https: data: blob:; style-src 'self' 'unsafe-inline'; font-src 'self' data:; script-src 'self' 'unsafe-inline'; connect-src 'self'; frame-src blob:; form-action 'self'";
 
 /// S3 and probe responses share the console origin. `sandbox` gives them a
 /// unique origin and disables scripts (no `allow-scripts`, no
@@ -434,6 +434,19 @@ mod tests {
         assert!(!OBJECT_RESPONSE_CSP.contains("allow-scripts"));
         assert!(!OBJECT_RESPONSE_CSP.contains("allow-same-origin"));
         assert!(CONSOLE_CSP.contains("script-src 'self' 'unsafe-inline'"));
+        assert!(CONSOLE_CSP.contains("img-src 'self' https: data: blob:"));
+        assert!(
+            CONSOLE_CSP.contains("frame-src blob:"),
+            "PDF preview frames a blob URL"
+        );
+        assert!(
+            !CONSOLE_CSP.contains("frame-src 'self'"),
+            "the console does not frame same-origin documents"
+        );
+        assert!(
+            !OBJECT_RESPONSE_CSP.contains("blob:"),
+            "object responses stay sandboxed without blob:"
+        );
     }
 }
 

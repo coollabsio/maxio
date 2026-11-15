@@ -60,9 +60,9 @@ function DialogShell({
         >
           <div className="flex items-start justify-between gap-4 pb-1">
             <div className="flex min-w-0 flex-col gap-1">
-              <DialogPrimitive.Title className="truncate text-base font-semibold text-black dark:text-white">{title}</DialogPrimitive.Title>
+              <DialogPrimitive.Title className={cn('text-base font-semibold text-black dark:text-white', size === 'lg' && 'truncate')}>{title}</DialogPrimitive.Title>
               {description ? (
-                <DialogPrimitive.Description className="truncate text-[13px] text-neutral-500 dark:text-fg-faint">
+                <DialogPrimitive.Description className={cn('text-[13px] text-neutral-500 dark:text-fg-faint', size === 'lg' && 'truncate')}>
                   {description}
                 </DialogPrimitive.Description>
               ) : null}

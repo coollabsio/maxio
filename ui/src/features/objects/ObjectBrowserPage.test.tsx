@@ -65,6 +65,46 @@ test('shows upload and delete when the prefix allows them', async () => {
   expect(screen.getByRole('button', { name: 'Delete' })).toBeTruthy()
 })
 
+test('delete confirmation keeps the full object name visible', async () => {
+  const user = userEvent.setup()
+  const name = 'quarterly-report-final-v12-do-not-truncate-this-object-name.txt'
+  globalThis.fetch = (async (input: RequestInfo | URL) => {
+    const request = input as Request
+    const url = new URL(request.url)
+    if (url.pathname.includes('/capabilities')) {
+      return json({ createBucket: false, deleteBucket: false, putObject: true, deleteObject: true })
+    }
+    if (url.pathname.includes('/versioning')) return json({ enabled: false })
+    return json({
+      files: [
+        {
+          key: name,
+          size: 12,
+          lastModified: '2026-01-01T00:00:00.000Z',
+          etag: '"abc"',
+          contentType: 'text/plain',
+        },
+      ],
+      prefixes: [],
+      emptyPrefixes: [],
+    })
+  }) as typeof globalThis.fetch
+  const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+  const screen = render(
+    <QueryClientProvider client={queryClient}>
+      <MemoryRouter initialEntries={['/buckets/photos']}>
+        <Routes>
+          <Route path="/buckets/:bucket" element={<ObjectBrowserPage />} />
+        </Routes>
+      </MemoryRouter>
+    </QueryClientProvider>,
+  )
+  await user.click(await screen.findByRole('button', { name: 'Delete' }))
+  const description = await screen.findByText(`This will delete "${name}" from this bucket.`)
+  expect(description.className.includes('truncate')).toBe(false)
+  expect(screen.getByRole('heading', { name: 'Delete object?' }).className.includes('truncate')).toBe(false)
+})
+
 test('denied download stays on the page and shows the error', async () => {
   const userEvents = userEvent.setup()
   let sawDownload = false
@@ -207,6 +247,9 @@ test('preview opens a dialog with the fetched text and an in-page download', asy
   const dialog = within(await screen.findByRole('dialog', { name: 'readme.txt' }))
   await waitFor(() => expect(dialog.getByText('hello')).toBeTruthy())
   expect(dialog.getByText('text/plain')).toBeTruthy()
+  // The wide preview dialog truncates its header. Other dialogs do not.
+  expect(dialog.getByRole('heading', { name: 'readme.txt' }).className).toContain('truncate')
+  expect(dialog.getByText('text/plain').className).toContain('truncate')
   expect(downloads).toEqual(['/maxio/api/buckets/docs/download/readme.txt'])
 
   // Like the row action, the footer download fetches in place (errors stay in the page) instead of following a link.

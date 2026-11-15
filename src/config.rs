@@ -102,6 +102,13 @@ pub struct Config {
     #[arg(long, env = "MAXIO_DEFAULT_BUCKETS", default_value_t = default_default_buckets().unwrap_or_default())]
     pub default_buckets: String,
 
+    /// Comma-separated buckets to serve as anonymous public-read (not public-list).
+    /// Created if missing. On startup this list owns public-read only for buckets
+    /// it made public: a name removed later loses public-read. Buckets made public
+    /// another way are left alone. MinIO has no matching variable.
+    #[arg(long, env = "MAXIO_PUBLIC_BUCKETS", default_value = "")]
+    pub public_buckets: String,
+
     /// Max request body size for console JSON/form API routes, in bytes. Object uploads are streaming and not covered by this limit.
     #[arg(long, env = "MAXIO_MAX_CONSOLE_BODY_BYTES", default_value = "1048576")]
     pub max_console_body_bytes: usize,
@@ -184,6 +191,7 @@ impl Default for Config {
             chunk_size: 10_485_760,
             parity_shards: 0,
             default_buckets: String::new(),
+            public_buckets: String::new(),
             max_console_body_bytes: 1_048_576,
             shutdown_timeout_secs: 8,
             max_object_size: 5 * 1024 * 1024 * 1024,

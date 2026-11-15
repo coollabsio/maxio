@@ -97,6 +97,7 @@ printf 'Open http://localhost:9000/ui/ and sign in with %s / %s\n' \
 | `MAXIO_SECRET_KEY` | `maxioadmin` | Secret key (aliases: `MINIO_ROOT_PASSWORD`, `MINIO_SECRET_KEY`) |
 | `MAXIO_REGION` | `us-east-1` | S3 region (aliases: `MINIO_REGION_NAME`, `MINIO_REGION`) |
 | `MAXIO_DEFAULT_BUCKETS` | _(none)_ | Comma-separated buckets to create at startup (alias: `MINIO_DEFAULT_BUCKETS`) |
+| `MAXIO_PUBLIC_BUCKETS` | _(none)_ | Comma-separated buckets created at startup if missing and flagged anonymous public-read, not public-list. A later start drops public-read only for buckets this list made public |
 | `MAXIO_ALLOW_INSECURE_DEV` | `false` | Keep the built-in `maxioadmin` keys and omit `Secure` on console cookies for every host. Local only |
 | `MAXIO_SECURE_COOKIES` | `true` | `Secure` cookies on HTTPS and on non-loopback hosts. Plain `http://localhost` still stores a session. Set `false` to allow that on any host |
 | `MAXIO_ERASURE_CODING` | `false` | Enable erasure coding |

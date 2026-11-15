@@ -3089,7 +3089,8 @@
         ],
         "properties": {
           "contentType": {
-            "type": "string"
+            "type": "string",
+            "description": "Stored `Content-Type` of the object (what download/preview will serve)."
           },
           "etag": {
             "type": "string"

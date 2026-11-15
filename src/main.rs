@@ -15,19 +15,14 @@
     clippy::collapsible_else_if
 )]
 
-mod api;
-mod auth;
-mod config;
-mod embedded;
-mod error;
-mod iam;
-mod limits;
-mod openapi;
-mod serve;
-mod server;
-mod storage;
-mod vhost;
-mod xml;
+use maxio::api;
+use maxio::config;
+use maxio::iam;
+use maxio::openapi;
+use maxio::serve;
+use maxio::server;
+use maxio::storage;
+use maxio::vhost;
 
 use clap::Parser;
 use clap::Subcommand;
@@ -659,7 +654,7 @@ async fn shutdown_signal() {
 #[cfg(test)]
 mod keyring_lock_tests {
     use super::{run_keyring_merge, run_keyring_rotate};
-    use crate::storage::lock::{LockReason, acquire_exclusive};
+    use maxio::storage::lock::{LockReason, acquire_exclusive};
 
     #[tokio::test]
     async fn rotate_and_merge_take_the_lock_before_the_format_marker() {

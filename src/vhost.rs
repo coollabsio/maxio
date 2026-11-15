@@ -20,7 +20,7 @@ pub(crate) struct SignedRequestPath(pub(crate) String);
 
 /// Parse `--domain` / `MAXIO_DOMAIN` (comma-separated). Empty input disables
 /// virtual-hosted-style. `*.example.com` is accepted as `example.com`.
-pub(crate) fn parse_domains(raw: &str) -> Result<Vec<String>, String> {
+pub fn parse_domains(raw: &str) -> Result<Vec<String>, String> {
     let mut out = Vec::new();
     if raw.trim().is_empty() {
         return Ok(out);

@@ -1732,15 +1732,42 @@ async fn test_security_headers_are_applied() {
         .to_str()
         .unwrap();
     assert!(
-        csp.contains("font-src 'self' data:"),
-        "embedded Geist fonts are same-origin files or data: URIs: {csp}"
+        csp.contains("sandbox"),
+        "probes are not the console and must not inherit its script policy: {csp}"
     );
-    assert!(csp.contains("script-src 'self' 'unsafe-inline'"), "{csp}");
     assert!(
-        !csp.contains("script-src 'self' 'unsafe-inline' data:"),
-        "font data: URIs must not widen script-src: {csp}"
+        !csp.contains("unsafe-inline"),
+        "probe CSP must not allow inline scripts: {csp}"
     );
     assert_eq!(resp.headers().get("x-frame-options").unwrap(), "DENY");
+
+    let ui = client()
+        .get(format!("{base_url}/ui/"))
+        .send()
+        .await
+        .unwrap();
+    let ui_csp = ui
+        .headers()
+        .get("content-security-policy")
+        .unwrap()
+        .to_str()
+        .unwrap();
+    assert!(
+        ui_csp.contains("font-src 'self' data:"),
+        "embedded Geist fonts are same-origin files or data: URIs: {ui_csp}"
+    );
+    assert!(
+        ui_csp.contains("script-src 'self' 'unsafe-inline'"),
+        "{ui_csp}"
+    );
+    assert!(
+        !ui_csp.contains("script-src 'self' 'unsafe-inline' data:"),
+        "font data: URIs must not widen script-src: {ui_csp}"
+    );
+    assert!(
+        !ui_csp.contains("sandbox"),
+        "console CSP must stay on /ui: {ui_csp}"
+    );
 }
 
 #[tokio::test]
@@ -3400,6 +3427,18 @@ async fn test_copy_object_no_leading_slash() {
 
 /// Generate a presigned URL for the given method/path.
 fn presign_url(base_url: &str, method: &str, path: &str, expires_secs: u64) -> String {
+    presign_url_with(base_url, method, path, expires_secs, &[])
+}
+
+/// Presign `path`, including extra query pairs (for example `response-*`) in
+/// the signed canonical query string.
+fn presign_url_with(
+    base_url: &str,
+    method: &str,
+    path: &str,
+    expires_secs: u64,
+    extra_query: &[(&str, &str)],
+) -> String {
     let parsed = reqwest::Url::parse(&format!("{}{}", base_url, path)).unwrap();
     let host = parsed.host_str().unwrap();
     let port = parsed.port().unwrap();
@@ -3420,6 +3459,9 @@ fn presign_url(base_url: &str, method: &str, path: &str, expires_secs: u64) -> S
         ("X-Amz-Expires".to_string(), expires_secs.to_string()),
         ("X-Amz-SignedHeaders".to_string(), "host".to_string()),
     ];
+    for (key, value) in extra_query {
+        qs_params.push(((*key).to_string(), (*value).to_string()));
+    }
     qs_params.sort();
 
     let canonical_qs: String = qs_params
@@ -11471,10 +11513,212 @@ async fn test_c_get_response_header_overrides() {
     let r = s3_request("GET", &url, vec![]).await;
     assert_eq!(r.status(), 200);
     check(&r);
+    assert_sandbox_csp(&r);
     let r = s3_request_with_headers("GET", &url, vec![], vec![("range", "bytes=1-2")]).await;
     assert_eq!(r.status(), 206);
     check(&r);
+    assert_sandbox_csp(&r);
     assert_eq!(r.bytes().await.unwrap().as_ref(), b"bc");
+}
+
+fn assert_sandbox_csp(resp: &reqwest::Response) {
+    let csp = c_header(resp, "content-security-policy").unwrap_or_default();
+    assert!(
+        csp.contains("sandbox"),
+        "object responses must be sandboxed: {csp}"
+    );
+    assert!(
+        !csp.contains("unsafe-inline") && !csp.contains("allow-scripts"),
+        "sandbox must not allow scripts: {csp}"
+    );
+    assert!(
+        !csp.contains("allow-same-origin"),
+        "sandbox must be a unique origin: {csp}"
+    );
+    assert_eq!(
+        c_header(resp, "x-content-type-options").as_deref(),
+        Some("nosniff")
+    );
+}
+
+fn assert_console_csp(resp: &reqwest::Response) {
+    let csp = c_header(resp, "content-security-policy").unwrap_or_default();
+    assert!(
+        csp.contains("script-src 'self' 'unsafe-inline'"),
+        "console routes keep their CSP: {csp}"
+    );
+    assert!(!csp.contains("sandbox"), "console CSP: {csp}");
+}
+
+/// Anonymous `response-*` is AWS `InvalidRequest`. A presigned or signed
+/// override still applies, and every object body is sandboxed so a
+/// `text/html` object cannot run script in the console origin.
+#[tokio::test]
+async fn object_responses_are_sandboxed_and_anonymous_overrides_rejected() {
+    let (base_url, tmp) = start_server().await;
+    s3_request("PUT", &format!("{base_url}/xss-bkt"), vec![]).await;
+    let html = b"<html><body>visible<script>window.__xss=1</script></body></html>";
+    let put = s3_request_with_headers(
+        "PUT",
+        &format!("{base_url}/xss-bkt/notes.html"),
+        html.to_vec(),
+        vec![("content-type", "text/html")],
+    )
+    .await;
+    assert_eq!(put.status(), 200);
+    let put_txt = s3_request_with_headers(
+        "PUT",
+        &format!("{base_url}/xss-bkt/notes.txt"),
+        b"plain notes".to_vec(),
+        vec![("content-type", "text/plain")],
+    )
+    .await;
+    assert_eq!(put_txt.status(), 200);
+
+    // Private bucket: anonymous override is rejected before the object is read.
+    let denied = client()
+        .get(format!(
+            "{base_url}/xss-bkt/notes.txt?response-content-type=text%2Fhtml"
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(denied.status(), 400);
+    let denied_body = denied.text().await.unwrap();
+    assert!(
+        denied_body.contains("<Code>InvalidRequest</Code>"),
+        "{denied_body}"
+    );
+    assert!(
+        denied_body.contains("cannot be used for anonymous GET requests"),
+        "{denied_body}"
+    );
+
+    set_public_on_disk(&tmp, "xss-bkt", true, false);
+
+    let anon_override = client()
+        .get(format!(
+            "{base_url}/xss-bkt/notes.txt?response-content-type=text%2Fhtml&response-content-disposition=attachment"
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(anon_override.status(), 400);
+    let anon_body = anon_override.text().await.unwrap();
+    assert!(
+        anon_body.contains("<Code>InvalidRequest</Code>"),
+        "{anon_body}"
+    );
+    assert!(
+        !anon_body.contains("plain notes"),
+        "override rejection must not return the object: {anon_body}"
+    );
+
+    let anon_head = client()
+        .head(format!(
+            "{base_url}/xss-bkt/notes.txt?response-content-type=text%2Fhtml"
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(anon_head.status(), 400);
+
+    // Anonymous read, range, and stored text/html still succeed, sandboxed.
+    let anon_get = client()
+        .get(format!("{base_url}/xss-bkt/notes.txt"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(anon_get.status(), 200);
+    assert_eq!(
+        c_header(&anon_get, "content-type").as_deref(),
+        Some("text/plain")
+    );
+    assert_sandbox_csp(&anon_get);
+    assert_eq!(anon_get.bytes().await.unwrap().as_ref(), b"plain notes");
+
+    let anon_html = client()
+        .get(format!("{base_url}/xss-bkt/notes.html"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(anon_html.status(), 200);
+    assert_eq!(
+        c_header(&anon_html, "content-type").as_deref(),
+        Some("text/html")
+    );
+    assert_sandbox_csp(&anon_html);
+    assert_eq!(anon_html.bytes().await.unwrap().as_ref(), html);
+
+    let anon_range = client()
+        .get(format!("{base_url}/xss-bkt/notes.txt"))
+        .header("range", "bytes=0-4")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(anon_range.status(), 206);
+    assert_sandbox_csp(&anon_range);
+    assert_eq!(anon_range.bytes().await.unwrap().as_ref(), b"plain");
+
+    // Presigned HTML object, and a presigned response-* override.
+    let presigned_html = presign_url(&base_url, "GET", "/xss-bkt/notes.html", 300);
+    let presigned = client().get(&presigned_html).send().await.unwrap();
+    assert_eq!(presigned.status(), 200);
+    assert_eq!(
+        c_header(&presigned, "content-type").as_deref(),
+        Some("text/html")
+    );
+    assert_sandbox_csp(&presigned);
+    assert_eq!(presigned.bytes().await.unwrap().as_ref(), html);
+
+    let presigned_override = presign_url_with(
+        &base_url,
+        "GET",
+        "/xss-bkt/notes.txt",
+        300,
+        &[
+            ("response-content-type", "text/html"),
+            ("response-content-disposition", "attachment"),
+        ],
+    );
+    let overridden = client().get(&presigned_override).send().await.unwrap();
+    assert_eq!(overridden.status(), 200);
+    assert_eq!(
+        c_header(&overridden, "content-type").as_deref(),
+        Some("text/html")
+    );
+    assert_eq!(
+        c_header(&overridden, "content-disposition").as_deref(),
+        Some("attachment")
+    );
+    assert_sandbox_csp(&overridden);
+    assert_eq!(overridden.bytes().await.unwrap().as_ref(), b"plain notes");
+
+    let signed = s3_request(
+        "GET",
+        &format!("{base_url}/xss-bkt/notes.txt?response-cache-control=no-store"),
+        vec![],
+    )
+    .await;
+    assert_eq!(signed.status(), 200);
+    assert_eq!(
+        c_header(&signed, "cache-control").as_deref(),
+        Some("no-store")
+    );
+    assert_sandbox_csp(&signed);
+
+    let ui = client()
+        .get(format!("{base_url}/ui/"))
+        .send()
+        .await
+        .unwrap();
+    assert_console_csp(&ui);
+    let api = client()
+        .get(format!("{base_url}/maxio/api/auth/check"))
+        .send()
+        .await
+        .unwrap();
+    assert_console_csp(&api);
 }
 
 fn c_delete_xml(objects: &[(&str, Option<&str>)], quiet: bool) -> Vec<u8> {

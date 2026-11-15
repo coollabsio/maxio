@@ -94,10 +94,34 @@ impl Service<Request<Body>> for AppService {
     }
 }
 
-fn insert_security_headers(headers: &mut axum::http::HeaderMap) {
-    headers.entry(header::CONTENT_SECURITY_POLICY).or_insert_with(|| {
-        HeaderValue::from_static("default-src 'self'; base-uri 'self'; object-src 'none'; frame-ancestors 'none'; img-src 'self' https: data:; style-src 'self' 'unsafe-inline'; font-src 'self' data:; script-src 'self' 'unsafe-inline'; connect-src 'self'; form-action 'self'")
-    });
+/// SPA policy for `/ui` and `/maxio/api` only. Inline scripts stay, because
+/// the console bundle needs them. Object responses must not inherit this:
+/// they are same-origin bytes and `'unsafe-inline'` would run them.
+const CONSOLE_CSP: &str = "default-src 'self'; base-uri 'self'; object-src 'none'; frame-ancestors 'none'; img-src 'self' https: data:; style-src 'self' 'unsafe-inline'; font-src 'self' data:; script-src 'self' 'unsafe-inline'; connect-src 'self'; form-action 'self'";
+
+/// S3 and probe responses share the console origin. `sandbox` gives them a
+/// unique origin and disables scripts (no `allow-scripts`, no
+/// `allow-same-origin`). `allow-downloads` does not enable scripts; without
+/// it browsers drop `Content-Disposition: attachment` downloads.
+const OBJECT_RESPONSE_CSP: &str = "sandbox allow-downloads";
+
+fn is_console_path(path: &str) -> bool {
+    path == "/ui"
+        || path.starts_with("/ui/")
+        || path == "/maxio/api"
+        || path.starts_with("/maxio/api/")
+}
+
+fn insert_security_headers(path: &str, headers: &mut axum::http::HeaderMap) {
+    let csp = if is_console_path(path) {
+        CONSOLE_CSP
+    } else {
+        OBJECT_RESPONSE_CSP
+    };
+    headers.insert(
+        header::CONTENT_SECURITY_POLICY,
+        HeaderValue::from_static(csp),
+    );
     headers
         .entry(header::X_CONTENT_TYPE_OPTIONS)
         .or_insert(HeaderValue::from_static("nosniff"));
@@ -392,13 +416,31 @@ mod tests {
             .insert(SignedRequestPath("/note.txt".to_string()));
         assert!(!is_browser_console_request(&virtual_host));
     }
+
+    #[test]
+    fn console_csp_is_limited_to_ui_and_api() {
+        assert!(is_console_path("/ui"));
+        assert!(is_console_path("/ui/"));
+        assert!(is_console_path("/ui/buckets/photos"));
+        assert!(is_console_path("/maxio/api"));
+        assert!(is_console_path("/maxio/api/auth/check"));
+        assert!(!is_console_path("/maxio/health/live"));
+        assert!(!is_console_path("/minio/health/ready"));
+        assert!(!is_console_path("/"));
+        assert!(!is_console_path("/media/notes.txt"));
+        assert!(OBJECT_RESPONSE_CSP.contains("sandbox"));
+        assert!(!OBJECT_RESPONSE_CSP.contains("allow-scripts"));
+        assert!(!OBJECT_RESPONSE_CSP.contains("allow-same-origin"));
+        assert!(CONSOLE_CSP.contains("script-src 'self' 'unsafe-inline'"));
+    }
 }
 
 async fn security_headers_middleware(
     request: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> axum::response::Response {
+    let path = request.uri().path().to_string();
     let mut response = next.run(request).await;
-    insert_security_headers(response.headers_mut());
+    insert_security_headers(&path, response.headers_mut());
     response
 }

@@ -33,6 +33,19 @@ pub async fn auth_middleware(
 
     let has_auth_header = request.headers().get("authorization").is_some();
 
+    // AWS rejects response-* overrides on anonymous GET/HEAD with InvalidRequest
+    // before the object is read. Presigned URLs are handled above and may
+    // still override; a signed Authorization header may too. The public
+    // allowlist below also omits these keys, so a miss here fails closed.
+    if !has_auth_header
+        && (method == "GET" || method == "HEAD")
+        && query_has_response_override(&query)
+    {
+        return Err(S3Error::invalid_request(
+            "Request specific response headers cannot be used for anonymous GET requests.",
+        ));
+    }
+
     // Anonymous public-bucket access: no auth header, safe method, bucket flagged public.
     // Virtual-hosted requests have already been rewritten to path-style, so this
     // path is `/{bucket}` or `/{bucket}/{key}`.
@@ -276,7 +289,22 @@ fn is_public_query_key(name: &str) -> bool {
         "partNumber",
         "x-id",
     ];
-    LIST_KEYS.contains(&name) || name.starts_with("response-")
+    LIST_KEYS.contains(&name)
+}
+
+/// True when the raw query asks for a `response-*` header override.
+///
+/// Keys are percent-decoded so `response%2Dcontent-type` cannot skip the
+/// anonymous rejection. Matching is case-sensitive, same as S3 parameter names.
+fn query_has_response_override(query: &str) -> bool {
+    query.split('&').any(|pair| {
+        if pair.is_empty() {
+            return false;
+        }
+        let raw = pair.split('=').next().unwrap_or(pair);
+        let name = percent_encoding::percent_decode_str(raw).decode_utf8_lossy();
+        name.starts_with("response-")
+    })
 }
 
 async fn handle_presigned(
@@ -357,4 +385,29 @@ async fn handle_presigned(
         return Err(err);
     }
     Ok(response)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{is_public_query_key, query_has_response_override};
+
+    #[test]
+    fn anonymous_queries_allow_part_reads_and_reject_response_overrides() {
+        assert!(is_public_query_key("partNumber"));
+        assert!(is_public_query_key("prefix"));
+        assert!(!is_public_query_key("response-content-type"));
+        assert!(!is_public_query_key("uploadId"));
+        assert!(!is_public_query_key("versionId"));
+        assert!(query_has_response_override(
+            "response-content-type=text%2Fhtml"
+        ));
+        assert!(query_has_response_override(
+            "foo=1&response%2Dcontent-disposition=attachment"
+        ));
+        assert!(!query_has_response_override("prefix=a&partNumber=1"));
+        assert!(!query_has_response_override(""));
+        assert!(!query_has_response_override(
+            "Response-Content-Type=text/html"
+        ));
+    }
 }

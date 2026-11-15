@@ -1837,6 +1837,59 @@ EOF
     ANON_GET=$(curl -sS -o "$TMPDIR/anon-get.txt" -w '%{http_code}' "$ENDPOINT/$FEAT_BUCKET/pub.txt")
     assert_eq "anonymous GetObject" "200" "$ANON_GET"
     assert_eq "anonymous GetObject body" "public body" "$(cat "$TMPDIR/anon-get.txt")"
+    # Anonymous response-* overrides are InvalidRequest (AWS). A stored
+    # text/html object and a presigned override stay readable, but sandboxed.
+    ANON_OVERRIDE=$(curl -sS -o "$TMPDIR/anon-override.xml" -w '%{http_code}' \
+        "$ENDPOINT/$FEAT_BUCKET/pub.txt?response-content-type=text%2Fhtml")
+    assert_eq "anonymous response-content-type rejected" "400" "$ANON_OVERRIDE"
+    assert_eq "anonymous response-content-type is InvalidRequest" "true" \
+        "$(grep -q 'InvalidRequest' "$TMPDIR/anon-override.xml" && echo true || echo false)"
+    assert_eq "anonymous response override names the AWS error" "true" \
+        "$(grep -q 'cannot be used for anonymous GET requests' "$TMPDIR/anon-override.xml" && echo true || echo false)"
+    ANON_OVERRIDE_HEAD=$(curl -sS -o /dev/null -w '%{http_code}' -I \
+        "$ENDPOINT/$FEAT_BUCKET/pub.txt?response-content-type=text%2Fhtml")
+    assert_eq "anonymous HEAD response-content-type rejected" "400" "$ANON_OVERRIDE_HEAD"
+    ANON_RANGE=$(curl -sS -D "$TMPDIR/anon-range.hdr" -o "$TMPDIR/anon-range.txt" -w '%{http_code}' \
+        -H 'Range: bytes=0-5' "$ENDPOINT/$FEAT_BUCKET/pub.txt")
+    assert_eq "anonymous range still 206" "206" "$ANON_RANGE"
+    assert_eq "anonymous range body" "public" "$(cat "$TMPDIR/anon-range.txt")"
+    assert_eq "anonymous object CSP is sandbox" "true" \
+        "$(grep -i '^content-security-policy:' "$TMPDIR/anon-range.hdr" | grep -q 'sandbox' && echo true || echo false)"
+    assert_eq "anonymous object CSP has no inline scripts" "true" \
+        "$(grep -i '^content-security-policy:' "$TMPDIR/anon-range.hdr" | grep -q 'unsafe-inline' && echo false || echo true)"
+    assert_eq "anonymous object nosniff" "true" \
+        "$(grep -i '^x-content-type-options:' "$TMPDIR/anon-range.hdr" | grep -qi 'nosniff' && echo true || echo false)"
+    printf '<html><body>visible<script>window.__xss=1</script></body></html>\n' > "$TMPDIR/xss.html"
+    assert "put html object" $AWS s3api put-object --bucket "$FEAT_BUCKET" \
+        --key notes.html --content-type text/html --body "$TMPDIR/xss.html"
+    HTML_PRESIGN=$($AWS s3 presign "s3://$FEAT_BUCKET/notes.html" --expires-in 300)
+    curl -sS -D "$TMPDIR/html-presign.hdr" -o "$TMPDIR/html-presign.body" "$HTML_PRESIGN"
+    assert_eq "presigned html object body intact" "true" \
+        "$(grep -q 'window.__xss' "$TMPDIR/html-presign.body" && echo true || echo false)"
+    assert_eq "presigned html CSP is sandbox" "true" \
+        "$(grep -i '^content-security-policy:' "$TMPDIR/html-presign.hdr" | grep -q 'sandbox' && echo true || echo false)"
+    assert_eq "presigned html CSP is not the console policy" "true" \
+        "$(grep -i '^content-security-policy:' "$TMPDIR/html-presign.hdr" | grep -q 'unsafe-inline' && echo false || echo true)"
+    assert_eq "presigned html nosniff" "true" \
+        "$(grep -i '^x-content-type-options:' "$TMPDIR/html-presign.hdr" | grep -qi 'nosniff' && echo true || echo false)"
+    OVERRIDE_META=$($AWS s3api get-object --bucket "$FEAT_BUCKET" --key pub.txt \
+        --response-content-type text/html --response-content-disposition attachment \
+        "$TMPDIR/signed-override.txt")
+    assert_eq "signed response-content-type override" "text/html" \
+        "$(printf '%s' "$OVERRIDE_META" | python3 -c 'import sys,json; print(json.load(sys.stdin).get("ContentType",""))')"
+    assert_eq "signed response-content-disposition override" "attachment" \
+        "$(printf '%s' "$OVERRIDE_META" | python3 -c 'import sys,json; print(json.load(sys.stdin).get("ContentDisposition",""))')"
+    assert_eq "signed override body intact" "public body" "$(cat "$TMPDIR/signed-override.txt")"
+    UI_CSP=$(curl -sS -D - -o /dev/null "$ENDPOINT/ui/" | tr -d '\r')
+    assert_eq "console /ui keeps CSP" "true" \
+        "$(printf '%s\n' "$UI_CSP" | grep -i '^content-security-policy:' | grep -q 'unsafe-inline' && echo true || echo false)"
+    assert_eq "console /ui CSP is not object sandbox" "true" \
+        "$(printf '%s\n' "$UI_CSP" | grep -i '^content-security-policy:' | grep -q 'sandbox' && echo false || echo true)"
+    API_CSP=$(curl -sS -D - -o /dev/null "$ENDPOINT/maxio/api/auth/check" | tr -d '\r')
+    assert_eq "console /maxio/api keeps CSP" "true" \
+        "$(printf '%s\n' "$API_CSP" | grep -i '^content-security-policy:' | grep -q 'unsafe-inline' && echo true || echo false)"
+    assert_eq "console /maxio/api CSP is not object sandbox" "true" \
+        "$(printf '%s\n' "$API_CSP" | grep -i '^content-security-policy:' | grep -q 'sandbox' && echo false || echo true)"
     ANON_LIST=$(curl -sS -o /dev/null -w '%{http_code}' "$ENDPOINT/$FEAT_BUCKET")
     assert_eq "anonymous ListBucket denied without list policy" "403" "$ANON_LIST"
     cat > "$TMPDIR/policy-write.json" <<EOF

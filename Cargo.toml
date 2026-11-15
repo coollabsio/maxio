@@ -64,3 +64,19 @@ utoipa = { version = "5", features = ["axum_extras"] }
 [dev-dependencies]
 reqwest = { version = "0.12", features = ["json"] }
 tempfile = "3"
+
+# Dev builds keep file and line numbers, and skip full variable debuginfo.
+# `cargo build --profile debugging` restores full debuginfo on this crate.
+# Dependency overrides below still apply under that profile.
+[profile.dev]
+debug = "line-tables-only"
+
+# Dependencies only. "*" does not apply to the package being built.
+# Debuginfo stays off so dependency artifacts are smaller and link faster.
+# opt-level is left at 0: setting it to 1 slowed cold builds and cargo check.
+[profile.dev.package."*"]
+debug = false
+
+[profile.debugging]
+inherits = "dev"
+debug = true

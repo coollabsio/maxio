@@ -43,12 +43,16 @@ expect_plan() {
   local actual
   local err
   err="$(mktemp)"
-  if ! actual="$(MAXIO_AGENT_CHECK_ROOT="$dir" "$SCRIPT" --base HEAD --print-plan 2>"$err")"; then
+  local cache
+  cache="$(mktemp -d)"
+  if ! actual="$(MAXIO_AGENT_CHECK_TOOLCHAIN=test-toolchain MAXIO_AGENT_CHECK_CACHE="$cache" MAXIO_AGENT_CHECK_ROOT="$dir" "$SCRIPT" --base HEAD --print-plan 2>"$err")"; then
     fail "$name: print-plan exited $?"
     cat "$err" >&2 || true
     return
   fi
-  if [[ "$actual" != "$expected" ]]; then
+  local head
+  head="$(printf '%s\n' "$actual" | head -n 3)"
+  if [[ "$head" != "$expected" ]]; then
     fail "$name: plan mismatch"
     echo "stderr:" >&2
     cat "$err" >&2 || true
@@ -172,8 +176,17 @@ run_with_shims() {
   local shims
   shims="$(mktemp -d)"
   make_shims "$shims"
-  PATH="$shims:$PATH" AGENT_CHECK_LOG="$log" MAXIO_AGENT_CHECK_ROOT="$dir" \
+  local cache="${2:-}"
+  if [[ -z "$cache" ]]; then
+    cache="$(mktemp -d)"
+  fi
+  PATH="$shims:$PATH" \
+    AGENT_CHECK_LOG="$log" \
+    MAXIO_AGENT_CHECK_ROOT="$dir" \
+    MAXIO_AGENT_CHECK_TOOLCHAIN=test-toolchain \
+    MAXIO_AGENT_CHECK_CACHE="$cache" \
     "$SCRIPT" --base HEAD
+  printf '%s' "$cache" >"${log}.cache"
   printf '%s' "$log"
 }
 
@@ -197,6 +210,52 @@ printf '\nfn bin_only() {}\n' >>"$dir/src/main.rs"
 printf '\nfn extra() {}\n' >>"$dir/tests/limits.rs"
 log="$(run_with_shims "$dir")"
 assert_log run-scoped "$log" $'check -p maxio --all-features --bin maxio --test limits\nclippy -p maxio --all-features --bin maxio --test limits -- -D warnings\ntest -p maxio --all-features --bin maxio --test limits'
+
+# A tracked doc edit must not hide an untracked Rust file.
+dir="$(new_repo)"
+printf '\nmore\n' >>"$dir/README.md"
+printf 'pub fn fresh() {}\n' >"$dir/src/fresh.rs"
+expect_plan tracked-and-untracked "$dir" $'rust=package\ncargo-test=all\nui=no'
+
+plan_lines() {
+  local dir="$1"
+  local cache="$2"
+  MAXIO_AGENT_CHECK_TOOLCHAIN=test-toolchain \
+    MAXIO_AGENT_CHECK_CACHE="$cache" \
+    MAXIO_AGENT_CHECK_ROOT="$dir" \
+    "$SCRIPT" --base HEAD --print-plan
+}
+
+dir="$(new_repo)"
+cache="$(mktemp -d)"
+actual="$(plan_lines "$dir" "$cache")"
+if [[ "$actual" != $'rust=none\ncargo-test=none\nui=no\nfingerprint=n/a\nrun-tests=no' ]]; then
+  fail "clean fingerprint plan: $actual"
+else
+  echo "ok fingerprint-clean"
+fi
+
+dir="$(new_repo)"
+printf '\npub fn extra() {}\n' >>"$dir/src/lib.rs"
+cache="$(mktemp -d)"
+log="$(run_with_shims "$dir" "$cache")"
+assert_log fingerprint-miss "$log" $'check -p maxio --all-features --all-targets\nclippy -p maxio --all-features --all-targets -- -D warnings\ntest -p maxio --all-features --all-targets'
+actual="$(plan_lines "$dir" "$cache")"
+case "$actual" in
+  *$'\nfingerprint=hit\nrun-tests=no') echo "ok fingerprint-hit-plan" ;;
+  *) fail "expected fingerprint hit, got: $actual" ;;
+esac
+log="$(run_with_shims "$dir" "$cache")"
+assert_log fingerprint-hit-run "$log" $'check -p maxio --all-features --all-targets\nclippy -p maxio --all-features --all-targets -- -D warnings'
+
+find "$cache" -type f -exec sh -c 'printf "not a key\n" > "$1"' _ {} \;
+actual="$(plan_lines "$dir" "$cache")"
+case "$actual" in
+  *$'\nfingerprint=fail-open\nrun-tests=yes') echo "ok fingerprint-fail-open-plan" ;;
+  *) fail "expected fail-open, got: $actual" ;;
+esac
+log="$(run_with_shims "$dir" "$cache")"
+assert_log fingerprint-fail-open-run "$log" $'check -p maxio --all-features --all-targets\nclippy -p maxio --all-features --all-targets -- -D warnings\ntest -p maxio --all-features --all-targets'
 
 if [[ "$failures" -ne 0 ]]; then
   echo "$failures failed" >&2

@@ -25,6 +25,18 @@ Rust and UI both run when both trees change. Clippy uses `--all-features -- -D w
 
 A library edit does not skip integration tests. Skipping work is only safe when the changed files cannot affect the other targets.
 
+### Test fingerprint
+
+Check, clippy, and `bun run lint` always run. `cargo test` and `bun test` are skipped when a fingerprint hits. The cache directory is `target/agent-check/` (`MAXIO_AGENT_CHECK_CACHE` overrides it). Each record is one line, `v1` and a sha256:
+
+- version string `maxio-agent-check-v1`
+- scope id (package tests, the binary, one integration test, or the UI)
+- the cargo or bun flags for that scope
+- `rustc -vV` and `cargo --version` (and `bun --version` for the UI)
+- the bytes of that scope's source closure: manifests and `build.rs`, `src/**/*.rs`, the selected `tests/*.rs`, or `ui/**` excluding `node_modules` and `dist`
+
+A missing record is a miss: the tests run, and a success writes the key. A record that is not `v1` plus 64 hex characters is corrupt and fails open: the tests run. A hash error (unreadable file, `rustc` failure) also fails open. A hit does not rewrite the key. Bump the `v1` prefix when the hashed inputs change meaning.
+
 ### Crate split
 
 Not part of this loop. Cold `cargo build --timings` on this machine showed the library and the binary as the two largest units, because `src/main.rs` repeats the library's `mod` tree instead of depending on the library. Incremental rebuilds of a leaf module and of `validate_bucket_name` were both a few seconds, so the incremental cache already drops most of a clean library compile. Splitting modules into crates would not shrink the dependency graph that dominates a cold build. The timings and the machine are in the compile-time experiment notes on the dev-profile pull request.

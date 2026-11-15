@@ -56,7 +56,12 @@ check:
     cargo test
     cd ui && bun run lint
     cd ui && bun run test
+    bash scripts/agent-check-test.sh
     just api-check
+
+# Check and test only the targets touched since a base ref. See AGENTS.md.
+agent-check base="origin/main":
+    bash scripts/agent-check.sh --base {{base}}
 
 # Regenerate the OpenAPI document and the typed UI client.
 api:

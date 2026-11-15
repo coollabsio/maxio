@@ -65,6 +65,8 @@ cargo build && RUST_LOG=info ./target/debug/maxio --data-dir /tmp/maxio-test --p
 kill %1 && rm -rf /tmp/maxio-test
 ```
 
+**Agent loop**: MaxIO is a single Cargo package, not a workspace. `scripts/agent-check.sh` (or `just agent-check`) maps the diff against a base ref to the binary, the library, one integration-test binary, or the UI, and runs `cargo check`, clippy, and tests only for that scope. A fingerprint of the source closure, lockfile, toolchain, and flags skips tests on a hit and fails open (runs the tests) if the cache is missing, corrupt, or cannot be hashed. A `src/` change still tests the library's in-package dependents (the binary and the integration tests). There are no downstream crates. Details are in [AGENTS.md](AGENTS.md).
+
 **Hot-reload dev server** (for manual testing):
 
 ```bash

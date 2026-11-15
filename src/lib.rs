@@ -27,4 +27,4 @@ pub mod serve;
 pub mod server;
 pub mod storage;
 pub mod vhost;
-pub mod xml;
+pub use maxio_xml as xml;

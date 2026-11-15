@@ -22,6 +22,7 @@ http = "1"
 bytes = "1"
 
 # XML
+maxio-xml = { path = "crates/maxio-xml" }
 quick-xml = { version = "0.37", features = ["serialize"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -80,3 +81,7 @@ debug = false
 [profile.debugging]
 inherits = "dev"
 debug = true
+
+[workspace]
+members = [".", "crates/maxio-xml"]
+resolver = "2"

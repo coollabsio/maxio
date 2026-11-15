@@ -1115,6 +1115,7 @@ dependencies = [
  "http",
  "hyper",
  "hyper-util",
+ "maxio-xml",
  "md-5",
  "mime_guess",
  "percent-encoding",
@@ -1138,6 +1139,14 @@ dependencies = [
  "utoipa",
  "uuid",
  "zeroize",
+]
+
+[[package]]
+name = "maxio-xml"
+version = "1.0.0"
+dependencies = [
+ "quick-xml",
+ "serde",
 ]
 
 [[package]]

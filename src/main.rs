@@ -340,6 +340,13 @@ async fn main() -> anyhow::Result<()> {
         config.max_part_size,
         config.max_multipart_object_size,
     );
+    let (compression_on, compression_level) =
+        config::parse_compression(&config.compression, config.compression_level)
+            .map_err(anyhow::Error::msg)?;
+    storage.set_compression(compression_on, compression_level);
+    if compression_on {
+        tracing::info!("compression at rest: zstd level {compression_level}");
+    }
 
     storage::provision_default_buckets(&storage, &config.default_buckets, &config.region).await;
     storage::provision_public_buckets(&storage, &config.public_buckets, &config.region).await;

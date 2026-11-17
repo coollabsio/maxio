@@ -1205,6 +1205,7 @@ pub async fn create_bucket(
         versioning_suspended: false,
         tags: None,
         lifecycle: None,
+        compression: None,
     };
 
     match state.storage.create_bucket(&meta).await {
@@ -1903,6 +1904,48 @@ pub async fn set_encryption(
         state.storage.delete_bucket_encryption(&bucket).await
     };
     match result {
+        Ok(()) => ok(),
+        Err(e) => internal(e),
+    }
+}
+
+#[utoipa::path(
+    get,
+    path = "/maxio/api/buckets/{bucket}/compression",
+    operation_id = "getCompression",
+    tag = "settings",
+    params(("bucket" = String, Path)),
+    responses((status = 200, body = EnabledResponse))
+)]
+pub async fn get_compression(
+    State(state): State<AppState>,
+    Path(bucket): Path<String>,
+) -> Response {
+    match state.storage.get_bucket_compression(&bucket).await {
+        Ok(enabled) => (StatusCode::OK, Json(EnabledResponse { enabled })).into_response(),
+        Err(e) => internal(e),
+    }
+}
+
+#[utoipa::path(
+    put,
+    path = "/maxio/api/buckets/{bucket}/compression",
+    operation_id = "setCompression",
+    tag = "settings",
+    params(("bucket" = String, Path)),
+    request_body = SetEnabledRequest,
+    responses((status = 200, body = OkResponse))
+)]
+pub async fn set_compression(
+    State(state): State<AppState>,
+    Path(bucket): Path<String>,
+    Json(body): Json<SetEnabledRequest>,
+) -> Response {
+    match state
+        .storage
+        .set_bucket_compression(&bucket, body.enabled)
+        .await
+    {
         Ok(()) => ok(),
         Err(e) => internal(e),
     }
@@ -2707,6 +2750,8 @@ pub fn console_router(state: AppState) -> Router<AppState> {
         .route("/buckets/{bucket}/versioning", put(set_versioning))
         .route("/buckets/{bucket}/encryption", get(get_encryption))
         .route("/buckets/{bucket}/encryption", put(set_encryption))
+        .route("/buckets/{bucket}/compression", get(get_compression))
+        .route("/buckets/{bucket}/compression", put(set_compression))
         .route("/buckets/{bucket}/public", get(get_public))
         .route("/buckets/{bucket}/public", put(set_public))
         .route("/buckets/{bucket}/versions", get(list_versions))
@@ -2795,6 +2840,7 @@ mod tests {
                 versioning_suspended: false,
                 tags: None,
                 lifecycle: None,
+                compression: None,
             })
             .await
             .unwrap();

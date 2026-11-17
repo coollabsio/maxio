@@ -1,4 +1,5 @@
 use super::chunk_reader::VerifiedChunkReader;
+use super::compress::{self, ChunkCompressor};
 use super::crypto::{AadBuilder, FRAME_CHUNK_SIZE, FrameDecryptor};
 use super::keys::Keyring;
 use super::{
@@ -74,6 +75,9 @@ pub struct FilesystemStorage {
     max_object_size: u64,
     max_part_size: u64,
     max_multipart_object_size: u64,
+    /// Server default for buckets without their own compression setting.
+    compression_enabled: bool,
+    compression_level: i32,
 }
 
 fn shard_index(parts: &[&str], shards: usize) -> usize {
@@ -557,6 +561,8 @@ impl FilesystemStorage {
             max_object_size: u64::MAX,
             max_part_size: u64::MAX,
             max_multipart_object_size: u64::MAX,
+            compression_enabled: false,
+            compression_level: 3,
         };
         // An older build allowed object keys this version reserves. Serving
         // them in place collides with the on-disk layout, so refuse before
@@ -584,6 +590,37 @@ impl FilesystemStorage {
         self.max_object_size = max_object;
         self.max_part_size = max_part;
         self.max_multipart_object_size = max_multipart;
+    }
+
+    /// Server default for compressing new objects, and the zstd level used
+    /// whenever an object is compressed. Set from server config.
+    pub fn set_compression(&mut self, enabled: bool, level: i32) {
+        self.compression_enabled = enabled;
+        self.compression_level = level;
+    }
+
+    /// Compressor for a new object: the bucket setting (or the server
+    /// default), then the per-object skip rules.
+    async fn compressor_for(
+        &self,
+        bucket: &str,
+        key: &str,
+        content_type: &str,
+        metadata: &StoredObjectMetadata,
+    ) -> Result<ChunkCompressor, StorageError> {
+        let enabled = self.get_bucket_compression(bucket).await?;
+        Ok(
+            if compress::should_compress(
+                enabled,
+                key,
+                content_type,
+                metadata.content_encoding.as_deref(),
+            ) {
+                ChunkCompressor::new(self.compression_level)
+            } else {
+                ChunkCompressor::off()
+            },
+        )
     }
 
     fn check_object_size(&self, size: u64) -> Result<(), StorageError> {
@@ -1008,11 +1045,27 @@ impl FilesystemStorage {
         let mut buf = vec![0u8; IO_BUFFER_SIZE];
         let mut frame_buf: Vec<u8> = Vec::with_capacity(FRAME_CHUNK_SIZE);
         let mut chunk_index: u64 = 0;
+        let mut compressor = self
+            .compressor_for(bucket, key, content_type, &opts.metadata)
+            .await?;
 
         loop {
             let n = body.read(&mut buf).await?;
             if n == 0 {
-                // flush remaining partial frame
+                let tail = compressor.finish();
+                emit_stored(
+                    &mut writer,
+                    cipher_opt.as_ref(),
+                    &nonce_prefix,
+                    &mut frame_buf,
+                    &mut chunk_index,
+                    &mut stored_hash,
+                    bucket,
+                    key,
+                    version_id.as_deref(),
+                    &tail,
+                )
+                .await?;
                 if let Some(ref cipher) = cipher_opt {
                     if !frame_buf.is_empty() {
                         let aad = build_frame_aad(bucket, key, version_id.as_deref(), chunk_index);
@@ -1036,27 +1089,20 @@ impl FilesystemStorage {
             }
             size += n as u64;
             self.check_object_size(size)?;
-            if let Some(ref cipher) = cipher_opt {
-                frame_buf.extend_from_slice(&buf[..n]);
-                while frame_buf.len() >= FRAME_CHUNK_SIZE {
-                    let frame_data: Vec<u8> = frame_buf.drain(..FRAME_CHUNK_SIZE).collect();
-                    let aad = build_frame_aad(bucket, key, version_id.as_deref(), chunk_index);
-                    write_encrypted_frame(
-                        &mut writer,
-                        cipher,
-                        &nonce_prefix,
-                        chunk_index,
-                        &frame_data,
-                        &aad,
-                        &mut stored_hash,
-                    )
-                    .await?;
-                    chunk_index += 1;
-                }
-            } else {
-                stored_hash.update(&buf[..n]);
-                writer.write_all(&buf[..n]).await?;
-            }
+            let stored = compressor.push(&buf[..n]);
+            emit_stored(
+                &mut writer,
+                cipher_opt.as_ref(),
+                &nonce_prefix,
+                &mut frame_buf,
+                &mut chunk_index,
+                &mut stored_hash,
+                bucket,
+                key,
+                version_id.as_deref(),
+                &stored,
+            )
+            .await?;
         }
         writer.flush().await?;
 
@@ -1105,6 +1151,7 @@ impl FilesystemStorage {
             ..Default::default()
         };
         opts.apply_to(&mut meta);
+        meta.compression = compressor.into_meta();
         if let (Some(dek), Some(em)) = (dek_opt.as_ref(), meta.encryption.as_mut()) {
             em.sidecar_mac = String::new();
             let mac = compute_sidecar_mac(dek, &meta)?;
@@ -1198,11 +1245,14 @@ impl FilesystemStorage {
 
         let mut read_buf = vec![0u8; IO_BUFFER_SIZE];
         let mut chunk_buf = Vec::with_capacity(self.chunk_size as usize);
+        let mut compressor = self
+            .compressor_for(bucket, key, content_type, &opts.metadata)
+            .await?;
 
         loop {
             let n = body.read(&mut read_buf).await?;
             if n == 0 {
-                // Flush remaining chunk_buf
+                chunk_buf.extend(compressor.finish());
                 if !chunk_buf.is_empty() {
                     let ci = write_chunk_to_dir(&tmp_ec_dir, chunk_index, &chunk_buf).await?;
                     chunks.push(ci);
@@ -1216,7 +1266,7 @@ impl FilesystemStorage {
             }
             total_size += n as u64;
             self.check_object_size(total_size)?;
-            chunk_buf.extend_from_slice(&read_buf[..n]);
+            chunk_buf.extend_from_slice(&compressor.push(&read_buf[..n]));
 
             while chunk_buf.len() >= self.chunk_size as usize {
                 let chunk_data: Vec<u8> = chunk_buf.drain(..self.chunk_size as usize).collect();
@@ -1261,6 +1311,14 @@ impl FilesystemStorage {
             },
             plaintext_size: None,
         };
+        let compression = compressor.into_meta();
+        let manifest = ChunkManifest {
+            total_size: compression
+                .as_ref()
+                .map(|comp| comp.stored_size)
+                .unwrap_or(manifest.total_size),
+            ..manifest
+        };
         let manifest_json = serde_json::to_string_pretty(&manifest)?;
         write_file_atomic(&tmp_ec_dir.join("manifest.json"), manifest_json.as_bytes()).await?;
 
@@ -1302,6 +1360,7 @@ impl FilesystemStorage {
             ..Default::default()
         };
         opts.apply_to(&mut meta);
+        meta.compression = compression;
 
         let meta_path = self.meta_path(bucket, key);
         if let Some(parent) = meta_path.parent() {
@@ -1413,10 +1472,14 @@ impl FilesystemStorage {
         let mut read_buf = vec![0u8; IO_BUFFER_SIZE];
         let mut frame_buf: Vec<u8> = Vec::with_capacity(FRAME_CHUNK_SIZE);
         let mut chunk_buf: Vec<u8> = Vec::with_capacity(self.chunk_size as usize);
+        let mut compressor = self
+            .compressor_for(bucket, key, content_type, &opts.metadata)
+            .await?;
 
         loop {
             let n = body.read(&mut read_buf).await?;
             if n == 0 {
+                frame_buf.extend(compressor.finish());
                 // Flush trailing partial frame.
                 if !frame_buf.is_empty() {
                     let aad = build_frame_aad(bucket, key, version_id.as_deref(), frame_index);
@@ -1452,7 +1515,7 @@ impl FilesystemStorage {
             }
             plaintext_size += n as u64;
             self.check_object_size(plaintext_size)?;
-            frame_buf.extend_from_slice(&read_buf[..n]);
+            frame_buf.extend_from_slice(&compressor.push(&read_buf[..n]));
             while frame_buf.len() >= FRAME_CHUNK_SIZE {
                 let frame_data: Vec<u8> = frame_buf.drain(..FRAME_CHUNK_SIZE).collect();
                 let aad = build_frame_aad(bucket, key, version_id.as_deref(), frame_index);
@@ -1487,6 +1550,7 @@ impl FilesystemStorage {
             chunks.extend(parity_infos);
         }
 
+        let compression = compressor.into_meta();
         let manifest = ChunkManifest {
             version: if has_parity { 2 } else { 1 },
             total_size: ct_size,
@@ -1503,7 +1567,12 @@ impl FilesystemStorage {
             } else {
                 None
             },
-            plaintext_size: Some(plaintext_size),
+            plaintext_size: Some(
+                compression
+                    .as_ref()
+                    .map(|comp| comp.stored_size)
+                    .unwrap_or(plaintext_size),
+            ),
         };
         write_file_atomic(
             &tmp_ec_dir.join("manifest.json"),
@@ -1557,6 +1626,7 @@ impl FilesystemStorage {
             ..Default::default()
         };
         opts.apply_to(&mut meta);
+        meta.compression = compression;
         meta.encryption.as_mut().unwrap().sidecar_mac = String::new();
         let mac = compute_sidecar_mac(&dek, &meta)?;
         meta.encryption.as_mut().unwrap().sidecar_mac = mac;
@@ -2692,6 +2762,14 @@ impl FilesystemStorage {
         let mut chunks: Vec<ChunkInfo> = Vec::new();
         let mut chunk_index: u32 = 0;
         let mut chunk_buf = Vec::with_capacity(self.chunk_size as usize);
+        let mut compressor = self
+            .compressor_for(
+                bucket,
+                key,
+                &upload_meta.content_type,
+                &upload_meta.object_metadata,
+            )
+            .await?;
 
         let mut buf = vec![0u8; IO_BUFFER_SIZE];
         for part in selected {
@@ -2710,7 +2788,7 @@ impl FilesystemStorage {
                 if let Some(hasher) = full_object_checksum.as_mut() {
                     hasher.update(&buf[..n]);
                 }
-                chunk_buf.extend_from_slice(&buf[..n]);
+                chunk_buf.extend_from_slice(&compressor.push(&buf[..n]));
 
                 while chunk_buf.len() >= self.chunk_size as usize {
                     let chunk_data: Vec<u8> = chunk_buf.drain(..self.chunk_size as usize).collect();
@@ -2726,6 +2804,7 @@ impl FilesystemStorage {
             etag_hasher.update(raw_md5);
         }
 
+        chunk_buf.extend(compressor.finish());
         // Flush remaining
         if !chunk_buf.is_empty() {
             let ci = write_chunk_to_dir(&tmp_ec_dir, chunk_index, &chunk_buf).await?;
@@ -2748,9 +2827,13 @@ impl FilesystemStorage {
             chunks.extend(parity_infos);
         }
 
+        let compression = compressor.into_meta();
         let manifest = ChunkManifest {
             version: if has_parity { 2 } else { 1 },
-            total_size,
+            total_size: compression
+                .as_ref()
+                .map(|comp| comp.stored_size)
+                .unwrap_or(total_size),
             chunk_size: self.chunk_size,
             chunk_count: data_chunk_count,
             chunks,
@@ -2808,6 +2891,7 @@ impl FilesystemStorage {
             ..Default::default()
         };
         apply_upload_metadata(upload_meta, &mut object_meta);
+        object_meta.compression = compression;
 
         let meta_path = self.meta_path(bucket, key);
         if let Some(parent) = meta_path.parent() {
@@ -2940,6 +3024,14 @@ impl FilesystemStorage {
         let mut read_buf = vec![0u8; IO_BUFFER_SIZE];
         let mut frame_buf: Vec<u8> = Vec::with_capacity(FRAME_CHUNK_SIZE);
         let mut chunk_buf: Vec<u8> = Vec::with_capacity(self.chunk_size as usize);
+        let mut compressor = self
+            .compressor_for(
+                bucket,
+                key,
+                &upload_meta.content_type,
+                &upload_meta.object_metadata,
+            )
+            .await?;
 
         for part in selected {
             let part_path = self.part_path(bucket, upload_id, part.part_number);
@@ -2970,7 +3062,7 @@ impl FilesystemStorage {
                 if let Some(hasher) = full_object_checksum.as_mut() {
                     hasher.update(&read_buf[..n]);
                 }
-                frame_buf.extend_from_slice(&read_buf[..n]);
+                frame_buf.extend_from_slice(&compressor.push(&read_buf[..n]));
                 while frame_buf.len() >= FRAME_CHUNK_SIZE {
                     let frame_data: Vec<u8> = frame_buf.drain(..FRAME_CHUNK_SIZE).collect();
                     let aad = build_frame_aad(bucket, key, version_id.as_deref(), frame_index);
@@ -3000,6 +3092,7 @@ impl FilesystemStorage {
             etag_hasher.update(raw_md5);
         }
 
+        frame_buf.extend(compressor.finish());
         // Flush trailing partial frame + any remaining chunk_buf bytes.
         if !frame_buf.is_empty() {
             let aad = build_frame_aad(bucket, key, version_id.as_deref(), frame_index);
@@ -3027,6 +3120,7 @@ impl FilesystemStorage {
         }
 
         let data_chunk_count = chunks.len() as u32;
+        let compression = compressor.into_meta();
         let has_parity = self.parity_shards > 0 && ct_size > 0;
         if has_parity {
             let parity_infos = self
@@ -3051,7 +3145,12 @@ impl FilesystemStorage {
             } else {
                 None
             },
-            plaintext_size: Some(total_plaintext),
+            plaintext_size: Some(
+                compression
+                    .as_ref()
+                    .map(|comp| comp.stored_size)
+                    .unwrap_or(total_plaintext),
+            ),
         };
         write_file_atomic(
             &tmp_ec_dir.join("manifest.json"),
@@ -3095,6 +3194,7 @@ impl FilesystemStorage {
             ..Default::default()
         };
         apply_upload_metadata(upload_meta, &mut object_meta);
+        object_meta.compression = compression;
         object_meta.encryption.as_mut().unwrap().sidecar_mac = String::new();
         let mac = compute_sidecar_mac(&dek, &object_meta)?;
         object_meta.encryption.as_mut().unwrap().sidecar_mac = mac;
@@ -3236,7 +3336,7 @@ impl FilesystemStorage {
                 let dek = self.resolve_dek(enc_meta, customer_key)?;
                 verify_sidecar_mac(&meta, &dek)?;
                 let frame_size = enc_meta.chunk_size as usize;
-                let plaintext_size = meta.size;
+                let plaintext_size = Self::decrypt_plaintext_len(&meta);
                 let aad_builder = object_aad_builder(bucket, key, meta.version_id.as_deref());
                 let ct_reader = VerifiedChunkReader::new(ec_dir, manifest);
                 let decryptor = FrameDecryptor::new(
@@ -3246,10 +3346,10 @@ impl FilesystemStorage {
                     frame_size,
                     aad_builder,
                 );
-                return Ok((Box::pin(decryptor), meta));
+                return Ok((Self::decompress_stored(&meta, Box::pin(decryptor))?, meta));
             }
             let reader = VerifiedChunkReader::new(ec_dir, manifest);
-            return Ok((Box::pin(reader), meta));
+            return Ok((Self::decompress_stored(&meta, Box::pin(reader))?, meta));
         }
         let obj_path = self.plain_object_read_path(bucket, key).await;
         // Encrypted object — wrap in FrameDecryptor
@@ -3257,7 +3357,7 @@ impl FilesystemStorage {
             let dek = self.resolve_dek(enc_meta, customer_key)?;
             verify_sidecar_mac(&meta, &dek)?;
             let chunk_size = enc_meta.chunk_size as usize;
-            let plaintext_size = meta.size;
+            let plaintext_size = Self::decrypt_plaintext_len(&meta);
             let file = fs::File::open(&obj_path).await.map_err(|e| {
                 if e.kind() == std::io::ErrorKind::NotFound {
                     StorageError::NotFound(key.to_string())
@@ -3273,16 +3373,19 @@ impl FilesystemStorage {
                 chunk_size,
                 aad_builder,
             );
-            return Ok((Box::pin(decryptor), meta));
+            return Ok((Self::decompress_stored(&meta, Box::pin(decryptor))?, meta));
         }
         // A sidecar size smaller than the file makes GET advertise a short
         // Content-Length and drop the tail. The file is the plain object.
-        if let Ok(len) = fs::metadata(&obj_path).await.map(|m| m.len()) {
-            if len > meta.size {
-                meta.size = len;
+        // Compressed objects are shorter on purpose. Their size stays original.
+        if meta.compression.is_none() {
+            if let Ok(len) = fs::metadata(&obj_path).await.map(|m| m.len()) {
+                if len > meta.size {
+                    meta.size = len;
+                }
             }
         }
-        if meta.size <= SMALL_OBJECT_THRESHOLD {
+        if meta.compression.is_none() && meta.size <= SMALL_OBJECT_THRESHOLD {
             let data = fs::read(&obj_path).await.map_err(|e| {
                 if e.kind() == std::io::ErrorKind::NotFound {
                     StorageError::NotFound(key.to_string())
@@ -3300,7 +3403,7 @@ impl FilesystemStorage {
             }
         })?;
         let reader = BufReader::with_capacity(IO_BUFFER_SIZE, file);
-        Ok((Box::pin(reader), meta))
+        Ok((Self::decompress_stored(&meta, Box::pin(reader))?, meta))
     }
 
     pub async fn get_object_range(
@@ -4018,6 +4121,14 @@ impl FilesystemStorage {
         let mut chunk_index: u64 = 0;
         let bucket_for_aad = bucket;
         let key_for_aad = upload_meta.key.as_str();
+        let mut compressor = self
+            .compressor_for(
+                bucket,
+                &upload_meta.key,
+                &upload_meta.content_type,
+                &upload_meta.object_metadata,
+            )
+            .await?;
 
         for part in &selected {
             let part_path = self.part_path(bucket, upload_id, part.part_number);
@@ -4052,32 +4163,20 @@ impl FilesystemStorage {
                 if let Some(hasher) = full_object_checksum.as_mut() {
                     hasher.update(&buf[..n]);
                 }
-                if let Some(ref cipher) = cipher_opt {
-                    frame_buf.extend_from_slice(&buf[..n]);
-                    while frame_buf.len() >= FRAME_CHUNK_SIZE {
-                        let frame_data: Vec<u8> = frame_buf.drain(..FRAME_CHUNK_SIZE).collect();
-                        let aad = build_frame_aad(
-                            bucket_for_aad,
-                            key_for_aad,
-                            version_id.as_deref(),
-                            chunk_index,
-                        );
-                        write_encrypted_frame(
-                            &mut writer,
-                            cipher,
-                            &nonce_prefix,
-                            chunk_index,
-                            &frame_data,
-                            &aad,
-                            &mut stored_hash,
-                        )
-                        .await?;
-                        chunk_index += 1;
-                    }
-                } else {
-                    stored_hash.update(&buf[..n]);
-                    writer.write_all(&buf[..n]).await?;
-                }
+                let stored = compressor.push(&buf[..n]);
+                emit_stored(
+                    &mut writer,
+                    cipher_opt.as_ref(),
+                    &nonce_prefix,
+                    &mut frame_buf,
+                    &mut chunk_index,
+                    &mut stored_hash,
+                    bucket_for_aad,
+                    key_for_aad,
+                    version_id.as_deref(),
+                    &stored,
+                )
+                .await?;
             }
             verify_part_bytes(part, part_bytes, part_md5)?;
 
@@ -4085,6 +4184,20 @@ impl FilesystemStorage {
                 .map_err(|_| StorageError::InvalidKey("invalid part etag".into()))?;
             etag_hasher.update(raw_md5);
         }
+        let tail = compressor.finish();
+        emit_stored(
+            &mut writer,
+            cipher_opt.as_ref(),
+            &nonce_prefix,
+            &mut frame_buf,
+            &mut chunk_index,
+            &mut stored_hash,
+            bucket_for_aad,
+            key_for_aad,
+            version_id.as_deref(),
+            &tail,
+        )
+        .await?;
         // Flush trailing partial frame
         if let Some(ref cipher) = cipher_opt {
             if !frame_buf.is_empty() {
@@ -4139,9 +4252,11 @@ impl FilesystemStorage {
             tags: upload_meta.tags,
             part_sizes: Some(part_sizes),
             encryption: enc_meta_opt,
+            compression: None,
             metadata: upload_meta.object_metadata,
             rebuilt_from_bytes: false,
         };
+        object_meta.compression = compressor.into_meta();
         if let (Some(dek), Some(em)) = (dek_opt.as_ref(), object_meta.encryption.as_mut()) {
             em.sidecar_mac = String::new();
             let mac = compute_sidecar_mac(dek, &object_meta)?;
@@ -5009,6 +5124,42 @@ impl FilesystemStorage {
             .await
     }
 
+    // --- Bucket compression ---
+
+    /// Whether new objects in `bucket` are compressed: its own setting, or the
+    /// server default when it has none.
+    pub async fn get_bucket_compression(&self, bucket: &str) -> Result<bool, StorageError> {
+        let meta = self.get_bucket_meta(bucket).await?;
+        Ok(meta.compression.unwrap_or(self.compression_enabled))
+    }
+
+    /// Store a bucket setting that overrides the server default.
+    pub async fn set_bucket_compression(
+        &self,
+        bucket: &str,
+        enabled: bool,
+    ) -> Result<(), StorageError> {
+        self.update_bucket_meta(bucket, |m| m.compression = Some(enabled))
+            .await
+    }
+
+    fn decrypt_plaintext_len(meta: &ObjectMeta) -> u64 {
+        meta.compression
+            .as_ref()
+            .map(|comp| comp.stored_size)
+            .unwrap_or(meta.size)
+    }
+
+    fn decompress_stored(
+        meta: &ObjectMeta,
+        stored: ByteStream,
+    ) -> Result<ByteStream, StorageError> {
+        match &meta.compression {
+            Some(comp) => Ok(comp.range(meta.size, 0, meta.size)?.decompress(stored)),
+            None => Ok(stored),
+        }
+    }
+
     // --- Bucket lifecycle ---
 
     /// Lifecycle rules of `bucket`, `None` when no configuration is set.
@@ -5742,7 +5893,7 @@ impl FilesystemStorage {
                 let dek = self.resolve_dek(enc_meta, customer_key)?;
                 verify_sidecar_mac(&meta, &dek)?;
                 let frame_size = enc_meta.chunk_size as usize;
-                let plaintext_size = meta.size;
+                let plaintext_size = Self::decrypt_plaintext_len(&meta);
                 let aad_builder = object_aad_builder(bucket, key, meta.version_id.as_deref());
                 let ct_reader = VerifiedChunkReader::new(ver_ec_dir, manifest);
                 let decryptor = FrameDecryptor::new(
@@ -5752,10 +5903,10 @@ impl FilesystemStorage {
                     frame_size,
                     aad_builder,
                 );
-                return Ok((Box::pin(decryptor), meta));
+                return Ok((Self::decompress_stored(&meta, Box::pin(decryptor))?, meta));
             }
             let reader = VerifiedChunkReader::new(ver_ec_dir, manifest);
-            return Ok((Box::pin(reader), meta));
+            return Ok((Self::decompress_stored(&meta, Box::pin(reader))?, meta));
         }
 
         let ver_data_path = self.version_data_path(bucket, key, version_id);
@@ -5767,7 +5918,7 @@ impl FilesystemStorage {
             let dek = self.resolve_dek(enc_meta, customer_key)?;
             verify_sidecar_mac(&meta, &dek)?;
             let chunk_size = enc_meta.chunk_size as usize;
-            let plaintext_size = meta.size;
+            let plaintext_size = Self::decrypt_plaintext_len(&meta);
             let file = fs::File::open(&ver_data_path).await.map_err(|e| {
                 if e.kind() == std::io::ErrorKind::NotFound {
                     StorageError::VersionNotFound(version_id.to_string())
@@ -5783,7 +5934,7 @@ impl FilesystemStorage {
                 chunk_size,
                 aad_builder,
             );
-            return Ok((Box::pin(decryptor), meta));
+            return Ok((Self::decompress_stored(&meta, Box::pin(decryptor))?, meta));
         }
 
         let file = fs::File::open(&ver_data_path).await.map_err(|e| {
@@ -5793,13 +5944,18 @@ impl FilesystemStorage {
                 StorageError::Io(e)
             }
         })?;
-        if let Ok(len) = file.metadata().await.map(|m| m.len()) {
-            if len > meta.size {
-                meta.size = len;
+        if meta.compression.is_none() {
+            if let Ok(len) = file.metadata().await.map(|m| m.len()) {
+                if len > meta.size {
+                    meta.size = len;
+                }
             }
         }
         Ok((
-            Box::pin(BufReader::with_capacity(IO_BUFFER_SIZE, file)),
+            Self::decompress_stored(
+                &meta,
+                Box::pin(BufReader::with_capacity(IO_BUFFER_SIZE, file)),
+            )?,
             meta,
         ))
     }
@@ -5968,6 +6124,45 @@ impl FilesystemStorage {
 
 /// Encrypt and write one frame: [nonce:12B][ciphertext||tag:16B]. The AAD
 /// binds the frame to object identity (bucket/key/version/chunk_index).
+async fn emit_stored(
+    writer: &mut BufWriter<fs::File>,
+    cipher: Option<&Aes256Gcm>,
+    nonce_prefix: &[u8],
+    frame_buf: &mut Vec<u8>,
+    chunk_index: &mut u64,
+    stored_hash: &mut Sha256,
+    bucket: &str,
+    key: &str,
+    version_id: Option<&str>,
+    data: &[u8],
+) -> Result<(), StorageError> {
+    if data.is_empty() {
+        return Ok(());
+    }
+    if let Some(cipher) = cipher {
+        frame_buf.extend_from_slice(data);
+        while frame_buf.len() >= FRAME_CHUNK_SIZE {
+            let frame_data: Vec<u8> = frame_buf.drain(..FRAME_CHUNK_SIZE).collect();
+            let aad = build_frame_aad(bucket, key, version_id, *chunk_index);
+            write_encrypted_frame(
+                writer,
+                cipher,
+                nonce_prefix,
+                *chunk_index,
+                &frame_data,
+                &aad,
+                stored_hash,
+            )
+            .await?;
+            *chunk_index += 1;
+        }
+    } else {
+        stored_hash.update(data);
+        writer.write_all(data).await?;
+    }
+    Ok(())
+}
+
 async fn write_encrypted_frame(
     writer: &mut BufWriter<fs::File>,
     cipher: &Aes256Gcm,
@@ -6135,6 +6330,19 @@ impl FilesystemStorage {
         length: u64,
         customer_key: Option<[u8; 32]>,
     ) -> Result<(ByteStream, ObjectMeta), StorageError> {
+        let compressed = match &meta.compression {
+            Some(comp) => Some(comp.range(meta.size, offset, length)?),
+            None => None,
+        };
+        let plain_len = Self::decrypt_plaintext_len(&meta);
+        let offset = compressed
+            .as_ref()
+            .map(|range| range.stored_offset)
+            .unwrap_or(offset);
+        let length = compressed
+            .as_ref()
+            .map(|range| range.stored_length)
+            .unwrap_or(length);
         if Self::is_chunked_path(&ec_dir).await {
             let manifest: ChunkManifest =
                 match fs::read_to_string(ec_dir.join("manifest.json")).await {
@@ -6157,16 +6365,26 @@ impl FilesystemStorage {
                 let decryptor = FrameDecryptor::for_range(
                     Box::pin(ct_reader),
                     &dek,
-                    meta.size,
+                    plain_len,
                     frame_size,
                     offset,
                     length,
                     aad_builder,
                 );
-                return Ok((Box::pin(decryptor), meta));
+                let stored = Box::pin(decryptor) as ByteStream;
+                let stream = match compressed {
+                    Some(range) => range.decompress(stored),
+                    None => stored,
+                };
+                return Ok((stream, meta));
             }
             let reader = VerifiedChunkReader::with_range(ec_dir, manifest, offset, length);
-            return Ok((Box::pin(reader), meta));
+            let stored = Box::pin(reader) as ByteStream;
+            let stream = match compressed {
+                Some(range) => range.decompress(stored),
+                None => stored,
+            };
+            return Ok((stream, meta));
         }
         // Encrypted object — seek to frame boundary and wrap in ranged FrameDecryptor
         if let Some(ref enc_meta) = meta.encryption {
@@ -6188,13 +6406,18 @@ impl FilesystemStorage {
             let decryptor = FrameDecryptor::for_range(
                 Box::pin(file),
                 &dek,
-                meta.size,
+                plain_len,
                 chunk_size,
                 offset,
                 length,
                 aad_builder,
             );
-            return Ok((Box::pin(decryptor), meta));
+            let stored = Box::pin(decryptor) as ByteStream;
+            let stream = match compressed {
+                Some(range) => range.decompress(stored),
+                None => stored,
+            };
+            return Ok((stream, meta));
         }
         if length <= SMALL_OBJECT_THRESHOLD {
             let mut file = fs::File::open(obj_path).await.map_err(|e| {
@@ -6209,7 +6432,12 @@ impl FilesystemStorage {
                 .map_err(StorageError::Io)?;
             let mut data = vec![0u8; length as usize];
             file.read_exact(&mut data).await.map_err(StorageError::Io)?;
-            return Ok((Box::pin(std::io::Cursor::new(data)), meta));
+            let stored = Box::pin(std::io::Cursor::new(data)) as ByteStream;
+            let stream = match compressed {
+                Some(range) => range.decompress(stored),
+                None => stored,
+            };
+            return Ok((stream, meta));
         }
         let mut file = fs::File::open(obj_path).await.map_err(|e| {
             if e.kind() == std::io::ErrorKind::NotFound {
@@ -6223,7 +6451,12 @@ impl FilesystemStorage {
             .map_err(StorageError::Io)?;
         let limited = file.take(length);
         let reader = BufReader::with_capacity(IO_BUFFER_SIZE, limited);
-        Ok((Box::pin(reader), meta))
+        let stored = Box::pin(reader) as ByteStream;
+        let stream = match compressed {
+            Some(range) => range.decompress(stored),
+            None => stored,
+        };
+        Ok((stream, meta))
     }
 
     /// Read a version sidecar verbatim — delete markers included.
@@ -6377,6 +6610,7 @@ mod durability_tests {
             versioning_suspended: false,
             tags: None,
             lifecycle: None,
+            compression: None,
         }
     }
 
@@ -6554,5 +6788,493 @@ mod durability_tests {
         let (body, size) = read_obj(&storage, "ok.txt").await;
         assert_eq!(body, b"hey");
         assert_eq!(size, 3);
+    }
+}
+
+#[cfg(test)]
+mod compression_tests {
+    use super::*;
+    use crate::storage::keys::Keyring;
+    use crate::storage::{BucketMeta, ObjectMeta};
+    use std::io::Cursor;
+    use tokio::io::AsyncReadExt;
+
+    const MIB: usize = 1024 * 1024;
+
+    async fn storage_at(dir: &Path, erasure_coding: bool) -> FilesystemStorage {
+        let keyring = Arc::new(Keyring::load(dir.to_str().unwrap(), None).await.unwrap());
+        let parity = if erasure_coding { 1 } else { 0 };
+        let storage = FilesystemStorage::new(
+            dir.to_str().unwrap(),
+            erasure_coding,
+            MIB as u64,
+            parity,
+            keyring,
+        )
+        .await
+        .unwrap();
+        storage.create_bucket(&bucket_meta("bkt")).await.unwrap();
+        storage
+    }
+
+    fn bucket_meta(name: &str) -> BucketMeta {
+        BucketMeta {
+            name: name.to_string(),
+            created_at: "2020-01-01T00:00:00.000Z".into(),
+            region: "us-east-1".into(),
+            versioning: false,
+            cors_rules: None,
+            encryption_config: None,
+            public_read: false,
+            public_list: false,
+            versioning_suspended: false,
+            tags: None,
+            lifecycle: None,
+            compression: None,
+        }
+    }
+
+    /// JSON log lines: compresses well but is not one repeated byte.
+    fn logs(len: usize, seed: u64) -> Vec<u8> {
+        let mut out = Vec::with_capacity(len + 128);
+        let mut n = seed;
+        while out.len() < len {
+            out.extend_from_slice(
+                format!(
+                    "{{\"seq\":{n},\"level\":\"info\",\"msg\":\"request served\",\"path\":\"/api/items/{}\"}}\n",
+                    n % 97
+                )
+                .as_bytes(),
+            );
+            n += 1;
+        }
+        out.truncate(len);
+        out
+    }
+
+    fn noise(len: usize) -> Vec<u8> {
+        let mut state = 0x2545_F491_4F6C_DD1Du64;
+        (0..len)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                (state >> 24) as u8
+            })
+            .collect()
+    }
+
+    fn md5_etag(body: &[u8]) -> String {
+        format!("\"{}\"", hex::encode(Md5::digest(body)))
+    }
+
+    async fn put(
+        storage: &FilesystemStorage,
+        key: &str,
+        content_type: &str,
+        body: &[u8],
+        sse: bool,
+    ) -> PutResult {
+        storage
+            .put_object(
+                "bkt",
+                key,
+                content_type,
+                Box::pin(Cursor::new(body.to_vec())),
+                None,
+                sse.then(EncryptionRequest::sse_s3),
+            )
+            .await
+            .unwrap()
+    }
+
+    async fn put_multipart(
+        storage: &FilesystemStorage,
+        key: &str,
+        parts: &[&[u8]],
+        sse: bool,
+    ) -> PutResult {
+        let spec = sse.then(|| crate::api::object::spec_from_request(&EncryptionRequest::sse_s3()));
+        let upload = storage
+            .create_multipart_upload(
+                "bkt",
+                key,
+                "text/plain",
+                None,
+                None,
+                spec,
+                StoredObjectMetadata::default(),
+                None,
+            )
+            .await
+            .unwrap();
+        let mut completed = Vec::new();
+        for (index, body) in parts.iter().enumerate() {
+            let number = index as u32 + 1;
+            let part = storage
+                .upload_part(
+                    "bkt",
+                    &upload.upload_id,
+                    number,
+                    Box::pin(Cursor::new(body.to_vec())),
+                    None,
+                    None,
+                )
+                .await
+                .unwrap();
+            completed.push((number, part.etag));
+        }
+        storage
+            .complete_multipart_upload("bkt", &upload.upload_id, &completed, None, None, None, None)
+            .await
+            .unwrap()
+    }
+
+    async fn drain(mut reader: ByteStream) -> Vec<u8> {
+        let mut out = Vec::new();
+        reader.read_to_end(&mut out).await.unwrap();
+        out
+    }
+
+    async fn read(storage: &FilesystemStorage, key: &str) -> (Vec<u8>, ObjectMeta) {
+        let (reader, meta) = storage.get_object("bkt", key, None).await.unwrap();
+        (drain(reader).await, meta)
+    }
+
+    async fn read_range(
+        storage: &FilesystemStorage,
+        key: &str,
+        offset: usize,
+        len: usize,
+    ) -> Vec<u8> {
+        let (reader, _) = storage
+            .get_object_range("bkt", key, offset as u64, len as u64, None)
+            .await
+            .unwrap();
+        drain(reader).await
+    }
+
+    fn sidecar(dir: &Path, key: &str) -> ObjectMeta {
+        let path = dir.join("buckets/bkt").join(format!("{key}.meta.json"));
+        serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap()
+    }
+
+    fn data_len(dir: &Path, key: &str) -> u64 {
+        std::fs::metadata(dir.join("buckets/bkt").join(key))
+            .unwrap()
+            .len()
+    }
+
+    fn manifest(dir: &Path, key: &str) -> ChunkManifest {
+        let path = dir
+            .join("buckets/bkt")
+            .join(format!("{key}.ec/manifest.json"));
+        serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn compressible_object_round_trips_and_takes_less_disk() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut storage = storage_at(tmp.path(), false).await;
+        storage.set_compression(true, 3);
+        let body = logs(3 * MIB + 777, 0);
+
+        let put = put(&storage, "app.log", "text/plain", &body, false).await;
+        assert_eq!(put.etag, md5_etag(&body));
+        assert_eq!(put.size, body.len() as u64);
+
+        let (got, meta) = read(&storage, "app.log").await;
+        assert_eq!(got, body);
+        assert_eq!(meta.size, body.len() as u64);
+        assert_eq!(meta.etag, md5_etag(&body));
+        let head = storage.head_object("bkt", "app.log").await.unwrap();
+        assert_eq!(head.size, body.len() as u64);
+        assert_eq!(head.etag, md5_etag(&body));
+
+        let on_disk = data_len(tmp.path(), "app.log");
+        assert!(
+            on_disk < body.len() as u64 / 4,
+            "{on_disk} bytes on disk for {} original bytes",
+            body.len()
+        );
+        let stored = sidecar(tmp.path(), "app.log");
+        assert_eq!(stored.size, body.len() as u64);
+        assert_eq!(stored.compression.unwrap().stored_size, on_disk);
+    }
+
+    #[tokio::test]
+    async fn range_across_a_chunk_boundary_returns_the_original_slice() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut storage = storage_at(tmp.path(), false).await;
+        storage.set_compression(true, 3);
+        let body = logs(3 * MIB, 1);
+        put(&storage, "app.log", "text/plain", &body, false).await;
+        assert!(sidecar(tmp.path(), "app.log").compression.is_some());
+
+        for (offset, len) in [
+            (MIB - 1000, 5000),
+            (MIB / 2, MIB + 300_000),
+            (2 * MIB + 5, MIB - 5),
+            (17, 1),
+        ] {
+            assert_eq!(
+                read_range(&storage, "app.log", offset, len).await,
+                body[offset..offset + len],
+                "range {offset}+{len}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn switching_compression_keeps_old_and_new_objects_readable() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut storage = storage_at(tmp.path(), false).await;
+        let old = logs(2 * MIB, 2);
+        put(&storage, "old.log", "text/plain", &old, false).await;
+        assert!(sidecar(tmp.path(), "old.log").compression.is_none());
+        assert_eq!(data_len(tmp.path(), "old.log"), old.len() as u64);
+
+        storage.set_compression(true, 3);
+        assert_eq!(read(&storage, "old.log").await.0, old);
+        let new = logs(2 * MIB, 3);
+        put(&storage, "new.log", "text/plain", &new, false).await;
+        assert!(sidecar(tmp.path(), "new.log").compression.is_some());
+        assert!(data_len(tmp.path(), "new.log") < new.len() as u64);
+
+        storage.set_compression(false, 3);
+        assert_eq!(read(&storage, "old.log").await.0, old);
+        assert_eq!(read(&storage, "new.log").await.0, new);
+        assert_eq!(
+            read_range(&storage, "new.log", MIB - 10, 20).await,
+            new[MIB - 10..MIB + 10]
+        );
+    }
+
+    #[tokio::test]
+    async fn bucket_setting_overrides_the_server_default() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut storage = storage_at(tmp.path(), false).await;
+        let body = logs(MIB, 4);
+
+        assert!(!storage.get_bucket_compression("bkt").await.unwrap());
+        storage.set_bucket_compression("bkt", true).await.unwrap();
+        assert!(storage.get_bucket_compression("bkt").await.unwrap());
+        put(&storage, "on.log", "text/plain", &body, false).await;
+        assert!(sidecar(tmp.path(), "on.log").compression.is_some());
+        assert_eq!(read(&storage, "on.log").await.0, body);
+
+        storage.set_compression(true, 3);
+        storage.set_bucket_compression("bkt", false).await.unwrap();
+        assert!(!storage.get_bucket_compression("bkt").await.unwrap());
+        put(&storage, "off.log", "text/plain", &body, false).await;
+        assert!(sidecar(tmp.path(), "off.log").compression.is_none());
+        assert_eq!(
+            std::fs::read(tmp.path().join("buckets/bkt/off.log")).unwrap(),
+            body
+        );
+
+        storage
+            .create_bucket(&bucket_meta("inherit"))
+            .await
+            .unwrap();
+        assert!(storage.get_bucket_compression("inherit").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn sse_s3_compresses_before_encrypting_and_the_mac_covers_the_index() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut storage = storage_at(tmp.path(), false).await;
+        storage.set_compression(true, 3);
+        let body = logs(2 * MIB + 5, 5);
+        let put = put(&storage, "secret.log", "text/plain", &body, true).await;
+        assert_eq!(put.etag, md5_etag(&body));
+
+        let stored = sidecar(tmp.path(), "secret.log");
+        assert!(stored.encryption.is_some());
+        assert!(stored.compression.is_some());
+        assert!(data_len(tmp.path(), "secret.log") < body.len() as u64 / 4);
+
+        let (got, meta) = read(&storage, "secret.log").await;
+        assert_eq!(got, body);
+        assert_eq!(meta.size, body.len() as u64);
+        assert_eq!(
+            read_range(&storage, "secret.log", MIB - 7, 70_000).await,
+            body[MIB - 7..MIB - 7 + 70_000]
+        );
+
+        let mut tampered = stored.clone();
+        tampered.compression.as_mut().unwrap().level += 1;
+        std::fs::write(
+            tmp.path().join("buckets/bkt/secret.log.meta.json"),
+            serde_json::to_vec_pretty(&tampered).unwrap(),
+        )
+        .unwrap();
+        assert!(matches!(
+            storage.get_object("bkt", "secret.log", None).await,
+            Err(StorageError::IntegrityError(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn multipart_compresses_the_assembled_object_and_keeps_part_offsets() {
+        for sse in [false, true] {
+            let tmp = tempfile::tempdir().unwrap();
+            let mut storage = storage_at(tmp.path(), false).await;
+            storage.set_compression(true, 3);
+            let first = logs(5 * MIB + 10, 6);
+            let second = logs(MIB + MIB / 2, 7);
+            let put = put_multipart(&storage, "mp.log", &[&first, &second], sse).await;
+            let mut part_md5s = Md5::new();
+            part_md5s.update(Md5::digest(&first));
+            part_md5s.update(Md5::digest(&second));
+            let expected_etag = format!("\"{}-2\"", hex::encode(part_md5s.finalize()));
+            assert_eq!(put.etag, expected_etag, "sse={sse}");
+
+            let body = [first.as_slice(), second.as_slice()].concat();
+            let (got, meta) = read(&storage, "mp.log").await;
+            assert_eq!(got, body, "sse={sse}");
+            assert_eq!(meta.size, body.len() as u64);
+            assert_eq!(meta.etag, expected_etag);
+            assert_eq!(
+                meta.part_sizes,
+                Some(vec![first.len() as u64, second.len() as u64])
+            );
+            assert!(sidecar(tmp.path(), "mp.log").compression.is_some());
+            assert!(data_len(tmp.path(), "mp.log") < body.len() as u64 / 4);
+
+            let boundary = first.len();
+            assert_eq!(
+                read_range(&storage, "mp.log", boundary - 100, 300).await,
+                body[boundary - 100..boundary + 200],
+                "sse={sse}"
+            );
+            assert_eq!(
+                read_range(&storage, "mp.log", boundary, second.len()).await,
+                second,
+                "part 2 by its recorded offset, sse={sse}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn precompressed_encoded_and_tiny_objects_are_stored_as_sent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut storage = storage_at(tmp.path(), false).await;
+        storage.set_compression(true, 3);
+        let text = logs(256 * 1024, 8);
+        let tiny = logs(1023, 9);
+        let cases: [(&str, &str, &[u8], Option<&str>); 4] = [
+            ("photo.png", "image/png", &text, None),
+            ("archive.gz", "application/octet-stream", &text, None),
+            ("encoded.txt", "text/plain", &text, Some("gzip")),
+            ("tiny.txt", "text/plain", &tiny, None),
+        ];
+        for (key, content_type, body, content_encoding) in cases {
+            let opts = PutOptions {
+                metadata: StoredObjectMetadata {
+                    content_encoding: content_encoding.map(str::to_string),
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            storage
+                .put_object_with(
+                    "bkt",
+                    key,
+                    content_type,
+                    Box::pin(Cursor::new(body.to_vec())),
+                    None,
+                    None,
+                    &opts,
+                )
+                .await
+                .unwrap();
+            assert!(sidecar(tmp.path(), key).compression.is_none(), "{key}");
+            assert_eq!(
+                std::fs::read(tmp.path().join("buckets/bkt").join(key)).unwrap(),
+                body,
+                "{key}"
+            );
+            assert_eq!(read(&storage, key).await.0, body, "{key}");
+        }
+    }
+
+    #[tokio::test]
+    async fn incompressible_bytes_are_stored_raw() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut storage = storage_at(tmp.path(), false).await;
+        storage.set_compression(true, 3);
+        let body = noise(2 * MIB + 3);
+        put(
+            &storage,
+            "random.bin",
+            "application/octet-stream",
+            &body,
+            false,
+        )
+        .await;
+        assert!(sidecar(tmp.path(), "random.bin").compression.is_none());
+        assert_eq!(data_len(tmp.path(), "random.bin"), body.len() as u64);
+        assert_eq!(read(&storage, "random.bin").await.0, body);
+    }
+
+    #[tokio::test]
+    async fn versions_decompress_on_read() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut storage = storage_at(tmp.path(), false).await;
+        storage.set_compression(true, 3);
+        storage.set_versioning("bkt", true).await.unwrap();
+        let v1 = logs(2 * MIB, 10);
+        let v2 = logs(MIB + 9, 11);
+        let first = put(&storage, "doc.log", "text/plain", &v1, false).await;
+        put(&storage, "doc.log", "text/plain", &v2, true).await;
+        let vid = first.version_id.unwrap();
+
+        let (reader, meta) = storage
+            .get_object_version("bkt", "doc.log", &vid, None)
+            .await
+            .unwrap();
+        assert!(meta.compression.is_some());
+        assert_eq!(drain(reader).await, v1);
+        let (reader, _) = storage
+            .get_object_version_range("bkt", "doc.log", &vid, (MIB - 3) as u64, 9, None)
+            .await
+            .unwrap();
+        assert_eq!(drain(reader).await, v1[MIB - 3..MIB + 6]);
+        assert_eq!(read(&storage, "doc.log").await.0, v2);
+    }
+
+    #[tokio::test]
+    async fn erasure_coding_shards_the_compressed_payload() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut storage = storage_at(tmp.path(), true).await;
+        storage.set_compression(true, 3);
+        let body = logs(3 * MIB + 11, 12);
+        let first = logs(5 * MIB, 13);
+        let second = logs(MIB, 14);
+        let joined = [first.as_slice(), second.as_slice()].concat();
+        for sse in [false, true] {
+            let single = format!("single-{sse}.log");
+            let multi = format!("multi-{sse}.log");
+            put(&storage, &single, "text/plain", &body, sse).await;
+            put_multipart(&storage, &multi, &[&first, &second], sse).await;
+            for (key, original) in [(&single, &body), (&multi, &joined)] {
+                let meta = sidecar(tmp.path(), key);
+                let compression = meta.compression.as_ref().expect("compressed");
+                let manifest = manifest(tmp.path(), key);
+                if sse {
+                    assert_eq!(manifest.plaintext_size, Some(compression.stored_size));
+                } else {
+                    assert_eq!(manifest.total_size, compression.stored_size);
+                }
+                assert!(manifest.total_size < original.len() as u64 / 4, "{key}");
+                assert_eq!(read(&storage, key).await.0, *original, "{key}");
+                assert_eq!(
+                    read_range(&storage, key, MIB - 50, MIB + 100).await,
+                    original[MIB - 50..2 * MIB + 50],
+                    "{key}"
+                );
+            }
+        }
     }
 }

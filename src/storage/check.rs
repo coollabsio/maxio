@@ -37,6 +37,7 @@ use base64::Engine;
 use md5::{Digest, Md5};
 use sha2::Sha256;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
 
@@ -995,7 +996,10 @@ async fn check_meta_pair(
     // A crashed publish can leave a newer payload with the previous sidecar.
     // A size change is that case and is repaired below. A same-size content
     // hash miss is damage: do not adopt the bytes.
-    let size_changed = !encrypted && file_len != meta.size;
+    let compressed = meta.compression.is_some();
+    // A compressed file is shorter than the original size on purpose. Do not
+    // adopt that shorter length as the object size or the etag.
+    let size_changed = !encrypted && !compressed && file_len != meta.size;
     if !size_changed {
         if let Some(expected) = meta.content_sha256.clone() {
             let actual = match file_sha256_hex(data_path).await {
@@ -1063,7 +1067,22 @@ async fn check_meta_pair(
         }
     }
     // Ciphertext length and MD5 are not the plaintext size and etag.
-    if !encrypted {
+    // A compressed payload is not the original bytes either.
+    if compressed && !encrypted {
+        let expected = meta
+            .compression
+            .as_ref()
+            .map(|comp| comp.stored_size)
+            .unwrap_or(file_len);
+        if file_len != expected {
+            report.push(
+                IssueKind::SizeMismatch,
+                data_path,
+                format!("compressed payload is {file_len} bytes, index records {expected}"),
+                false,
+            );
+        }
+    } else if !encrypted {
         if file_len != meta.size {
             let repaired = repair;
             report.push(
@@ -3112,6 +3131,7 @@ mod tests {
             versioning_suspended: false,
             tags: None,
             lifecycle: None,
+            compression: None,
         }
     }
 
@@ -6095,6 +6115,98 @@ fn composite_part_count(value: &str) -> Option<u32> {
     super::composite_checksum_part_count(value)
 }
 
+async fn checksum_compressed(
+    data_path: &Path,
+    meta: &ObjectMeta,
+    algo: ChecksumAlgorithm,
+    bucket: &str,
+    key: &str,
+    keyring: Option<&Arc<super::keys::Keyring>>,
+    expected: &str,
+) -> Result<String, String> {
+    let comp = meta
+        .compression
+        .as_ref()
+        .ok_or("object is not compressed")?;
+    let file = tokio::fs::File::open(data_path)
+        .await
+        .map_err(|err| err.to_string())?;
+    let stored: Pin<Box<dyn tokio::io::AsyncRead + Send>> = if let Some(enc) = &meta.encryption {
+        if enc.mode != EncryptionMode::SseS3 {
+            return Err(
+                "SSE-C payload cannot be checked without the customer key; it was left in place"
+                    .into(),
+            );
+        }
+        let Some(keyring) = keyring else {
+            return Err("SSE-S3 master key is not loaded; the payload was left in place".into());
+        };
+        let b64 = base64::engine::general_purpose::STANDARD;
+        let key_id = enc.key_id.as_deref().ok_or("missing key_id")?;
+        let wrapped = b64
+            .decode(enc.wrapped_dek.as_deref().ok_or("missing wrapped_dek")?)
+            .map_err(|err| err.to_string())?;
+        let nonce_raw = b64
+            .decode(enc.wrap_nonce.as_deref().ok_or("missing wrap_nonce")?)
+            .map_err(|err| err.to_string())?;
+        if nonce_raw.len() != 12 {
+            return Err("wrap_nonce must be 12 bytes".into());
+        }
+        let mut nonce = [0u8; 12];
+        nonce.copy_from_slice(&nonce_raw);
+        let dek = keyring
+            .unwrap_dek(key_id, &wrapped, &nonce)
+            .map_err(|err| err.to_string())?;
+        let aad = super::filesystem::object_aad_builder(bucket, key, meta.version_id.as_deref());
+        Box::pin(super::crypto::FrameDecryptor::new(
+            Box::pin(file),
+            &dek,
+            comp.stored_size,
+            enc.chunk_size.max(1) as usize,
+            aad,
+        ))
+    } else {
+        Box::pin(file)
+    };
+    let mut plain = comp
+        .range(meta.size, 0, meta.size)
+        .map_err(|err| err.to_string())?
+        .decompress(stored);
+    if composite_part_count(expected).is_some() {
+        let Some(parts) = meta.part_sizes.as_deref().filter(|parts| !parts.is_empty()) else {
+            return Err(
+                "unverifiable: multipart composite checksum cannot be verified from the full object; per-part sizes are not stored"
+                    .into(),
+            );
+        };
+        let covered: u64 = parts.iter().copied().sum();
+        if covered != meta.size {
+            return Err(
+                "damaged-sidecar: multipart part sizes do not cover the recorded size".into(),
+            );
+        }
+        return checksum_parts(plain, algo, parts, meta.encryption.is_some()).await;
+    }
+    let mut hasher = ChecksumHasher::new(algo);
+    let mut buf = vec![0u8; 64 * 1024];
+    loop {
+        let n = tokio::io::AsyncReadExt::read(&mut plain, &mut buf)
+            .await
+            .map_err(|err| {
+                if meta.encryption.is_some() {
+                    format!("authentication failed ({err})")
+                } else {
+                    err.to_string()
+                }
+            })?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok(hasher.finalize_base64())
+}
+
 async fn payload_checksum(
     data_path: &Path,
     meta: &ObjectMeta,
@@ -6104,6 +6216,9 @@ async fn payload_checksum(
     keyring: Option<&Arc<super::keys::Keyring>>,
     expected: &str,
 ) -> Result<String, String> {
+    if meta.compression.is_some() {
+        return checksum_compressed(data_path, meta, algo, bucket, key, keyring, expected).await;
+    }
     if composite_part_count(expected).is_some() {
         return composite_checksum(data_path, meta, algo, bucket, key, keyring).await;
     }

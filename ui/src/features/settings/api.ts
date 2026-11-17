@@ -17,6 +17,16 @@ export async function getEncryption(bucket: string) {
   return data
 }
 
+export async function getCompression(bucket: string) {
+  const { data } = await sdk.getCompression({ client: apiClient, path: { bucket }, throwOnError: true })
+  return data
+}
+
+export async function setCompression(bucket: string, enabled: boolean) {
+  const { data } = await sdk.setCompression({ client: apiClient, path: { bucket }, body: { enabled }, throwOnError: true })
+  return data
+}
+
 export async function setEncryption(bucket: string, enabled: boolean) {
   const { data } = await sdk.setEncryption({ client: apiClient, path: { bucket }, body: { enabled }, throwOnError: true })
   return data

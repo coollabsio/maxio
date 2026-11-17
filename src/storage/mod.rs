@@ -1,5 +1,6 @@
 pub mod check;
 pub mod chunk_reader;
+pub mod compress;
 pub mod crypto;
 pub mod filesystem;
 pub mod format;
@@ -12,6 +13,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 use std::pin::Pin;
 use tokio::io::AsyncRead;
+
+pub use compress::CompressionMeta;
 
 pub type ByteStream = Pin<Box<dyn AsyncRead + Send>>;
 
@@ -358,6 +361,10 @@ pub struct BucketMeta {
     /// Lifecycle rules (`PutBucketLifecycleConfiguration` / console).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lifecycle: Option<Vec<lifecycle::LifecycleRule>>,
+    /// None inherits the server default. Some(true) forces compression on.
+    /// Some(false) forces it off.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compression: Option<bool>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -398,6 +405,8 @@ pub struct ObjectMeta {
     pub part_sizes: Option<Vec<u64>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub encryption: Option<EncryptionMeta>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compression: Option<CompressionMeta>,
     /// Client-supplied metadata, stored as top-level sidecar fields.
     #[serde(flatten)]
     pub metadata: StoredObjectMetadata,
@@ -744,6 +753,7 @@ pub async fn provision_default_buckets(
             versioning_suspended: false,
             tags: None,
             lifecycle: None,
+            compression: None,
         };
         match storage.create_bucket(&meta).await {
             Ok(true) => tracing::info!("Created default bucket: {}", bucket_name),
@@ -778,6 +788,7 @@ fn fresh_public_meta(name: &str, region: &str) -> BucketMeta {
         versioning_suspended: false,
         tags: None,
         lifecycle: None,
+        compression: None,
     }
 }
 

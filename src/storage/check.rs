@@ -1247,6 +1247,18 @@ async fn check_meta_pair(
                 )
                 .await;
             }
+            // A zstd frame that does not decode is damaged payload. It is not
+            // a missing SSE key. The stored file no longer matches the index.
+            Err(err) if is_compression_decode_failure(&err) => {
+                report.push(
+                    IssueKind::ContentHashMismatch,
+                    data_path,
+                    format!(
+                        "compressed payload failed to decode ({err}). The bytes were not rewritten."
+                    ),
+                    false,
+                );
+            }
             Err(err) if !err.contains("authentication failed") => {
                 report.note(
                     IssueKind::UnverifiableWithoutKey,
@@ -6109,6 +6121,67 @@ mod tests {
             again.issues
         );
     }
+
+    #[tokio::test]
+    async fn corrupt_compressed_byte_is_a_decode_issue_not_a_missing_key() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut storage = storage_at(tmp.path()).await;
+        storage.set_compression(true, 3);
+        storage.create_bucket(&bucket_meta("bkt")).await.unwrap();
+        let body = br#"{"msg":"request served","status":200}
+"#
+        .repeat(80);
+        storage
+            .put_object(
+                "bkt",
+                "logs.json",
+                "application/json",
+                Box::pin(std::io::Cursor::new(body)),
+                Some((crate::storage::ChecksumAlgorithm::CRC32, None)),
+                None,
+            )
+            .await
+            .unwrap();
+        let meta = storage.head_object("bkt", "logs.json").await.unwrap();
+        assert!(
+            meta.compression.is_some(),
+            "the object must be stored compressed"
+        );
+        let path = tmp.path().join("buckets/bkt/logs.json");
+        let mut bytes = std::fs::read(&path).unwrap();
+        let mid = bytes.len() / 2;
+        bytes[mid] ^= 0xff;
+        std::fs::write(&path, &bytes).unwrap();
+
+        let report = check(tmp.path(), false).await.unwrap();
+        assert!(
+            report.issues.iter().any(|issue| {
+                !issue.advisory
+                    && issue.kind == IssueKind::ContentHashMismatch
+                    && issue.path.ends_with("logs.json")
+            }),
+            "expected a content-hash issue, got {:?}",
+            report
+                .issues
+                .iter()
+                .map(|issue| (issue.kind.as_str(), issue.detail.as_str()))
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            report
+                .issues
+                .iter()
+                .all(|issue| issue.kind != IssueKind::UnverifiableWithoutKey),
+            "zstd decode must not be reported as a missing key: {:?}",
+            report.issues
+        );
+    }
+}
+
+fn is_compression_decode_failure(err: &str) -> bool {
+    err.contains("compressed chunk does not decode")
+        || err.contains("compressed payload ended inside a chunk")
+        || err.contains("compressed chunk decoded to")
 }
 
 fn composite_part_count(value: &str) -> Option<u32> {

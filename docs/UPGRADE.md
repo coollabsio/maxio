@@ -69,6 +69,8 @@ Future releases append a migration step and bump the marker only after that step
 
 Do not roll back to a pre-1.0 build after this upgrade. No format-1 binary was released. Builds from before 1.0.0 ignore `.maxio-format`. They start on a version 2 directory and then return `InternalError` for a key stored at `<key>/.maxio.object`. Deleting the marker does not make those objects readable.
 
+Do not downgrade after this process has stored an object with `MAXIO_COMPRESSION=zstd` or a bucket compression override. The format marker stays at version 2, so an older binary still starts. It ignores the compression record, serves the raw zstd bytes, and reports the original Content-Length and ETag. Those responses are not the object the client stored. Turning compression off does not rewrite objects already stored. Stay on this version, or a newer one, to read them.
+
 Future releases refuse a marker newer than they understand. That refusal is the safe path. Do not delete the marker to force an older binary to start.
 
 To undo an upgrade that has not yet stored data you need:

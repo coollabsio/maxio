@@ -9,7 +9,7 @@ import { PageHeader } from '@/components/ui/page-header'
 import { Switch } from '@/components/ui/switch'
 import { LifecycleCard } from '@/features/lifecycle/LifecycleCard'
 import { toast } from '@/lib/toast'
-import { getEncryption, getPublicAccess, getVersioning, setEncryption, setPublicAccess, setVersioning } from './api'
+import { getCompression, getEncryption, getPublicAccess, getVersioning, setCompression, setEncryption, setPublicAccess, setVersioning } from './api'
 import { BucketPolicyCard } from './BucketPolicyCard'
 import { BucketTagsCard } from './BucketTagsCard'
 
@@ -57,10 +57,12 @@ function BucketSettings({ bucket }: { bucket: string }) {
 
   const versioningQuery = useQuery({ queryKey: settingsKeys.versioning(bucket), queryFn: () => getVersioning(bucket) })
   const encryptionQuery = useQuery({ queryKey: settingsKeys.encryption(bucket), queryFn: () => getEncryption(bucket) })
+  const compressionQuery = useQuery({ queryKey: settingsKeys.compression(bucket), queryFn: () => getCompression(bucket) })
   const publicQuery = useQuery({ queryKey: settingsKeys.publicAccess(bucket), queryFn: () => getPublicAccess(bucket) })
 
   const versioningEnabled = !!versioningQuery.data?.enabled
   const encryptionEnabled = !!encryptionQuery.data?.enabled
+  const compressionEnabled = !!compressionQuery.data?.enabled
   const publicRead = !!publicQuery.data?.read
   const publicList = !!publicQuery.data?.list
 
@@ -79,6 +81,14 @@ function BucketSettings({ bucket }: { bucket: string }) {
       toast.success(enabled ? 'Default encryption enabled' : 'Default encryption disabled')
       void queryClient.invalidateQueries({ queryKey: settingsKeys.encryption(bucket) })
       void queryClient.invalidateQueries({ queryKey: bucketKeys.list() })
+    },
+  })
+
+  const compressionMutation = useMutation({
+    mutationFn: (enabled: boolean) => setCompression(bucket, enabled),
+    onSuccess: (_data, enabled) => {
+      toast.success(enabled ? 'Compression enabled' : 'Compression disabled')
+      void queryClient.invalidateQueries({ queryKey: settingsKeys.compression(bucket) })
     },
   })
 
@@ -145,6 +155,19 @@ function BucketSettings({ bucket }: { bucket: string }) {
     void applyVersioning(true)
   }
 
+  async function applyCompression(enabled: boolean) {
+    try {
+      await compressionMutation.mutateAsync(enabled)
+    } catch (err) {
+      console.error('toggleCompression failed:', err)
+      toast.error(err instanceof ApiError ? err.message : 'Failed to update compression')
+    }
+  }
+
+  function toggleCompression() {
+    void applyCompression(!compressionEnabled)
+  }
+
   function toggleEncryption() {
     if (encryptionEnabled) {
       setPendingConfirmation({
@@ -192,7 +215,7 @@ function BucketSettings({ bucket }: { bucket: string }) {
       <div className="flex max-w-3xl flex-col gap-6">
         <PageHeader title="Settings" description={`Configuration of bucket ${bucket}`} />
 
-        {versioningQuery.isError || encryptionQuery.isError || publicQuery.isError ? (
+        {versioningQuery.isError || encryptionQuery.isError || compressionQuery.isError || publicQuery.isError ? (
           <Callout type="danger">Failed to load bucket settings</Callout>
         ) : null}
 
@@ -206,7 +229,7 @@ function BucketSettings({ bucket }: { bucket: string }) {
         <section className="settings-section">
           <div className="settings-section-header">
             <h2>General</h2>
-            <p>Versioning, encryption at rest, and anonymous access.</p>
+            <p>Versioning, encryption at rest, compression, and anonymous access.</p>
           </div>
           <div className="settings-section-body divide-y divide-neutral-200 dark:divide-white/[0.06]">
             <SettingRow
@@ -235,6 +258,20 @@ function BucketSettings({ bucket }: { bucket: string }) {
               disabled={encryptionMutation.isPending}
               label="Toggle default encryption"
               onToggle={toggleEncryption}
+            />
+
+            <SettingRow
+              title="Compression"
+              loading={compressionQuery.isPending}
+              description={
+                compressionEnabled
+                  ? 'New objects are stored with zstd. Existing objects stay as they are. Downloads still return the original bytes.'
+                  : 'New objects are stored uncompressed. This overrides the server default.'
+              }
+              checked={compressionEnabled}
+              disabled={compressionMutation.isPending}
+              label="Toggle compression"
+              onToggle={toggleCompression}
             />
 
             <SettingRow

@@ -34,6 +34,7 @@ export const settingsKeys = {
   all: ['settings'] as const,
   versioning: (bucket: string) => [...settingsKeys.all, 'versioning', bucket] as const,
   encryption: (bucket: string) => [...settingsKeys.all, 'encryption', bucket] as const,
+  compression: (bucket: string) => [...settingsKeys.all, 'compression', bucket] as const,
   publicAccess: (bucket: string) => [...settingsKeys.all, 'public', bucket] as const,
   tags: (bucket: string) => [...settingsKeys.all, 'tags', bucket] as const,
   policy: (bucket: string) => [...settingsKeys.all, 'policy', bucket] as const,

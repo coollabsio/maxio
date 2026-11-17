@@ -614,6 +614,36 @@ export type DeleteBucketResponses = {
 
 export type DeleteBucketResponse = DeleteBucketResponses[keyof DeleteBucketResponses];
 
+export type GetCompressionData = {
+    body?: never;
+    path: {
+        bucket: string;
+    };
+    query?: never;
+    url: '/maxio/api/buckets/{bucket}/compression';
+};
+
+export type GetCompressionResponses = {
+    200: EnabledResponse;
+};
+
+export type GetCompressionResponse = GetCompressionResponses[keyof GetCompressionResponses];
+
+export type SetCompressionData = {
+    body: SetEnabledRequest;
+    path: {
+        bucket: string;
+    };
+    query?: never;
+    url: '/maxio/api/buckets/{bucket}/compression';
+};
+
+export type SetCompressionResponses = {
+    200: OkResponse;
+};
+
+export type SetCompressionResponse = SetCompressionResponses[keyof SetCompressionResponses];
+
 export type DownloadObjectData = {
     body?: never;
     path: {

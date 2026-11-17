@@ -108,8 +108,20 @@ printf 'Open http://localhost:9000/ui/ and sign in with %s / %s\n' \
 | `MAXIO_ALLOW_MISSING_MASTER_KEY` | `false` | Start even if SSE-S3 objects exist and their master key is missing. Those objects stay unreadable. Pass it on every start until the key is restored |
 | `MAXIO_MAX_CONSOLE_BODY_BYTES` | `1048576` | Max body size for console JSON routes |
 | `MAXIO_DOMAIN` | _(none)_ | Comma-separated base domains for virtual-hosted-style (`<bucket>.<domain>`). Alias: `MINIO_DOMAIN`. Unset keeps every host on path-style |
+| `MAXIO_COMPRESSION` | `off` | `off` or `zstd`. `zstd` compresses new objects at rest. Existing objects are not rewritten. See [Compression](#compression) |
+| `MAXIO_COMPRESSION_LEVEL` | `3` | zstd level, 1 through 22. Used whenever an object is compressed, including when a bucket turns compression on and the server default is off |
 
-Each variable also has a CLI flag (for example `--port`, `--domain`). Run `maxio --help` for the full list.
+Each variable also has a CLI flag (for example `--port`, `--domain`, `--compression`). Run `maxio --help` for the full list.
+
+## Compression
+
+Compression is off unless you turn it on with `MAXIO_COMPRESSION=zstd` or `--compression zstd`. A bucket setting overrides the server default. The console switch is **Compression** on the bucket settings page. The API is `PUT /maxio/api/buckets/{bucket}/compression` with `{ "enabled": true }` or `false`. A bucket with no setting inherits the server default.
+
+Eligible new objects are split into 1 MiB chunks of the original bytes. Each chunk is one zstd frame, or the original bytes of that chunk when zstd does not shrink it. The sidecar records the algorithm, the level, the chunk size, and each chunk. Clients still receive the original bytes. Content-Length, ETag, checksums, listings, and range reads use the original size. Responses do not add `Content-Encoding`.
+
+Objects under 1024 bytes, objects that already have `Content-Encoding`, and already-compressed types (images, video, audio except WAV, zip, gzip, zstd, 7z, rar, xz, bzip2, PDF, WOFF2) are stored unchanged. If no chunk shrinks, the file is the original bytes and the sidecar has no compression record.
+
+Do not run an older MaxIO binary after this process has stored a compressed object. An older binary ignores the compression record, serves the raw zstd bytes, and still reports the original Content-Length and ETag. Those responses are not the object the client stored. Turning compression off does not rewrite objects that are already compressed. Stay on this version, or a newer one, to read them. See [UPGRADE.md](UPGRADE.md).
 
 ## Virtual-hosted-style addressing
 

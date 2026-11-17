@@ -171,6 +171,34 @@ pub struct Config {
     /// `MINIO_DOMAIN` is accepted when `MAXIO_DOMAIN` is unset.
     #[arg(long = "domain", env = "MAXIO_DOMAIN", default_value_t = default_domain())]
     pub domain: String,
+
+    /// Compression for new objects. `off` (default) or `zstd`.
+    /// A bucket setting overrides this. Existing objects are left as stored.
+    #[arg(long, env = "MAXIO_COMPRESSION", default_value = "off")]
+    pub compression: String,
+
+    /// zstd level, 1 through 22. Used whenever an object is compressed,
+    /// including when a bucket enables compression and this server default is off.
+    #[arg(long, env = "MAXIO_COMPRESSION_LEVEL", default_value_t = 3)]
+    pub compression_level: i32,
+}
+
+/// `off` or `zstd`. Returns whether compression is on, and the level to use.
+pub fn parse_compression(value: &str, level: i32) -> Result<(bool, i32), String> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "off" => Ok((false, level)),
+        "zstd" => {
+            if !(1..=22).contains(&level) {
+                return Err(format!(
+                    "MAXIO_COMPRESSION_LEVEL must be from 1 to 22, got {level}"
+                ));
+            }
+            Ok((true, level))
+        }
+        other => Err(format!(
+            "MAXIO_COMPRESSION must be off or zstd, got {other}"
+        )),
+    }
 }
 
 impl Default for Config {
@@ -204,6 +232,8 @@ impl Default for Config {
             idle_timeout_secs: 60,
             trusted_proxy: String::new(),
             domain: String::new(),
+            compression: "off".into(),
+            compression_level: 3,
         }
     }
 }

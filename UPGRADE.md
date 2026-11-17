@@ -32,6 +32,14 @@ aws s3 mv s3://bucket/a/.maxio.object s3://bucket/a-object --endpoint-url http:/
 
 A `.maxio-promote-*` directory with no `*.meta.json` sidecar is this version's own crash leftover, not one of those objects. Startup removes an empty directory, removes a duplicate payload when the original object is still there, and restores a payload when the original is missing.
 
+## Compression
+
+Objects written with `MAXIO_COMPRESSION=zstd` (or a bucket compression override) record that fact in the sidecar. The data file is zstd frames, or raw chunks when a chunk did not shrink. It is not a copy of the original bytes.
+
+Do not downgrade to a binary that does not understand that record after any compressed object exists. The format marker stays at version 2, so the older binary still starts. It serves the raw zstd bytes and reports the original Content-Length and ETag. Those responses are not the object the client stored.
+
+Stay on this version, or a newer one, to read compressed objects. Turning compression off does not rewrite objects already stored.
+
 ## Key and prefix layout
 
 A key that is also a prefix (`photos/cat.jpg` and `photos/cat.jpg/thumb`) keeps its bytes at `photos/cat.jpg/.maxio.object`.

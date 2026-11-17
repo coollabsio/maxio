@@ -115,6 +115,7 @@ pub async fn create_bucket(
         versioning_suspended: false,
         tags: None,
         lifecycle: None,
+        compression: None,
     };
 
     let created = state

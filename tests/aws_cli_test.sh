@@ -3463,6 +3463,163 @@ EOF
     rm -rf "$PUB_DATA"
 fi
 
+# --- Transparent zstd compression ---
+# Starts its own server with compression on, so the caller-owned server can be
+# running either way. The rest of this script must also pass against a server
+# started with MAXIO_COMPRESSION=zstd.
+echo ""
+echo "--- Compression at rest ---"
+COMP_BIN="${MAXIO_BIN:-}"
+if [ -z "$COMP_BIN" ] || [ ! -x "$COMP_BIN" ]; then
+    COMP_BIN=""
+    for candidate in ./target/debug/maxio ./target/release/maxio; do
+        if [ -x "$candidate" ]; then
+            COMP_BIN="$candidate"
+            break
+        fi
+    done
+fi
+if [ -z "$COMP_BIN" ]; then
+    echo "SKIP: compression tests (maxio binary not found)"
+else
+    COMP_DATA=$(mktemp -d)
+    COMP_PORT=$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1]); s.close()')
+    COMP_EP="http://127.0.0.1:$COMP_PORT"
+    COMP_AWS=(aws --endpoint-url "$COMP_EP")
+    COMP_BUCKET="compress-$$"
+    COMP_ALIAS="maxio-compress-$$"
+    start_compress() {
+        local -a cred_args=(
+            --access-key "$MAXIO_TEST_ACCESS_KEY"
+            --secret-key "$MAXIO_TEST_SECRET_KEY"
+        )
+        if [ "$MAXIO_TEST_ACCESS_KEY" = "maxioadmin" ] && [ "$MAXIO_TEST_SECRET_KEY" = "maxioadmin" ]; then
+            cred_args+=(--allow-insecure-dev)
+        fi
+        RUST_LOG=warn "$COMP_BIN" --data-dir "$COMP_DATA" --port "$COMP_PORT" \
+            --address 127.0.0.1 --compression zstd "${cred_args[@]}" \
+            >"$COMP_DATA/server.log" 2>&1 &
+        COMP_PID=$!
+        for _ in $(seq 1 50); do
+            if curl -sf "$COMP_EP/maxio/health/live" >/dev/null 2>&1; then
+                return 0
+            fi
+            sleep 0.1
+        done
+        echo "compression server failed to start; log:"
+        cat "$COMP_DATA/server.log" || true
+        return 1
+    }
+    if start_compress; then
+        python3 - <<'PY' > "$TMPDIR/comp.json"
+line = b'{"ts":"2026-11-17T10:00:00Z","level":"info","msg":"request served","status":200}\n'
+chunk = line * 64
+target = 3 * 1024 * 1024
+written = 0
+import sys
+while written < target:
+    sys.stdout.buffer.write(chunk)
+    written += len(chunk)
+PY
+        dd if=/dev/urandom of="$TMPDIR/noise.bin" bs=1048576 count=3 status=none
+        python3 - <<'PY' > "$TMPDIR/part-a.bin"
+import sys
+sys.stdout.buffer.write(b"A" * (5 * 1024 * 1024))
+PY
+        python3 - <<'PY' > "$TMPDIR/part-b.bin"
+import sys
+sys.stdout.buffer.write(b"B" * (1024 * 1024))
+PY
+        assert "create compression bucket" "${COMP_AWS[@]}" s3api create-bucket --bucket "$COMP_BUCKET"
+        PUT_JSON=$("${COMP_AWS[@]}" s3api put-object --bucket "$COMP_BUCKET" --key comp.json \
+            --content-type application/json --body "$TMPDIR/comp.json")
+        PUT_ETAG=$(printf '%s' "$PUT_JSON" | python3 -c 'import json,sys; print(json.load(sys.stdin)["ETag"])')
+        assert "get compressible object" "${COMP_AWS[@]}" s3api get-object --bucket "$COMP_BUCKET" \
+            --key comp.json "$TMPDIR/comp.out"
+        assert "compressible body matches" cmp "$TMPDIR/comp.json" "$TMPDIR/comp.out"
+        ORIG_MD5=$(python3 -c 'import hashlib,sys; print(hashlib.md5(open(sys.argv[1],"rb").read()).hexdigest())' "$TMPDIR/comp.json")
+        assert_eq "single-part etag is the original md5" "\"$ORIG_MD5\"" "$PUT_ETAG"
+        HEAD_JSON=$("${COMP_AWS[@]}" s3api head-object --bucket "$COMP_BUCKET" --key comp.json)
+        HEAD_LEN=$(printf '%s' "$HEAD_JSON" | python3 -c 'import json,sys; print(json.load(sys.stdin)["ContentLength"])')
+        HEAD_ETAG=$(printf '%s' "$HEAD_JSON" | python3 -c 'import json,sys; print(json.load(sys.stdin)["ETag"])')
+        ORIG_LEN=$(wc -c < "$TMPDIR/comp.json" | tr -d ' ')
+        assert_eq "head content-length is the original size" "$ORIG_LEN" "$HEAD_LEN"
+        assert_eq "head etag matches put" "$PUT_ETAG" "$HEAD_ETAG"
+        assert_eq "head has no content-encoding" "absent" \
+            "$(printf '%s' "$HEAD_JSON" | python3 -c 'import json,sys; d=json.load(sys.stdin); print("absent" if not d.get("ContentEncoding") else d["ContentEncoding"])')"
+        RANGE_START=$((1024 * 1024 - 16))
+        RANGE_END=$((1024 * 1024 + 16))
+        assert "ranged get across 1 MiB" "${COMP_AWS[@]}" s3api get-object --bucket "$COMP_BUCKET" \
+            --key comp.json --range "bytes=${RANGE_START}-${RANGE_END}" "$TMPDIR/comp.range"
+        python3 -c 'import sys; d=open(sys.argv[1],"rb").read(); s,e=int(sys.argv[2]),int(sys.argv[3]); open(sys.argv[4],"wb").write(d[s:e+1])' \
+            "$TMPDIR/comp.json" "$RANGE_START" "$RANGE_END" "$TMPDIR/comp.range.exp"
+        assert "range matches the original slice" cmp "$TMPDIR/comp.range.exp" "$TMPDIR/comp.range"
+        assert "copy compressible object" "${COMP_AWS[@]}" s3api copy-object \
+            --bucket "$COMP_BUCKET" --key comp-copy.json \
+            --copy-source "$COMP_BUCKET/comp.json"
+        assert "get copied object" "${COMP_AWS[@]}" s3api get-object --bucket "$COMP_BUCKET" \
+            --key comp-copy.json "$TMPDIR/comp-copy.out"
+        assert "copy matches the original" cmp "$TMPDIR/comp.json" "$TMPDIR/comp-copy.out"
+        LIST_SIZE=$("${COMP_AWS[@]}" s3api list-objects-v2 --bucket "$COMP_BUCKET" \
+            --prefix comp.json --query 'Contents[0].Size' --output text)
+        assert_eq "list size is the original size" "$ORIG_LEN" "$LIST_SIZE"
+        DISK_LEN=$(wc -c < "$COMP_DATA/buckets/$COMP_BUCKET/comp.json" | tr -d ' ')
+        if [ "$DISK_LEN" -lt "$ORIG_LEN" ]; then
+            green "PASS: compressible object is smaller on disk ($DISK_LEN < $ORIG_LEN)"
+            PASS=$((PASS + 1))
+        else
+            red "FAIL: compressible object was not smaller on disk ($DISK_LEN vs $ORIG_LEN)"
+            FAIL=$((FAIL + 1))
+        fi
+        assert "put incompressible object" "${COMP_AWS[@]}" s3api put-object --bucket "$COMP_BUCKET" \
+            --key noise.bin --content-type application/octet-stream --body "$TMPDIR/noise.bin"
+        assert "get incompressible object" "${COMP_AWS[@]}" s3api get-object --bucket "$COMP_BUCKET" \
+            --key noise.bin "$TMPDIR/noise.out"
+        assert "incompressible body matches" cmp "$TMPDIR/noise.bin" "$TMPDIR/noise.out"
+        NOISE_LEN=$(wc -c < "$TMPDIR/noise.bin" | tr -d ' ')
+        NOISE_DISK=$(wc -c < "$COMP_DATA/buckets/$COMP_BUCKET/noise.bin" | tr -d ' ')
+        assert_eq "incompressible object is stored raw" "$NOISE_LEN" "$NOISE_DISK"
+        MP=$("${COMP_AWS[@]}" s3api create-multipart-upload --bucket "$COMP_BUCKET" --key multi.log \
+            --content-type text/plain)
+        UPLOAD_ID=$(printf '%s' "$MP" | python3 -c 'import json,sys; print(json.load(sys.stdin)["UploadId"])')
+        P1=$("${COMP_AWS[@]}" s3api upload-part --bucket "$COMP_BUCKET" --key multi.log \
+            --upload-id "$UPLOAD_ID" --part-number 1 --body "$TMPDIR/part-a.bin")
+        E1=$(printf '%s' "$P1" | python3 -c 'import json,sys; print(json.load(sys.stdin)["ETag"])')
+        P2=$("${COMP_AWS[@]}" s3api upload-part --bucket "$COMP_BUCKET" --key multi.log \
+            --upload-id "$UPLOAD_ID" --part-number 2 --body "$TMPDIR/part-b.bin")
+        E2=$(printf '%s' "$P2" | python3 -c 'import json,sys; print(json.load(sys.stdin)["ETag"])')
+        python3 -c 'import json,sys; json.dump({"Parts":[{"ETag":sys.argv[1],"PartNumber":1},{"ETag":sys.argv[2],"PartNumber":2}]}, open(sys.argv[3],"w"))' \
+            "$E1" "$E2" "$TMPDIR/mp-complete.json"
+        assert "complete multipart upload" "${COMP_AWS[@]}" s3api complete-multipart-upload \
+            --bucket "$COMP_BUCKET" --key multi.log --upload-id "$UPLOAD_ID" \
+            --multipart-upload "file://$TMPDIR/mp-complete.json"
+        cat "$TMPDIR/part-a.bin" "$TMPDIR/part-b.bin" > "$TMPDIR/multi.exp"
+        assert "get multipart object" "${COMP_AWS[@]}" s3api get-object --bucket "$COMP_BUCKET" \
+            --key multi.log "$TMPDIR/multi.out"
+        assert "multipart body matches" cmp "$TMPDIR/multi.exp" "$TMPDIR/multi.out"
+        MP_BOUNDARY=$((5 * 1024 * 1024 - 8))
+        assert "multipart ranged get" "${COMP_AWS[@]}" s3api get-object --bucket "$COMP_BUCKET" \
+            --key multi.log --range "bytes=${MP_BOUNDARY}-$((MP_BOUNDARY + 16))" "$TMPDIR/multi.range"
+        python3 -c 'import sys; d=open(sys.argv[1],"rb").read(); s=int(sys.argv[2]); open(sys.argv[3],"wb").write(d[s:s+17])' \
+            "$TMPDIR/multi.exp" "$MP_BOUNDARY" "$TMPDIR/multi.range.exp"
+        assert "multipart range matches" cmp "$TMPDIR/multi.range.exp" "$TMPDIR/multi.range"
+        assert "sse-s3 put" "${COMP_AWS[@]}" s3api put-object --bucket "$COMP_BUCKET" --key sse.json \
+            --content-type application/json --server-side-encryption AES256 --body "$TMPDIR/comp.json"
+        assert "sse-s3 get" "${COMP_AWS[@]}" s3api get-object --bucket "$COMP_BUCKET" \
+            --key sse.json "$TMPDIR/sse.out"
+        assert "sse-s3 body matches" cmp "$TMPDIR/comp.json" "$TMPDIR/sse.out"
+        assert "mc alias for compression" mc alias set "$COMP_ALIAS" "$COMP_EP" \
+            "$MAXIO_TEST_ACCESS_KEY" "$MAXIO_TEST_SECRET_KEY"
+        assert "mc put compressible object" mc cp "$TMPDIR/comp.json" "$COMP_ALIAS/$COMP_BUCKET/mc.json"
+        assert "mc get compressible object" mc cp "$COMP_ALIAS/$COMP_BUCKET/mc.json" "$TMPDIR/mc.out"
+        assert "mc body matches" cmp "$TMPDIR/comp.json" "$TMPDIR/mc.out"
+        mc alias rm "$COMP_ALIAS" >/dev/null 2>&1 || true
+        kill -TERM "$COMP_PID" 2>/dev/null || true
+        wait "$COMP_PID" 2>/dev/null || true
+    fi
+    rm -rf "$COMP_DATA"
+fi
+
 # --- Summary ---
 echo ""
 echo "=== Results: $PASS passed, $FAIL failed ==="

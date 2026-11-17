@@ -2257,6 +2257,7 @@ async fn test_delete_bucket_sweeps_nested_versions() {
             versioning_suspended: false,
             tags: None,
             lifecycle: None,
+            compression: None,
         })
         .await
         .unwrap();
@@ -9085,6 +9086,7 @@ fn test_bucket_meta(name: &str) -> maxio::storage::BucketMeta {
         versioning_suspended: false,
         tags: None,
         lifecycle: None,
+        compression: None,
     }
 }
 
